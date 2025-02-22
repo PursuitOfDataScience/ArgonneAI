@@ -11,7 +11,7 @@ from transformers import (
     PreTrainedModel
 )
 from tqdm import tqdm
-from datasets import load_dataset 
+from datasets import load_dataset, load_from_disk
 
 #####################################
 # BPE Tokenizer Utilities
@@ -21,11 +21,13 @@ def train_bpe_tokenizer(file_path, vocab_size=12000):
     """Train a ByteLevel BPE tokenizer on the text and save it in Hugging Face format."""
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train([file_path], vocab_size=vocab_size, min_frequency=2,
-                    special_tokens=["<|start_of_text|>", 
-                                    "<pad>", 
-                                    "<|end_of_text|>",
-                                    "<unk>", 
-                                    "<mask>"])
+                    special_tokens=[
+                        "<|start_of_text|>", 
+                        "<pad>", 
+                        "<|end_of_text|>",
+                        "<unk>", 
+                        "<mask>"
+                    ])
     os.makedirs("bpe_tokenizer", exist_ok=True)
     tokenizer.save_model("bpe_tokenizer")
 
@@ -62,9 +64,10 @@ def load_bpe_tokenizer():
     hf_tokenizer = PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
     return hf_tokenizer
 
+#####################################
+# STREAMING MODE
+#####################################
 
-# We'll define a generator that iterates over a streaming dataset (Arrow files)
-# and yields token lists. 
 def streaming_token_generator(data_files, hf_tokenizer):
     """
     Yields tokenized examples from a streaming dataset (no shuffle).
@@ -74,32 +77,95 @@ def streaming_token_generator(data_files, hf_tokenizer):
         data_files=data_files,
         streaming=True    
     )
-
     for example in dataset:
-        # If your Arrow has a column "text", we do:
         text = example["text"] if "text" in example else ""
-        # Tokenize
         token_ids = hf_tokenizer.encode(text)
         if len(token_ids) > 0:
             yield token_ids
 
+#####################################
+# NON-STREAMING: Full Pass
+#####################################
+
+from datasets import load_dataset, load_from_disk
+import os
+
+def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
+    """
+    Loads the entire dataset in memory either from a cached processed directory
+    or processes it in parallel if not yet cached.
+    Returns a list of token ID sequences.
+    """
+
+    # 1) Check if cached data exists
+    processed_dir = "processed_data/tokenized_data"
+    if os.path.exists(processed_dir):
+        print(f"Loading cached dataset from '{processed_dir}'...")
+        ds = load_from_disk(processed_dir)
+        tokenized_data = ds["token_ids"]
+        return tokenized_data
+
+    # 2) Otherwise, read + process from scratch
+    print("No cached dataset found. Processing in parallel...")
+
+    # Load the raw dataset in memory
+    ds_dict = load_dataset("arrow", data_files=data_files, streaming=False)
+    if "train" in ds_dict:
+        ds = ds_dict["train"]
+    else:
+        ds = ds_dict
+
+    # Define the parallel tokenization function
+    def tokenize_and_truncate(example):
+        text = example["text"] if "text" in example else ""
+        token_ids = hf_tokenizer.encode(text)
+        # skip if < block_size+1
+        if len(token_ids) < block_size + 1:
+            return {"token_ids": None}
+        # truncate if needed
+        token_ids = token_ids[:block_size+1]
+        return {"token_ids": token_ids}
+
+    # Parallel map
+    ds = ds.map(
+        tokenize_and_truncate,
+        batched=False,
+        num_proc=num_proc
+    )
+
+    # Filter out rows where token_ids=None
+    ds = ds.filter(lambda ex: ex["token_ids"] is not None)
+
+    # (Optionally remove original text column if you want to save space)
+    if "text" in ds.column_names:
+        ds = ds.remove_columns(["text"])
+
+    # 3) Save the processed dataset for next time
+    os.makedirs(os.path.dirname(processed_dir), exist_ok=True)
+    ds.save_to_disk(processed_dir)
+    print(f"Processed dataset saved to '{processed_dir}'.")
+
+    # 4) Convert to Python list of lists
+    tokenized_data = ds["token_ids"]
+    return tokenized_data
+
+
+
 def collate_batch(token_list_batch, block_size):
     """
-    Given a list of tokenized sequences, each a Python list of ints,
-    produce a single batch of shape (batch_size, block_size).
-    We'll truncate or skip if too short.
+    Convert a list of token-ID lists into x,y Tensors for causal LM.
+    We'll truncate if longer than block_size+1, skip if shorter.
     """
     x_list, y_list = [], []
     for tokens in token_list_batch:
-        # Ensure at least block_size+1 tokens to form x,y
         if len(tokens) < block_size + 1:
             continue
-        tokens = tokens[:block_size+1]  # truncate if longer
+        tokens = tokens[:block_size+1]
         x_list.append(tokens[:-1])
         y_list.append(tokens[1:])
 
     if not x_list:
-        return None, None 
+        return None, None
 
     x_tensor = torch.tensor(x_list, dtype=torch.long)
     y_tensor = torch.tensor(y_list, dtype=torch.long)
@@ -198,22 +264,17 @@ class ArgonneModelParallel(PreTrainedModel):
         # Build all blocks on CPU
         all_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
-        # Final LayerNorm + output head (stay on CPU for now)
+        # Final LayerNorm + output head
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Init position embedding
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
         self.post_init()
 
-        # Split blocks evenly across GPUs
         num_gpus = len(self.devices)
         blocks_per_gpu = math.ceil(config.n_layer / num_gpus)
-
-        # We'll store these pipeline stages in a ModuleList
         self.pipeline_stages = nn.ModuleList()
 
-        # Assign slices of blocks to each GPU
         start_idx = 0
         for i in range(num_gpus):
             end_idx = min(start_idx + blocks_per_gpu, config.n_layer)
@@ -222,19 +283,18 @@ class ArgonneModelParallel(PreTrainedModel):
             self.pipeline_stages.append(stage)
             start_idx = end_idx
             if end_idx >= config.n_layer:
-                break  # we assigned all blocks
+                break
 
-        # Move embeddings to the first GPU
+        # embeddings on first GPU
         self.token_embedding.to(self.devices[0])
         self.position_embedding = self.position_embedding.to(self.devices[0])
         self.drop.to(self.devices[0])
 
-        # Move final LN + head to the last GPU
+        # final LN + head on last GPU
         self.ln_f.to(self.devices[-1])
         self.head.to(self.devices[-1])
 
     def _init_weights(self, module):
-        """Initialize weights."""
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -243,36 +303,24 @@ class ArgonneModelParallel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        """
-        Pipeline forward pass:
-          1) Move idx to GPU[0], compute input embeddings.
-          2) Pass through pipeline stages 0..N-1. Transfer hidden states each time.
-          3) On the final GPU, apply ln_f, head, compute loss if targets provided.
-        """
-        # Start on device[0]
         x = idx.to(self.devices[0])
         b, t = x.size()
         assert t <= self.config.block_size, "Sequence length exceeds block size"
 
-        # Embeddings on GPU0
         token_embeddings = self.token_embedding(x)
         position_embeddings = self.position_embedding[:, :t, :]
         hidden_states = self.drop(token_embeddings + position_embeddings)
 
-        # Forward pass through each stage
         for stage_idx, stage in enumerate(self.pipeline_stages):
-            # stage is already on self.devices[stage_idx]
             hidden_states = hidden_states.to(self.devices[stage_idx])
-            hidden_states = stage(hidden_states)  # forward on this stage
+            hidden_states = stage(hidden_states)
 
-        # Now hidden_states is on the last GPU
         hidden_states = hidden_states.to(self.devices[-1])
         hidden_states = self.ln_f(hidden_states)
         logits = self.head(hidden_states)
 
         loss = None
         if targets is not None:
-            # Move targets to the final GPU as well
             targets = targets.to(self.devices[-1])
             logits = logits.view(-1, logits.size(-1))
             targets = targets.view(-1)
@@ -288,13 +336,11 @@ class ArgonneModelParallel(PreTrainedModel):
 
         generated = input_ids.to(self.devices[0])
         for _ in range(max_new_tokens):
-            # Crop context if longer than block_size
             if generated.shape[1] > self.config.block_size:
                 generated = generated[:, -self.config.block_size:]
 
             logits, _ = self.forward(generated)
-            # logits on last device
-            logits = logits[:, -1, :].to(self.devices[-1])  # shape [batch, vocab_size]
+            logits = logits[:, -1, :].to(self.devices[-1])  
             logits = logits / temperature
 
             if top_k is not None:
@@ -303,22 +349,19 @@ class ArgonneModelParallel(PreTrainedModel):
 
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            # Move next_token back to device[0] to append
             next_token = next_token.to(self.devices[0])
             generated = torch.cat((generated, next_token), dim=1)
 
         return generated
 
 #####################################
-# Training Loop (Streaming Version)
+# Training Loop (Streaming OR Full-Pass Non-Streaming)
 #####################################
 
-def train_model_parallel(data_path="data/*.arrow"):
-
-    # If the tokenizer doesn't exist, train it (but typically for streaming you'd pre-make it)
+def train_model_parallel(data_path, use_streaming=False):
+    # 1) If no tokenizer, train it
     if not os.path.exists("bpe_tokenizer/vocab.json"):
         print("Training BPE tokenizer...")
-        # We pass a single file or pattern here. Possibly just the first arrow file or a text file.
         train_bpe_tokenizer(data_path, vocab_size=12000)
     hf_tokenizer = load_bpe_tokenizer()
 
@@ -328,9 +371,8 @@ def train_model_parallel(data_path="data/*.arrow"):
     n_head = 24
     n_embd = 1296
     dropout = 0.1
-    batch_size = 24
+    batch_size = 8
 
-    # Build model config
     config_model = ArgonneConfig(
         vocab_size=12000,
         block_size=block_size,
@@ -339,92 +381,146 @@ def train_model_parallel(data_path="data/*.arrow"):
         n_embd=n_embd,
         dropout=dropout
     )
-    # Build pipeline-parallel GPT model
     model = ArgonneModelParallel(config_model)
 
-    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
     scaler = torch.amp.GradScaler("cuda")
 
-    steps_per_epoch = 1000  
+    if use_streaming:
+        ########################################################
+        # STREAMING MODE
+        ########################################################
+        steps_per_epoch = 500  
+        global_step = 0
 
-    global_step = 0
+        for epoch in tqdm(range(epochs)):
+            print(f"==== Starting epoch {epoch} (STREAMING) ====")
+            token_gen = streaming_token_generator(data_path, hf_tokenizer)  
+            step_in_epoch = 0
+            token_batch = []
 
-    for epoch in tqdm(range(epochs)):
-        print(f"==== Starting epoch {epoch} ====")
+            while step_in_epoch < steps_per_epoch:
+                try:
+                    tokens = next(token_gen)
+                    token_batch.append(tokens)
 
-        # Re-initialize the generator for each epoch if you want multiple passes
-        token_gen = streaming_token_generator(data_path, hf_tokenizer)  # returns token lists
-        step_in_epoch = 0
+                    if len(token_batch) == batch_size:
+                        x_tens, y_tens = collate_batch(token_batch, block_size)
+                        token_batch.clear()
+                        if x_tens is None:
+                            continue
 
-        # We'll accumulate tokenized sequences to form a batch:
-        token_batch = []
+                        first_device = model.devices[0]
+                        x_tens, y_tens = x_tens.to(first_device), y_tens.to(first_device)
 
-        while step_in_epoch < steps_per_epoch:
-            try:
-                tokens = next(token_gen)  # get next tokenized example
-                token_batch.append(tokens)
+                        optimizer.zero_grad()
+                        with torch.amp.autocast("cuda"):
+                            logits, loss = model(x_tens, y_tens)
 
-                # Once we have 'batch_size' examples, do a training step
-                if len(token_batch) == batch_size:
-                    x_tens, y_tens = collate_batch(token_batch, block_size)
-                    token_batch.clear()  # reset for next batch
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
 
-                    # If x_tens is None, it means all examples were too short
-                    if x_tens is None:
-                        continue
+                        global_step += 1
+                        step_in_epoch += 1
+                        print(f'current global step: {global_step}, current step in epoch: {step_in_epoch}')
+                        if global_step % 50 == 0:
+                            print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+                            prompt_str = "Long long time ago, "
+                            token_ids = hf_tokenizer.encode(prompt_str)
+                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                            generated = model.generate(prompt_tensor, max_new_tokens=50)
+                            generated_text = hf_tokenizer.decode(generated[0].tolist())
+                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                    # We'll always sample the batch on the first device
-                    first_device = model.devices[0]
-                    x_tens = x_tens.to(first_device)
-                    y_tens = y_tens.to(first_device)
+                        if global_step % 10000 == 0:
+                            checkpoint = {
+                                "epoch": epoch,
+                                "global_step": global_step,
+                                "model_state_dict": model.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "loss": loss.item()
+                            }
+                            os.makedirs("pretrained", exist_ok=True)
+                            torch.save(checkpoint, f"pretrained/checkpoint_step_{global_step}.pth")
+                            print(f"Checkpoint saved at step {global_step}")
 
-                    optimizer.zero_grad()
-                    with torch.amp.autocast("cuda"):
-                        logits, loss = model(x_tens, y_tens)
+                except StopIteration:
+                    print("Reached end of dataset (stream) before finishing this epoch.")
+                    break
 
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+    else:
+        ########################################################
+        # NON-STREAMING MODE: full pass each epoch
+        ########################################################
+        print("=== Loading dataset in memory for a full pass approach ===")
+        tokenized_data = load_nonstream_data(data_path, hf_tokenizer, block_size, num_proc=8)
+        total_samples = len(tokenized_data)
+        print(f"Total tokenized samples: {total_samples}")
 
-                    global_step += 1
-                    step_in_epoch += 1
+        batches_per_epoch = total_samples // batch_size
+        global_step = 0
 
-                    if global_step % 100 == 0:
-                        print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+        for epoch in tqdm(range(epochs)):
+            print(f"==== Starting epoch {epoch} (NON-STREAMING) ====")
 
-                        # Quick test generation
-                        prompt_str = "Long long time ago, "
-                        token_ids = hf_tokenizer.encode(prompt_str)
-                        prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-                        generated = model.generate(prompt_tensor, max_new_tokens=50)
-                        generated_text = hf_tokenizer.decode(generated[0].tolist())
-                        print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+            for batch_idx in tqdm(range(batches_per_epoch)):
+                # slice out the portion of data for this batch
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                batch_token_lists = tokenized_data[start_idx:end_idx]
 
-                    if global_step % 10000 == 0:
-                        checkpoint = {
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "loss": loss.item()
-                        }
-                        os.makedirs("pretrained", exist_ok=True)
-                        torch.save(checkpoint, f"pretrained/checkpoint_step_{global_step}.pth")
-                        print(f"Checkpoint saved at step {global_step}")
+                x_tens, y_tens = collate_batch(batch_token_lists, block_size)
+                if x_tens is None:
+                    continue
 
-            except StopIteration:
-                # End of streaming dataset. If you want a single pass, break. 
-                print("Reached end of dataset before finishing this epoch.")
-                break
+                first_device = model.devices[0]
+                x_tens = x_tens.to(first_device)
+                y_tens = y_tens.to(first_device)
+
+                optimizer.zero_grad()
+                with torch.amp.autocast("cuda"):
+                    logits, loss = model(x_tens, y_tens)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                global_step += 1
+
+                # Logging
+                if global_step % 50 == 0:
+                    print(f"Epoch {epoch} | global_step {global_step} | Loss: {loss.item():.4f}")
+
+                    # Quick generation
+                    prompt_str = "Long long time ago, "
+                    token_ids = hf_tokenizer.encode(prompt_str)
+                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                    generated = model.generate(prompt_tensor, max_new_tokens=50)
+                    generated_text = hf_tokenizer.decode(generated[0].tolist())
+                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                # Checkpointing
+                if global_step % 5000 == 0:
+                    checkpoint = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": loss.item()
+                    }
+                    os.makedirs("pretrained", exist_ok=True)
+                    torch.save(checkpoint, f"pretrained/checkpoint_step_{global_step}.pth")
+                    print(f"Checkpoint saved at step {global_step}")
 
     # Save final model and tokenizer
     model.save_pretrained("Argonne_LLM")
     hf_tokenizer.save_pretrained("Argonne_LLM")
-    print("Model-parallel streaming training complete; model and tokenizer saved successfully.")
+    print("Model-parallel training complete; model and tokenizer saved successfully.")
 
 def main():
-    train_model_parallel()
+    train_model_parallel(data_path="data/fineweb-edu-train-00144-of-00218.arrow",
+                         use_streaming=False)
 
 if __name__ == "__main__":
     main()

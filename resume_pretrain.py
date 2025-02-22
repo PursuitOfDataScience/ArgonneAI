@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-# Import functions from mp_pretrain
+# Import functions from mp_pretrain.py
 from mp_pretrain import (
     ArgonneConfig,
     ArgonneModelParallel,
