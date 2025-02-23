@@ -297,7 +297,7 @@ class ArgonneModelParallel(PreTrainedModel):
 
         # embeddings on first GPU
         self.token_embedding.to(self.devices[0])
-        self.position_embedding = self.position_embedding.to(self.devices[0])
+        self.position_embedding = nn.Parameter(self.position_embedding.to(self.devices[0]))
         self.drop.to(self.devices[0])
 
         # final LN + head on last GPU
