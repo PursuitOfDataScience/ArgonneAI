@@ -12,22 +12,48 @@ from transformers import (
 )
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
+import glob
 
 #####################################
 # BPE Tokenizer Utilities
 #####################################
 
-def train_bpe_tokenizer(file_path, vocab_size=12000):
-    """Train a ByteLevel BPE tokenizer on the text and save it in Hugging Face format."""
+def create_text_file_from_arrow(arrow_files, output_file="all_text_for_tokenizer.txt"):
+    """
+    Given a list of Arrow files, extract the 'text' column and write
+    it to a single text file (one text example per line).
+    """
+    print(f"Creating a combined text file '{output_file}' from Arrow files...")
+    with open(output_file, "w", encoding="utf-8") as wf:
+        for arrow_path in tqdm(arrow_files):
+            # Load the Arrow file in *streaming* mode to avoid large memory usage
+            ds = load_dataset("arrow", data_files=[arrow_path], streaming=True)
+            # If "train" split exists, use ds["train"], else ds is the dataset
+            if "train" in ds:
+                ds = ds["train"]
+            for example in ds:
+                text = example.get("text", "")
+                # Write one line of text
+                wf.write(text.replace("\n", " ") + "\n")
+
+def train_bpe_tokenizer(text_file, vocab_size=12000):
+    """
+    Train a ByteLevel BPE tokenizer on a *plain-text file* and save it.
+    """
     tokenizer = ByteLevelBPETokenizer()
-    tokenizer.train([file_path], vocab_size=vocab_size, min_frequency=2,
-                    special_tokens=[
-                        "<|start_of_text|>", 
-                        "<pad>", 
-                        "<|end_of_text|>",
-                        "<unk>", 
-                        "<mask>"
-                    ])
+    tokenizer.train(
+        files=[text_file],
+        vocab_size=vocab_size,
+        min_frequency=2,
+        special_tokens=[
+            "<|start_of_text|>",
+            "<pad>",
+            "<|end_of_text|>",
+            "<unk>",
+            "<mask>"
+        ]
+    )
+
     os.makedirs("bpe_tokenizer", exist_ok=True)
     tokenizer.save_model("bpe_tokenizer")
 
@@ -59,6 +85,7 @@ def train_bpe_tokenizer(file_path, vocab_size=12000):
     hf_tokenizer.save_pretrained("bpe_tokenizer")
     return hf_tokenizer
 
+
 def load_bpe_tokenizer():
     """Load a previously trained BPE tokenizer in Hugging Face format."""
     hf_tokenizer = PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
@@ -71,12 +98,12 @@ def load_bpe_tokenizer():
 def streaming_token_generator(data_files, hf_tokenizer):
     """
     Yields tokenized examples from a streaming dataset (no shuffle).
+    data_files should be a list of Arrow files.
     """
-    dataset = load_dataset(
-        "arrow",
-        data_files=data_files,
-        streaming=True    
-    )
+    dataset = load_dataset("arrow", data_files=data_files, streaming=True)
+    if "train" in dataset:
+        dataset = dataset["train"]
+
     for example in dataset:
         text = example["text"] if "text" in example else ""
         token_ids = hf_tokenizer.encode(text)
@@ -87,9 +114,6 @@ def streaming_token_generator(data_files, hf_tokenizer):
 # NON-STREAMING: Full Pass
 #####################################
 
-from datasets import load_dataset, load_from_disk
-import os
-
 def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
     """
     Loads the entire dataset in memory either from a cached processed directory
@@ -97,7 +121,6 @@ def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
     Returns a list of token ID sequences.
     """
 
-    # 1) Check if cached data exists
     processed_dir = "processed_data/tokenized_data"
     if os.path.exists(processed_dir):
         print(f"Loading cached dataset from '{processed_dir}'...")
@@ -105,51 +128,38 @@ def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
         tokenized_data = ds["token_ids"]
         return tokenized_data
 
-    # 2) Otherwise, read + process from scratch
     print("No cached dataset found. Processing in parallel...")
 
-    # Load the raw dataset in memory
     ds_dict = load_dataset("arrow", data_files=data_files, streaming=False)
     if "train" in ds_dict:
         ds = ds_dict["train"]
     else:
         ds = ds_dict
 
-    # Define the parallel tokenization function
     def tokenize_and_truncate(example):
         text = example["text"] if "text" in example else ""
         token_ids = hf_tokenizer.encode(text)
-        # skip if < block_size+1
         if len(token_ids) < block_size + 1:
             return {"token_ids": None}
-        # truncate if needed
         token_ids = token_ids[:block_size+1]
         return {"token_ids": token_ids}
 
-    # Parallel map
     ds = ds.map(
         tokenize_and_truncate,
         batched=False,
         num_proc=num_proc
     )
-
-    # Filter out rows where token_ids=None
     ds = ds.filter(lambda ex: ex["token_ids"] is not None)
 
-    # (Optionally remove original text column if you want to save space)
     if "text" in ds.column_names:
         ds = ds.remove_columns(["text"])
 
-    # 3) Save the processed dataset for next time
     os.makedirs(os.path.dirname(processed_dir), exist_ok=True)
     ds.save_to_disk(processed_dir)
     print(f"Processed dataset saved to '{processed_dir}'.")
 
-    # 4) Convert to Python list of lists
     tokenized_data = ds["token_ids"]
     return tokenized_data
-
-
 
 def collate_batch(token_list_batch, block_size):
     """
@@ -215,6 +225,7 @@ class CausalSelfAttention(nn.Module):
             torch.tril(torch.ones(config.block_size, config.block_size))
                  .view(1, 1, config.block_size, config.block_size)
         )
+
     def forward(self, x):
         b, t, c = x.size()
         q = self.query(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
@@ -246,11 +257,10 @@ class MLP(nn.Module):
         return x
 
 class ArgonneModelParallel(PreTrainedModel):
-
     config_class = ArgonneConfig
+
     def __init__(self, config):
         super().__init__(config)
-
         # Detect all available CUDA devices
         self.devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
         if len(self.devices) == 0:
@@ -258,7 +268,7 @@ class ArgonneModelParallel(PreTrainedModel):
 
         # Create embeddings on CPU initially
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd, device=self.devices[0]))
+        self.position_embedding = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.dropout)
 
         # Build all blocks on CPU
@@ -340,7 +350,7 @@ class ArgonneModelParallel(PreTrainedModel):
                 generated = generated[:, -self.config.block_size:]
 
             logits, _ = self.forward(generated)
-            logits = logits[:, -1, :].to(self.devices[-1])  
+            logits = logits[:, -1, :].to(self.devices[-1])
             logits = logits / temperature
 
             if top_k is not None:
@@ -358,11 +368,21 @@ class ArgonneModelParallel(PreTrainedModel):
 # Training Loop (Streaming OR Full-Pass Non-Streaming)
 #####################################
 
-def train_model_parallel(data_path, use_streaming=False):
-    # 1) If no tokenizer, train it
+def train_model_parallel(data_files, use_streaming=False):
+    """
+    data_files should be a list of actual .arrow file paths, e.g.
+    ["data/file1.arrow", "data/file2.arrow", ...]
+    """
+    # 1) If no tokenizer, train it on text extracted from Arrow
     if not os.path.exists("bpe_tokenizer/vocab.json"):
-        print("Training BPE tokenizer...")
-        train_bpe_tokenizer(data_path, vocab_size=12000)
+        print("No existing tokenizer found. Building a text file from Arrow and training one...")
+        # Create a text file from Arrow files
+        text_file_path = "all_text_for_tokenizer.txt"
+        create_text_file_from_arrow(data_files, text_file_path)
+        # Now train BPE on that text file
+        train_bpe_tokenizer(text_file_path, vocab_size=12000)
+
+    # Load the tokenizer we just created (or found)
     hf_tokenizer = load_bpe_tokenizer()
 
     block_size = 2048
@@ -395,7 +415,7 @@ def train_model_parallel(data_path, use_streaming=False):
 
         for epoch in tqdm(range(epochs)):
             print(f"==== Starting epoch {epoch} (STREAMING) ====")
-            token_gen = streaming_token_generator(data_path, hf_tokenizer)  
+            token_gen = streaming_token_generator(data_files, hf_tokenizer)
             step_in_epoch = 0
             token_batch = []
 
@@ -454,7 +474,7 @@ def train_model_parallel(data_path, use_streaming=False):
         # NON-STREAMING MODE: full pass each epoch
         ########################################################
         print("=== Loading dataset in memory for a full pass approach ===")
-        tokenized_data = load_nonstream_data(data_path, hf_tokenizer, block_size, num_proc=8)
+        tokenized_data = load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8)
         total_samples = len(tokenized_data)
         print(f"Total tokenized samples: {total_samples}")
 
@@ -465,7 +485,6 @@ def train_model_parallel(data_path, use_streaming=False):
             print(f"==== Starting epoch {epoch} (NON-STREAMING) ====")
 
             for batch_idx in tqdm(range(batches_per_epoch)):
-                # slice out the portion of data for this batch
                 start_idx = batch_idx * batch_size
                 end_idx = start_idx + batch_size
                 batch_token_lists = tokenized_data[start_idx:end_idx]
@@ -488,11 +507,8 @@ def train_model_parallel(data_path, use_streaming=False):
 
                 global_step += 1
 
-                # Logging
                 if global_step % 50 == 0:
                     print(f"Epoch {epoch} | global_step {global_step} | Loss: {loss.item():.4f}")
-
-                    # Quick generation
                     prompt_str = "Long long time ago, "
                     token_ids = hf_tokenizer.encode(prompt_str)
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
@@ -500,7 +516,6 @@ def train_model_parallel(data_path, use_streaming=False):
                     generated_text = hf_tokenizer.decode(generated[0].tolist())
                     print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                # Checkpointing
                 if global_step % 5000 == 0:
                     checkpoint = {
                         "epoch": epoch,
@@ -519,8 +534,12 @@ def train_model_parallel(data_path, use_streaming=False):
     print("Model-parallel training complete; model and tokenizer saved successfully.")
 
 def main():
-    train_model_parallel(data_path="data/fineweb-edu-train-00144-of-00218.arrow",
-                         use_streaming=False)
+    # Expand .arrow files via glob
+    data_files = glob.glob("data/*.arrow")
+    if not data_files:
+        raise ValueError("No files matched the pattern 'data/*.arrow'")
+
+    train_model_parallel(data_files=data_files, use_streaming=False)
 
 if __name__ == "__main__":
     main()
