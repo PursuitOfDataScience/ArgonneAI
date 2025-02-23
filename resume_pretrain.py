@@ -4,20 +4,13 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# No intel_extension_for_pytorch import needed for pure CUDA
-# from mpi4py import MPI  # only if you need MPI-based distributed
-
-# Import from your main script (mp_pretrain.py or similar) that has:
-#  - ArgonneConfig, ArgonneModelParallel
-#  - load_bpe_tokenizer, streaming_token_generator, collate_batch
-#  - load_nonstream_data (if you do non-streaming parallel map)
 from mp_pretrain import (
     ArgonneConfig,
     ArgonneModelParallel,
     load_bpe_tokenizer,
     streaming_token_generator,
     collate_batch,
-    load_nonstream_data  # optional, if you do parallel map for non-streaming
+    load_nonstream_data 
 )
 
 def resume_training(
@@ -88,7 +81,6 @@ def resume_training(
                         if x_tens is None:
                             continue
 
-                        # We'll feed to model.devices[0], if your pipeline logic expects that
                         first_device = model.devices[0]
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
@@ -185,7 +177,7 @@ def main():
     resume_training(
         data_path="data/*.arrow",
         checkpoint_path="pretrained/checkpoint_step_2000.pth", # manually set
-        epochs=5,
+        epochs=3,
         steps_per_epoch=500,
         block_size=2048,
         batch_size=24,
