@@ -50,18 +50,43 @@ dist.init_process_group(
 )
 
 # Pin the XPU device to local rank
-# If each node has e.g. multiple XPUs, each process might pick a different local XPU.
 torch.xpu.set_device(int(LOCAL_RANK))
 device = torch.device(f"xpu:{LOCAL_RANK}")
+
+#####################################
+# Create Text File from Arrow
+#####################################
+
+def create_text_file_from_arrow(arrow_files, output_file="all_text_for_tokenizer.txt"):
+    """
+    Load each Arrow file in streaming mode, extract the 'text' field,
+    and write it (one example per line) to a plain-text file.
+    """
+    print(f"[Rank {RANK}] Creating text file '{output_file}' from Arrow files: {arrow_files}")
+    with open(output_file, "w", encoding="utf-8") as wf:
+        for arrow_file in arrow_files:
+            ds = load_dataset("arrow", data_files=[arrow_file], streaming=True)
+            # If there's a "train" split, use ds["train"], else ds is the dataset
+            if "train" in ds:
+                ds = ds["train"]
+            for example in ds:
+                text = example["text"] if "text" in example else ""
+                # Replace newlines with spaces to keep one line per example
+                text = text.replace("\n", " ")
+                wf.write(text + "\n")
+
 
 #####################################
 # BPE Tokenizer Utilities
 #####################################
 
-def train_bpe_tokenizer(file_path, vocab_size=12000):
+def train_bpe_tokenizer(text_file_path, vocab_size=12000):
+    """
+    Train a ByteLevel BPE tokenizer on a *plain text* file in UTF-8.
+    """
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train(
-        [file_path],
+        [text_file_path],
         vocab_size=vocab_size,
         min_frequency=2,
         special_tokens=[
@@ -72,6 +97,7 @@ def train_bpe_tokenizer(file_path, vocab_size=12000):
             "<mask>"
         ]
     )
+
     os.makedirs("bpe_tokenizer", exist_ok=True)
     tokenizer.save_model("bpe_tokenizer")
 
@@ -101,6 +127,9 @@ def train_bpe_tokenizer(file_path, vocab_size=12000):
     return hf_tokenizer
 
 def load_bpe_tokenizer():
+    """
+    Load a previously trained BPE tokenizer in Hugging Face format.
+    """
     return PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
 
 #####################################
@@ -109,6 +138,11 @@ def load_bpe_tokenizer():
 
 def streaming_token_generator(data_files, hf_tokenizer):
     dataset = load_dataset("arrow", data_files=data_files, streaming=True)
+    # If dataset has 'train' split, use dataset["train"]
+    # Otherwise, dataset is the entire data
+    if "train" in dataset:
+        dataset = dataset["train"]
+
     for example in dataset:
         text = example["text"] if "text" in example else ""
         token_ids = hf_tokenizer.encode(text)
@@ -116,6 +150,7 @@ def streaming_token_generator(data_files, hf_tokenizer):
             yield token_ids
 
 def collate_batch(token_list_batch, block_size):
+    x_list, y_list = []
     x_list, y_list = [], []
     for tokens in token_list_batch:
         if len(tokens) < block_size + 1:
@@ -123,8 +158,10 @@ def collate_batch(token_list_batch, block_size):
         tokens = tokens[:block_size+1]
         x_list.append(tokens[:-1])
         y_list.append(tokens[1:])
+
     if not x_list:
         return None, None
+
     x_tensor = torch.tensor(x_list, dtype=torch.long)
     y_tensor = torch.tensor(y_list, dtype=torch.long)
     return x_tensor, y_tensor
@@ -207,7 +244,7 @@ class MLP(nn.Module):
 
 #####################################
 # Pipeline Parallel Model
-# We'll wrap it in DDP for multi-node data parallel
+# (We'll wrap in DDP for multi-node data parallel)
 #####################################
 
 class ArgonneModelParallel(PreTrainedModel):
@@ -216,11 +253,7 @@ class ArgonneModelParallel(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        # We assume each process is pinned to a single XPU device (via set_device)
-        # but the code is set up for pipeline parallel across multiple XPUs in *one process*.
-        # If you truly want pipeline across multiple XPUs + multi-node DDP, that's advanced.
-        # We'll keep it simple and assume each process has 1 XPU or pipeline of XPUs?
-
+        # We assume each process is pinned to a single XPU device.
         xpu_count = torch.xpu.device_count()
         if xpu_count == 0:
             raise ValueError("No XPUs available?")
@@ -238,7 +271,8 @@ class ArgonneModelParallel(PreTrainedModel):
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
         self.post_init()
 
-        # If you truly want pipeline parallel, do so here
+        # If you truly want pipeline parallel across multiple XPUs *in one process*,
+        # the code below splits the blocks among XPUs in self.devices.
         blocks_per_xpu = math.ceil(config.n_layer / xpu_count)
         self.pipeline_stages = nn.ModuleList()
 
@@ -252,6 +286,7 @@ class ArgonneModelParallel(PreTrainedModel):
             if end_idx >= config.n_layer:
                 break
 
+        # Move embeddings + final layers
         self.token_embedding.to(self.devices[0])
         self.position_embedding = nn.Parameter(
             self.position_embedding.to(self.devices[0])
@@ -314,12 +349,33 @@ class ArgonneModelParallel(PreTrainedModel):
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
-    # Build / load tokenizer
+    """
+    Main training function using DistributedDataParallel on XPUs + pipeline parallel.
+    data_path can be a wildcard or list of Arrow files.
+    """
+
+    # 1) Build / load tokenizer
+    #    => We cannot pass arrow files directly to ByteLevelBPETokenizer (it's binary).
+    #    => Instead, we create a text file from arrow if needed.
     if not os.path.exists("bpe_tokenizer/vocab.json"):
-        print("No tokenizer found, training new one...")
-        train_bpe_tokenizer(data_path, vocab_size=12000)
+        print("[Rank 0] No tokenizer found, creating text file from Arrow and training a new one...")
+        if RANK == 0:
+            # Only rank 0 performs the text-file generation + training
+            # Then we barrier so other ranks wait until it's done
+            import glob
+            arrow_files = glob.glob(data_path)  # expand wildcard
+            if len(arrow_files) == 0:
+                raise ValueError(f"No files match the pattern {data_path}")
+
+            create_text_file_from_arrow(arrow_files, "all_text_for_tokenizer.txt")
+            train_bpe_tokenizer("all_text_for_tokenizer.txt", vocab_size=12000)
+
+        dist.barrier()  # all ranks wait here
+
+    # Now, each rank can load the tokenizer from disk
     hf_tokenizer = load_bpe_tokenizer()
 
+    # 2) Prepare model
     block_size = 2048
     batch_size = 24
 
@@ -333,26 +389,29 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
     )
     base_model = ArgonneModelParallel(config_model).to(device)
 
-    lr = 3e-5 
+    lr = 3e-5
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=lr)
 
-    # IPEX optimize
+    # IPEX optimization
     base_model, optimizer = ipex.optimize(base_model, optimizer=optimizer)
 
     # Wrap in DDP
-    # device_ids=None because we have pipeline parallel inside the model
-    # so we don't rely on a single device per rank
     model = DDP(base_model, device_ids=None)
 
     scaler = torch.amp.GradScaler()
 
+    # 3) Streaming vs. Non-streaming
     if use_streaming:
         steps_per_epoch = 1000
         global_step = 0
 
         for epoch in range(epochs):
             print(f"[Rank {RANK}] Starting epoch {epoch}, streaming mode.")
-            token_gen = streaming_token_generator(data_path, hf_tokenizer)
+            # Expand the Arrow pattern for streaming
+            import glob
+            arrow_files = glob.glob(data_path)
+            token_gen = streaming_token_generator(arrow_files, hf_tokenizer)
+
             step_in_epoch = 0
             token_batch = []
 
@@ -367,9 +426,13 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
                         if x_tens is None:
                             continue
 
+                        # Move data to local XPU
+                        x_tens = x_tens.to(device)
+                        y_tens = y_tens.to(device)
+
                         optimizer.zero_grad()
                         with torch.amp.autocast(device_type="xpu"):
-                            logits, loss = model(x_tens, y_tens)  # model(...) calls the DDP-wrapped pipeline
+                            logits, loss = model(x_tens, y_tens)
                         scaler.scale(loss).backward()
                         scaler.step(optimizer)
                         scaler.update()
@@ -378,7 +441,7 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
                         step_in_epoch += 1
 
                         if global_step % 100 == 0 and RANK == 0:
-                            print(f"[Rank 0] Epoch {epoch} step {global_step} loss={loss.item():.4f}")
+                            print(f"[Rank 0] Epoch={epoch}, step={global_step}, loss={loss.item():.4f}")
 
                 except StopIteration:
                     print(f"[Rank {RANK}] Reached end of dataset stream early.")
@@ -387,58 +450,44 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
     else:
         print(f"[Rank {RANK}] Non-streaming mode with DDP + full pass approach.")
 
-        # 1) Load entire dataset in memory
-        ds_dict = load_dataset("arrow", data_files=data_path, streaming=False)
-        if "train" in ds_dict:
-            raw_dataset = ds_dict["train"]
-        else:
-            raw_dataset = ds_dict
+        # 1) Expand arrow files
+        import glob
+        arrow_files = glob.glob(data_path)
+        if len(arrow_files) == 0:
+            raise ValueError(f"No files match the pattern {data_path}")
 
-        # 2) Convert dataset to a Torch Dataset if needed
-        #    For instance, you might do:
-        #    raw_dataset = raw_dataset.map( your_tokenizing_fn, num_proc=? ) 
-        #    Or at least get raw_dataset as a list of items.
+        # 2) Convert dataset to a Torch Dataset
+        #    We'll do a minimal approach: load them all into a single HuggingFace dataset
+        from torch.utils.data import Dataset, DataLoader
+        from torch.utils.data.distributed import DistributedSampler
 
-        # We want a standard PyTorch dataset. For demonstration, let's do something minimal:
-        from torch.utils.data import Dataset
+        hf_ds = load_dataset("arrow", data_files=arrow_files, streaming=False)
+        if "train" in hf_ds:
+            hf_ds = hf_ds["train"]
 
         class ArrowWrapDataset(Dataset):
-            def __init__(self, hf_ds):
-                self.data = hf_ds
+            def __init__(self, ds):
+                self.ds = ds
             def __len__(self):
-                return len(self.data)
+                return len(self.ds)
             def __getitem__(self, idx):
-                example = self.data[idx]
+                example = self.ds[idx]
                 text = example["text"] if "text" in example else ""
                 token_ids = hf_tokenizer.encode(text)
-                return token_ids  # or (input, label) etc.
+                return token_ids
 
-        dataset = ArrowWrapDataset(raw_dataset)
+        dataset = ArrowWrapDataset(hf_ds)
+        sampler = DistributedSampler(dataset=dataset, num_replicas=SIZE, rank=RANK, shuffle=True)
 
-        # 3) Create a DistributedSampler so each rank sees a unique slice
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(
-            dataset=dataset,
-            num_replicas=SIZE,   # total ranks
-            rank=RANK,
-            shuffle=True
-        )
-
-        # 4) Create a DataLoader referencing that sampler
-        from torch.utils.data import DataLoader
         def collate_fn(batch):
-            # batch is a list of token_ids from ArrowWrapDataset
-            # We can do a truncation or create x,y
-            # For demonstration, let's create x,y using your block_size
             x_list, y_list = [], []
             for token_ids in batch:
                 if len(token_ids) < block_size + 1:
                     continue
-                token_ids = token_ids[: block_size+1]
+                token_ids = token_ids[: block_size + 1]
                 x_list.append(token_ids[:-1])
                 y_list.append(token_ids[1:])
             if len(x_list) == 0:
-                # if entire batch is empty, handle carefully
                 return None, None
             x_tensor = torch.tensor(x_list, dtype=torch.long)
             y_tensor = torch.tensor(y_list, dtype=torch.long)
@@ -451,43 +500,40 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
             collate_fn=collate_fn
         )
 
-        # 5) Now do a full pass each epoch
+        # 3) Train for multiple epochs
         global_step = 0
         for epoch_idx in range(epochs):
-            # DDP: set epoch so sampler can reshuffle consistently across ranks
-            sampler.set_epoch(epoch_idx)
+            sampler.set_epoch(epoch_idx)  # ensure consistent shuffling across ranks
+
             print(f"[Rank {RANK}] Starting epoch {epoch_idx}, dataset size ~ {len(dataset)}")
 
             for batch_idx, (x_tens, y_tens) in enumerate(dataloader):
                 if x_tens is None:
-                    # Means collate_fn returned None because all too short
                     continue
 
-                # Move data to local XPU (some rank pinned to device xpu:{LOCAL_RANK})
                 x_tens = x_tens.to(device)
                 y_tens = y_tens.to(device)
 
                 optimizer.zero_grad()
                 with torch.amp.autocast(device_type="xpu"):
-                    logits, loss = model(x_tens, y_tens)  # model is DDP-wrapped pipeline model
+                    logits, loss = model(x_tens, y_tens)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
                 global_step += 1
-                # Logging
                 if global_step % 100 == 0 and RANK == 0:
                     print(f"[Rank 0] Epoch={epoch_idx}, global_step={global_step}, Loss={loss.item():.4f}")
 
-                # 6) Save checkpoint at intervals from rank 0 only
+                # Save checkpoint occasionally from rank 0
                 if global_step % 5000 == 0 and RANK == 0:
+                    os.makedirs("pretrained", exist_ok=True)
                     ckpt_path = f"pretrained/ckpt_step_{global_step}.pth"
                     checkpoint = {
                         "epoch": epoch_idx,
                         "global_step": global_step,
-                        # with DDP, model is wrapped in model=DDP(base_model),
-                        # so we do model.module.state_dict()
+                        # For DDP, the underlying model is in model.module
                         "model_state_dict": model.module.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "loss": loss.item()
@@ -495,20 +541,23 @@ def train_model_ddp(data_path="data/*.arrow", use_streaming=False, epochs=3):
                     torch.save(checkpoint, ckpt_path)
                     print(f"[Rank 0] Saved checkpoint at step {global_step} to {ckpt_path}")
 
-        # End of full pass training
-
-
+    # 4) Save final model + tokenizer (rank 0)
     if RANK == 0:
-        # Save from rank 0 only
+        os.makedirs("Argonne_LLM", exist_ok=True)
         model.module.save_pretrained("Argonne_LLM")
         hf_tokenizer.save_pretrained("Argonne_LLM")
         print("[Rank 0] Model + tokenizer saved successfully!")
 
+    # 5) Cleanup
     dist.destroy_process_group()
-    print(f"[Rank {RANK}] training complete. Cleaned up.")
+    print(f"[Rank {RANK}] Training complete. Process group destroyed.")
 
 def main():
-    train_model_ddp(use_streaming=False, epochs=3)
+    train_model_ddp(
+        data_path="data/*.arrow",  
+        use_streaming=False,
+        epochs=3
+    )
 
 if __name__ == "__main__":
     main()
