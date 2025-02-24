@@ -3,6 +3,7 @@ import math
 import json
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 import torch.nn.functional as F
 from mp_pretrain import (
     ArgonneConfig,
@@ -64,7 +65,7 @@ def resume_training(
     # 6) Decide streaming vs non-streaming
     if use_streaming:
         print("=== Resuming in STREAMING mode (CUDA) ===")
-        for epoch in range(start_epoch, start_epoch + epochs):
+        for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
             print(f"=== Resume Epoch {epoch} (streaming) ===")
             token_gen = streaming_token_generator(data_path, hf_tokenizer)
             step_in_epoch = 0
@@ -98,6 +99,12 @@ def resume_training(
 
                         if global_step % 100 == 0:
                             print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+                            prompt_str = "Long long time ago, "
+                            token_ids = hf_tokenizer.encode(prompt_str)
+                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                            generated = model.generate(prompt_tensor, max_new_tokens=50)
+                            generated_text = hf_tokenizer.decode(generated[0].tolist())
+                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                         if global_step % 2000 == 0:
                             ckpt_dict = {
@@ -127,10 +134,10 @@ def resume_training(
         # 2) Full pass each epoch
         batches_per_epoch = total_samples // batch_size
 
-        for epoch in range(start_epoch, start_epoch + epochs):
+        for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
             print(f"=== Resume Epoch {epoch} (CUDA non-streaming) ===")
 
-            for batch_idx in range(batches_per_epoch):
+            for batch_idx in tqdm(range(batches_per_epoch)):
                 start_idx = batch_idx * batch_size
                 end_idx = start_idx + batch_size
                 batch_token_lists = tokenized_data[start_idx:end_idx]
@@ -154,6 +161,12 @@ def resume_training(
                 global_step += 1
                 if global_step % 100 == 0:
                     print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+                    prompt_str = "Long long time ago, "
+                    token_ids = hf_tokenizer.encode(prompt_str)
+                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                    generated = model.generate(prompt_tensor, max_new_tokens=50)
+                    generated_text = hf_tokenizer.decode(generated[0].tolist())
+                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                 if global_step % 2000 == 0:
                     ckpt_dict = {
