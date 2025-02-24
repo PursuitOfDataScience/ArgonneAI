@@ -1,4 +1,6 @@
 data/*
-bpe_tokenizer/*
 processed_data/*
 pretrain/*
+logs/*
+all_text_for_tokenizer.txt
+processed_data/*
