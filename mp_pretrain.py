@@ -247,7 +247,7 @@ class ArgonneModelParallel(PreTrainedModel):
         self.pipeline_stages = nn.ModuleList()
 
         start_idx = 0
-        for i in range(xpu_count):
+        for i in tqdm(range(xpu_count)):
             end_idx = min(start_idx + blocks_per_xpu, config.n_layer)
             stage_blocks = all_blocks[start_idx:end_idx]
 
@@ -376,7 +376,7 @@ def train_model(data_path="data/*.arrow", use_streaming=False, epochs=3):
         steps_per_epoch = 1000
         global_step = 0
 
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs)):
             print(f"Starting epoch {epoch} (streaming).")
             import glob
             arrow_files = glob.glob(data_path)
@@ -412,6 +412,12 @@ def train_model(data_path="data/*.arrow", use_streaming=False, epochs=3):
 
                         if global_step % 100 == 0:
                             print(f"Epoch={epoch}, step={global_step}, loss={loss.item():.4f}")
+                            prompt_str = "Long long time ago, "
+                            token_ids = hf_tokenizer.encode(prompt_str)
+                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                            generated = base_model.generate(prompt_tensor, max_new_tokens=200)
+                            generated_text = hf_tokenizer.decode(generated[0].tolist())
+                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                 except StopIteration:
                     print("Reached end of dataset stream early.")
@@ -465,7 +471,7 @@ def train_model(data_path="data/*.arrow", use_streaming=False, epochs=3):
         )
 
         global_step = 0
-        for epoch_idx in range(epochs):
+        for epoch_idx in tqdm(range(epochs)):
             print(f"Starting epoch {epoch_idx}, dataset size ~ {len(dataset)}")
             for batch_idx, (x_tens, y_tens) in enumerate(dataloader):
                 if x_tens is None:
@@ -483,11 +489,17 @@ def train_model(data_path="data/*.arrow", use_streaming=False, epochs=3):
                 scaler.update()
 
                 global_step += 1
-                if global_step % 100 == 0:
+                if global_step % 50 == 0:
                     print(f"Epoch={epoch_idx}, step={global_step}, loss={loss.item():.4f}")
+                    prompt_str = "Long long time ago, "
+                    token_ids = hf_tokenizer.encode(prompt_str)
+                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                    generated = base_model.generate(prompt_tensor, max_new_tokens=50)
+                    generated_text = hf_tokenizer.decode(generated[0].tolist())
+                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                # Save checkpoint occasionally
-                if global_step % 5000 == 0:
+                # Save checkpoint 
+                if global_step % 1000 == 0:
                     os.makedirs("pretrained", exist_ok=True)
                     ckpt_path = f"pretrained/ckpt_step_{global_step}.pth"
                     checkpoint = {
