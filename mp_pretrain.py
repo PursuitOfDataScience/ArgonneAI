@@ -14,6 +14,8 @@ from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
 import glob
 
+os.environ["HF_DATASETS_CACHE"] = "./.cache"
+
 #####################################
 # BPE Tokenizer Utilities
 #####################################
@@ -149,7 +151,8 @@ def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
         batched=False,
         num_proc=num_proc
     )
-    ds = ds.filter(lambda ex: ex["token_ids"] is not None)
+    ds = ds.filter(lambda ex: ex["token_ids"] is not None,
+                   num_proc=num_proc)
 
     if "text" in ds.column_names:
         ds = ds.remove_columns(["text"])
@@ -474,8 +477,8 @@ def train_model_parallel(data_files, use_streaming=False):
         # NON-STREAMING MODE: full pass each epoch
         ########################################################
         print("=== Loading dataset in memory for a full pass approach ===")
-        tokenized_data = load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8)
-        total_samples = len(tokenized_data)
+        tokenized_data = load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=128)
+        total_samples = len(tokenized_data) # 2_494_618
         print(f"Total tokenized samples: {total_samples}")
 
         batches_per_epoch = total_samples // batch_size

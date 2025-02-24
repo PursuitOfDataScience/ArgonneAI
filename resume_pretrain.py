@@ -31,8 +31,8 @@ def resume_training(
     config = ArgonneConfig(
         vocab_size=12000,
         block_size=block_size,
-        n_layer=24,
-        n_head=24,
+        n_layer=12,
+        n_head=12,
         n_embd=1296,
         dropout=0.1
     )
@@ -59,7 +59,7 @@ def resume_training(
     global_step = ckpt.get("global_step", 0)
     print(f"Loaded checkpoint with epoch={start_epoch}, global_step={global_step}")
 
-    model = base_model  # rename for clarity
+    model = base_model 
 
     # 6) Decide streaming vs non-streaming
     if use_streaming:
@@ -176,11 +176,11 @@ def resume_training(
 def main():
     resume_training(
         data_path="data/*.arrow",
-        checkpoint_path="pretrained/checkpoint_step_2000.pth", # manually set
+        checkpoint_path="pretrained/checkpoint_step_9000.pth", # manually set
         epochs=3,
         steps_per_epoch=500,
         block_size=2048,
-        batch_size=24,
+        batch_size=48,
         lr=3e-5,
         use_streaming=False, 
         num_proc=4
