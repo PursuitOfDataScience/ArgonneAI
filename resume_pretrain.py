@@ -19,6 +19,7 @@ def resume_training(
     checkpoint_path=None,
     epochs=3,
     steps_per_epoch=1000,
+    total_training_steps=160_000,
     block_size=2048,
     batch_size=24,
     lr=3e-5,
@@ -181,10 +182,14 @@ def resume_training(
                     torch.save(ckpt_dict, save_path)
                     print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
-    # 7) Final save
-    model.save_pretrained("Argonne_LLM_CUDA_Resumed")
-    hf_tokenizer.save_pretrained("Argonne_LLM_CUDA_Resumed")
-    print("Resumed training finished on CUDA; final model saved to Argonne_LLM_CUDA_Resumed.")
+                # Perform a final save after 160k steps, then break
+                if global_step >= total_training_steps:
+                    model.save_pretrained("Argonne_LLM_CUDA_Resumed")
+                    hf_tokenizer.save_pretrained("Argonne_LLM_CUDA_Resumed")
+                    print("Resumed training finished on CUDA; final model saved to Argonne_LLM_CUDA_Resumed.")
+                    break  # Break out of the batch loop
+
+
 
 def main():
     resume_training(
@@ -193,7 +198,7 @@ def main():
         epochs=3,
         steps_per_epoch=500,
         block_size=2048,
-        batch_size=48,
+        batch_size=60,
         lr=3e-5,
         use_streaming=False, 
         num_proc=4

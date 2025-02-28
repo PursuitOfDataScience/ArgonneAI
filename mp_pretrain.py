@@ -390,11 +390,11 @@ def train_model_parallel(data_files, use_streaming=False):
 
     block_size = 2048
     epochs = 5
-    n_layer = 24
-    n_head = 24
+    n_layer = 12
+    n_head = 12
     n_embd = 1296
     dropout = 0.1
-    batch_size = 8
+    batch_size = 60
 
     config_model = ArgonneConfig(
         vocab_size=12000,
