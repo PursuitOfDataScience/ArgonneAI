@@ -571,7 +571,6 @@ def train_model_parallel(data_files, use_streaming=False):
 
                                 global_step += 1
                                 step_in_epoch += 1
-                                print(f'current global step: {global_step}, current step in epoch: {step_in_epoch}')
                                 
                                 if global_step % 50 == 0:
                                     print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
@@ -690,7 +689,7 @@ def main():
     if not data_files:
         raise ValueError("No files matched the pattern 'data/*.arrow'")
 
-    train_model_parallel(data_files=data_files, use_streaming=False)
+    train_model_parallel(data_files=data_files, use_streaming=True)
 
 if __name__ == "__main__":
     main()
