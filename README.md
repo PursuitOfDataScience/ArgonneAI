@@ -1,3 +1,5 @@
+# Argonne LLM
+
 ## Argonne 1.0
 
 ### 🤗 Hugging Face Model
@@ -16,18 +18,23 @@ The model has 275,827,680 parameters in total with the following parameters:
 
 ```
 block_size = 2048
-epochs = 5
 n_layer = 12
 n_head = 12
 n_embd = 1296
 dropout = 0.1
 ```
+The learning rate (LR) was initially set to 3e-5 until step 62,000, after which it was increased to 5e-5. Correspondingly, the batch size was increased from 48 to 60 at the same step.
 
 ### Training
 
 We trained the model on a single DGX node with 8× A100 GPUs (80 GB HBM each).
 
-- Total training cost: 1440 GPU hours.
+- Total training cost: **1440 GPU hours**.
+- Total training steps: **160,000 global steps**
+
+Below is the training loss curve over time:
+
+![](plots/pretrain_loss_20250303.png)
 
 ### Repository Scripts
 
@@ -38,11 +45,6 @@ The repository contains the following key scripts:
 - **convert_model.py**: Utility to convert a pipeline-parallel model to single-GPU format
 - **instruct_finetuning.py**: Fine-tuning script for instruction-based learning using DDP
 - **run_instruct_finetuning.sh**: PBS batch script to run distributed fine-tuning
-
-
-Below is the training loss curve over time:
-
-![](plots/pretrain_loss_20250303.png)
 
 ### Inference
 
