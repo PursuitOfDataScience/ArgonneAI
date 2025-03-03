@@ -689,7 +689,7 @@ def main():
     if not data_files:
         raise ValueError("No files matched the pattern 'data/*.arrow'")
 
-    train_model_parallel(data_files=data_files, use_streaming=True)
+    train_model_parallel(data_files=data_files, use_streaming=False)
 
 if __name__ == "__main__":
     main()

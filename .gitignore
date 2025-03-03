@@ -6,3 +6,8 @@ all_text_for_tokenizer.txt
 processed_data/*
 instruct_data/*
 *.sh
+plot_loss.py
+Argonne_LLM/*
+Argonne_LLM_Inference/*
+__pycache__
+Argonne-1.0/
