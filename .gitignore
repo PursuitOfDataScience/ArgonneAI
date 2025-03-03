@@ -5,3 +5,4 @@ logs/*
 all_text_for_tokenizer.txt
 processed_data/*
 instruct_data/*
+*.sh
