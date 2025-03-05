@@ -264,11 +264,6 @@ class ArgonneModelParallel(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        # # Detect all available CUDA devices
-        # self.devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
-        # if len(self.devices) == 0:
-        #     raise ValueError("No GPUs available for model parallelism. (torch.cuda.device_count() == 0)")
-
         # Create embeddings on CPU initially
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
@@ -283,29 +278,6 @@ class ArgonneModelParallel(PreTrainedModel):
 
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
         self.post_init()
-
-        # num_gpus = len(self.devices)
-        # blocks_per_gpu = math.ceil(config.n_layer / num_gpus)
-        # self.pipeline_stages = nn.ModuleList()
-
-        # start_idx = 0
-        # for i in range(num_gpus):
-        #     end_idx = min(start_idx + blocks_per_gpu, config.n_layer)
-        #     stage_blocks = all_blocks[start_idx:end_idx]
-        #     stage = nn.Sequential(*stage_blocks).to(self.devices[i])
-        #     self.pipeline_stages.append(stage)
-        #     start_idx = end_idx
-        #     if end_idx >= config.n_layer:
-        #         break
-
-        # # embeddings on first GPU
-        # self.token_embedding.to(self.devices[0])
-        # self.position_embedding = nn.Parameter(self.position_embedding.to(self.devices[0]))
-        # self.drop.to(self.devices[0])
-
-        # # final LN + head on last GPU
-        # self.ln_f.to(self.devices[-1])
-        # self.head.to(self.devices[-1])
 
         # Keep the blocks on CPU in a single ModuleList
         self.blocks = all_blocks
@@ -358,31 +330,6 @@ class ArgonneModelParallel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        # x = idx.to(self.devices[0])
-        # b, t = x.size()
-        # assert t <= self.config.block_size, "Sequence length exceeds block size"
-
-        # token_embeddings = self.token_embedding(x)
-        # position_embeddings = self.position_embedding[:, :t, :]
-        # hidden_states = self.drop(token_embeddings + position_embeddings)
-
-        # for stage_idx, stage in enumerate(self.pipeline_stages):
-        #     hidden_states = hidden_states.to(self.devices[stage_idx])
-        #     hidden_states = stage(hidden_states)
-
-        # hidden_states = hidden_states.to(self.devices[-1])
-        # hidden_states = self.ln_f(hidden_states)
-        # logits = self.head(hidden_states)
-
-        # loss = None
-        # if targets is not None:
-        #     targets = targets.to(self.devices[-1])
-        #     logits = logits.view(-1, logits.size(-1))
-        #     targets = targets.view(-1)
-        #     loss = F.cross_entropy(logits, targets)
-
-        # return logits, loss
-
         """
         If self.pipeline_stages is None, we do a normal single-device forward 
         (whatever device everything is currently on—CPU or a single GPU).
@@ -682,6 +629,18 @@ def train_model_parallel(data_files, use_streaming=False):
         print("Model-parallel training complete; model and tokenizer saved successfully.")
     except:
         print("Failed to save final model, likely due to OOM issues.")
+
+#####################################
+# Register with Hugging Face Auto Classes
+#####################################
+
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+# Register the model with Hugging Face's Auto classes
+AutoConfig.register("argonne", ArgonneConfig)
+AutoModel.register(ArgonneConfig, ArgonneModelParallel)
+AutoModelForCausalLM.register(ArgonneConfig, ArgonneModelParallel)
+
 
 def main():
     # Expand .arrow files via glob
