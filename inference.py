@@ -12,7 +12,8 @@ AutoModelForCausalLM.register(ArgonneConfig, ArgonneModelParallel)
 
 def main():
     # Load model and tokenizer using the Auto classes
-    model_dir = "Argonne_LLM_Fixed"
+    model_dir = "../Argonne-1.0"
+    #model_dir = "Argonne_LLM_Finetuned/checkpoint-early-stop-1900"
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_pretrained(model_dir)
     
@@ -29,15 +30,14 @@ def main():
         model.pipeline_stages = None
     
     # Generate text from a prompt
-    prompt = "The future of AI research is "
-    
+    prompt = f"USER: Can you write a short introduction about economics?\n\nASSISTANT:"
     # Extract just the input_ids from tokenizer output
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     
     # Generate text
     outputs = model.generate(
         input_ids,
-        max_new_tokens=100,
+        max_new_tokens=150,
         temperature=0.7,
         top_k=50
     )
