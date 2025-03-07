@@ -12,8 +12,6 @@ from model import ArgonneConfig, ArgonneModel
 def resume_training(
     data_path="data/*.arrow",
     checkpoint_path=None,
-    epochs=3,
-    steps_per_epoch=50_000,
     total_training_steps=160_000,
     block_size=2048,
     batch_size=24,
@@ -52,22 +50,37 @@ def resume_training(
     base_model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    start_epoch = ckpt.get("epoch", 0)
+    # Get global step from checkpoint
     global_step = ckpt.get("global_step", 0)
-    print(f"Loaded checkpoint with epoch={start_epoch}, global_step={global_step}")
+    print(f"Loaded checkpoint at global_step={global_step}")
 
-    model = base_model 
+    model = base_model
+    model.distribute_model()  # Make sure model is distributed across GPUs
+
+    # Try to apply torch.compile() if available
+    if hasattr(torch, 'compile'):
+        try:
+            print("Applying torch.compile() to optimize model execution...")
+            model = torch.compile(model)
+            print("Model successfully compiled!")
+        except Exception as e:
+            print(f"Failed to compile model: {e}")
+            print("Continuing with uncompiled model.")
+
+    first_device = model.devices[0]
 
     # 6) Decide streaming vs non-streaming
     if use_streaming:
-        print("=== Resuming in STREAMING mode (CUDA) ===")
-        for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
-            print(f"=== Resume from Global Step {global_step} (streaming) ===")
-            token_gen = streaming_token_generator(data_path, hf_tokenizer)
-            step_in_epoch = 0
-            token_buffer = []
+        print(f"=== Resuming training from global step {global_step} in STREAMING mode ===")
+        print(f"=== Will train until reaching {total_training_steps} steps ===")
+        
+        # Train until we reach the target number of steps
+        token_gen = streaming_token_generator(data_path, hf_tokenizer)
+        token_buffer = []
 
-            while step_in_epoch < steps_per_epoch:
+        # Use tqdm to track global step progress toward total_training_steps
+        with tqdm(initial=global_step, total=total_training_steps, desc="Training") as pbar:
+            while global_step < total_training_steps:
                 try:
                     tokens = next(token_gen)
                     token_buffer.append(tokens)
@@ -78,33 +91,32 @@ def resume_training(
                         if x_tens is None:
                             continue
 
-                        first_device = model.devices[0]
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
 
                         optimizer.zero_grad()
                         with torch.amp.autocast("cuda"):
                             logits, loss = model(x_tens, y_tens)
+                            loss = loss.to(first_device)
 
                         scaler.scale(loss).backward()
                         scaler.step(optimizer)
                         scaler.update()
 
                         global_step += 1
-                        step_in_epoch += 1
+                        pbar.update(1)
 
                         if global_step % 50 == 0:
                             print(f"Step {global_step} | Loss: {loss.item():.4f}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
-                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
                             generated = model.generate(prompt_tensor, max_new_tokens=50)
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                         if global_step % 2000 == 0:
                             ckpt_dict = {
-                                "epoch": epoch,
                                 "global_step": global_step,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
@@ -116,82 +128,92 @@ def resume_training(
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                 except StopIteration:
-                    print("Reached end of dataset (stream) early.")
-                    break
+                    print("Reached end of dataset stream. Restarting data generator.")
+                    token_gen = streaming_token_generator(data_path, hf_tokenizer)
+                    continue
 
     else:
-        print("=== Resuming in NON-STREAMING (Full-Pass) mode (CUDA) ===")
+        print(f"=== Resuming training from global step {global_step} in NON-STREAMING mode ===")
+        print(f"=== Will train until reaching {total_training_steps} steps ===")
 
         # 1) Load entire data in memory. Possibly parallel map with `num_proc`.
         tokenized_data = load_nonstream_data(data_path, hf_tokenizer, block_size, num_proc=num_proc)
         total_samples = len(tokenized_data)
         print(f"Total in-memory tokenized samples: {total_samples}")
 
-        # 2) Full pass each epoch
+        # Calculate how many full passes we need
         batches_per_epoch = total_samples // batch_size
+        remaining_steps = total_training_steps - global_step
+        
+        # Use tqdm to track global step progress toward total_training_steps
+        with tqdm(initial=global_step, total=total_training_steps, desc="Training") as pbar:
+            while global_step < total_training_steps:
+                # Shuffle data for each epoch
+                indices = torch.randperm(total_samples)
+                
+                for idx in range(0, total_samples, batch_size):
+                    if global_step >= total_training_steps:
+                        break
+                        
+                    # Get batch indices
+                    batch_indices = indices[idx:min(idx + batch_size, total_samples)]
+                    batch_token_lists = [tokenized_data[i] for i in batch_indices]
+                    
+                    x_tens, y_tens = collate_batch(batch_token_lists, block_size)
+                    if x_tens is None:
+                        continue
 
-        for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
-            print(f"=== Resume Global Step {global_step} (CUDA non-streaming) ===")
+                    x_tens = x_tens.to(first_device)
+                    y_tens = y_tens.to(first_device)
 
-            for batch_idx in tqdm(range(batches_per_epoch)):
-                start_idx = batch_idx * batch_size
-                end_idx = start_idx + batch_size
-                batch_token_lists = tokenized_data[start_idx:end_idx]
+                    optimizer.zero_grad()
+                    with torch.amp.autocast("cuda"):
+                        logits, loss = model(x_tens, y_tens)
+                        loss = loss.to(first_device)
 
-                x_tens, y_tens = collate_batch(batch_token_lists, block_size)
-                if x_tens is None:
-                    continue
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                first_device = model.devices[0]
-                x_tens = x_tens.to(first_device)
-                y_tens = y_tens.to(first_device)
+                    global_step += 1
+                    pbar.update(1)
+                    
+                    if global_step % 50 == 0:
+                        print(f"Step {global_step} | Loss: {loss.item():.4f}")
+                        prompt_str = "Long long time ago, "
+                        token_ids = hf_tokenizer.encode(prompt_str)
+                        prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
+                        generated = model.generate(prompt_tensor, max_new_tokens=50)
+                        generated_text = hf_tokenizer.decode(generated[0].tolist())
+                        print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                optimizer.zero_grad()
-                with torch.amp.autocast("cuda"):
-                    logits, loss = model(x_tens, y_tens)
+                    if global_step % 2000 == 0:
+                        ckpt_dict = {
+                            "global_step": global_step,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "loss": loss.item()
+                        }
+                        os.makedirs("pretrained", exist_ok=True)
+                        save_path = f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
+                        torch.save(ckpt_dict, save_path)
+                        print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                global_step += 1
-                if global_step % 50 == 0:
-                    print(f"Step {global_step} | Loss: {loss.item():.4f}")
-                    prompt_str = "Long long time ago, "
-                    token_ids = hf_tokenizer.encode(prompt_str)
-                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-                    generated = model.generate(prompt_tensor, max_new_tokens=50)
-                    generated_text = hf_tokenizer.decode(generated[0].tolist())
-                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                if global_step % 1000 == 0:
-                    ckpt_dict = {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": loss.item()
-                    }
-                    os.makedirs("pretrained", exist_ok=True)
-                    save_path = f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
-                    torch.save(ckpt_dict, save_path)
-                    print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-
-                # Perform a final save after 160k steps, then break
-                if global_step >= total_training_steps:
-                    model.save_pretrained("Argonne_LLM")
-                    hf_tokenizer.save_pretrained("Argonne_LLM")
-                    print("Resumed training finished on CUDA; final model saved.")
-                    break  # Break out of the batch loop
-
+    # Perform final save at the end of training
+    try:
+        model = model.half()  # Convert to FP16
+        model.save_pretrained("Argonne_LLM")
+        hf_tokenizer.save_pretrained("Argonne_LLM")
+        print(f"Training completed at step {global_step}. Final model saved.")
+    except Exception as e:
+        print(f"Failed to save final model: {e}")
 
 
 def main():
     resume_training(
         data_path="data/*.arrow",
         checkpoint_path="pretrained/streaming_checkpoint_step_9000.pth", # manually set
-        epochs=3,
-        steps_per_epoch=50000,
+        total_training_steps=160_000,
         block_size=2048,
         batch_size=128,
         lr=3e-5,
