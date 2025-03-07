@@ -5,17 +5,24 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from mp_pretrain import ArgonneConfig, ArgonneModelParallel
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
+# Create a wrapper class with _no_split_modules
+class ArgonneModelParallelWithDeviceMap(ArgonneModelParallel):
+    # Add modules that shouldn't be split across devices
+    _no_split_modules = ["attention", "mlp", "block", "layer"]
+
 # Register the model with Hugging Face's Auto classes
 AutoConfig.register("argonne", ArgonneConfig)
 AutoModel.register(ArgonneConfig, ArgonneModelParallel)
-AutoModelForCausalLM.register(ArgonneConfig, ArgonneModelParallel)
+AutoModelForCausalLM.register(ArgonneConfig, ArgonneModelParallelWithDeviceMap)
 
 def main():
     # Load model and tokenizer using the Auto classes
-    model_dir = "../Argonne-1.0"
-    #model_dir = "Argonne_LLM_Finetuned/checkpoint-early-stop-1900"
+    #model_dir = "../Argonne-1.0"
+    model_dir = "Argonne_LLM_Finetuned"
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir)
+    model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                 device_map="auto",
+                                                 torch_dtype=torch.float16)
     
     # Setup for inference
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,7 +44,7 @@ def main():
     # Generate text
     outputs = model.generate(
         input_ids,
-        max_new_tokens=150,
+        max_new_tokens=650,
         temperature=0.7,
         top_k=50
     )
