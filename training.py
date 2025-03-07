@@ -237,6 +237,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
     # Save final model and tokenizer
     try:
+        model = model.half() # Convert from FP32 to FP16
         model.save_pretrained("Argonne_LLM")
         hf_tokenizer.save_pretrained("Argonne_LLM")
         print("Model-parallel training complete; model and tokenizer saved successfully.")
