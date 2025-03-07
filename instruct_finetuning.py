@@ -9,8 +9,8 @@ import random
 from datetime import datetime
 import argparse
 
-from mp_pretrain import ArgonneModelParallel, ArgonneConfig, load_bpe_tokenizer
-
+from data_processing import load_bpe_tokenizer
+from model import ArgonneConfig, ArgonneModel
 # Set up minimal logging
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +65,7 @@ def load_model(model_path, device):
     
     # Create config and model
     config = ArgonneConfig(**config_dict)
-    model = ArgonneModelParallel(config)
+    model = ArgonneModel(config)
     
     # Load weights - try safetensors first, then PyTorch format
     try:

@@ -2,17 +2,17 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Register the model architecture with AutoModel
-from mp_pretrain import ArgonneConfig, ArgonneModelParallel
+from model import ArgonneConfig, ArgonneModel
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 # Create a wrapper class with _no_split_modules
-class ArgonneModelParallelWithDeviceMap(ArgonneModelParallel):
+class ArgonneModelParallelWithDeviceMap(ArgonneModel):
     # Add modules that shouldn't be split across devices
     _no_split_modules = ["attention", "mlp", "block", "layer"]
 
 # Register the model with Hugging Face's Auto classes
 AutoConfig.register("argonne", ArgonneConfig)
-AutoModel.register(ArgonneConfig, ArgonneModelParallel)
+AutoModel.register(ArgonneConfig, ArgonneModel)
 AutoModelForCausalLM.register(ArgonneConfig, ArgonneModelParallelWithDeviceMap)
 
 def main():
