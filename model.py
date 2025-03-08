@@ -163,14 +163,21 @@ class ArgonneModel(PreTrainedModel):
             if end_idx >= len(self.blocks):
                 break
 
-        # Move token_embedding + position_embedding to the first device
-        self.token_embedding.to(device_ids[0])
-        self.position_embedding.data = self.position_embedding.data.to(device_ids[0])
-        self.drop.to(device_ids[0])
+        # Move embeddings to the first device
+        first_device = device_ids[0]
+        self.token_embedding = self.token_embedding.to(first_device)
+        # For nn.Parameter, we need to move the data, not replace the parameter
+        self.position_embedding.data = self.position_embedding.data.to(first_device)
+        self.drop = self.drop.to(first_device)
 
         # Move final LayerNorm + head to the last device
-        self.ln_f.to(device_ids[-1])
-        self.head.to(device_ids[-1])
+        last_device = device_ids[-1]
+        self.ln_f = self.ln_f.to(last_device)
+        self.head = self.head.to(last_device)
+
+        print(f"Model distributed across {len(device_ids)} devices")
+        print(f"First device: {first_device}, Last device: {last_device}")
+        print(f"Transformer layers per device: ~{blocks_per_gpu}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -228,8 +235,8 @@ class ArgonneModel(PreTrainedModel):
             return logits, loss
         else:
             # Pipeline parallel forward
-            first_device = next(self.pipeline_stages[0].parameters()).device
-            last_device = next(self.pipeline_stages[-1].parameters()).device
+            first_device = next(self.token_embedding.parameters()).device
+            last_device = next(self.ln_f.parameters()).device
 
             x = idx.to(first_device)
             b, t = x.size()
@@ -240,11 +247,12 @@ class ArgonneModel(PreTrainedModel):
             hidden_states = self.drop(token_embeddings + position_embeddings)
 
             # Pass through each pipeline stage in sequence
-            for stage in self.pipeline_stages:
+            for stage_idx, stage in enumerate(self.pipeline_stages):
                 device_stage = next(stage.parameters()).device
                 hidden_states = hidden_states.to(device_stage)
                 hidden_states = stage(hidden_states)
 
+            # Explicitly move to last device before final operations
             hidden_states = hidden_states.to(last_device)
             hidden_states = self.ln_f(hidden_states)
             logits = self.head(hidden_states)

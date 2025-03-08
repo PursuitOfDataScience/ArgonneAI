@@ -13,3 +13,4 @@ __pycache__
 Argonne_LLM_Finetuned/*
 Argonne_LLM_Fixed/*
 code_junk/*
+pretrained/*

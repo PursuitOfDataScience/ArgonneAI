@@ -50,12 +50,19 @@ def resume_training(
     base_model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    # Get global step from checkpoint
+    # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
-    print(f"Loaded checkpoint at global_step={global_step}")
+    total_tokens_processed = ckpt.get("tokens_processed", 0)
+    print(f"Loaded checkpoint at global_step={global_step}, tokens_processed={total_tokens_processed:,}")
 
     model = base_model
     model.distribute_model()  # Make sure model is distributed across GPUs
+
+    # Log GPU info
+    num_gpus = torch.cuda.device_count()
+    print(f"Available GPUs: {num_gpus}")
+    for i in range(num_gpus):
+        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
 
     # Try to apply torch.compile() if available
     if hasattr(torch, 'compile'):
@@ -68,6 +75,9 @@ def resume_training(
             print("Continuing with uncompiled model.")
 
     first_device = model.devices[0]
+
+    # Token counting variables
+    tokens_in_this_session = 0
 
     # 6) Decide streaming vs non-streaming
     if use_streaming:
@@ -91,6 +101,10 @@ def resume_training(
                         if x_tens is None:
                             continue
 
+                        # Count tokens in this batch
+                        batch_tokens = x_tens.numel()
+                        tokens_in_this_session += batch_tokens
+                        
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
 
@@ -107,7 +121,8 @@ def resume_training(
                         pbar.update(1)
 
                         if global_step % 50 == 0:
-                            print(f"Step {global_step} | Loss: {loss.item():.4f}")
+                            current_total_tokens = total_tokens_processed + tokens_in_this_session
+                            print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
                             prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
@@ -116,8 +131,10 @@ def resume_training(
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                         if global_step % 2000 == 0:
+                            current_total_tokens = total_tokens_processed + tokens_in_this_session
                             ckpt_dict = {
                                 "global_step": global_step,
+                                "tokens_processed": current_total_tokens,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "loss": loss.item()
@@ -126,6 +143,17 @@ def resume_training(
                             save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                             torch.save(ckpt_dict, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                            
+                            # Also update the stats file
+                            update_training_stats(
+                                tokens=current_total_tokens,
+                                batch_size=batch_size,
+                                steps=global_step,
+                                model=model,
+                                n_layer=config.n_layer,
+                                n_head=config.n_head,
+                                n_embd=config.n_embd
+                            )
 
                 except StopIteration:
                     print("Reached end of dataset stream. Restarting data generator.")
@@ -163,6 +191,10 @@ def resume_training(
                     if x_tens is None:
                         continue
 
+                    # Count tokens in this batch
+                    batch_tokens = x_tens.numel()
+                    tokens_in_this_session += batch_tokens
+                    
                     x_tens = x_tens.to(first_device)
                     y_tens = y_tens.to(first_device)
 
@@ -179,7 +211,8 @@ def resume_training(
                     pbar.update(1)
                     
                     if global_step % 50 == 0:
-                        print(f"Step {global_step} | Loss: {loss.item():.4f}")
+                        current_total_tokens = total_tokens_processed + tokens_in_this_session
+                        print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
                         prompt_str = "Long long time ago, "
                         token_ids = hf_tokenizer.encode(prompt_str)
                         prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
@@ -188,8 +221,10 @@ def resume_training(
                         print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                     if global_step % 2000 == 0:
+                        current_total_tokens = total_tokens_processed + tokens_in_this_session
                         ckpt_dict = {
                             "global_step": global_step,
+                            "tokens_processed": current_total_tokens,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "loss": loss.item()
@@ -198,6 +233,37 @@ def resume_training(
                         save_path = f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
                         torch.save(ckpt_dict, save_path)
                         print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                        
+                        # Also update the stats file
+                        update_training_stats(
+                            tokens=current_total_tokens,
+                            batch_size=batch_size,
+                            steps=global_step,
+                            model=model,
+                            n_layer=config.n_layer,
+                            n_head=config.n_head,
+                            n_embd=config.n_embd
+                        )
+
+    # Final token count calculation
+    final_token_count = total_tokens_processed + tokens_in_this_session
+    
+    # Update final stats
+    update_training_stats(
+        tokens=final_token_count,
+        batch_size=batch_size,
+        steps=global_step,
+        model=model,
+        n_layer=config.n_layer,
+        n_head=config.n_head,
+        n_embd=config.n_embd,
+        final=True
+    )
+    
+    print(f"\n===== TRAINING SUMMARY =====")
+    print(f"Total tokens processed: {final_token_count:,}")
+    print(f"Final step count: {global_step}")
+    print(f"Training complete!")
 
     # Perform final save at the end of training
     try:
@@ -207,6 +273,41 @@ def resume_training(
         print(f"Training completed at step {global_step}. Final model saved.")
     except Exception as e:
         print(f"Failed to save final model: {e}")
+
+
+def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_embd, final=False):
+    """Update the training statistics file with current information"""
+    # Calculate model parameters
+    model_params = sum(p.numel() for p in model.parameters())
+    
+    training_stats = {
+        "total_tokens": tokens,
+        "batch_size": batch_size,
+        "global_steps": steps,
+        "n_layer": n_layer,
+        "n_head": n_head,
+        "n_embd": n_embd,
+        "model_params": model_params,
+        "final_training": final
+    }
+    
+    # Write stats to JSON file
+    os.makedirs("stats", exist_ok=True)
+    
+    # For the final update, create a timestamped file
+    if final:
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"stats/final_training_stats_{timestamp}.json"
+    else:
+        filename = "stats/current_training_stats.json"
+        
+    with open(filename, "w") as f:
+        json.dump(training_stats, f, indent=2)
+    
+    if final:
+        print(f"Final training stats saved to: {filename}")
+    return filename
 
 
 def main():
