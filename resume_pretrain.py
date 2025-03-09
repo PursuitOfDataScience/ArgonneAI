@@ -14,7 +14,7 @@ def resume_training(
     checkpoint_path=None,
     total_training_steps=160_000,
     block_size=2048,
-    batch_size=24,
+    batch_size=320,
     lr=3e-5,
     use_streaming=False,   
     num_proc=8
@@ -26,8 +26,8 @@ def resume_training(
     config = ArgonneConfig(
         vocab_size=12000,
         block_size=block_size,
-        n_layer=12,
-        n_head=12,
+        n_layer=16,
+        n_head=16,
         n_embd=1296,
         dropout=0.1
     )
@@ -316,7 +316,7 @@ def main():
         checkpoint_path="pretrained/streaming_checkpoint_step_9000.pth", # manually set
         total_training_steps=160_000,
         block_size=2048,
-        batch_size=128,
+        batch_size=256,
         lr=3e-5,
         use_streaming=True, 
         num_proc=4

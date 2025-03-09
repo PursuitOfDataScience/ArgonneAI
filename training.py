@@ -23,7 +23,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
         use_compile: Whether to use torch.compile() for model optimization
     """
     # Initial batch size settings
-    initial_batch_size = 256  # initial batch size
+    initial_batch_size = 284  # initial batch size
     min_batch_size = 12  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
     
@@ -41,8 +41,8 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
     epochs = 3
     block_size = 2048
-    n_layer = 12
-    n_head = 12
+    n_layer = 16
+    n_head = 16
     n_embd = 1296
     dropout = 0.1
 
