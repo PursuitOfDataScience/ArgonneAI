@@ -31,38 +31,60 @@ def resume_training(
         n_embd=1296,
         dropout=0.1
     )
-    base_model = ArgonneModel(config)  # some pipeline parallel logic
-
-    # 3) Create optimizer
-    optimizer = torch.optim.AdamW(base_model.parameters(), lr=lr)
-
-    # 4) GradScaler for CUDA
-    from torch.cuda.amp import GradScaler
-    scaler = torch.amp.GradScaler("cuda")
-
-    # 5) Load checkpoint
+    base_model = ArgonneModel(config)
+    
+    # 3) Load checkpoint
     if not os.path.isfile(checkpoint_path):
         raise ValueError(f"Checkpoint file not found: {checkpoint_path}")
     print(f"Resuming from: {checkpoint_path}")
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)  # Added weights_only=True to avoid warning
+
+    # Convert compiled model state dict to regular model format
+    if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
+        print("Detected compiled model checkpoint, converting parameter names...")
+        new_state_dict = {}
+        for k, v in ckpt["model_state_dict"].items():
+            if k.startswith("_orig_mod.") and "pipeline_stages" not in k:
+                new_key = k.replace("_orig_mod.", "")
+                new_state_dict[new_key] = v
+        ckpt["model_state_dict"] = new_state_dict
+        print("Checkpoint parameter names converted successfully")
 
     base_model.load_state_dict(ckpt["model_state_dict"])
+    
+    # 4) Distribute model BEFORE creating optimizer
+    base_model.distribute_model()  # Make sure model is distributed across GPUs first
+    model = base_model  # Keep reference to distributed model
+    
+    # 5) NOW create optimizer with already-distributed parameters
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    
+    # 7) CRITICAL FIX: Move optimizer states to match parameter devices
+    for param_group in optimizer.param_groups:
+        for param in param_group['params']:
+            # For each parameter, ensure its state is on the same device as the parameter
+            if param in optimizer.state:
+                for state_key, state_val in optimizer.state[param].items():
+                    if isinstance(state_val, torch.Tensor):
+                        optimizer.state[param][state_key] = state_val.to(param.device)
 
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
     total_tokens_processed = ckpt.get("tokens_processed", 0)
     print(f"Loaded checkpoint at global_step={global_step}, tokens_processed={total_tokens_processed:,}")
 
-    model = base_model
-    model.distribute_model()  # Make sure model is distributed across GPUs
-
     # Log GPU info
     num_gpus = torch.cuda.device_count()
     print(f"Available GPUs: {num_gpus}")
     for i in range(num_gpus):
         print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    # 8) GradScaler for CUDA
+    scaler = torch.amp.GradScaler("cuda")
 
     # Try to apply torch.compile() if available
     if hasattr(torch, 'compile'):
@@ -79,7 +101,7 @@ def resume_training(
     # Token counting variables
     tokens_in_this_session = 0
 
-    # 6) Decide streaming vs non-streaming
+    # 9) Decide streaming vs non-streaming
     if use_streaming:
         print(f"=== Resuming training from global step {global_step} in STREAMING mode ===")
         print(f"=== Will train until reaching {total_training_steps} steps ===")
@@ -316,7 +338,7 @@ def main():
         checkpoint_path="pretrained/streaming_checkpoint_step_9000.pth", # manually set
         total_training_steps=160_000,
         block_size=2048,
-        batch_size=256,
+        batch_size=756,
         lr=3e-5,
         use_streaming=True, 
         num_proc=4
