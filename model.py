@@ -12,7 +12,7 @@ from transformers import (
 
 class ArgonneConfig(PretrainedConfig):
     model_type = "argonne"
-    def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, **kwargs):
+    def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, use_flash_attn=True, **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -20,6 +20,7 @@ class ArgonneConfig(PretrainedConfig):
         self.n_head = n_head
         self.n_embd = n_embd
         self.dropout = dropout
+        self.use_flash_attn = use_flash_attn
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -45,6 +46,9 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(config.dropout)
         self.resid_drop = nn.Dropout(config.dropout)
         self.proj = nn.Linear(config.n_embd, config.n_embd)
+        self.use_flash_attn = getattr(config, 'use_flash_attn', True)
+        
+        # Register the causal mask for the traditional attention path
         self.register_buffer(
             "mask",
             torch.tril(torch.ones(config.block_size, config.block_size))
@@ -57,14 +61,26 @@ class CausalSelfAttention(nn.Module):
         k = self.key(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
         v = self.value(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float('-inf'))
-        att = torch.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
-        y = self.resid_drop(self.proj(y))
-        return y
+        if hasattr(F, 'scaled_dot_product_attention') and self.use_flash_attn:
+            # When using is_causal=True, don't provide an attention mask
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=True  # Let PyTorch handle the causal mask internally
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, c)
+            y = self.resid_drop(self.proj(attn_output))
+            return y
+        else:
+            # Original attention implementation (fallback)
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float('-inf'))
+            att = torch.softmax(att, dim=-1)
+            att = self.attn_drop(att)
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(b, t, c)
+            y = self.resid_drop(self.proj(y))
+            return y
 
 class MLP(nn.Module):
     def __init__(self, config):
