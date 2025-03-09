@@ -113,7 +113,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
                 else:
                     print("torch.compile() not available in this PyTorch version. Continuing with uncompiled model.")
             
-            optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.1, fused=True) # Fused AdamW for better performance
             scaler = torch.amp.GradScaler("cuda")
             global_step = 0
             tokens_in_current_attempt = 0  # Track tokens in this training attempt
@@ -171,7 +171,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
                                     generated_text = hf_tokenizer.decode(generated[0].tolist())
                                     print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                                if global_step % 1000 == 0:
+                                if global_step % 300 == 0:
                                     # Include token count in checkpoint
                                     checkpoint = {
                                         "epoch": epoch,

@@ -61,7 +61,7 @@ def resume_training(
     model = base_model  # Keep reference to distributed model
     
     # 5) NOW create optimizer with already-distributed parameters
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, fused=True)
     
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -155,7 +155,7 @@ def resume_training(
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                        if global_step % 2000 == 0:
+                        if global_step % 300 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
                             ckpt_dict = {
                                 "global_step": global_step,
