@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from data_processing import collate_batch, load_bpe_tokenizer, load_nonstream_data, streaming_token_generator
 from model import ArgonneConfig, ArgonneModel
 
+# Enable TF32 precision on Ampere/Hopper GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def resume_training(
     data_path="data/*.arrow",

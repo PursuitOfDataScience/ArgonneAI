@@ -10,6 +10,10 @@ from model import ArgonneConfig, ArgonneModel
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Enable TF32 precision on Ampere/Hopper GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 def train_model_parallel(data_files, use_streaming=False, use_compile=True):
     """
     data_files should be a list of actual .arrow file paths, e.g.
