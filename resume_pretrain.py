@@ -61,7 +61,7 @@ def resume_training(
     model = base_model  # Keep reference to distributed model
     
     # 5) NOW create optimizer with already-distributed parameters
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, fused=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
