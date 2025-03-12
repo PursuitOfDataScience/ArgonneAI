@@ -1,5 +1,4 @@
 data/*
-bpe_tokenizer/*
 processed_data/*
 pretrained/*
 Argonne_LLM/*
