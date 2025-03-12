@@ -2,3 +2,6 @@ data/*
 bpe_tokenizer/*
 processed_data/*
 pretrained/*
+Argonne_LLM/*
+all_text_for_tokenizer.txt 
+logs/*
