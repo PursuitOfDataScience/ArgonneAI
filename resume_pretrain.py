@@ -250,11 +250,11 @@ def resume_training(
         # Set global step from loaded checkpoint
         data_position.global_step = global_step
     else:
-        print("No data position information found in checkpoint - starting from beginning of dataset")
-        # Start from the beginning (index 0) since files are now properly sorted
+        print("No data position information found in checkpoint - manually setting to start from file 0")
         data_position.current_file_idx = 0
         data_position.position_in_file = 0
         data_position.global_step = global_step  # Initialize with global_step from checkpoint
+        print(f"Manually set to start from file {data_position.current_file_idx}, position {data_position.position_in_file}")
 
     # Log GPU info
     num_gpus = torch.cuda.device_count()
