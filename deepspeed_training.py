@@ -6,11 +6,13 @@ import time
 import glob
 import argparse
 import json
-from data_processing import collate_batch, load_bpe_tokenizer, load_nonstream_data
+from data_processing import collate_batch, load_bpe_tokenizer
 from model import ArgonneConfig, ArgonneModel
 from datasets import Dataset
-from ds_config_optimized import get_optimized_ds_config, save_optimized_ds_config
+from ds_config import save_ds_config as save_optimized_ds_config
 
+# Set NumExpr max threads to avoid the error
+os.environ["NUMEXPR_MAX_THREADS"] = "64"
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -114,12 +116,12 @@ def train_with_deepspeed(args):
     # Set up parameters for DeepSpeed ZeRO
     parameters = filter(lambda p: p.requires_grad, model.parameters())
     
-    # Initialize DeepSpeed
+    # Initialize DeepSpeed - FIX: Don't pass config directly when using --deepspeed flag
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
         model=model,
-        model_parameters=parameters,
-        config=args.deepspeed_config if hasattr(args, "deepspeed_config") and args.deepspeed_config else None
+        model_parameters=parameters
+        # Removed the config parameter that was causing the conflict
     )
     
     # Get the device we'll use for tensor operations
@@ -272,6 +274,10 @@ def main():
                         help="ZeRO optimization stage (0, 1, 2, or 3)")
     parser.add_argument("--offload", action="store_true",
                         help="Offload optimizer states to CPU")
+    
+    # Add local_rank argument that DeepSpeed expects
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="Local rank for distributed training")
     
     # Add DeepSpeed arguments
     parser = deepspeed.add_config_arguments(parser)

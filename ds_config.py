@@ -2,9 +2,9 @@ import os
 import json
 import torch
 
-def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=False):
+def get_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=False):
     """
-    Optimized DeepSpeed configuration for Intel XPU clusters
+    Optimized DeepSpeed configuration with automatic resource detection
     
     Args:
         batch_size: Per-GPU batch size (8 recommended for better memory usage)
@@ -15,18 +15,42 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
     Returns:
         Dictionary containing optimized DeepSpeed configuration
     """
+    # Auto-detect available resources
+    # NOTE: DeepSpeed will actually handle this at runtime based on hostfile
+    # We're just estimating for config generation
+    local_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    world_size = int(os.environ.get("WORLD_SIZE", local_size))
+    
+    # For batch size calculation, use conservative estimate
+    # Actual parallelism will be determined by DeepSpeed at runtime
+    if world_size == 1:  # Single node fallback detection
+        try:
+            import torch.xpu
+            local_gpus = torch.xpu.device_count()
+            print(f"Auto-detected {local_gpus} Intel XPUs on this node")
+        except (ImportError, AttributeError):
+            try:
+                local_gpus = torch.cuda.device_count()
+                print(f"Auto-detected {local_gpus} NVIDIA GPUs on this node")
+            except (ImportError, AttributeError):
+                local_gpus = 1
+                print("Could not detect GPUs, assuming single device")
+        
+        world_size = local_gpus
+    
+    print(f"Configuring for estimated world_size = {world_size}")
+    
     # Calculate effective global batch size
-    num_gpus_per_node = 12  # For Intel GPU with 12 tiles per node 
-    num_nodes = 32  # Based on job script
-    total_gpus = num_gpus_per_node * num_nodes
-    global_batch_size = batch_size * total_gpus * grad_accum
+    global_batch_size = batch_size * world_size * grad_accum
     
     # Initial learning rate based on batch size - square root scaling
     base_lr = 6e-4  # Base learning rate for batch size 2048
     scaled_lr = base_lr * (global_batch_size / 2048)**0.5
     
+    # The train_batch_size will be automatically adjusted by DeepSpeed
+    # based on the actual number of GPUs at runtime
     config = {
-        "train_batch_size": batch_size * total_gpus,
+        "train_micro_batch_size_per_gpu": batch_size,
         "gradient_accumulation_steps": grad_accum,
         
         # Optimizer settings with warmup and decay
@@ -62,7 +86,7 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
             "min_loss_scale": 1
         },
         
-        # ZeRO optimization - tuned for Intel XPUs
+        # ZeRO optimization - basic parameters that work for all stages
         "zero_optimization": {
             "stage": zero_stage,
             "allgather_partitions": True,
@@ -71,8 +95,6 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
             "reduce_bucket_size": 2e8,     # Adjusted for Intel network
             "overlap_comm": True,
             "contiguous_gradients": True,
-            "stage3_prefetch_bucket_size": 5e8 if zero_stage == 3 else None,
-            "stage3_param_persistence_threshold": 1e6 if zero_stage == 3 else None,
         },
         
         # Intel XPU specific settings
@@ -87,8 +109,8 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
         
         # Performance monitoring
         "steps_per_print": 100,
-        "wall_clock_breakdown": True,
-        "timer_detailed_breakdown": True,  # For performance debugging
+        "wall_clock_breakdown": False,  # Setting to False to reduce overhead
+        "timer_detailed_breakdown": False,  # Setting to False to reduce overhead
         
         # Additional performance settings
         "activation_checkpointing": {
@@ -96,14 +118,16 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
             "contiguous_memory_optimization": True,
         },
 
-        # Misc settings
+        # Simplified profiler settings
         "flops_profiler": {
-            "enabled": True,
-            "profile_step": 100,
-            "module_depth": -1,
-            "top_modules": 3,
+            "enabled": False,  # Disable by default for performance
         },
     }
+    
+    # Add stage3-specific parameters only when using stage 3
+    if zero_stage == 3:
+        config["zero_optimization"]["stage3_prefetch_bucket_size"] = 5e8
+        config["zero_optimization"]["stage3_param_persistence_threshold"] = 1e6
     
     # Add CPU offloading if requested
     if offload and zero_stage > 0:
@@ -116,14 +140,18 @@ def get_optimized_ds_config(batch_size=8, grad_accum=2, zero_stage=2, offload=Fa
     
     return config
 
-def save_optimized_ds_config(filename="ds_config_optimized.json", **kwargs):
+def save_ds_config(filename="ds_config_optimized.json", **kwargs):
     """Save optimized DeepSpeed config to a file"""
-    config = get_optimized_ds_config(**kwargs)
+    config = get_ds_config(**kwargs)
     with open(filename, "w") as f:
         json.dump(config, f, indent=4)
     return filename
 
+# Add aliases for backward compatibility
+get_optimized_ds_config = get_ds_config
+save_optimized_ds_config = save_ds_config
+
 if __name__ == "__main__":
     # Generate a default optimized config
-    save_optimized_ds_config()
+    save_ds_config()
     print(f"Created optimized DeepSpeed config file")
