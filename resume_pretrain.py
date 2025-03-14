@@ -506,8 +506,12 @@ def resume_training(
 
     # Perform final save at the end of training
     try:
-        model = model.half()  # Convert to FP16
-        model.save_pretrained("Argonne_LLM")
+        # Convert to FP16 or keep in FP32 as needed
+        model = model.half()
+        # Move entire model to CPU to avoid cross-device references
+        model = model.to("cpu")
+        # Disable safe_serialization to allow shared tensor references
+        model.save_pretrained("Argonne_LLM", safe_serialization=False)
         hf_tokenizer.save_pretrained("Argonne_LLM")
         print(f"Training completed at step {global_step}. Final model saved.")
     except Exception as e:

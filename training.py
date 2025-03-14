@@ -475,14 +475,13 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
     # Save final model and tokenizer
     try:
-        model = model.half() # Convert from FP32 to FP16
-        model.save_pretrained("Argonne_LLM")
+        model = model.half()
+        model = model.to("cpu")
+        model.save_pretrained("Argonne_LLM", safe_serialization=False)
         hf_tokenizer.save_pretrained("Argonne_LLM")
-        print("Model-parallel training complete; model and tokenizer saved successfully.")
-    except:
-        print("Failed to save final model, likely due to OOM issues.")
-
-
+        print(f"Training completed. Final model saved.")
+    except Exception as e:
+        print(f"Failed to save final model: {e}")
 
 def main():
     # Expand .arrow files via glob
