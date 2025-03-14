@@ -10,6 +10,8 @@ from transformers import (
     AutoModelForCausalLM
 )
 
+from typing import Optional
+
 class ArgonneConfig(PretrainedConfig):
     model_type = "argonne"
     def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, use_flash_attn=True, **kwargs):
@@ -281,88 +283,102 @@ class ArgonneModel(PreTrainedModel):
                 loss = F.cross_entropy(logits, targets)
 
             return logits, loss
+    
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens, temperature=0.7, top_k=None, top_p=None, sample=True):
+    def generate(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        max_length: int = 50,            # Standard HF param
+        do_sample: bool = True,          # Replaces "sample=True/False"
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        temperature: float = 0.7,
+        attention_mask: Optional[torch.Tensor] = None,
+        # Catch-all for additional HF params (e.g. num_beams) so it doesn't crash:
+        **kwargs
+    ):
         """
-        Generate text using the model.
-        
+        A bridging generate method that accepts common HF arguments
+        but uses your custom GPT-style generation loop.
+
         Args:
-            input_ids: Input token IDs to continue from
-            max_new_tokens: Number of tokens to generate
-            temperature: Temperature for sampling (higher = more random)
-            top_k: If set, only sample from the top k most likely tokens
-            top_p: If set, sample from the smallest set of tokens whose cumulative probability exceeds p
-            sample: If True, sample from the distribution; if False, use greedy decoding
-            
+            input_ids (Tensor): Starting prompt tokens [batch_size, seq_len].
+            max_length (int): The total length of the final sequence (seq_len + new tokens).
+            do_sample (bool): If True, sample from distribution; if False, do greedy.
+            top_k (int): Top-k filtering threshold.
+            top_p (float): Nucleus sampling threshold.
+            temperature (float): Sampling temperature.
+            attention_mask (Tensor): If you want to handle padding (unused in this minimal example).
+            **kwargs: Ignored extra arguments (e.g. num_beams) so they don't cause an error.
         Returns:
-            Tensor containing the input_ids extended with max_new_tokens generated tokens
+            Tensor of shape [batch_size, total_seq_len] with the generated tokens.
         """
         self.eval()
-        
-        # Determine which device to use - explicitly use first device for consistency
+
+        # 1) Figure out device
         if self.pipeline_stages is not None and len(self.devices) > 0:
-            device = self.devices[0]  # Always use first device for generation
+            device = self.devices[0]
         else:
             device = next(self.parameters()).device
-        
-        # Ensure input is on the correct device
+
+        # 2) Sanity checks
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided for generation.")
+
+        batch_size, current_length = input_ids.shape
+        if current_length >= max_length:
+            raise ValueError(f"Current sequence length {current_length} >= max_length={max_length}")
+
+        # 3) Move to the correct device
         generated = input_ids.to(device)
-        
-        for _ in range(max_new_tokens):
+
+        # We'll generate new tokens until length == max_length
+        total_new_tokens = max_length - current_length
+
+        for _ in range(total_new_tokens):
             # Truncate if necessary to fit within the model's context window
             if generated.shape[1] > self.config.block_size:
                 generated = generated[:, -self.config.block_size:]
 
             # Forward pass
             logits, _ = self.forward(generated)
-            
-            # Make sure logits are on the same device
-            logits = logits.to(device)
-            
-            # Get logits for the last token only
-            logits = logits[:, -1, :]
-            
-            # Apply temperature
+            logits = logits[:, -1, :]  # get the last token's logits
+
+            # Temperature
             if temperature != 1.0:
                 logits = logits / temperature
-            
-            # Greedy decoding (argmax) if sample=False
-            if not sample:
+
+            # Greedy decode if do_sample=False
+            if not do_sample:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                # Sampling logic
-                # Apply top-k filtering
+                # top-k filtering
                 if top_k is not None:
-                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-                
-                # Apply top-p (nucleus) filtering
+                    threshold = torch.topk(logits, top_k)[0][..., -1, None]
+                    filter_mask = logits < threshold
+                    logits = logits.masked_fill(filter_mask, float('-inf'))
+
+                # top-p (nucleus) filtering
                 if top_p is not None:
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-                    # Remove tokens with cumulative probability above the threshold
+
                     sorted_indices_to_remove = cumulative_probs > top_p
-                    
-                    # Shift the indices to the right to keep the first token above the threshold
+                    # shift right to retain the first token above threshold
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-                    
-                    indices_to_remove = sorted_indices_to_remove.scatter(
+
+                    filter_mask = sorted_indices_to_remove.scatter(
                         dim=1, index=sorted_indices, src=sorted_indices_to_remove
                     )
-                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-                
-                # Convert to probability distribution and sample
+                    logits = logits.masked_fill(filter_mask, float('-inf'))
+
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Ensure next_token is on the same device before concatenation
-            next_token = next_token.to(device)
-            
-            # Append the generated token to the sequence
-            generated = torch.cat((generated, next_token), dim=1)
+
+            # Append new token
+            generated = torch.cat([generated, next_token.to(device)], dim=1)
 
         return generated
 
