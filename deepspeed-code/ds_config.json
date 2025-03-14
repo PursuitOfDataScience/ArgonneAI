@@ -2,7 +2,7 @@
   "train_batch_size": "auto",
   "train_micro_batch_size_per_gpu": "auto",
   "gradient_accumulation_steps": "auto",
-  "steps_per_print": 100,
+  "steps_per_print": 50,
   "zero_optimization": {
     "stage": 3,
     "overlap_comm": true,
@@ -41,5 +41,10 @@
     "number_checkpoints": null,
     "synchronize_checkpoint_boundary": false,
     "profile": false
+  },
+  "zero_force_ds_cpu_optimizer": false,
+  "zero_allow_untested_optimizer": true,
+  "amp": {
+    "enabled": false
   }
 }
