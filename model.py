@@ -9,6 +9,7 @@ from transformers import (
     AutoModel, 
     AutoModelForCausalLM
 )
+from transformers.modeling_outputs import CausalLMOutput
 
 from typing import Optional
 
@@ -101,6 +102,9 @@ class MLP(nn.Module):
 
 class ArgonneModel(PreTrainedModel):
     config_class = ArgonneConfig
+
+    # for map_device = "auto"
+    _no_split_modules = ["Block"]
 
     def __init__(self, config, device_map=None):
         super().__init__(config)
@@ -214,18 +218,40 @@ class ArgonneModel(PreTrainedModel):
         # For now, we'll just return self since our model structure should be compatible
         return self
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        **kwargs
+    ):
         """
-        If self.pipeline_stages is None, we do a normal single-device forward 
-        (whatever device everything is currently on—CPU or a single GPU).
-        Otherwise, we do a pipeline parallel forward.
+        HF-friendly forward method.
+
+        Args:
+            input_ids (torch.LongTensor): Tokens to be fed to the model. [batch_size, seq_len].
+            attention_mask (torch.LongTensor, optional): Mask of shape [batch_size, seq_len],
+                with 1 for actual tokens and 0 for padding, if you want to incorporate it. 
+                Currently ignored in this minimal example.
+            labels (torch.LongTensor, optional): Targets for language modeling, same shape as `input_ids`.
+            **kwargs: Catch-all for any additional arguments (e.g. past_key_values) so we don't crash.
         """
-        # Make the forward method more compiler-friendly
+        # 1) We'll rename the parameters from the old code
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided.")
+
+        # We used to call it 'idx'
+        idx = input_ids
+        # We used to call it 'targets'
+        targets = labels
+
+        # [Optional] If we want to handle single-dim input_ids
         if idx.dim() == 1:
-            # Add batch dimension if missing
             idx = idx.unsqueeze(0)
-        
-        # Rest of the forward method remains the same
+
+        # 2) Now the rest of your old forward logic remains, just replacing references
+        #    to "idx" and "targets" with these new variables.
+
         if self.pipeline_stages is None:
             # Single-device forward pass
             device = self.token_embedding.weight.device
@@ -250,7 +276,11 @@ class ArgonneModel(PreTrainedModel):
                 targets = targets.view(-1)
                 loss = F.cross_entropy(logits, targets)
 
-            return logits, loss
+            return CausalLMOutput(
+                loss=loss,
+                logits=logits,
+                )
+
         else:
             # Pipeline parallel forward
             first_device = next(self.token_embedding.parameters()).device
@@ -270,7 +300,7 @@ class ArgonneModel(PreTrainedModel):
                 hidden_states = hidden_states.to(device_stage)
                 hidden_states = stage(hidden_states)
 
-            # Explicitly move to last device before final operations
+            # Move to last device before final ops
             hidden_states = hidden_states.to(last_device)
             hidden_states = self.ln_f(hidden_states)
             logits = self.head(hidden_states)
@@ -282,7 +312,11 @@ class ArgonneModel(PreTrainedModel):
                 targets = targets.view(-1)
                 loss = F.cross_entropy(logits, targets)
 
-            return logits, loss
+            return CausalLMOutput(
+                loss=loss,
+                logits=logits,
+                )
+
     
 
     @torch.no_grad()
@@ -342,8 +376,9 @@ class ArgonneModel(PreTrainedModel):
                 generated = generated[:, -self.config.block_size:]
 
             # Forward pass
-            logits, _ = self.forward(generated)
-            logits = logits[:, -1, :]  # get the last token's logits
+            outputs = self.forward(generated)
+            logits = outputs.logits            # outputs is a CausalLMOutput
+            logits = logits[:, -1, :]          # get the last token's logits
 
             # Temperature
             if temperature != 1.0:
