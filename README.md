@@ -1,5 +1,90 @@
 # Argonne LLM
 
+## Argonne 1.5
+
+### 🤗 Hugging Face Model
+
+The pretrained model weights and detailed model card are available on Hugging Face:
+
+[👉 https://huggingface.co/PursuitOfDataScience/Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5)
+
+
+
+### Improvements
+
+Compared to Argonne-1.0 pretraining, significant amount of changes were made to improve the model pretraining phase, listed below:
+
+- `torch.compile()` used to boost up pretraining speed
+- flash attention implemented to gain additional 2.6x times memeory efficiency, 
+translated by training batch size
+- More layers and attention heads for the model
+- GPU hardware harnessed much more efficiently
+- Integrated to Hugging Face AutoModel class for ease of usage
+- More support for text generation
+
+### Data
+
+The same as Argonne-1.0.
+
+
+### Model
+
+The model has 356,516,640 parameters in total with the following parameters:
+
+```
+block_size = 2048
+n_layer = 16
+n_head = 16
+n_embd = 1296
+batch_size = 756
+```
+
+
+### Training
+
+We trained the model on one DGX node with 8× A100 GPUs (80 GB HBM each).
+
+- Total training cost: **1248 GPU hours**.
+- Total training steps: **80,000 global steps**
+
+Below is the training loss curve over time:
+
+![](plots/v1.5_pretraining_loss_plot.png)
+
+### Inference
+
+```
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_path = "PursuitOfDataScience/Argonne-1.5"
+
+# 1) Load the custom Argonne model with trust_remote_code=True
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    trust_remote_code=True
+)
+
+# 2) Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# 3) Inference
+prompt = "The meaning of life is "
+inputs = tokenizer(prompt, return_tensors="pt")
+
+# call generate with typical HF params
+outputs = model.generate(**inputs, max_length=150, do_sample=True, top_k=50, top_p=0.95, temperature=0.7)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+Sample generation text:
+
+<pre>
+The meaning of life is tamed in many ways. It is a state of mental and physical development. It is a state of deep emotional strength and confidence, and it is a state of physical and mental balance. In this article, we will explore the meaning of life, the different ways life is defined, and how we can apply this concept to our own lives.
+</pre>
+
+
+
 ## Argonne 1.0
 
 ### 🤗 Hugging Face Model
