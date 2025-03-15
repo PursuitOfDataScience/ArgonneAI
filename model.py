@@ -15,7 +15,7 @@ from typing import Optional
 
 class ArgonneConfig(PretrainedConfig):
     model_type = "argonne"
-    def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, use_flash_attn=True, **kwargs):
+    def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, use_flash_attn=True, use_gradient_checkpointing=False, **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -24,6 +24,7 @@ class ArgonneConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
         self.use_flash_attn = use_flash_attn
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -127,9 +128,26 @@ class ArgonneModel(PreTrainedModel):
         self.pipeline_stages = None
         self.devices = []
         
+        # For gradient checkpointing
+        self._use_gradient_checkpointing = config.use_gradient_checkpointing
+        
         # Handle device_map="auto" for inference
         if device_map is not None:
             self.setup_device_map(device_map)
+    
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Enable gradient checkpointing for the model.
+        
+        Args:
+            gradient_checkpointing_kwargs: Additional arguments for gradient checkpointing
+                (unused in this implementation)
+        """
+        self._use_gradient_checkpointing = True
+        
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the model."""
+        self._use_gradient_checkpointing = False
 
     def setup_device_map(self, device_map):
         """
@@ -263,8 +281,24 @@ class ArgonneModel(PreTrainedModel):
             position_embeddings = self.position_embedding[:, :t, :]
             hidden_states = self.drop(token_embeddings + position_embeddings)
 
-            for block in self.blocks:
-                hidden_states = block(hidden_states)
+            # Use gradient checkpointing if enabled
+            if self._use_gradient_checkpointing and self.training:
+                # Define a custom forward function for checkpointing
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(inputs[0])
+                    return custom_forward
+                
+                # Apply each block with gradient checkpointing
+                for block in self.blocks:
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states
+                    )
+            else:
+                # Standard forward pass through blocks
+                for block in self.blocks:
+                    hidden_states = block(hidden_states)
 
             hidden_states = self.ln_f(hidden_states)
             logits = self.head(hidden_states)
@@ -294,11 +328,27 @@ class ArgonneModel(PreTrainedModel):
             position_embeddings = self.position_embedding[:, :t, :]
             hidden_states = self.drop(token_embeddings + position_embeddings)
 
-            # Pass through each pipeline stage in sequence
-            for stage_idx, stage in enumerate(self.pipeline_stages):
-                device_stage = next(stage.parameters()).device
-                hidden_states = hidden_states.to(device_stage)
-                hidden_states = stage(hidden_states)
+            # For pipeline model, we apply gradient checkpointing to each stage if enabled
+            if self._use_gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(inputs[0])
+                    return custom_forward
+                
+                # Pass through each pipeline stage with gradient checkpointing if enabled
+                for stage_idx, stage in enumerate(self.pipeline_stages):
+                    device_stage = next(stage.parameters()).device
+                    hidden_states = hidden_states.to(device_stage)
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(stage),
+                        hidden_states
+                    )
+            else:
+                # Standard pipeline pass
+                for stage_idx, stage in enumerate(self.pipeline_stages):
+                    device_stage = next(stage.parameters()).device
+                    hidden_states = hidden_states.to(device_stage)
+                    hidden_states = stage(hidden_states)
 
             # Move to last device before final ops
             hidden_states = hidden_states.to(last_device)
@@ -316,8 +366,6 @@ class ArgonneModel(PreTrainedModel):
                 loss=loss,
                 logits=logits,
                 )
-
-    
 
     @torch.no_grad()
     def generate(
