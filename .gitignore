@@ -8,9 +8,8 @@ instruct_data/*
 *.sh
 plot_loss.py
 Argonne_LLM/*
-Argonne_LLM_Inference/*
+argonne_instruct_finetuned/*
 __pycache__
-Argonne_LLM_Finetuned/*
 Argonne_LLM_Fixed/*
 code_junk/*
 pretrained/*

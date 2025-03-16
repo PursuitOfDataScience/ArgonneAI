@@ -1,463 +1,347 @@
 import os
-import torch
-from tqdm import tqdm
-from datasets import load_from_disk
 import json
-import re
-import logging
+import torch
+import glob
 import random
-from datetime import datetime
-import argparse
-
-from data_processing import load_bpe_tokenizer
-from model import ArgonneConfig, ArgonneModel
-# Set up minimal logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+import re
+from datasets import load_from_disk, Dataset, DatasetDict, concatenate_datasets, IterableDataset, load_dataset
+import pyarrow as pa
+import pyarrow.parquet as pq
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    TrainerCallback
 )
-logger = logging.getLogger("instruct_finetuning")
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from typing import Dict, List, Union
+import torch.utils.data as torch_data  # Add this import for PyTorch DataLoader
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizers parallelism to avoid warnings
 
-def fix_pipeline_state_dict(state_dict):
-    """Convert pipeline-parallel state_dict keys to match single-GPU model structure."""
-    new_state_dict = {}
-    pipeline_pattern = r'pipeline_stages\.(\d+)\.(\d+)\.(.*)'
+# Model path
+model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
+
+# Parameters - using conservative values to prevent catastrophic forgetting
+output_dir = "./argonne_synthetic_finetuned"
+max_steps = 5000  # Train for specific number of steps instead of epochs
+per_device_train_batch_size = 16
+gradient_accumulation_steps = 1
+learning_rate = 1e-5  # Low learning rate to prevent catastrophic forgetting
+warmup_steps = 100
+logging_steps = 10
+save_steps = 200
+max_seq_length = 2048
+lora_r = 16
+lora_alpha = 16
+lora_dropout = 0.05
+weight_decay = 0.01  # Add weight decay for regularization
+
+# Dataset path
+dataset_path = "../data/PrimeIntellect/SYNTHETIC-1"
+
+def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
+    """Load and process the synthetic dataset from arrow files.
+    Process, format, and tokenize data in a streaming fashion."""
+    print(f"Loading synthetic dataset from {path}")
     
-    # First pass to detect structure
-    processed_blocks = {}
-    for key in state_dict.keys():
-        if not key.startswith('pipeline_stages.'):
-            continue
-            
-        match = re.match(pipeline_pattern, key)
+    # Get all arrow files in the train directory
+    arrow_files = glob.glob(os.path.join(path, "train", "data-*.arrow"))
+    if not arrow_files:
+        raise ValueError(f"No arrow files found in {os.path.join(path, 'train')}")
+    
+    # Sort files numerically
+    def extract_number(filename):
+        match = re.search(r'data-(\d+)-of-', filename)
         if match:
-            gpu_idx, block_in_gpu_idx = int(match.group(1)), int(match.group(2))
-            processed_blocks.setdefault(gpu_idx, set()).add(block_in_gpu_idx)
+            return int(match.group(1))
+        return 0
     
-    # Determine blocks_per_gpu (maximum block index + 1)
-    blocks_per_gpu = 1
-    if processed_blocks:
-        blocks_per_gpu = max(max(indices) for indices in processed_blocks.values()) + 1
+    arrow_files = sorted(arrow_files, key=extract_number)
+    print(f"Found {len(arrow_files)} arrow files, starting with {os.path.basename(arrow_files[0])}")
     
-    # Second pass to convert keys
-    for key, value in state_dict.items():
-        if key.startswith('pipeline_stages.'):
-            match = re.match(pipeline_pattern, key)
-            if match:
-                gpu_idx, block_in_gpu_idx, rest = int(match.group(1)), int(match.group(2)), match.group(3)
-                # Calculate global block index
-                global_block_idx = gpu_idx * blocks_per_gpu + block_in_gpu_idx
-                new_key = f'blocks.{global_block_idx}.{rest}'
-                new_state_dict[new_key] = value
-        else:
-            # Copy other weights unchanged
-            new_state_dict[key] = value
+    if max_files and max_files < len(arrow_files):
+        arrow_files = arrow_files[:max_files]
+        print(f"Using first {max_files} files")
     
-    return new_state_dict
-
-def load_model(model_path, device):
-    """Load model for single GPU."""
-    # Load config
-    config_path = os.path.join(model_path, "config.json")
-    with open(config_path, 'r') as f:
-        config_dict = json.load(f)
-    
-    # Create config and model
-    config = ArgonneConfig(**config_dict)
-    model = ArgonneModel(config)
-    
-    # Load weights - try safetensors first, then PyTorch format
-    try:
-        from safetensors.torch import load_file
-        model_path_st = os.path.join(model_path, "model.safetensors")
-        if os.path.exists(model_path_st):
-            state_dict = load_file(model_path_st)
+    # Create a PyTorch-compatible dataset that processes data on-the-fly
+    class SyntheticInstructDataset(torch_data.IterableDataset):
+        def __init__(self, file_paths, tokenizer, max_length):
+            super().__init__()
+            self.file_paths = file_paths
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+            self.spillover_text = None
+            self._length = 1000000  # Arbitrary large number for batching
             
-            # Check if weights use pipeline structure
-            has_pipeline = any(k.startswith('pipeline_stages.') for k in state_dict.keys())
-            if has_pipeline:
-                state_dict = fix_pipeline_state_dict(state_dict)
+        def __len__(self):
+            return self._length  # Just a placeholder value for DataLoader
             
-            # Load weights
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            model_path_pt = os.path.join(model_path, "pytorch_model.bin")
-            if os.path.exists(model_path_pt):
-                state_dict = torch.load(model_path_pt, map_location="cpu")
+        def process_example(self, example):
+            """Process a single example: extract instruction and response."""
+            try:
+                instruction = example.get("prompt", "")
+                response = example.get("llm_response", "")
                 
-                # Check if weights use pipeline structure
-                has_pipeline = any(k.startswith('pipeline_stages.') for k in state_dict.keys())
-                if has_pipeline:
-                    state_dict = fix_pipeline_state_dict(state_dict)
+                if not instruction or not response:
+                    return None
                 
-                # Load weights
-                model.load_state_dict(state_dict, strict=False)
+                # Format as instruction tuning format
+                formatted_text = f"Instruction: {instruction}\nResponse: {response}"
+                
+                if len(formatted_text) < 20:  # Filter out very short examples
+                    return None
+                    
+                return formatted_text
+            except Exception as e:
+                print(f"Error processing example: {e}")
+                return None
+                
+        def tokenize_text(self, text):
+            """Tokenize text with handling of examples longer than max_length."""
+            if self.spillover_text:
+                text = self.spillover_text + text
+                self.spillover_text = None
+                
+            # Tokenize without truncation
+            tokens = self.tokenizer(text, truncation=False, padding=False)
+            input_ids = tokens["input_ids"]
+            
+            # If text is too long, split it
+            if len(input_ids) > self.max_length - 1:  # -1 for EOS token
+                chunk = input_ids[:self.max_length - 1]
+                # Save remainder for next sample
+                self.spillover_text = self.tokenizer.decode(input_ids[self.max_length - 1:], skip_special_tokens=True)
+                
+                # Pad to max_length
+                padded_chunk = chunk + [self.tokenizer.eos_token_id]
+                while len(padded_chunk) < self.max_length:
+                    padded_chunk.append(self.tokenizer.pad_token_id)
+                    
+                attention_mask = [1] * len(chunk) + [1] + [0] * (self.max_length - len(chunk) - 1)
+                return {
+                    "input_ids": padded_chunk,
+                    "labels": padded_chunk.copy(),
+                    "attention_mask": attention_mask
+                }
             else:
-                raise FileNotFoundError(f"No model weights found at {model_path}")
-    except Exception as e:
-        raise
-    
-    # Move model to device
-    model.to(device)
-    
-    # Add devices attribute needed by generate method
-    if not hasattr(model, 'devices'):
-        model.devices = [device]
-    
-    return model
-
-def prepare_data(data_dir, tokenizer, max_length=2048, batch_size=8):
-    """Load and prepare data for training."""
-    # Load datasets
-    train_dataset = load_from_disk(os.path.join(data_dir, "train"))
-    
-    # Process conversation format datasets
-    if 'conversations' in train_dataset.column_names:
-        def process_conversation(example, idx):
-            """Process conversation with proper masking for instruction tuning."""
-            conversation = example.get("conversation", [])
+                # Pad normally
+                padded_input_ids = input_ids + [self.tokenizer.eos_token_id]
+                padding_length = self.max_length - len(padded_input_ids)
+                padded_input_ids.extend([self.tokenizer.pad_token_id] * padding_length)
+                attention_mask = [1] * (len(input_ids) + 1) + [0] * padding_length
+                return {
+                    "input_ids": padded_input_ids,
+                    "labels": padded_input_ids.copy(),
+                    "attention_mask": attention_mask
+                }
+        
+        def __iter__(self):
+            worker_info = torch_data.get_worker_info()
+            files_to_process = self.file_paths
             
-            # Build the formatted text with role prefixes
-            full_text = ""
-            user_segments = []  # Track positions of user segments to mask
+            # If using multiple workers, split files among workers
+            if worker_info:
+                per_worker = len(files_to_process) // worker_info.num_workers
+                files_to_process = files_to_process[
+                    worker_info.id * per_worker : (worker_info.id + 1) * per_worker
+                ]
             
-            for turn in conversation:
-                role = turn.get("role", "").lower()  # Use lowercase for comparison
-                text = turn.get("text", "")
-                
-                start_pos = len(full_text)
-                
-                if role.lower() == "user":
-                    full_text += f"USER: {text}\n\n"
-                    user_segments.append((start_pos, len(full_text)))
-                elif role.lower() == "assistant":
-                    full_text += f"ASSISTANT: {text}\n\n"
-                # Ignore other roles
-            
-            # Tokenize the full conversation
-            tokens = tokenizer.encode(full_text, truncation=True, max_length=max_length)
-            input_ids = torch.tensor(tokens)
-            
-            # Create labels - start by copying input_ids
-            labels = input_ids.clone()
-            
-            # Simple approach - first encode each user segment separately to find token positions
-            char_to_token_map = []
-            running_text = ""
-            
-            # Build char-to-token mapping
-            for token_idx, token_id in enumerate(tokens):
-                token_text = tokenizer.decode([token_id])
-                char_to_token_map.extend([token_idx] * len(token_text))
-                running_text += token_text
-            
-            # Apply masking to user segments
-            for start_char, end_char in user_segments:
-                if start_char >= len(char_to_token_map):
-                    continue  # Skip if beyond our mapping
-                
-                # Find token indices
-                start_token = char_to_token_map[start_char]
-                end_token = char_to_token_map[min(end_char-1, len(char_to_token_map)-1)] + 1
-                
-                # Mask user tokens in labels
-                labels[start_token:end_token] = -100
-            
-            return {
-                "input_ids": input_ids,
-                "labels": labels
-            }
-        
-        # Process dataset
-        train_dataset = train_dataset.map(
-            process_conversation,
-            with_indices=True,
-            desc="Processing conversations (train)"
-        )
-    
-    # Set format for PyTorch
-    train_dataset.set_format(type="torch", columns=["input_ids", "labels"])
-    
-    # Custom collate function for dynamic batching
-    def collate_fn(examples):
-        if not examples or 'input_ids' not in examples[0]:
-            empty_tensor = torch.zeros((1, 1), dtype=torch.long)
-            return {"input_ids": empty_tensor, "labels": empty_tensor}
-        
-        # Extract input_ids and labels
-        input_ids = [ex['input_ids'] for ex in examples if 'input_ids' in ex]
-        labels = [ex['labels'] if 'labels' in ex else ex['input_ids'].clone() for ex in examples if 'input_ids' in ex]
-        
-        if len(input_ids) == 0:
-            empty_tensor = torch.zeros((1, 1), dtype=torch.long)
-            return {"input_ids": empty_tensor, "labels": empty_tensor}
-        
-        # Determine max length in this batch
-        max_length = max(len(ids) for ids in input_ids)
-        
-        # Pad sequences
-        padded_input_ids = []
-        padded_labels = []
-        
-        for ids, lbl in zip(input_ids, labels):
-            if ids.numel() == 0 or lbl.numel() == 0:
-                continue
-                
-            padding_length = max_length - len(ids)
-            padded_ids = torch.nn.functional.pad(ids, (0, padding_length), value=tokenizer.pad_token_id)
-            padded_input_ids.append(padded_ids)
-            
-            # Use -100 as padding for labels to ignore in loss calculation
-            padded_lbl = torch.nn.functional.pad(lbl, (0, padding_length), value=-100)
-            padded_labels.append(padded_lbl)
-        
-        if len(padded_input_ids) == 0:
-            empty_tensor = torch.zeros((1, 1), dtype=torch.long)
-            return {"input_ids": empty_tensor, "labels": empty_tensor}
-            
-        return {
-            "input_ids": torch.stack(padded_input_ids),
-            "labels": torch.stack(padded_labels)
-        }
-    
-    # Create data loader
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True
-    )
-    
-    return train_loader
-
-def generate_sample_response(model, tokenizer, device, prompt="USER: Can you write a scientific essay about climate change?\n\nASSISTANT:"):
-    """Generate a sample response from the model to track training progress."""
-    model.eval()  # Set model to evaluation mode
-    
-    # Tokenize the prompt
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    
-    # Generate response
-    try:
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=150,
-            )
-        
-        # Get only the generated text (not the prompt)
-        generated_ids = output_ids[0][input_ids.shape[1]:]
-        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        # Check if output is empty
-        if not generated_text or not any(c.isalnum() for c in generated_text):
-            return "[Model generated empty or non-text output]"
-            
-        return generated_text
-    except Exception as e:
-        return f"Error generating sample: {str(e)}"
-
-def train(args):
-    """Main training function for single GPU."""
-    # Set environment variables
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    
-    # Select GPU if specified, otherwise use default
-    gpu_id = args.gpu_id if hasattr(args, 'gpu_id') and args.gpu_id is not None else 0
-    if torch.cuda.is_available():
-        device = torch.device(f'cuda:{gpu_id}')
-    else:
-        device = torch.device('cpu')
-    
-    # Set seed for reproducibility
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    try:
-        # Load tokenizer
-        tokenizer = load_bpe_tokenizer()
-        
-        # Prepare data
-        train_loader = prepare_data(
-            args.data_dir, tokenizer, batch_size=args.batch_size
-        )
-        
-        # Reset peak memory stats and clear cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Load model
-        model = load_model(args.model_path, device)
-        
-        # Set up optimizer
-        no_decay = ['bias', 'LayerNorm.weight']
-        optimizer_grouped_params = [
-            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-             'weight_decay': args.weight_decay},
-            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-             'weight_decay': 0.0}
-        ]
-        
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_params,
-            lr=args.learning_rate,
-            eps=1e-8
-        )
-        
-        # Training loop
-        logger.info(f"Starting training with lr={args.learning_rate}, batch={args.batch_size}, accumulation={args.gradient_accumulation_steps}")
-        
-        # Define a few different prompts to test generation capacity
-        sample_prompts = [
-            "USER: Can you write a scientific essay about climate change?\n\nASSISTANT:",
-            "USER: Explain the basic principles of quantum mechanics\n\nASSISTANT:",
-            "USER: What are some healthy breakfast recipes?\n\nASSISTANT:"
-        ]
-        
-        # Test model generation capability before training
-        print("\n==== Pre-training generation test ====")
-        test_output = generate_sample_response(model, tokenizer, device, sample_prompts[0])
-        print(f"Prompt: {sample_prompts[0]}\nResponse: {test_output}\n")
-        print("="*50)
-        
-        # Initialize global step counter
-        global_step = 0
-        
-        for epoch in range(args.num_epochs):
-            # Training phase
-            model.train()
-            train_loss = 0.0
-            train_steps = 0
-            
-            # Reset gradients
-            optimizer.zero_grad()
-            accumulated_steps = 0
-            
-            # Progress bar
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
-            
-            # Clear GPU cache
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            for batch_idx, batch in enumerate(pbar):
+            for file_idx, file_path in enumerate(files_to_process):
                 try:
-                    # Move batch to device
-                    input_ids = batch["input_ids"].to(device)
-                    labels = batch["labels"].to(device)
+                    print(f"Worker {getattr(worker_info, 'id', 0)} streaming file {file_idx}/{len(files_to_process)}: {os.path.basename(file_path)}")
+                    dataset = load_dataset('arrow', data_files=file_path, split='train')
+                    print(f"Loaded file with {len(dataset)} rows")
                     
-                    # Forward pass
-                    with torch.amp.autocast('cuda'):
-                        outputs, loss = model(input_ids, labels)
-                        # Scale loss by accumulation steps
-                        if args.gradient_accumulation_steps > 1:
-                            loss = loss / args.gradient_accumulation_steps
-                    
-                    # Backward pass
-                    loss.backward()
-                    
-                    # Track metrics
-                    train_loss += loss.item() * (args.gradient_accumulation_steps if args.gradient_accumulation_steps > 1 else 1)
-                    train_steps += 1
-                    accumulated_steps += 1
-                    global_step += 1
-                    
-                    # Update weights after accumulation steps or at end of epoch
-                    if (args.gradient_accumulation_steps == 1) or \
-                       (accumulated_steps % args.gradient_accumulation_steps == 0) or \
-                       (batch_idx == len(train_loader) - 1):
-                        
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                        # Update weights
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        accumulated_steps = 0
-                    
-                    # Update progress bar
-                    pbar.set_postfix({"loss": loss.item() * (args.gradient_accumulation_steps if args.gradient_accumulation_steps > 1 else 1)})
-                    
-                    # Generate sample response 
-                    if global_step % 1000 == 0:
-                        # Temporarily set model to eval mode for generation
-                        model.eval()
-                        prompt_idx = (global_step // 100) % len(sample_prompts)
-                        current_prompt = sample_prompts[prompt_idx]
-                        sample_output = generate_sample_response(model, tokenizer, device, current_prompt)
-                        
-                        print(f"\n==== Step {global_step} Generation ====")
-                        print(f"Prompt: {current_prompt}")
-                        print(f"Response: {sample_output}")
-                        print(f"Loss", f"{loss.item() * (args.gradient_accumulation_steps if args.gradient_accumulation_steps > 1 else 1):.4f}")
-                        print("="*50)
-                        
-                        # Save checkpoint 
-                        if global_step % 10000 == 0:
-                            checkpoint_path = os.path.join(args.output_dir, f"checkpoint-step-{global_step}")
-                            os.makedirs(checkpoint_path, exist_ok=True)
-                            model.save_pretrained(checkpoint_path)
-                            tokenizer.save_pretrained(checkpoint_path)
-                            
-                        # Set model back to training mode
-                        model.train()
-                        
-                except torch.cuda.OutOfMemoryError as e:
-                    torch.cuda.empty_cache()
-                    continue
+                    for example in dataset:
+                        processed_text = self.process_example(example)
+                        if processed_text is not None:
+                            tokenized = self.tokenize_text(processed_text)
+                            if tokenized:
+                                yield tokenized
+                                
+                except Exception as e:
+                    print(f"Error streaming from {file_path}: {str(e)}")
             
-            # Calculate average training loss
-            avg_train_loss = train_loss / max(1, train_steps)
-            print(f"Epoch {epoch+1}: Training Loss = {avg_train_loss:.4f}")
-            
-            # Generate sample at the end of each epoch
-            print(f"\n==== End of Epoch {epoch+1} Generation ====")
-            sample_output = generate_sample_response(model, tokenizer, device, sample_prompts[0])
-            print(f"Prompt: {sample_prompts[0]}")
-            print(f"Response: {sample_output}")
-            print("="*50)
-            
-            # Save model after each epoch
-            epoch_checkpoint_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
-            os.makedirs(epoch_checkpoint_path, exist_ok=True)
-            model.save_pretrained(epoch_checkpoint_path)
-            tokenizer.save_pretrained(epoch_checkpoint_path)
-        
-        # Save the final model
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        
-        print("Training completed successfully!")
-        
-    except Exception as e:
-        print(f"Error during training: {str(e)}")
-        import traceback
-        print(traceback.format_exc())
+            # Reset spillover text at the end of the dataset
+            self.spillover_text = None
+    
+    # Create streaming dataset
+    streaming_dataset = SyntheticInstructDataset(arrow_files, tokenizer, max_length)
+    
+    print("Dataset ready for streaming with processing and tokenization")
+    return streaming_dataset
+
+def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article about AI\nResponse:", max_length=150):
+    """Generate sample text from the model to evaluate its capabilities"""
+    print(f"\n=== Generating sample text for prompt: '{prompt}' ===")
+    
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(model.device)
+    
+    gen_kwargs = {
+        "max_length": max_length,
+        "min_length": 50,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "num_return_sequences": 1,
+        "do_sample": True,
+        "repetition_penalty": 1.2,
+        "no_repeat_ngram_size": 3,
+    }
+    
+    with torch.no_grad():
+        outputs = model.generate(input_ids, **gen_kwargs)
+    
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(f"\nGenerated text:\n{generated_text}\n")
+    print("=" * 80)
+    
+    return generated_text
+
+class TextGenerationCallback(TrainerCallback):
+    """Callback to generate sample text during training"""
+    def __init__(self, model, tokenizer, prompts, eval_steps=100):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+        self.eval_steps = eval_steps
+        self.step = 0
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        # Generate text every eval_steps
+        if state.global_step > 0 and state.global_step % self.eval_steps == 0 and state.global_step > self.step:
+            self.step = state.global_step
+            model = kwargs.get("model", self.model)
+            prompt = random.choice(self.prompts)
+            print(f"\nStep {state.global_step}:")
+            generate_sample_text(model, self.tokenizer, prompt)
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        print("\n=== Final model evaluation ===")
+        for i, prompt in enumerate(self.prompts):
+            print(f"\nTest prompt {i+1}:")
+            generate_sample_text(self.model, self.tokenizer, prompt)
+    
+    # Required callback methods
+    def on_init_end(self, args, state, control, **kwargs): pass
+    def on_train_begin(self, args, state, control, **kwargs): pass
+    def on_evaluate(self, args, state, control, **kwargs): pass
+    def on_epoch_begin(self, args, state, control, **kwargs): pass
+    def on_epoch_end(self, args, state, control, **kwargs): pass
+    def on_step_begin(self, args, state, control, **kwargs): pass
+    def on_substep_end(self, args, state, control, **kwargs): pass
+    def on_prediction_step(self, args, state, control, **kwargs): pass
+    def on_save(self, args, state, control, **kwargs): pass
+    def on_log(self, args, state, control, **kwargs): pass
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple fine-tune Argonne LLM on a single GPU")
-    parser.add_argument("--model_path", type=str, default="../Argonne-1.0")
-    parser.add_argument("--data_dir", type=str, default="../data/open-thoughts/OpenThoughts-114k")
-    parser.add_argument("--output_dir", type=str, default="./Argonne_LLM_Finetuned")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=1e-8)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--num_epochs", type=int, default=6)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--max_grad_norm", type=float, default=10.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use")
+    # Test prompts for evaluation
+    test_prompts = [
+        "Instruction: Write an article about AI\nResponse:",
+        "Instruction: Explain the theory of relativity to a high school student\nResponse:",
+        "Instruction: What are the main causes of climate change?\nResponse:",
+        "Instruction: Create a short story about a robot who wants to become human\nResponse:",
+        "Instruction: Provide tips for effective time management\nResponse:",
+    ]
     
-    args = parser.parse_args()
+    # Load tokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.pad_token = tokenizer.eos_token
     
-    train(args)
+    # Load dataset with integrated processing
+    print("Loading and preparing dataset...")
+    train_tokenized_dataset = load_synthetic_dataset(
+        dataset_path, 
+        tokenizer, 
+        max_length=max_seq_length
+    )
+    
+    print(f"Training dataset ready with streaming processing and chunking support")
+    
+    # Load base model - simple version without any fancy options
+    print("Loading base model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+    )
+    
+    # Configure LoRA
+    print("Configuring LoRA...")
+    peft_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["query", "key", "value"],
+    )
+    
+    # Prepare model for training
+    print("Preparing model for training...")
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = get_peft_model(model, peft_config)
+    
+    # Define training arguments - simple version without DDP settings
+    print("Setting up training arguments...")
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        max_steps=max_steps,  # Set maximum number of steps instead of epochs
+        num_train_epochs=100,  # Set to a large number that won't be reached
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        warmup_steps=warmup_steps,
+        weight_decay=weight_decay,
+        fp16=True,
+        logging_steps=logging_steps,
+        save_strategy="steps",
+        save_steps=save_steps,
+        save_total_limit=2,
+        report_to="none",
+        evaluation_strategy="no",
+        dataloader_num_workers=1,
+        group_by_length=False,
+        dataloader_drop_last=False
+    )
+    
+    # Data collator for language modeling
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+    
+    # Create text generation callback
+    text_gen_callback = TextGenerationCallback(model, tokenizer, test_prompts, eval_steps=100)
+    
+    # Initialize trainer
+    print("Initializing trainer...")
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_tokenized_dataset,
+        data_collator=data_collator,
+        callbacks=[text_gen_callback],
+    )
+    
+    # Generate sample text before training
+    print("\nGenerating sample text before training:")
+    generate_sample_text(model, tokenizer, test_prompts[0])
+    
+    # Start training with step-based progress tracking
+    print(f"Starting training for {max_steps} steps...")
+    trainer.train()
+    
+    # Save model
+    print("Saving model...")
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    print(f"Training completed ({max_steps} steps) and model saved!")
 
 if __name__ == "__main__":
     main()
