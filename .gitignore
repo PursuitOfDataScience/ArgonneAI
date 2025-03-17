@@ -14,3 +14,4 @@ Argonne_LLM_Fixed/*
 code_junk/*
 pretrained/*
 make_plot.py
+argonne_synthetic_finetuned/*

@@ -234,21 +234,23 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                     tokens = tokens + [self.tokenizer.pad_token_id] * padding_length
                     attention_mask = attention_mask + [0] * padding_length
                 
-                # Create labels with -100 for prompt tokens
-                labels = tokens.copy()
+                # IMPROVED MASKING: Create a more robust way to find response start position
+                labels = [-100] * len(tokens)  # Start with all masked
                 
-                # Find position where response starts
-                response_start_str = FORMAT_RESPONSE
-                response_start_tokens = self.tokenizer(response_start_str, add_special_tokens=False).input_ids
+                # Find position where response starts (after FORMAT_RESPONSE)
+                prompt_end_text = FORMAT_RESPONSE
+                prompt_end_tokens = self.tokenizer(prompt_end_text, add_special_tokens=False).input_ids
                 
-                for i in range(len(tokens) - len(response_start_tokens)):
-                    if tokens[i:i+len(response_start_tokens)] == response_start_tokens:
-                        # Mask everything before the response (including FORMAT_RESPONSE)
-                        response_start_pos = i + len(response_start_tokens)
-                        labels[:response_start_pos] = [-100] * response_start_pos
+                # Look for the token sequence
+                for i in range(len(tokens) - len(prompt_end_tokens)):
+                    if tokens[i:i+len(prompt_end_tokens)] == prompt_end_tokens:
+                        # Found the response start marker - unmask everything AFTER the response marker
+                        response_start_pos = i + len(prompt_end_tokens)
+                        # Copy the original tokens for all positions after response start
+                        labels[response_start_pos:] = tokens[response_start_pos:].copy()
                         break
                 
-                # Mask padding tokens
+                # Make sure padding stays masked
                 if padding_length > 0:
                     labels[-padding_length:] = [-100] * padding_length
                 
@@ -279,21 +281,22 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                     first_chunk_tokens = first_chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
                     attention_mask = attention_mask + [0] * padding_length
                 
-                # Create labels with -100 for prompt tokens
-                first_chunk_labels = first_chunk_tokens.copy()
+                # IMPROVED MASKING for first chunk
+                first_chunk_labels = [-100] * len(first_chunk_tokens)  # Start with all masked
                 
                 # Find position where response starts
-                response_start_str = FORMAT_RESPONSE
-                response_start_tokens = self.tokenizer(response_start_str, add_special_tokens=False).input_ids
+                prompt_end_text = FORMAT_RESPONSE
+                prompt_end_tokens = self.tokenizer(prompt_end_text, add_special_tokens=False).input_ids
                 
-                for i in range(len(first_chunk_tokens) - len(response_start_tokens)):
-                    if first_chunk_tokens[i:i+len(response_start_tokens)] == response_start_tokens:
-                        # Mask everything before the response (including FORMAT_RESPONSE)
-                        response_start_pos = i + len(response_start_tokens)
-                        first_chunk_labels[:response_start_pos] = [-100] * response_start_pos
+                for i in range(len(first_chunk_tokens) - len(prompt_end_tokens)):
+                    if first_chunk_tokens[i:i+len(prompt_end_tokens)] == prompt_end_tokens:
+                        # Found the response start marker
+                        response_start_pos = i + len(prompt_end_tokens)
+                        # Copy tokens for the response part only
+                        first_chunk_labels[response_start_pos:] = first_chunk_tokens[response_start_pos:].copy()
                         break
                 
-                # Mask padding tokens
+                # Ensure padding stays masked
                 if padding_length > 0:
                     first_chunk_labels[-padding_length:] = [-100] * padding_length
                 
@@ -324,21 +327,22 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                         chunk_tokens = chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
                         attention_mask = attention_mask + [0] * padding_length
                     
-                    # Create labels with -100 for prompt tokens
-                    chunk_labels = chunk_tokens.copy()
+                    # IMPROVED MASKING for continuation chunks
+                    chunk_labels = [-100] * len(chunk_tokens)  # Start with all masked
                     
-                    # Find position where response starts
-                    continued_start_str = FORMAT_CONTINUED
-                    continued_start_tokens = self.tokenizer(continued_start_str, add_special_tokens=False).input_ids
+                    # Find position where continued response starts
+                    cont_marker = FORMAT_CONTINUED
+                    cont_marker_tokens = self.tokenizer(cont_marker, add_special_tokens=False).input_ids
                     
-                    for j in range(len(chunk_tokens) - len(continued_start_tokens)):
-                        if chunk_tokens[j:j+len(continued_start_tokens)] == continued_start_tokens:
-                            # Mask everything before the response (including FORMAT_CONTINUED)
-                            response_start_pos = j + len(continued_start_tokens)
-                            chunk_labels[:response_start_pos] = [-100] * response_start_pos
+                    for j in range(len(chunk_tokens) - len(cont_marker_tokens)):
+                        if chunk_tokens[j:j+len(cont_marker_tokens)] == cont_marker_tokens:
+                            # Found the continued response marker
+                            response_start_pos = j + len(cont_marker_tokens)
+                            # Copy tokens for the response part only
+                            chunk_labels[response_start_pos:] = chunk_tokens[response_start_pos:].copy()
                             break
                     
-                    # Mask padding tokens
+                    # Ensure padding stays masked
                     if padding_length > 0:
                         chunk_labels[-padding_length:] = [-100] * padding_length
                     
@@ -538,6 +542,7 @@ def main():
         output_dir=output_dir,
         max_steps=max_steps,
         num_train_epochs=100,
+        max_grad_norm=1.0, # Gradient clipping
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
