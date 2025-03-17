@@ -45,7 +45,7 @@ lora_r = 2
 lora_alpha = 16
 lora_dropout = 0.05
 weight_decay = 0.1  # Add weight decay for regularization
-validation_size = 200  # Added for validation set size
+validation_size = 2000  # Added for validation set size
 
 # Dataset path
 dataset_path = "../data/PrimeIntellect/SYNTHETIC-1"
@@ -93,7 +93,7 @@ def create_validation_set(path, tokenizer, max_length=2048, validation_size=200)
             # Format exactly as in training
             formatted_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{response}"
             
-            # Tokenize - keep it simple for validation
+            # Tokenize
             tokens = tokenizer(
                 formatted_text,
                 truncation=True,
@@ -102,10 +102,27 @@ def create_validation_set(path, tokenizer, max_length=2048, validation_size=200)
                 return_tensors="pt"
             )
             
+            # Create labels with -100 for prompt tokens
+            labels = tokens["input_ids"][0].clone()
+            
+            # Find position where response starts
+            response_start_str = FORMAT_RESPONSE
+            response_start_tokens = tokenizer(response_start_str, add_special_tokens=False).input_ids
+            
+            for i in range(len(labels) - len(response_start_tokens)):
+                if tokens["input_ids"][0][i:i+len(response_start_tokens)].tolist() == response_start_tokens:
+                    # Mask everything before the response (including FORMAT_RESPONSE)
+                    response_start_pos = i + len(response_start_tokens)
+                    labels[:response_start_pos] = -100
+                    break
+            
+            # Mask padding tokens
+            labels[tokens["attention_mask"][0] == 0] = -100
+            
             processed_examples.append({
                 "input_ids": tokens["input_ids"][0],
                 "attention_mask": tokens["attention_mask"][0],
-                "labels": tokens["input_ids"][0].clone()
+                "labels": labels
             })
         except Exception as e:
             print(f"Error processing validation example: {e}")
@@ -161,7 +178,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             # Cache for common instructions
             self._instr_cache = {}
             
-            # Cached format token lengths - FIX: Changed .input.ids to .input_ids
+            # Cached format token lengths
             self.format_instr_len = len(tokenizer(FORMAT_INSTRUCTION, add_special_tokens=False).input_ids)
             self.format_resp_len = len(tokenizer(FORMAT_RESPONSE, add_special_tokens=False).input_ids)
             self.format_cont_len = len(tokenizer(FORMAT_CONTINUED, add_special_tokens=False).input_ids)
@@ -175,12 +192,11 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             if instruction in self._instr_cache:
                 instr_tokens = self._instr_cache[instruction]
             else:
-                # FIX: Changed .input.ids to .input_ids
                 instr_tokens = self.tokenizer(instruction, add_special_tokens=False).input_ids
                 if len(instruction) < 1000:  # Only cache reasonably sized instructions
                     self._instr_cache[instruction] = instr_tokens
                     
-            # Get response tokens - FIX: Changed .input.ids to .input_ids
+            # Get response tokens
             resp_tokens = self.tokenizer(response, add_special_tokens=False).input_ids
             
             # Calculate available space in first chunk
@@ -203,7 +219,6 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             if len(instr_tokens) + len(resp_tokens) + format_overhead + 1 <= self.max_length:
                 # Simple case - everything fits in one chunk
                 full_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{response}"
-                # FIX: Changed .input.ids to .input_ids
                 tokens = self.tokenizer(full_text).input_ids
                 
                 # Add EOS and create example
@@ -219,9 +234,27 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                     tokens = tokens + [self.tokenizer.pad_token_id] * padding_length
                     attention_mask = attention_mask + [0] * padding_length
                 
+                # Create labels with -100 for prompt tokens
+                labels = tokens.copy()
+                
+                # Find position where response starts
+                response_start_str = FORMAT_RESPONSE
+                response_start_tokens = self.tokenizer(response_start_str, add_special_tokens=False).input_ids
+                
+                for i in range(len(tokens) - len(response_start_tokens)):
+                    if tokens[i:i+len(response_start_tokens)] == response_start_tokens:
+                        # Mask everything before the response (including FORMAT_RESPONSE)
+                        response_start_pos = i + len(response_start_tokens)
+                        labels[:response_start_pos] = [-100] * response_start_pos
+                        break
+                
+                # Mask padding tokens
+                if padding_length > 0:
+                    labels[-padding_length:] = [-100] * padding_length
+                
                 chunks.append({
                     "input_ids": tokens,
-                    "labels": tokens.copy(),
+                    "labels": labels,
                     "attention_mask": attention_mask
                 })
                 
@@ -232,7 +265,6 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                 first_resp_tokens = resp_tokens[:first_chunk_avail]
                 first_resp_text = self.tokenizer.decode(first_resp_tokens, skip_special_tokens=True)
                 first_chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{first_resp_text}"
-                # FIX: Changed .input.ids to .input_ids
                 first_chunk_tokens = self.tokenizer(first_chunk_text).input_ids
                 
                 # Add EOS and handle padding for first chunk
@@ -247,9 +279,27 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                     first_chunk_tokens = first_chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
                     attention_mask = attention_mask + [0] * padding_length
                 
+                # Create labels with -100 for prompt tokens
+                first_chunk_labels = first_chunk_tokens.copy()
+                
+                # Find position where response starts
+                response_start_str = FORMAT_RESPONSE
+                response_start_tokens = self.tokenizer(response_start_str, add_special_tokens=False).input_ids
+                
+                for i in range(len(first_chunk_tokens) - len(response_start_tokens)):
+                    if first_chunk_tokens[i:i+len(response_start_tokens)] == response_start_tokens:
+                        # Mask everything before the response (including FORMAT_RESPONSE)
+                        response_start_pos = i + len(response_start_tokens)
+                        first_chunk_labels[:response_start_pos] = [-100] * response_start_pos
+                        break
+                
+                # Mask padding tokens
+                if padding_length > 0:
+                    first_chunk_labels[-padding_length:] = [-100] * padding_length
+                
                 chunks.append({
                     "input_ids": first_chunk_tokens,
-                    "labels": first_chunk_tokens.copy(),
+                    "labels": first_chunk_labels,
                     "attention_mask": attention_mask
                 })
                 
@@ -260,7 +310,6 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                     cont_tokens = remaining_tokens[i:i+cont_chunk_avail]
                     cont_text = self.tokenizer.decode(cont_tokens, skip_special_tokens=True)
                     chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_CONTINUED}{cont_text}"
-                    # FIX: Changed .input.ids to .input_ids
                     chunk_tokens = self.tokenizer(chunk_text).input_ids
                     
                     # Add EOS and handle padding
@@ -275,9 +324,27 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                         chunk_tokens = chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
                         attention_mask = attention_mask + [0] * padding_length
                     
+                    # Create labels with -100 for prompt tokens
+                    chunk_labels = chunk_tokens.copy()
+                    
+                    # Find position where response starts
+                    continued_start_str = FORMAT_CONTINUED
+                    continued_start_tokens = self.tokenizer(continued_start_str, add_special_tokens=False).input_ids
+                    
+                    for j in range(len(chunk_tokens) - len(continued_start_tokens)):
+                        if chunk_tokens[j:j+len(continued_start_tokens)] == continued_start_tokens:
+                            # Mask everything before the response (including FORMAT_CONTINUED)
+                            response_start_pos = j + len(continued_start_tokens)
+                            chunk_labels[:response_start_pos] = [-100] * response_start_pos
+                            break
+                    
+                    # Mask padding tokens
+                    if padding_length > 0:
+                        chunk_labels[-padding_length:] = [-100] * padding_length
+                    
                     chunks.append({
                         "input_ids": chunk_tokens,
-                        "labels": chunk_tokens.copy(),
+                        "labels": chunk_labels,
                         "attention_mask": attention_mask
                     })
             
@@ -458,7 +525,6 @@ def main():
         bias="none",
         target_modules=["value"],
         task_type="CAUSAL_LM",
-        #target_modules=["query", "key", "value"],
     )
     
     # Prepare model for training
