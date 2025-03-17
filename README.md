@@ -84,14 +84,13 @@ The meaning of life is tamed in many ways. It is a state of mental and physical 
 </pre>
 
 
-# MMLU Evaluation Results
+### MMLU Evaluation Results
 
-## **Overall Accuracy**
+#### **Overall Accuracy**
 **0.2549 (3579/14042)**
 
-# MMLU Evaluation Results
+#### MMLU Evaluation Results
 
-## Breakdown by Subject (Alphabetical Order):
 | Subject | Accuracy (Correct/Total) |
 |------------------------------|----------------------|
 | abstract_algebra             | 0.3200 (32/100)     |
