@@ -24,7 +24,7 @@ translated by training batch size
 
 ### Data
 
-The same as Argonne-1.0.
+The same as Argonne-1.0. Total processed tokens: 15,453,927,424.
 
 
 ### Model
@@ -82,6 +82,77 @@ Sample generation text:
 <pre>
 The meaning of life is tamed in many ways. It is a state of mental and physical development. It is a state of deep emotional strength and confidence, and it is a state of physical and mental balance. In this article, we will explore the meaning of life, the different ways life is defined, and how we can apply this concept to our own lives.
 </pre>
+
+
+# MMLU Evaluation Results
+
+## **Overall Accuracy**
+**0.2549 (3579/14042)**
+
+# MMLU Evaluation Results
+
+## Breakdown by Subject (Alphabetical Order):
+| Subject | Accuracy (Correct/Total) |
+|------------------------------|----------------------|
+| abstract_algebra             | 0.3200 (32/100)     |
+| anatomy                      | 0.3333 (45/135)     |
+| astronomy                    | 0.2566 (39/152)     |
+| business_ethics              | 0.2300 (23/100)     |
+| clinical_knowledge           | 0.2226 (59/265)     |
+| college_biology              | 0.3056 (44/144)     |
+| college_chemistry            | 0.2100 (21/100)     |
+| college_computer_science     | 0.2700 (27/100)     |
+| college_medicine             | 0.2543 (44/173)     |
+| college_mathematics          | 0.2700 (27/100)     |
+| college_physics              | 0.2255 (23/102)     |
+| computer_security            | 0.2900 (29/100)     |
+| conceptual_physics           | 0.2213 (52/235)     |
+| electrical_engineering       | 0.2759 (40/145)     |
+| elementary_mathematics       | 0.2963 (112/378)    |
+| econometrics                 | 0.2544 (29/114)     |
+| formal_logic                 | 0.1508 (19/126)     |
+| global_facts                 | 0.3100 (31/100)     |
+| high_school_biology          | 0.2613 (81/310)     |
+| high_school_chemistry        | 0.3054 (62/203)     |
+| high_school_computer_science | 0.3100 (31/100)     |
+| high_school_european_history | 0.2970 (49/165)     |
+| high_school_geography        | 0.2626 (52/198)     |
+| high_school_government_and_politics | 0.2280 (44/193) |
+| high_school_macroeconomics   | 0.2051 (80/390)     |
+| high_school_mathematics      | 0.2630 (71/270)     |
+| high_school_microeconomics   | 0.2059 (49/238)     |
+| high_school_physics          | 0.2384 (36/151)     |
+| high_school_psychology       | 0.2220 (121/545)    |
+| high_school_statistics       | 0.2222 (48/216)     |
+| high_school_us_history       | 0.2549 (52/204)     |
+| high_school_world_history    | 0.2658 (63/237)     |
+| human_aging                  | 0.2377 (53/223)     |
+| human_sexuality              | 0.2137 (28/131)     |
+| international_law            | 0.3636 (44/121)     |
+| jurisprudence                | 0.2315 (25/108)     |
+| logical_fallacies            | 0.2945 (48/163)     |
+| machine_learning             | 0.2054 (23/112)     |
+| management                   | 0.1845 (19/103)     |
+| marketing                    | 0.2436 (57/234)     |
+| medical_genetics             | 0.2100 (21/100)     |
+| miscellaneous                | 0.2439 (191/783)    |
+| moral_disputes               | 0.2803 (97/346)     |
+| moral_scenarios              | 0.2469 (221/895)    |
+| nutrition                    | 0.2353 (72/306)     |
+| philosophy                   | 0.3055 (95/311)     |
+| prehistory                   | 0.3025 (98/324)     |
+| professional_accounting      | 0.2766 (78/282)     |
+| professional_law             | 0.2692 (413/1534)   |
+| professional_medicine        | 0.1654 (45/272)     |
+| professional_psychology      | 0.2827 (173/612)    |
+| public_relations             | 0.2182 (24/110)     |
+| security_studies             | 0.2449 (60/245)     |
+| sociology                    | 0.2388 (48/201)     |
+| us_foreign_policy            | 0.2500 (25/100)     |
+| virology                     | 0.2048 (34/166)     |
+| world_religions              | 0.3041 (52/171)     |
+
+---
 
 
 
