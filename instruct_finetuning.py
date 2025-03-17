@@ -13,37 +13,121 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
-    TrainerCallback
+    TrainerCallback,
+    EarlyStoppingCallback  # Added import for early stopping
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from typing import Dict, List, Union
-import torch.utils.data as torch_data  # Add this import for PyTorch DataLoader
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizers parallelism to avoid warnings
+import torch.utils.data as torch_data
+import numpy as np
+
+# Disable tokenizers parallelism
+os.environ["TOKENIZERS_PARALLELISM"] = "false" 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Model path
 model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
-max_steps = 5000  # Train for specific number of steps instead of epochs
-per_device_train_batch_size = 16
+per_device_train_batch_size = 36
+per_device_eval_batch_size = 36  # Added for evaluation
+max_steps = 2_000_000 // per_device_train_batch_size  # Train for specific number of steps instead of epochs
 gradient_accumulation_steps = 1
-learning_rate = 1e-5  # Low learning rate to prevent catastrophic forgetting
+learning_rate = 1e-6  # Low learning rate to prevent catastrophic forgetting
 warmup_steps = 100
 logging_steps = 10
 save_steps = 200
+eval_steps = 100  # Added for evaluation
+early_stopping_patience = 3  # Added for early stopping
 max_seq_length = 2048
-lora_r = 16
+lora_r = 2
 lora_alpha = 16
 lora_dropout = 0.05
-weight_decay = 0.01  # Add weight decay for regularization
+weight_decay = 0.1  # Add weight decay for regularization
+validation_size = 200  # Added for validation set size
 
 # Dataset path
 dataset_path = "../data/PrimeIntellect/SYNTHETIC-1"
 
+# Format strings
+FORMAT_INSTRUCTION = "Instruction: "
+FORMAT_RESPONSE = "\nResponse: "
+FORMAT_CONTINUED = "\nResponse (continued): "
+
+def create_validation_set(path, tokenizer, max_length=2048, validation_size=200):
+    """Create a validation dataset using the same processing as the training dataset."""
+    print(f"Creating validation set with {validation_size} examples")
+    
+    # Get one arrow file for validation
+    arrow_files = glob.glob(os.path.join(path, "train", "data-*.arrow"))
+    if not arrow_files:
+        raise ValueError(f"No arrow files found in {path}")
+        
+    # Use a random file for validation data
+    val_file = random.choice(arrow_files)
+    print(f"Using {os.path.basename(val_file)} for validation data")
+    
+    # Load validation examples
+    try:
+        dataset = load_dataset('arrow', data_files=val_file, split='train')
+        # Sample random examples
+        val_indices = random.sample(range(len(dataset)), min(validation_size, len(dataset)))
+        val_examples = [dataset[i] for i in val_indices]
+        print(f"Loaded {len(val_examples)} examples for validation")
+    except Exception as e:
+        print(f"Error loading validation file: {e}")
+        return None
+    
+    # Process validation examples using the same format as training
+    processed_examples = []
+    
+    for example in val_examples:
+        try:
+            instruction = example.get("prompt", "")
+            response = example.get("llm_response", "")
+            
+            if not instruction or not response or len(instruction) < 3 or len(response) < 3:
+                continue
+            
+            # Format exactly as in training
+            formatted_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{response}"
+            
+            # Tokenize - keep it simple for validation
+            tokens = tokenizer(
+                formatted_text,
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt"
+            )
+            
+            processed_examples.append({
+                "input_ids": tokens["input_ids"][0],
+                "attention_mask": tokens["attention_mask"][0],
+                "labels": tokens["input_ids"][0].clone()
+            })
+        except Exception as e:
+            print(f"Error processing validation example: {e}")
+            continue
+    
+    print(f"Created validation set with {len(processed_examples)} examples")
+    
+    # Create a static dataset for validation
+    class StaticValidationDataset(torch_data.Dataset):
+        def __init__(self, examples):
+            self.examples = examples
+            
+        def __len__(self):
+            return len(self.examples)
+            
+        def __getitem__(self, idx):
+            return self.examples[idx]
+    
+    return StaticValidationDataset(processed_examples)
+
 def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
-    """Load and process the synthetic dataset from arrow files.
-    Process, format, and tokenize data in a streaming fashion."""
+    """Load and process the synthetic dataset from arrow files in a strictly sequential manner."""
     print(f"Loading synthetic dataset from {path}")
     
     # Get all arrow files in the train directory
@@ -51,7 +135,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
     if not arrow_files:
         raise ValueError(f"No arrow files found in {os.path.join(path, 'train')}")
     
-    # Sort files numerically
+    # Sort files numerically to ensure consistent order
     def extract_number(filename):
         match = re.search(r'data-(\d+)-of-', filename)
         if match:
@@ -65,112 +149,179 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
         arrow_files = arrow_files[:max_files]
         print(f"Using first {max_files} files")
     
-    # Create a PyTorch-compatible dataset that processes data on-the-fly
-    class SyntheticInstructDataset(torch_data.IterableDataset):
+    # Create a PyTorch-compatible dataset that processes data sequentially
+    class SequentialInstructDataset(torch_data.IterableDataset):
         def __init__(self, file_paths, tokenizer, max_length):
             super().__init__()
             self.file_paths = file_paths
             self.tokenizer = tokenizer
             self.max_length = max_length
-            self.spillover_text = None
             self._length = 1000000  # Arbitrary large number for batching
             
+            # Cache for common instructions
+            self._instr_cache = {}
+            
+            # Cached format token lengths - FIX: Changed .input.ids to .input_ids
+            self.format_instr_len = len(tokenizer(FORMAT_INSTRUCTION, add_special_tokens=False).input_ids)
+            self.format_resp_len = len(tokenizer(FORMAT_RESPONSE, add_special_tokens=False).input_ids)
+            self.format_cont_len = len(tokenizer(FORMAT_CONTINUED, add_special_tokens=False).input_ids)
+            
         def __len__(self):
-            return self._length  # Just a placeholder value for DataLoader
+            return self._length
             
-        def process_example(self, example):
-            """Process a single example: extract instruction and response."""
-            try:
-                instruction = example.get("prompt", "")
-                response = example.get("llm_response", "")
-                
-                if not instruction or not response:
-                    return None
-                
-                # Format as instruction tuning format
-                formatted_text = f"Instruction: {instruction}\nResponse: {response}"
-                
-                if len(formatted_text) < 20:  # Filter out very short examples
-                    return None
-                    
-                return formatted_text
-            except Exception as e:
-                print(f"Error processing example: {e}")
-                return None
-                
-        def tokenize_text(self, text):
-            """Tokenize text with handling of examples longer than max_length."""
-            if self.spillover_text:
-                text = self.spillover_text + text
-                self.spillover_text = None
-                
-            # Tokenize without truncation
-            tokens = self.tokenizer(text, truncation=False, padding=False)
-            input_ids = tokens["input_ids"]
-            
-            # If text is too long, split it
-            if len(input_ids) > self.max_length - 1:  # -1 for EOS token
-                chunk = input_ids[:self.max_length - 1]
-                # Save remainder for next sample
-                self.spillover_text = self.tokenizer.decode(input_ids[self.max_length - 1:], skip_special_tokens=True)
-                
-                # Pad to max_length
-                padded_chunk = chunk + [self.tokenizer.eos_token_id]
-                while len(padded_chunk) < self.max_length:
-                    padded_chunk.append(self.tokenizer.pad_token_id)
-                    
-                attention_mask = [1] * len(chunk) + [1] + [0] * (self.max_length - len(chunk) - 1)
-                return {
-                    "input_ids": padded_chunk,
-                    "labels": padded_chunk.copy(),
-                    "attention_mask": attention_mask
-                }
+        def tokenize_qa_pair(self, instruction, response):
+            """Tokenize and chunk an instruction-response pair if needed."""
+            # Get instruction tokens (with caching for common instructions)
+            if instruction in self._instr_cache:
+                instr_tokens = self._instr_cache[instruction]
             else:
-                # Pad normally
-                padded_input_ids = input_ids + [self.tokenizer.eos_token_id]
-                padding_length = self.max_length - len(padded_input_ids)
-                padded_input_ids.extend([self.tokenizer.pad_token_id] * padding_length)
-                attention_mask = [1] * (len(input_ids) + 1) + [0] * padding_length
-                return {
-                    "input_ids": padded_input_ids,
-                    "labels": padded_input_ids.copy(),
-                    "attention_mask": attention_mask
-                }
-        
-        def __iter__(self):
-            worker_info = torch_data.get_worker_info()
-            files_to_process = self.file_paths
-            
-            # If using multiple workers, split files among workers
-            if worker_info:
-                per_worker = len(files_to_process) // worker_info.num_workers
-                files_to_process = files_to_process[
-                    worker_info.id * per_worker : (worker_info.id + 1) * per_worker
-                ]
-            
-            for file_idx, file_path in enumerate(files_to_process):
-                try:
-                    print(f"Worker {getattr(worker_info, 'id', 0)} streaming file {file_idx}/{len(files_to_process)}: {os.path.basename(file_path)}")
-                    dataset = load_dataset('arrow', data_files=file_path, split='train')
-                    print(f"Loaded file with {len(dataset)} rows")
+                # FIX: Changed .input.ids to .input_ids
+                instr_tokens = self.tokenizer(instruction, add_special_tokens=False).input_ids
+                if len(instruction) < 1000:  # Only cache reasonably sized instructions
+                    self._instr_cache[instruction] = instr_tokens
                     
-                    for example in dataset:
-                        processed_text = self.process_example(example)
-                        if processed_text is not None:
-                            tokenized = self.tokenize_text(processed_text)
-                            if tokenized:
-                                yield tokenized
-                                
-                except Exception as e:
-                    print(f"Error streaming from {file_path}: {str(e)}")
+            # Get response tokens - FIX: Changed .input.ids to .input_ids
+            resp_tokens = self.tokenizer(response, add_special_tokens=False).input_ids
             
-            # Reset spillover text at the end of the dataset
-            self.spillover_text = None
+            # Calculate available space in first chunk
+            format_overhead = self.format_instr_len + self.format_resp_len
+            cont_format_overhead = self.format_instr_len + self.format_cont_len
+            
+            # If instruction is very long, truncate it
+            max_instr_len = self.max_length // 3
+            if len(instr_tokens) > max_instr_len:
+                instr_tokens = instr_tokens[:max_instr_len]
+                instruction = self.tokenizer.decode(instr_tokens, skip_special_tokens=True)
+            
+            # Calculate available space for response in chunks
+            first_chunk_avail = self.max_length - len(instr_tokens) - format_overhead - 1  # -1 for EOS
+            cont_chunk_avail = self.max_length - len(instr_tokens) - cont_format_overhead - 1
+            
+            chunks = []
+            
+            # Check if the entire QA pair fits in one chunk
+            if len(instr_tokens) + len(resp_tokens) + format_overhead + 1 <= self.max_length:
+                # Simple case - everything fits in one chunk
+                full_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{response}"
+                # FIX: Changed .input.ids to .input_ids
+                tokens = self.tokenizer(full_text).input_ids
+                
+                # Add EOS and create example
+                if len(tokens) < self.max_length:
+                    tokens = tokens + [self.tokenizer.eos_token_id]
+                else:
+                    tokens = tokens[:self.max_length-1] + [self.tokenizer.eos_token_id]
+                    
+                # Add padding
+                attention_mask = [1] * len(tokens)
+                padding_length = self.max_length - len(tokens)
+                if padding_length > 0:
+                    tokens = tokens + [self.tokenizer.pad_token_id] * padding_length
+                    attention_mask = attention_mask + [0] * padding_length
+                
+                chunks.append({
+                    "input_ids": tokens,
+                    "labels": tokens.copy(),
+                    "attention_mask": attention_mask
+                })
+                
+            else:
+                # Complex case - need to chunk the response
+                
+                # First chunk with start of response
+                first_resp_tokens = resp_tokens[:first_chunk_avail]
+                first_resp_text = self.tokenizer.decode(first_resp_tokens, skip_special_tokens=True)
+                first_chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{first_resp_text}"
+                # FIX: Changed .input.ids to .input_ids
+                first_chunk_tokens = self.tokenizer(first_chunk_text).input_ids
+                
+                # Add EOS and handle padding for first chunk
+                if len(first_chunk_tokens) < self.max_length:
+                    first_chunk_tokens = first_chunk_tokens + [self.tokenizer.eos_token_id]
+                else:
+                    first_chunk_tokens = first_chunk_tokens[:self.max_length-1] + [self.tokenizer.eos_token_id]
+                    
+                attention_mask = [1] * len(first_chunk_tokens)
+                padding_length = self.max_length - len(first_chunk_tokens)
+                if padding_length > 0:
+                    first_chunk_tokens = first_chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
+                    attention_mask = attention_mask + [0] * padding_length
+                
+                chunks.append({
+                    "input_ids": first_chunk_tokens,
+                    "labels": first_chunk_tokens.copy(),
+                    "attention_mask": attention_mask
+                })
+                
+                # Process remaining response in continuation chunks
+                remaining_tokens = resp_tokens[first_chunk_avail:]
+                
+                for i in range(0, len(remaining_tokens), cont_chunk_avail):
+                    cont_tokens = remaining_tokens[i:i+cont_chunk_avail]
+                    cont_text = self.tokenizer.decode(cont_tokens, skip_special_tokens=True)
+                    chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_CONTINUED}{cont_text}"
+                    # FIX: Changed .input.ids to .input_ids
+                    chunk_tokens = self.tokenizer(chunk_text).input_ids
+                    
+                    # Add EOS and handle padding
+                    if len(chunk_tokens) < self.max_length:
+                        chunk_tokens = chunk_tokens + [self.tokenizer.eos_token_id]
+                    else:
+                        chunk_tokens = chunk_tokens[:self.max_length-1] + [self.tokenizer.eos_token_id]
+                        
+                    attention_mask = [1] * len(chunk_tokens)
+                    padding_length = self.max_length - len(chunk_tokens)
+                    if padding_length > 0:
+                        chunk_tokens = chunk_tokens + [self.tokenizer.pad_token_id] * padding_length
+                        attention_mask = attention_mask + [0] * padding_length
+                    
+                    chunks.append({
+                        "input_ids": chunk_tokens,
+                        "labels": chunk_tokens.copy(),
+                        "attention_mask": attention_mask
+                    })
+            
+            return chunks
+            
+        def __iter__(self):
+            # Process files one at a time sequentially
+            for file_idx, file_path in enumerate(self.file_paths):
+                try:
+                    print(f"Processing file {file_idx+1}/{len(self.file_paths)}: {os.path.basename(file_path)}")
+                    
+                    # Load dataset one file at a time
+                    dataset = load_dataset('arrow', data_files=file_path, split='train')
+                    print(f"Loaded file with {len(dataset)} examples")
+                    
+                    # Process examples in sequence
+                    for example_idx, example in enumerate(dataset):
+                        # Print progress occasionally
+                        if example_idx > 0 and example_idx % 1000 == 0:
+                            print(f"  Processed {example_idx}/{len(dataset)} examples from file {file_idx+1}")
+                        
+                        # Extract instruction and response
+                        instruction = example.get("prompt", "")
+                        response = example.get("llm_response", "")
+                        
+                        # Skip invalid examples
+                        if not instruction or not response or len(instruction) < 3 or len(response) < 3:
+                            continue
+                            
+                        # Process the QA pair (chunk if needed)
+                        chunks = self.tokenize_qa_pair(instruction, response)
+                        
+                        # Yield all chunks for this example
+                        for chunk in chunks:
+                            yield chunk
+                            
+                except Exception as e:
+                    print(f"Error processing file {file_path}: {e}")
+                    continue
     
-    # Create streaming dataset
-    streaming_dataset = SyntheticInstructDataset(arrow_files, tokenizer, max_length)
+    # Create streaming dataset that processes files sequentially
+    streaming_dataset = SequentialInstructDataset(arrow_files, tokenizer, max_length)
     
-    print("Dataset ready for streaming with processing and tokenization")
+    print("Dataset ready for sequential streaming with smart chunking")
     return streaming_dataset
 
 def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article about AI\nResponse:", max_length=150):
@@ -237,6 +388,25 @@ class TextGenerationCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs): pass
     def on_log(self, args, state, control, **kwargs): pass
 
+class ValidationLossCallback(TrainerCallback):
+    """Callback to track validation loss during training"""
+    def __init__(self):
+        self.best_loss = float('inf')
+        self.no_improvement_count = 0
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is not None and "eval_loss" in metrics:
+            current_loss = metrics["eval_loss"]
+            print(f"\n>>> Validation Loss: {current_loss:.4f} (Best: {self.best_loss:.4f})")
+            
+            if current_loss < self.best_loss:
+                self.best_loss = current_loss
+                self.no_improvement_count = 0
+                print(f">>> New best validation loss!")
+            else:
+                self.no_improvement_count += 1
+                print(f">>> No improvement for {self.no_improvement_count} evaluations")
+
 def main():
     # Test prompts for evaluation
     test_prompts = [
@@ -252,7 +422,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Load dataset with integrated processing
+    # Create validation dataset (new)
+    print("Creating validation dataset...")
+    validation_dataset = create_validation_set(
+        dataset_path, 
+        tokenizer, 
+        max_length=max_seq_length,
+        validation_size=validation_size
+    )
+    
+    # Load dataset with sequential processing
     print("Loading and preparing dataset...")
     train_tokenized_dataset = load_synthetic_dataset(
         dataset_path, 
@@ -260,9 +439,9 @@ def main():
         max_length=max_seq_length
     )
     
-    print(f"Training dataset ready with streaming processing and chunking support")
+    print(f"Sequential training dataset ready with smart chunking")
     
-    # Load base model - simple version without any fancy options
+    # Load base model
     print("Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -277,8 +456,9 @@ def main():
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         bias="none",
+        target_modules=["value"],
         task_type="CAUSAL_LM",
-        target_modules=["query", "key", "value"],
+        #target_modules=["query", "key", "value"],
     )
     
     # Prepare model for training
@@ -286,13 +466,14 @@ def main():
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     model = get_peft_model(model, peft_config)
     
-    # Define training arguments - simple version without DDP settings
+    # Define training arguments
     print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=output_dir,
-        max_steps=max_steps,  # Set maximum number of steps instead of epochs
-        num_train_epochs=100,  # Set to a large number that won't be reached
+        max_steps=max_steps,
+        num_train_epochs=100,
         per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
@@ -303,10 +484,18 @@ def main():
         save_steps=save_steps,
         save_total_limit=2,
         report_to="none",
-        evaluation_strategy="no",
-        dataloader_num_workers=1,
+        # Add evaluation settings
+        evaluation_strategy="steps",  
+        eval_steps=eval_steps,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,  # Lower loss is better
+        # Keep original settings for performance
+        dataloader_num_workers=0,  # Force sequential processing with no workers
         group_by_length=False,
-        dataloader_drop_last=False
+        dataloader_drop_last=False,
+        gradient_checkpointing=False,
+        optim="adamw_torch"
     )
     
     # Data collator for language modeling
@@ -315,8 +504,13 @@ def main():
         mlm=False,
     )
     
-    # Create text generation callback
+    # Create callbacks
     text_gen_callback = TextGenerationCallback(model, tokenizer, test_prompts, eval_steps=100)
+    early_stopping_callback = EarlyStoppingCallback(
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_threshold=0.01
+    )
+    validation_loss_callback = ValidationLossCallback()
     
     # Initialize trainer
     print("Initializing trainer...")
@@ -324,8 +518,9 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_tokenized_dataset,
+        eval_dataset=validation_dataset,  # Add validation dataset
         data_collator=data_collator,
-        callbacks=[text_gen_callback],
+        callbacks=[text_gen_callback, early_stopping_callback, validation_loss_callback],  # Add new callbacks
     )
     
     # Generate sample text before training
@@ -333,7 +528,7 @@ def main():
     generate_sample_text(model, tokenizer, test_prompts[0])
     
     # Start training with step-based progress tracking
-    print(f"Starting training for {max_steps} steps...")
+    print(f"Starting training for {max_steps} steps with early stopping...")
     trainer.train()
     
     # Save model
