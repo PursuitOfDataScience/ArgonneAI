@@ -30,11 +30,11 @@ model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
-per_device_train_batch_size = 36
-per_device_eval_batch_size = 36  # Added for evaluation
-max_steps = 2_000_000 // per_device_train_batch_size  # Train for specific number of steps instead of epochs
+per_device_train_batch_size = 32
+per_device_eval_batch_size = per_device_train_batch_size  # Added for evaluation
+max_steps = 100_000 // per_device_train_batch_size  # Train for specific number of steps instead of epochs
 gradient_accumulation_steps = 1
-learning_rate = 1e-6  # Low learning rate to prevent catastrophic forgetting
+learning_rate = 5e-7  # Low learning rate to prevent catastrophic forgetting
 warmup_steps = 100
 logging_steps = 10
 save_steps = 200
@@ -42,13 +42,13 @@ eval_steps = 100  # Added for evaluation
 early_stopping_patience = 3  # Added for early stopping
 max_seq_length = 2048
 lora_r = 2
-lora_alpha = 16
+lora_alpha = 8
 lora_dropout = 0.05
 weight_decay = 0.1  # Add weight decay for regularization
 validation_size = 2000  # Added for validation set size
 
 # Dataset path
-dataset_path = "../data/PrimeIntellect/SYNTHETIC-1"
+dataset_path = "../data/tuanha1305/DeepSeek-R1-Distill"
 
 # Format strings
 FORMAT_INSTRUCTION = "Instruction: "
@@ -84,8 +84,8 @@ def create_validation_set(path, tokenizer, max_length=2048, validation_size=200)
     
     for example in val_examples:
         try:
-            instruction = example.get("prompt", "")
-            response = example.get("llm_response", "")
+            instruction = example.get("input", "")
+            response = example.get("content", "")
             
             if not instruction or not response or len(instruction) < 3 or len(response) < 3:
                 continue
@@ -102,7 +102,7 @@ def create_validation_set(path, tokenizer, max_length=2048, validation_size=200)
                 return_tensors="pt"
             )
             
-            # Create labels with -100 for prompt tokens
+            # Create labels with -100 for input tokens
             labels = tokens["input_ids"][0].clone()
             
             # Find position where response starts
@@ -370,9 +370,9 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                         if example_idx > 0 and example_idx % 1000 == 0:
                             print(f"  Processed {example_idx}/{len(dataset)} examples from file {file_idx+1}")
                         
-                        # Extract instruction and response
-                        instruction = example.get("prompt", "")
-                        response = example.get("llm_response", "")
+                        # Extract instruction and response using new column names
+                        instruction = example.get("input", "")
+                        response = example.get("content", "")
                         
                         # Skip invalid examples
                         if not instruction or not response or len(instruction) < 3 or len(response) < 3:
@@ -406,11 +406,11 @@ def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article
         "max_length": max_length,
         "min_length": 50,
         "temperature": 0.7,
-        "top_p": 0.9,
-        "top_k": 40,
+        "top_p": 0.95,
+        "top_k": 5,
         "num_return_sequences": 1,
         "do_sample": True,
-        "repetition_penalty": 1.2,
+        "repetition_penalty": 1.5,
         "no_repeat_ngram_size": 3,
     }
     
@@ -437,9 +437,11 @@ class TextGenerationCallback(TrainerCallback):
         if state.global_step > 0 and state.global_step % self.eval_steps == 0 and state.global_step > self.step:
             self.step = state.global_step
             model = kwargs.get("model", self.model)
-            prompt = random.choice(self.prompts)
             print(f"\nStep {state.global_step}:")
-            generate_sample_text(model, self.tokenizer, prompt)
+            # Generate text for all prompts instead of just a random one
+            for i, prompt in enumerate(self.prompts):
+                print(f"\nTest prompt {i+1}:")
+                generate_sample_text(model, self.tokenizer, prompt)
     
     def on_train_end(self, args, state, control, **kwargs):
         print("\n=== Final model evaluation ===")
@@ -594,9 +596,11 @@ def main():
         callbacks=[text_gen_callback, early_stopping_callback, validation_loss_callback],  # Add new callbacks
     )
     
-    # Generate sample text before training
+    # Generate sample text before training for all prompts
     print("\nGenerating sample text before training:")
-    generate_sample_text(model, tokenizer, test_prompts[0])
+    for i, prompt in enumerate(test_prompts):
+        print(f"\nTest prompt {i+1}:")
+        generate_sample_text(model, tokenizer, prompt)
     
     # Start training with step-based progress tracking
     print(f"Starting training for {max_steps} steps with early stopping...")
