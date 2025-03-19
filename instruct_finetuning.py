@@ -30,7 +30,7 @@ model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
-per_device_train_batch_size = 36
+per_device_train_batch_size = 8
 per_device_eval_batch_size = per_device_train_batch_size  # Added for evaluation
 max_steps = 100_000 // per_device_train_batch_size  # Train for specific number of steps instead of epochs
 gradient_accumulation_steps = 1
@@ -45,7 +45,6 @@ lora_r = 2
 lora_alpha = 8
 lora_dropout = 0.05
 weight_decay = 0.1  # Add weight decay for regularization
-validation_size = 2000  # Added for validation set size
 
 # Dataset path
 dataset_path = "../data/tuanha1305/DeepSeek-R1-Distill"
@@ -55,92 +54,52 @@ FORMAT_INSTRUCTION = "Instruction: "
 FORMAT_RESPONSE = "\nResponse: "
 FORMAT_CONTINUED = "\n(Continuation of prior response): "  # Updated to be more concise
 
-def create_validation_set(path, tokenizer, max_length=2048, validation_size=200):
-    """Create a validation dataset using the same processing as the training dataset."""
-    print(f"Creating validation set with {validation_size} examples")
-    
-    # Get one arrow file for validation
-    arrow_files = glob.glob(os.path.join(path, "train", "data-*.arrow"))
-    if not arrow_files:
-        raise ValueError(f"No arrow files found in {path}")
-        
-    # Use a random file for validation data
-    val_file = random.choice(arrow_files)
-    print(f"Using {os.path.basename(val_file)} for validation data")
-    
-    # Load validation examples
-    try:
-        dataset = load_dataset('arrow', data_files=val_file, split='train')
-        # Sample random examples
-        val_indices = random.sample(range(len(dataset)), min(validation_size, len(dataset)))
-        val_examples = [dataset[i] for i in val_indices]
-        print(f"Loaded {len(val_examples)} examples for validation")
-    except Exception as e:
-        print(f"Error loading validation file: {e}")
-        return None
-    
-    # Process validation examples using the same format as training
+def create_math_validation_set(path, tokenizer, max_length=2048):
+    print(f"Loading MATH-500 dataset from {path}")
+    raw_dataset = load_dataset(
+        'arrow',
+        data_files={"test": f"{path}/test/*.arrow"},
+        split='test'
+    )
     processed_examples = []
     
-    for example in val_examples:
-        try:
-            instruction = example.get("input", "")
-            response = example.get("content", "")
-            
-            if not instruction or not response or len(instruction) < 3 or len(response) < 3:
-                continue
-            
-            # Format exactly as in training
-            formatted_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{response}"
-            
-            # Tokenize
-            tokens = tokenizer(
-                formatted_text,
-                truncation=True,
-                padding="max_length",
-                max_length=max_length,
-                return_tensors="pt"
-            )
-            
-            # Create labels with -100 for input tokens
-            labels = tokens["input_ids"][0].clone()
-            
-            # Find position where response starts
-            response_start_str = FORMAT_RESPONSE
-            response_start_tokens = tokenizer(response_start_str, add_special_tokens=False).input_ids
-            
-            for i in range(len(labels) - len(response_start_tokens)):
-                if tokens["input_ids"][0][i:i+len(response_start_tokens)].tolist() == response_start_tokens:
-                    # Mask everything before the response (including FORMAT_RESPONSE)
-                    response_start_pos = i + len(response_start_tokens)
-                    labels[:response_start_pos] = -100
-                    break
-            
-            # Mask padding tokens
-            labels[tokens["attention_mask"][0] == 0] = -100
-            
-            processed_examples.append({
-                "input_ids": tokens["input_ids"][0],
-                "attention_mask": tokens["attention_mask"][0],
-                "labels": labels
-            })
-        except Exception as e:
-            print(f"Error processing validation example: {e}")
+    for ex in raw_dataset:
+        problem = ex.get("problem", "")
+        detailed_sol = ex.get("solution", "")
+        if len(problem) < 3 or len(detailed_sol) < 3:
             continue
+        # Format prompt + answer
+        formatted_text = f"{FORMAT_INSTRUCTION}{problem}{FORMAT_RESPONSE}{detailed_sol}"
+        tokens = tokenizer(
+            formatted_text,
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+            return_tensors="pt"
+        )
+        labels = tokens["input_ids"][0].clone()
+        # Mask everything before the response
+        response_start_str = FORMAT_RESPONSE
+        response_start_tokens = tokenizer(response_start_str, add_special_tokens=False).input_ids
+        for i in range(len(labels) - len(response_start_tokens)):
+            if tokens["input_ids"][0][i:i+len(response_start_tokens)].tolist() == response_start_tokens:
+                labels[:i+len(response_start_tokens)] = -100
+                break
+        labels[tokens["attention_mask"][0] == 0] = -100
+        processed_examples.append({
+            "input_ids": tokens["input_ids"][0],
+            "attention_mask": tokens["attention_mask"][0],
+            "labels": labels
+        })
     
-    print(f"Created validation set with {len(processed_examples)} examples")
-    
-    # Create a static dataset for validation
     class StaticValidationDataset(torch_data.Dataset):
         def __init__(self, examples):
             self.examples = examples
-            
         def __len__(self):
             return len(self.examples)
-            
         def __getitem__(self, idx):
             return self.examples[idx]
-    
+
     return StaticValidationDataset(processed_examples)
 
 def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
@@ -497,14 +456,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Create validation dataset (new)
-    print("Creating validation dataset...")
-    validation_dataset = create_validation_set(
-        dataset_path, 
-        tokenizer, 
-        max_length=max_seq_length,
-        validation_size=validation_size
-    )
+    eval_dataset_path = "../data/HuggingFaceH4/MATH-500"
+    validation_dataset = create_math_validation_set(eval_dataset_path, tokenizer, max_length=max_seq_length)
     
     # Load dataset with sequential processing
     print("Loading and preparing dataset...")
@@ -516,22 +469,16 @@ def main():
     
     print(f"Sequential training dataset ready with smart chunking")
     
-    # Load base model
+    # Load base model with automatic device placement
     print("Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
         torch_dtype=torch.float16,
+        device_map="auto"  # Enable automatic device mapping
     )
     
-    # Move model to GPU - standard step without Flash Attention 2.0
-    print("Moving model to CUDA...")
-    model = model.to("cuda")
-    
-    # Remove Flash Attention 2.0 specific code
-    # print("Setting attn_implementation to flash_attention_2...")
-    # model = model.to_bettertransformer()
-    
+    print("Configuring LoRA...")
     # Configure LoRA with original target modules
     print("Configuring LoRA...")
     peft_config = LoraConfig(
