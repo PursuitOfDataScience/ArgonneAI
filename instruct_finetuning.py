@@ -30,7 +30,7 @@ model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
-per_device_train_batch_size = 32
+per_device_train_batch_size = 36
 per_device_eval_batch_size = per_device_train_batch_size  # Added for evaluation
 max_steps = 100_000 // per_device_train_batch_size  # Train for specific number of steps instead of epochs
 gradient_accumulation_steps = 1
@@ -53,7 +53,7 @@ dataset_path = "../data/tuanha1305/DeepSeek-R1-Distill"
 # Format strings
 FORMAT_INSTRUCTION = "Instruction: "
 FORMAT_RESPONSE = "\nResponse: "
-FORMAT_CONTINUED = "\nResponse (continued): "
+FORMAT_CONTINUED = "\n(Continuation of prior response): "  # Updated to be more concise
 
 def create_validation_set(path, tokenizer, max_length=2048, validation_size=200):
     """Create a validation dataset using the same processing as the training dataset."""
@@ -201,7 +201,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             
             # Calculate available space in first chunk
             format_overhead = self.format_instr_len + self.format_resp_len
-            cont_format_overhead = self.format_instr_len + self.format_cont_len
+            cont_format_overhead = self.format_cont_len  # No need to include instruction overhead in continuation chunks
             
             # If instruction is very long, truncate it
             max_instr_len = self.max_length // 3
@@ -211,7 +211,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             
             # Calculate available space for response in chunks
             first_chunk_avail = self.max_length - len(instr_tokens) - format_overhead - 1  # -1 for EOS
-            cont_chunk_avail = self.max_length - len(instr_tokens) - cont_format_overhead - 1
+            cont_chunk_avail = self.max_length - cont_format_overhead - 1  # More space since we don't repeat instruction
             
             chunks = []
             
@@ -263,7 +263,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             else:
                 # Complex case - need to chunk the response
                 
-                # First chunk with start of response
+                # First chunk with start of response - includes instruction
                 first_resp_tokens = resp_tokens[:first_chunk_avail]
                 first_resp_text = self.tokenizer.decode(first_resp_tokens, skip_special_tokens=True)
                 first_chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_RESPONSE}{first_resp_text}"
@@ -312,7 +312,9 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
                 for i in range(0, len(remaining_tokens), cont_chunk_avail):
                     cont_tokens = remaining_tokens[i:i+cont_chunk_avail]
                     cont_text = self.tokenizer.decode(cont_tokens, skip_special_tokens=True)
-                    chunk_text = f"{FORMAT_INSTRUCTION}{instruction}{FORMAT_CONTINUED}{cont_text}"
+                    
+                    # Simplified continuation format - no instruction repeat
+                    chunk_text = f"{FORMAT_CONTINUED}{cont_text}"
                     chunk_tokens = self.tokenizer(chunk_text).input_ids
                     
                     # Add EOS and handle padding
@@ -522,14 +524,22 @@ def main():
         torch_dtype=torch.float16,
     )
     
-    # Configure LoRA
+    # Move model to GPU - standard step without Flash Attention 2.0
+    print("Moving model to CUDA...")
+    model = model.to("cuda")
+    
+    # Remove Flash Attention 2.0 specific code
+    # print("Setting attn_implementation to flash_attention_2...")
+    # model = model.to_bettertransformer()
+    
+    # Configure LoRA with original target modules
     print("Configuring LoRA...")
     peft_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         bias="none",
-        target_modules=["value"],
+        target_modules=["query", "key", "value"],  # Reverted to original target_modules
         task_type="CAUSAL_LM",
     )
     
