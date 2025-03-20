@@ -13,6 +13,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
+    DataCollatorWithFlattening,  # Add this import for Flash Attention 2
     TrainerCallback,
     EarlyStoppingCallback  # Added import for early stopping
 )
@@ -32,7 +33,7 @@ model_path = "../toxic-models/Qwen/Qwen2.5-1.5B-Instruct"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
-per_device_train_batch_size = 4
+per_device_train_batch_size = 24
 per_device_eval_batch_size = per_device_train_batch_size  # Added for evaluation
 gradient_accumulation_steps = 1
 max_steps = 100_000 // (per_device_train_batch_size * gradient_accumulation_steps)  # Train for specific number of steps instead of epochs
@@ -246,9 +247,15 @@ def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article
     """Generate sample text from the model to evaluate its capabilities"""
     print(f"\n=== Generating sample text for prompt: '{prompt}' ===")
     
-    inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = inputs["input_ids"].to(model.device)
+    # Get model's dtype for consistent tensor types
+    model_dtype = next(model.parameters()).dtype
+    print(f"Model using dtype: {model_dtype}")
     
+    # DO NOT convert input_ids to model's dtype - they should remain as integers
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(model.device)  # Only move to device, don't change dtype
+    
+    # Define generation parameters
     gen_kwargs = {
         "max_length": max_length,
         "min_length": 50,
@@ -259,12 +266,34 @@ def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article
         "do_sample": True,
         "repetition_penalty": 1.5,
         "no_repeat_ngram_size": 3,
+        "use_cache": True  # Enable KV caching
     }
     
     with torch.no_grad():
-        outputs = model.generate(input_ids, **gen_kwargs)
+        try:
+            # First attempt with default settings
+            outputs = model.generate(input_ids, **gen_kwargs)
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        except RuntimeError as e:
+            if "FlashAttention only support fp16 and bf16 data type" in str(e):
+                print("Flash Attention error detected. Trying simpler generation approach...")
+                # Try a more basic generation approach instead
+                try:
+                    # Don't try to disable flash attention - use greedy decoding as it's more reliable
+                    outputs = model.generate(
+                        input_ids, 
+                        max_length=max_length,
+                        do_sample=False,  # Use greedy decoding instead of sampling
+                        use_cache=True
+                    )
+                    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                except Exception as e2:
+                    print(f"Second attempt also failed: {e2}")
+                    # If all else fails, return a placeholder
+                    generated_text = f"{prompt} [Generation failed due to dtype compatibility issues]"
+            else:
+                raise  # Re-raise if it's a different error
     
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(f"\nGenerated text:\n{generated_text}\n")
     print("=" * 80)
     
@@ -355,35 +384,68 @@ def main():
     
     print(f"Streaming training dataset ready")
     
-    # Load base model with automatic device placement
-    print("Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        device_map="auto"  # Enable automatic device mapping
-    )
+    # Load base model with Flash Attention 2 - with check for bfloat16 support
+    print("Loading base model with Flash Attention 2...")
+    try:
+        # Check if BF16 is supported on this GPU
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            print("BFloat16 is supported on this GPU - using it with Flash Attention 2")
+            dtype = torch.bfloat16
+        else:
+            print("BFloat16 not supported - falling back to Float16")
+            dtype = torch.float16
+            
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            device_map="auto",
+            attn_implementation="flash_attention_2"
+        )
+    except Exception as e:
+        print(f"Error loading with Flash Attention 2: {e}")
+        print("Falling back to standard attention...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
     
-    print(model)
+    # Verify model dtype before PEFT
+    original_dtype = next(model.parameters()).dtype
+    print(f"Model parameter dtype before PEFT: {original_dtype}")
+    
+    # Define peft_config BEFORE using it
+    print("Configuring LoRA...")
     peft_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj"],  # Reverted to original target_modules
+        target_modules=["q_proj", "k_proj", "v_proj"],  # Target modules for Qwen model
         task_type="CAUSAL_LM",
     )
     
-    # Prepare model for training
+    # Prepare model for training - preserve original dtype
     print("Preparing model for training...")
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     model = get_peft_model(model, peft_config)
-
-    # for param in model.parameters():
-    #     param.requires_grad = True
     
-    # Define training arguments
-    print("Setting up training arguments...")
+    # IMPORTANT: Convert model back to original precision after PEFT
+    # PEFT sometimes converts to float32, breaking Flash Attention compatibility
+    print(f"Model parameter dtype after PEFT (before conversion): {next(model.parameters()).dtype}")
+    model = model.to(original_dtype)
+    print(f"Model parameter dtype after conversion back to {original_dtype}: {next(model.parameters()).dtype}")
+    
+    # Verify model dtype after PEFT
+    print(f"Model parameter dtype after PEFT: {next(model.parameters()).dtype}")
+    
+    # Adjust training arguments to match model's dtype
+    bf16_enabled = original_dtype == torch.bfloat16
+    fp16_enabled = original_dtype == torch.float16
+    
+    # Define training arguments with correct precision flags
     training_args = TrainingArguments(
         output_dir=output_dir,
         max_steps=max_steps,
@@ -395,7 +457,8 @@ def main():
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
         weight_decay=weight_decay,
-        fp16=True,
+        bf16=bf16_enabled,  # Changed from fp16=True to bf16=True
+        fp16=fp16_enabled, # Disable fp16 when using bf16
         logging_steps=logging_steps,
         save_strategy="steps",
         save_steps=save_steps,
@@ -415,10 +478,12 @@ def main():
         optim="adamw_torch"
     )
     
-    # Data collator for language modeling
+    # Use the standard DataCollatorForLanguageModeling instead
+    # Flash Attention 2 works at the model level without needing a special collator
+    print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False,
+        mlm=False
     )
     
     # Create callbacks
