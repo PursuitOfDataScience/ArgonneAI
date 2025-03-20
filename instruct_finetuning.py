@@ -26,7 +26,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Model path
-model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
+# model_path = "../toxic-models/PursuitOfDataScience/Argonne-1.5"
+model_path = "../toxic-models/meta-llama/Llama-3.2-1B-Instruct"
 
 # Parameters - using conservative values to prevent catastrophic forgetting
 output_dir = "./argonne_synthetic_finetuned"
@@ -132,7 +133,7 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             self.file_paths = file_paths
             self.tokenizer = tokenizer
             self.max_length = max_length
-            self._length = 1000000  # Arbitrary large number for batching
+            self._length = 100000000  # Much larger to prevent Trainer from thinking it's done
             
             # Cache for common instructions
             self._instr_cache = {}
@@ -316,39 +317,134 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
             return chunks
             
         def __iter__(self):
-            # Process files one at a time sequentially
-            for file_idx, file_path in enumerate(self.file_paths):
-                try:
-                    print(f"Processing file {file_idx+1}/{len(self.file_paths)}: {os.path.basename(file_path)}")
-                    
-                    # Load dataset one file at a time
-                    dataset = load_dataset('arrow', data_files=file_path, split='train')
-                    print(f"Loaded file with {len(dataset)} examples")
-                    
-                    # Process examples in sequence
-                    for example_idx, example in enumerate(dataset):
-                        # Print progress occasionally
-                        if example_idx > 0 and example_idx % 1000 == 0:
-                            print(f"  Processed {example_idx}/{len(dataset)} examples from file {file_idx+1}")
-                        
-                        # Extract instruction and response using new column names
-                        instruction = example.get("input", "")
-                        response = example.get("content", "")
-                        
-                        # Skip invalid examples
-                        if not instruction or not response or len(instruction) < 3 or len(response) < 3:
+            """Iterator that provides a continuous stream of examples for training by cycling through files"""
+            print(f"Starting dataset iteration with {len(self.file_paths)} files")
+            processed_examples = 0
+            bad_examples = 0
+            empty_chunks = 0
+            epoch = 0
+            
+            # Continue providing data indefinitely until training stops at max_steps
+            while True:
+                epoch += 1
+                print(f"=== Starting dataset epoch {epoch} ===")
+                
+                # Shuffle files each epoch for better training diversity
+                shuffled_files = self.file_paths.copy()
+                random.shuffle(shuffled_files)
+                
+                if len(shuffled_files) > 0:
+                    for file_idx, file_path in enumerate(shuffled_files):
+                        try:
+                            print(f"Processing file {file_idx+1}/{len(shuffled_files)} (epoch {epoch}): {os.path.basename(file_path)}")
+                            
+                            # Check if file exists
+                            if not os.path.exists(file_path):
+                                print(f"Warning: File does not exist: {file_path}")
+                                continue
+                                
+                            # Load dataset one file at a time
+                            try:
+                                dataset = load_dataset('arrow', data_files=file_path, split='train')
+                                print(f"Loaded file with {len(dataset)} examples")
+                            except Exception as load_err:
+                                print(f"Error loading dataset file {file_path}: {load_err}")
+                                continue
+                            
+                            if len(dataset) == 0:
+                                print(f"Warning: File {file_path} contains no examples")
+                                continue
+                                
+                            # Shuffle examples within each file for diversity
+                            dataset = dataset.shuffle(seed=42 + epoch)
+                            
+                            file_processed = 0
+                            # Process examples in sequence
+                            for example_idx, example in enumerate(dataset):
+                                # Print progress occasionally
+                                if example_idx > 0 and example_idx % 1000 == 0:
+                                    print(f"  Processed {example_idx}/{len(dataset)} examples from file {file_idx+1}")
+                                
+                                try:
+                                    # Extract instruction and response using new column names
+                                    instruction = example.get("input", "")
+                                    response = example.get("content", "")
+                                    
+                                    # Skip invalid examples
+                                    if not instruction or not response or len(instruction) < 3 or len(response) < 3:
+                                        bad_examples += 1
+                                        continue
+                                        
+                                    # Process the QA pair (chunk if needed)
+                                    chunks = self.tokenize_qa_pair(instruction, response)
+                                    
+                                    if not chunks:
+                                        empty_chunks += 1
+                                        continue
+                                    
+                                    # Validate each chunk before yielding
+                                    for chunk in chunks:
+                                        # Verify chunk has required fields
+                                        if not all(k in chunk for k in ["input_ids", "attention_mask", "labels"]):
+                                            print(f"Warning: Chunk missing required keys: {chunk.keys()}")
+                                            continue
+                                            
+                                        # Verify tensor shapes are as expected
+                                        if len(chunk["input_ids"]) != self.max_length:
+                                            print(f"Warning: input_ids has wrong length: {len(chunk['input_ids'])}")
+                                            continue
+                                            
+                                        # Yield only valid chunks
+                                        processed_examples += 1
+                                        file_processed += 1
+                                        yield chunk
+                                except Exception as e:
+                                    print(f"Error processing example {example_idx}: {e}")
+                                    bad_examples += 1
+                                    continue
+                            
+                            print(f"File {file_idx+1} (epoch {epoch}): Successfully yielded {file_processed} examples")
+                            
+                        except Exception as e:
+                            print(f"Error processing file {file_path}: {e}")
                             continue
-                            
-                        # Process the QA pair (chunk if needed)
-                        chunks = self.tokenize_qa_pair(instruction, response)
-                        
-                        # Yield all chunks for this example
-                        for chunk in chunks:
-                            yield chunk
-                            
-                except Exception as e:
-                    print(f"Error processing file {file_path}: {e}")
-                    continue
+                else:
+                    print("Warning: No files found in the dataset path.")
+                
+                print(f"Dataset iterator completed epoch {epoch}. Processed {processed_examples} valid examples so far.")
+                print(f"Skipped {bad_examples} bad examples and {empty_chunks} empty chunk sets.")
+                
+                # Every epoch, ensure we always have data by yielding a dummy example
+                # (this provides a safety valve in case all real examples have issues)
+                dummy_text = f"{FORMAT_INSTRUCTION}What is machine learning?{FORMAT_RESPONSE}Machine learning is a branch of artificial intelligence that focuses on developing systems that can learn from data."
+                tokens = self.tokenizer(
+                    dummy_text,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=self.max_length,
+                    return_tensors="pt"
+                )
+                
+                dummy_example = {
+                    "input_ids": tokens["input_ids"][0],
+                    "attention_mask": tokens["attention_mask"][0],
+                    "labels": tokens["input_ids"][0].clone()
+                }
+                
+                # Set labels for response part only (after FORMAT_RESPONSE)
+                response_start_str = FORMAT_RESPONSE
+                response_start_tokens = self.tokenizer(response_start_str, add_special_tokens=False).input_ids
+                
+                for i in range(len(dummy_example["labels"]) - len(response_start_tokens)):
+                    if dummy_example["input_ids"][i:i+len(response_start_tokens)].tolist() == response_start_tokens:
+                        dummy_example["labels"][:i+len(response_start_tokens)] = -100
+                        break
+                
+                # Make sure padding is masked
+                dummy_example["labels"][tokens["attention_mask"][0] == 0] = -100
+                
+                print(f"Yielding transition dummy example at end of epoch {epoch}")
+                yield dummy_example
     
     # Create streaming dataset that processes files sequentially
     streaming_dataset = SequentialInstructDataset(arrow_files, tokenizer, max_length)
@@ -358,7 +454,6 @@ def load_synthetic_dataset(path, tokenizer, max_length=2048, max_files=None):
 
 def generate_sample_text(model, tokenizer, prompt="Instruction: Write an article about AI\nResponse:", max_length=150):
     """Generate sample text from the model to evaluate its capabilities"""
-    print(f"\n=== Generating sample text for prompt: '{prompt}' ===")
     
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(model.device)
@@ -493,14 +588,16 @@ def main():
     # Prepare model for training
     print("Preparing model for training...")
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
-    model = get_peft_model(model, peft_config)
+    #model = get_peft_model(model, peft_config)
+
+    for name, param in model.name_parameters():
+        param.requires_grad = True
     
     # Define training arguments
     print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=output_dir,
         max_steps=max_steps,
-        num_train_epochs=100,
         max_grad_norm=1.0, # Gradient clipping
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
@@ -538,19 +635,29 @@ def main():
     text_gen_callback = TextGenerationCallback(model, tokenizer, test_prompts, eval_steps=100)
     early_stopping_callback = EarlyStoppingCallback(
         early_stopping_patience=early_stopping_patience,
-        early_stopping_threshold=0.01
+        early_stopping_threshold=1e-9
     )
     validation_loss_callback = ValidationLossCallback()
     
-    # Initialize trainer
-    print("Initializing trainer...")
+    # Create a progress tracking callback
+    class ProgressCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step % 100 == 0:
+                print(f"Completed {state.global_step}/{max_steps} steps ({(state.global_step/max_steps)*100:.1f}%)")
+    
+    # Initialize trainer - use default Trainer now
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_tokenized_dataset,
         eval_dataset=validation_dataset,  # Add validation dataset
         data_collator=data_collator,
-        callbacks=[text_gen_callback, early_stopping_callback, validation_loss_callback],  # Add new callbacks
+        callbacks=[
+            text_gen_callback, 
+            early_stopping_callback, 
+            validation_loss_callback,
+            ProgressCallback(),
+        ],
     )
     
     # Generate sample text before training for all prompts
@@ -562,6 +669,10 @@ def main():
     # Start training with step-based progress tracking
     print(f"Starting training for {max_steps} steps with early stopping...")
     trainer.train()
+    
+    # Verify training completed the desired number of steps
+    final_step_count = trainer.state.global_step
+    print(f"Training completed with {final_step_count}/{max_steps} steps ({(final_step_count/max_steps)*100:.1f}%)")
     
     # Save model
     print("Saving model...")
