@@ -1,5 +1,7 @@
 # Argonne LLM
 
+Author: Youzhi Yu
+
 ## Argonne 1.5
 
 ### 🤗 Hugging Face Model
