@@ -2,22 +2,62 @@
 
 Author: Youzhi Yu
 
-## Argonne 1.5
+## Argonne 2.0 (in progress)
 
-### 🤗 Hugging Face Model
+Argonne 2.0 is a ground-up modernization of the pretraining stack targeting a larger, faster, and more capable successor to Argonne 1.5. The new training run is designed around a single DGX node (8× A100 80 GB) operating completely offline. All datasets, checkpoints, and the tokenizer must be staged locally prior to launch.
+
+### Architecture upgrades
+
+- **Transformer core**: Grouped-query attention, SwiGLU feed-forward layers, RMSNorm, and rotary position embeddings provide higher quality per parameter and better long-context behavior.
+- **Context & scale**: Default configuration trains an ≈8 B parameter model (56 layers, 5,120 hidden size, 40 attention heads, 8 KV heads) with a 4,096 token context window.
+- **Tokenizer reuse**: We reuse a pre-existing tokenizer (e.g., `Qwen/Qwen2-7B` or `meta-llama/Llama-2-7b-hf`). Download it ahead of time and place it on the DGX, then reference the local path via `--tokenizer-path`.
+- **Training efficiency**: Multi-GPU pipeline parallelism, BF16 autocast, gradient checkpointing, and optional `torch.compile` keep memory usage low while maintaining Argonne 1.5 compatibility.
+
+### Data & objective
+
+- Target corpus size: **60 B+ tokens**, a 4× increase over Argonne 1.5.
+- Sequence length: **4,096** tokens with sliding-window friendly masking to enable long context mixes later on.
+- For offline execution, pre-download Arrow shards into a shared filesystem and point the launcher at them using `--data-glob`.
+
+### Training entrypoint
+
+Launch pretraining directly with `python training.py` (no `torchrun` invocation required). The script automatically discovers all available GPUs and splits the transformer stack into a pipeline across them.
+
+```bash
+python training.py \
+  --data-glob /raid/argonne2/shards/*.arrow \
+  --tokenizer-path /raid/tokenizers/Qwen2-7B-tokenizer \
+  --trust-remote-code \
+  --no-streaming            # optional: load Arrow shards into memory instead of streaming
+```
+
+Key checkpoints are automatically written every 300 pipeline steps (streaming mode) or every 2,000 steps (non-streaming). To resume, simply point the script at the most recent checkpoint saved under `pretrained/`.
+
+### Feature summary
+
+- Full offline compatibility (`local_files_only=True` when loading tokenizers).
+- BF16 mixed precision with TF32 matmuls for peak throughput.
+- Automatic data streaming iterator that tracks file/offset position to support job restarts.
+- Weight tying, scaled residual initialization, and cosine LR schedule with warmup out-of-the-box.
+
+### Current status
+
+Pretraining is staged to begin once the 60 B token mixture is finalized and copied to the DGX node. All code changes required to support the new run live on the `argonne2` branch.
+
+---
+
+## Argonne 1.5
 
 The pretrained model weights and detailed model card are available on Hugging Face:
 
 [👉 https://huggingface.co/PursuitOfDataScience/Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5)
-
-
 
 ### Improvements
 
 Compared to Argonne-1.0 pretraining, significant amount of changes were made to improve the model pretraining phase, listed below:
 
 - `torch.compile()` used to boost up pretraining speed
-- flash attention implemented to gain additional 2.6x times memeory efficiency, 
+- flash attention implemented to gain additional 2.6x times memeory efficiency,
 translated by training batch size
 - More layers and attention heads for the model
 - GPU hardware harnessed much more efficiently
@@ -27,7 +67,6 @@ translated by training batch size
 ### Data
 
 The same as Argonne-1.0. Total processed tokens: 15,453,927,424.
-
 
 ### Model
 
@@ -40,7 +79,6 @@ n_head = 16
 n_embd = 1296
 batch_size = 756
 ```
-
 
 ### Training
 

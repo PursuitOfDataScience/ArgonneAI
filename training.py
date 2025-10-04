@@ -1,12 +1,20 @@
-import os
-import torch
-from tqdm import tqdm
-import time
+import argparse
 import glob
 import json
-from data_processing import collate_batch, load_bpe_tokenizer, train_bpe_tokenizer, load_nonstream_data, create_text_file_from_arrow
-from model import ArgonneConfig, ArgonneModel
+import os
+import time
+from typing import List
+
+import torch
 from datasets import Dataset
+from tqdm import tqdm
+
+from data_processing import (
+    collate_batch,
+    load_nonstream_data,
+    load_tokenizer,
+)
+from model import ArgonneConfig, ArgonneModel
 
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -116,7 +124,7 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
                     # Get the text field - most commonly 'text' but could be others
                     if 'text' in item and item['text'] and isinstance(item['text'], str):
                         text = item['text']
-                        tokens = tokenizer.encode(text)
+                        tokens = tokenizer.encode(text, add_special_tokens=False)
                         processed_count += 1
                         yield tokens, file_idx, position
                     
@@ -136,7 +144,12 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
     # To be consistent with resume_pretrain.py, return sentinel value instead of raising StopIteration
     return None, -1, -1
 
-def train_model_parallel(data_files, use_streaming=False, use_compile=True):
+def train_model_parallel(
+    data_files: List[str],
+    tokenizer_path: str,
+    use_streaming: bool = False,
+    trust_remote_code: bool = False,
+):
     """
     data_files should be a list of actual .arrow file paths, e.g.
     ["data/file1.arrow", "data/file2.arrow", ...]
@@ -145,40 +158,37 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
     
     Args:
         data_files: List of .arrow file paths
+        tokenizer_path: Local directory containing tokenizer files.
         use_streaming: Whether to use streaming mode or load all data in memory
-        use_compile: Whether to use torch.compile() for model optimization
+        trust_remote_code: Allow tokenizers with custom code.
     """
     # Initial batch size settings
     initial_batch_size = 512  # initial batch size
     min_batch_size = 12  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
     
-    # 1) If no tokenizer, train it on text extracted from Arrow
-    if not os.path.exists("bpe_tokenizer/vocab.json"):
-        print("No existing tokenizer found. Building a text file from Arrow and training one...")
-        # Create a text file from Arrow files
-        text_file_path = "all_text_for_tokenizer.txt"
-        create_text_file_from_arrow(data_files, text_file_path)
-        # Now train BPE on that text file
-        train_bpe_tokenizer(text_file_path, vocab_size=12000)
-
-    # Load the tokenizer we just created (or found)
-    hf_tokenizer = load_bpe_tokenizer()
+    hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
 
     epochs = 3
-    block_size = 2048
-    n_layer = 16
-    n_head = 16
-    n_embd = 1296
-    dropout = 0.1
+    block_size = 4096
+
+    if hf_tokenizer.pad_token is None:
+        hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
+
+    hf_tokenizer.model_max_length = block_size
 
     config_model = ArgonneConfig(
-        vocab_size=12000,
-        block_size=block_size,
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        dropout=dropout
+        vocab_size=len(hf_tokenizer),
+        max_position_embeddings=block_size,
+        hidden_size=5120,
+        num_hidden_layers=56,
+        num_attention_heads=40,
+        num_key_value_heads=8,
+        rope_theta=500000.0,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        use_flash_attention=True,
+        tie_word_embeddings=False,
     )
     
     # Load non-streaming dataset once, outside the retry loop
@@ -195,10 +205,13 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
     # Initialize data position tracker
     data_position = DataPosition(streaming=use_streaming)
     
+    # Track the best batch size discovered during retries
+    final_batch_size = None
+
     # Main training loop with batch size adjustment
     while True:
         print(f"\n=== Attempting training with batch_size = {batch_size} ===")
-        
+
         try:
             # Initialize a fresh model for each attempt
             model = ArgonneModel(config_model)
@@ -211,32 +224,34 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
             
             # Distribute model across GPUs
             model.distribute_model()  # chunks across all visible GPUs
-            
+
             # Log the device placement
             print("\nModel distribution:")
             first_device = model.devices[0]
-            print(f"Token embedding on device: {next(model.token_embedding.parameters()).device}")
-            print(f"Position embedding on device: {model.position_embedding.device}")
-            for i, stage in enumerate(model.pipeline_stages):
-                device = next(stage.parameters()).device
-                print(f"Pipeline stage {i} on device: {device}")
-            print(f"Final LayerNorm on device: {next(model.ln_f.parameters()).device}")
-            print(f"Head on device: {next(model.head.parameters()).device}")
+            print(f"Token embedding on device: {model.embed_tokens.weight.device}")
+            if model.pipeline_partitions:
+                for i, (start, end, device) in enumerate(model.pipeline_partitions):
+                    print(f"Pipeline stage {i}: layers {start} - {end - 1} on {device}")
+            print(f"Final RMSNorm on device: {model.norm.weight.device}")
+            print(f"Head on device: {model.lm_head.weight.device}")
             
-            # Apply torch.compile() for speed optimization
-            if use_compile:
-                # Check if PyTorch version supports compile
-                if hasattr(torch, 'compile'):
-                    print("Applying torch.compile() to optimize model execution...")
-                    try:
-                        # Use default mode for a balance between compilation time and execution speed
-                        model = torch.compile(model, mode="default")
-                        print("Model compilation successful!")
-                    except Exception as e:
-                        print(f"Failed to compile model: {e}")
-                        print("Continuing with uncompiled model.")
-                else:
-                    print("torch.compile() not available in this PyTorch version. Continuing with uncompiled model.")
+            # Apply torch.compile() for speed optimization whenever possible
+            if len(model.devices) > 1:
+                print(
+                    "torch.compile() is skipped because the model spans multiple GPUs via pipeline parallelism."
+                )
+            elif hasattr(torch, "compile"):
+                print("Applying torch.compile() to optimize model execution...")
+                try:
+                    model = torch.compile(model, mode="default")
+                    print("Model compilation successful!")
+                except Exception as e:
+                    print(f"Failed to compile model: {e}")
+                    print("Continuing with uncompiled model.")
+            else:
+                print(
+                    "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
+                )
             
             optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.1) 
             scaler = torch.amp.GradScaler("cuda")
@@ -299,9 +314,8 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
                                 optimizer.zero_grad()
                                 with torch.amp.autocast("cuda"):
-                                    logits, loss = model(x_tens, y_tens)
-                                    # Ensure loss is on the first device
-                                    loss = loss.to(first_device)
+                                    outputs = model(input_ids=x_tens, labels=y_tens)
+                                    loss = outputs.loss.to(first_device)
 
                                 scaler.scale(loss).backward()
                                 scaler.step(optimizer)
@@ -310,14 +324,14 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
                                 global_step += 1
                                 step_in_epoch += 1
                                 
-                                if global_step % 50 == 0:
+                                if global_step % 50 == 0 and loss is not None:
                                     print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}")
                                     print(f"File: {file_idx}/{len(data_files)}, Position: {position}")
                                     prompt_str = "Long long time ago, "
                                     token_ids = hf_tokenizer.encode(prompt_str)
                                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
                                    
-                                    generated = model.generate(prompt_tensor, max_new_tokens=100)
+                                    generated = model.generate(prompt_tensor, max_length=prompt_tensor.shape[1] + 100)
                                     generated_text = hf_tokenizer.decode(generated[0].tolist())
                                     print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
@@ -330,7 +344,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
                                         "tokens_processed": tokens_in_current_attempt,
                                         "model_state_dict": model.state_dict(),
                                         "optimizer_state_dict": optimizer.state_dict(),
-                                        "loss": loss.item(),
+                                        "loss": loss.item() if loss is not None else None,
                                         "data_position": data_position.get_state()  # Save position
                                     }
                                     os.makedirs("pretrained", exist_ok=True)
@@ -380,9 +394,8 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
                         optimizer.zero_grad()
                         with torch.amp.autocast("cuda"):
-                            logits, loss = model(x_tens, y_tens)
-                            # Ensure loss is on the first device
-                            loss = loss.to(first_device)
+                            outputs = model(input_ids=x_tens, labels=y_tens)
+                            loss = outputs.loss.to(first_device)
 
                         scaler.scale(loss).backward()
                         scaler.step(optimizer)
@@ -390,13 +403,13 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
 
                         global_step += 1
 
-                        if global_step % 50 == 0:
+                        if global_step % 50 == 0 and loss is not None:
                             print(f"global_step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
                             prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
                             
-                            generated = model.generate(prompt_tensor, max_new_tokens=50)
+                            generated = model.generate(prompt_tensor, max_length=prompt_tensor.shape[1] + 50)
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
@@ -409,7 +422,7 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
                                 "tokens_processed": tokens_in_current_attempt,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
-                                "loss": loss.item(),
+                                "loss": loss.item() if loss is not None else None,
                                 "data_position": data_position.get_state()  # Save position
                             }
                             os.makedirs("pretrained", exist_ok=True)
@@ -419,8 +432,13 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
             # If we reach here, training completed successfully
             # Update total token count for successful training
             total_tokens_processed = tokens_in_current_attempt
+            final_batch_size = batch_size
             print(f"Training completed successfully with batch_size={batch_size}")
             print(f"Total tokens processed during training: {total_tokens_processed:,}")
+            print(
+                "Maximum stable batch size discovered (set this manually for future runs): "
+                f"{final_batch_size}"
+            )
             break
             
         except torch.cuda.OutOfMemoryError:
@@ -454,10 +472,11 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
         "batch_size": batch_size,
         "epochs": epochs,
         "global_steps": global_step,
-        "n_layer": n_layer,
-        "n_head": n_head,
-        "n_embd": n_embd,
-        "model_params": sum(p.numel() for p in model.parameters())
+        "num_layers": config_model.num_hidden_layers,
+        "num_attention_heads": config_model.num_attention_heads,
+        "hidden_size": config_model.hidden_size,
+        "model_params": sum(p.numel() for p in model.parameters()),
+        "max_batch_size": final_batch_size,
     }
     
     # Write stats to JSON file
@@ -470,6 +489,8 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
     print(f"Model parameters: {training_stats['model_params']:,}")
     print(f"Epochs completed: {epochs}")
     print(f"Final batch size: {batch_size}")
+    if final_batch_size is not None:
+        print(f"Maximum stable batch size: {final_batch_size}")
     print(f"Training steps: {global_step}")
     print(f"Stats saved to: stats/training_stats.json")
 
@@ -483,27 +504,57 @@ def train_model_parallel(data_files, use_streaming=False, use_compile=True):
     except Exception as e:
         print(f"Failed to save final model: {e}")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Argonne 2 model on offline Arrow shards.")
+    parser.add_argument(
+        "--data-glob",
+        type=str,
+        default="data/*.arrow",
+        help="Glob pattern for Arrow files (default: data/*.arrow)",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        required=True,
+        help="Local path to a pretrained tokenizer directory (e.g., a LLaMA or Qwen tokenizer).",
+    )
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable streaming mode and load Arrow files into memory.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading tokenizers that require custom code.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    # Expand .arrow files via glob
-    data_files = glob.glob("data/*.arrow")
+    args = parse_args()
+
+    data_files = glob.glob(args.data_glob)
     if not data_files:
-        raise ValueError("No files matched the pattern 'data/*.arrow'")
-    
-    # Sort the files numerically by extracting the number from the filename
-    # This assumes filenames like "fineweb-edu-train-00158-of-00218.arrow"
+        raise ValueError(f"No files matched the pattern '{args.data_glob}'")
+
     import re
-    def get_file_number(filename):
-        match = re.search(r'train-(\d+)-of', filename)
+
+    def get_file_number(filename: str) -> int:
+        match = re.search(r"train-(\d+)-of", filename)
         if match:
             return int(match.group(1))
-        return 0  # Default case
-    
-    # Sort files by their numerical order
+        return 0
+
     data_files = sorted(data_files, key=get_file_number)
     print(f"Files will be processed in order. First file: {data_files[0]}")
-    
-    # Added use_compile parameter with default True
-    train_model_parallel(data_files=data_files, use_streaming=True, use_compile=True)
+
+    train_model_parallel(
+        data_files=data_files,
+        tokenizer_path=args.tokenizer_path,
+        use_streaming=not args.no_streaming,
+        trust_remote_code=args.trust_remote_code,
+    )
 
 if __name__ == "__main__":
     main()
