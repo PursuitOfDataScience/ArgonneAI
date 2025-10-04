@@ -1,39 +1,38 @@
 import os
 import json
+from typing import Iterable, List, Optional, Tuple
+
 import torch
 from tokenizers import ByteLevelBPETokenizer
-from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 os.environ["HF_DATASETS_CACHE"] = "./.cache"
 
+
 #####################################
-# BPE Tokenizer Utilities
+# Tokenizer Utilities
 #####################################
 
-def create_text_file_from_arrow(arrow_files, output_file="all_text_for_tokenizer.txt"):
-    """
-    Given a list of Arrow files, extract the 'text' column and write
-    it to a single text file (one text example per line).
-    """
+
+def create_text_file_from_arrow(arrow_files: Iterable[str], output_file: str = "all_text_for_tokenizer.txt") -> None:
+    """Utility kept for backwards compatibility when a fallback BPE tokenizer is required."""
+
     print(f"Creating a combined text file '{output_file}' from Arrow files...")
     with open(output_file, "w", encoding="utf-8") as wf:
-        for arrow_path in tqdm(arrow_files):
-            # Load the Arrow file in *streaming* mode to avoid large memory usage
+        for arrow_path in tqdm(list(arrow_files)):
             ds = load_dataset("arrow", data_files=[arrow_path], streaming=True)
-            # If "train" split exists, use ds["train"], else ds is the dataset
             if "train" in ds:
                 ds = ds["train"]
             for example in ds:
                 text = example.get("text", "")
-                # Write one line of text
                 wf.write(text.replace("\n", " ") + "\n")
 
-def train_bpe_tokenizer(text_file, vocab_size=12000):
-    """
-    Train a ByteLevel BPE tokenizer on a *plain-text file* and save it.
-    """
+
+def train_bpe_tokenizer(text_file: str, vocab_size: int = 12000) -> PreTrainedTokenizerFast:
+    """Train a local ByteLevel BPE tokenizer. Only used as a fallback."""
+
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train(
         files=[text_file],
@@ -44,107 +43,107 @@ def train_bpe_tokenizer(text_file, vocab_size=12000):
             "<pad>",
             "<|end_of_text|>",
             "<unk>",
-            "<mask>"
-        ]
+            "<mask>",
+        ],
     )
 
     os.makedirs("bpe_tokenizer", exist_ok=True)
     tokenizer.save_model("bpe_tokenizer")
 
-    # Save the full tokenizer JSON representation
     with open(os.path.join("bpe_tokenizer", "tokenizer.json"), "w", encoding="utf-8") as f:
         f.write(tokenizer._tokenizer.to_str())
 
-    # Create a tokenizer configuration
     tokenizer_config = {
         "model_max_length": 2048,
         "bos_token": "<|start_of_text|>",
         "eos_token": "<|end_of_text|>",
         "unk_token": "<unk>",
         "pad_token": "<pad>",
-        "mask_token": "<mask>"
+        "mask_token": "<mask>",
     }
     with open(os.path.join("bpe_tokenizer", "tokenizer_config.json"), "w") as f:
         json.dump(tokenizer_config, f)
 
-    # Create a Hugging Face PreTrainedTokenizerFast instance
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join("bpe_tokenizer", "tokenizer.json"),
         bos_token="<|start_of_text|>",
         eos_token="<|end_of_text|>",
         unk_token="<unk>",
         pad_token="<pad>",
-        mask_token="<mask>"
+        mask_token="<mask>",
     )
     hf_tokenizer.save_pretrained("bpe_tokenizer")
     return hf_tokenizer
 
 
-def load_bpe_tokenizer():
-    """Load a previously trained BPE tokenizer in Hugging Face format."""
-    hf_tokenizer = PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
-    return hf_tokenizer
+def load_bpe_tokenizer() -> PreTrainedTokenizerFast:
+    return PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
+
+
+def load_tokenizer(tokenizer_name_or_path: str, trust_remote_code: bool = False):
+    """Load an existing tokenizer from disk. Assumes offline availability."""
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+        local_files_only=True,
+    )
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
+
+    return tokenizer
+
 
 #####################################
-# STREAMING MODE
+# Dataset utilities
 #####################################
 
-def streaming_token_generator(data_files, hf_tokenizer):
-    """
-    Yields tokenized examples from a streaming dataset (no shuffle).
-    data_files should be a list of Arrow files.
-    """
-    dataset = load_dataset("arrow", data_files=data_files, streaming=True)
+
+def streaming_token_generator(
+    data_files: Iterable[str],
+    hf_tokenizer,
+    min_length: int = 0,
+) -> Iterable[List[int]]:
+    dataset = load_dataset("arrow", data_files=list(data_files), streaming=True)
     if "train" in dataset:
         dataset = dataset["train"]
 
     for example in dataset:
-        text = example["text"] if "text" in example else ""
+        text = example.get("text", "") if isinstance(example, dict) else ""
         token_ids = hf_tokenizer.encode(text)
-        if len(token_ids) > 0:
+        if len(token_ids) > max(min_length, 0):
             yield token_ids
 
-#####################################
-# NON-STREAMING: Full Pass
-#####################################
 
-def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
-    """
-    Loads the entire dataset in memory either from a cached processed directory
-    or processes it in parallel if not yet cached.
-    Returns a list of token ID sequences.
-    """
-
+def load_nonstream_data(
+    data_files: Iterable[str],
+    hf_tokenizer,
+    block_size: int,
+    num_proc: int = 8,
+    min_length: int = 0,
+):
     processed_dir = "processed_data/tokenized_data"
     if os.path.exists(processed_dir):
         print(f"Loading cached dataset from '{processed_dir}'...")
         ds = load_from_disk(processed_dir)
-        tokenized_data = ds["token_ids"]
-        return tokenized_data
+        return ds["token_ids"]
 
     print("No cached dataset found. Processing in parallel...")
-
-    ds_dict = load_dataset("arrow", data_files=data_files, streaming=False)
-    if "train" in ds_dict:
-        ds = ds_dict["train"]
-    else:
-        ds = ds_dict
+    ds_dict = load_dataset("arrow", data_files=list(data_files), streaming=False)
+    ds = ds_dict["train"] if "train" in ds_dict else ds_dict
 
     def tokenize_and_truncate(example):
-        text = example["text"] if "text" in example else ""
+        text = example.get("text", "")
         token_ids = hf_tokenizer.encode(text)
-        if len(token_ids) < block_size + 1:
+        if len(token_ids) < max(block_size + 1, min_length):
             return {"token_ids": None}
-        token_ids = token_ids[:block_size+1]
+        token_ids = token_ids[: block_size + 1]
         return {"token_ids": token_ids}
 
-    ds = ds.map(
-        tokenize_and_truncate,
-        batched=False,
-        num_proc=num_proc
-    )
-    ds = ds.filter(lambda ex: ex["token_ids"] is not None,
-                   num_proc=num_proc)
+    ds = ds.map(tokenize_and_truncate, batched=False, num_proc=num_proc)
+    ds = ds.filter(lambda ex: ex["token_ids"] is not None, num_proc=num_proc)
 
     if "text" in ds.column_names:
         ds = ds.remove_columns(["text"])
@@ -152,20 +151,16 @@ def load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=8):
     os.makedirs(os.path.dirname(processed_dir), exist_ok=True)
     ds.save_to_disk(processed_dir)
     print(f"Processed dataset saved to '{processed_dir}'.")
+    return ds["token_ids"]
 
-    tokenized_data = ds["token_ids"]
-    return tokenized_data
 
-def collate_batch(token_list_batch, block_size):
-    """
-    Convert a list of token-ID lists into x,y Tensors for causal LM.
-    We'll truncate if longer than block_size+1, skip if shorter.
-    """
-    x_list, y_list = [], []
+def collate_batch(token_list_batch: Iterable[List[int]], block_size: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    x_list: List[List[int]] = []
+    y_list: List[List[int]] = []
     for tokens in token_list_batch:
         if len(tokens) < block_size + 1:
             continue
-        tokens = tokens[:block_size+1]
+        tokens = tokens[: block_size + 1]
         x_list.append(tokens[:-1])
         y_list.append(tokens[1:])
 

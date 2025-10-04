@@ -1,471 +1,438 @@
+import functools
 import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
-    PretrainedConfig,
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
     PreTrainedModel,
-    AutoConfig, 
-    AutoModel, 
-    AutoModelForCausalLM
+    PretrainedConfig,
 )
 from transformers.modeling_outputs import CausalLMOutput
 
-from typing import Optional
 
 class ArgonneConfig(PretrainedConfig):
-    model_type = "argonne"
-    def __init__(self, vocab_size=12000, block_size=2048, n_layer=24, n_head=24, n_embd=1296, dropout=0.1, use_flash_attn=True, use_gradient_checkpointing=False, **kwargs):
+    """Configuration for the Argonne v2 family of models."""
+
+    model_type = "argonne2"
+
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        num_hidden_layers: int = 48,
+        num_attention_heads: int = 32,
+        num_key_value_heads: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        max_position_embeddings: int = 4096,
+        attention_dropout: float = 0.0,
+        hidden_dropout: float = 0.0,
+        rms_norm_eps: float = 1e-6,
+        rope_theta: float = 10000.0,
+        sliding_window: Optional[int] = None,
+        use_flash_attention: bool = True,
+        use_gradient_checkpointing: bool = False,
+        tie_word_embeddings: bool = True,
+        attention_bias: bool = False,
+        mlp_bias: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
+        # Backwards compatibility with Argonne 1.x naming.
+        if "n_layer" in kwargs:
+            num_hidden_layers = kwargs["n_layer"]
+        if "n_head" in kwargs:
+            num_attention_heads = kwargs["n_head"]
+        if "n_embd" in kwargs:
+            hidden_size = kwargs["n_embd"]
+        if "block_size" in kwargs:
+            max_position_embeddings = kwargs["block_size"]
+
         self.vocab_size = vocab_size
-        self.block_size = block_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.dropout = dropout
-        self.use_flash_attn = use_flash_attn
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = (
+            num_key_value_heads if num_key_value_heads is not None else num_attention_heads // 2
+        )
+        if self.num_key_value_heads < 1:
+            self.num_key_value_heads = 1
+        if num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+
+        if intermediate_size is None:
+            width = int(8 * hidden_size / 3)
+            self.intermediate_size = ((width + 255) // 256) * 256
+        else:
+            self.intermediate_size = intermediate_size
+
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout = hidden_dropout
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_theta = rope_theta
+        self.sliding_window = sliding_window
+        self.use_flash_attention = use_flash_attention
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.tie_word_embeddings = tie_word_embeddings
+        self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
 
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
+        # Backwards compatibility aliases
+        self.n_embd = self.hidden_size
+        self.n_layer = self.num_hidden_layers
+        self.n_head = self.num_attention_heads
+        self.block_size = self.max_position_embeddings
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        assert config.n_embd % config.n_head == 0, "Embedding dim must be divisible by n_head"
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-        self.query = nn.Linear(config.n_embd, config.n_embd)
-        self.key = nn.Linear(config.n_embd, config.n_embd)
-        self.value = nn.Linear(config.n_embd, config.n_embd)
-        self.attn_drop = nn.Dropout(config.dropout)
-        self.resid_drop = nn.Dropout(config.dropout)
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
-        self.use_flash_attn = getattr(config, 'use_flash_attn', True)
-        
-        # Register the causal mask for the traditional attention path
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(config.block_size, config.block_size))
-                 .view(1, 1, config.block_size, config.block_size)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x.to(orig_dtype))
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(max_position_embeddings, device or inv_freq.device, torch.get_default_dtype())
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype, device=x.device),
+            self.sin_cached[:seq_len].to(dtype=x.dtype, device=x.device),
         )
 
-    def forward(self, x):
-        b, t, c = x.size()
-        q = self.query(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.key(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.value(x).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
 
-        if hasattr(F, 'scaled_dot_product_attention') and self.use_flash_attn:
-            # When using is_causal=True, don't provide an attention mask
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=True  # Let PyTorch handle the causal mask internally
-            )
-            attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, c)
-            y = self.resid_drop(self.proj(attn_output))
-            return y
-        else:
-            # Original attention implementation (fallback)
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float('-inf'))
-            att = torch.softmax(att, dim=-1)
-            att = self.attn_drop(att)
-            y = att @ v
-            y = y.transpose(1, 2).contiguous().view(b, t, c)
-            y = self.resid_drop(self.proj(y))
-            return y
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-class MLP(nn.Module):
-    def __init__(self, config):
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if position_ids is None:
+        cos = cos[:, None, None, :]
+        sin = sin[:, None, None, :]
+    else:
+        cos = cos[position_ids].unsqueeze(2)
+        sin = sin[position_ids].unsqueeze(2)
+
+    return (
+        (q * cos) + (rotate_half(q) * sin),
+        (k * cos) + (rotate_half(k) * sin),
+    )
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, config: ArgonneConfig) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.drop = nn.Dropout(config.dropout)
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
-class ArgonneModel(PreTrainedModel):
-    config_class = ArgonneConfig
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.o_proj._is_residual = True
 
-    # for map_device = "auto"
-    _no_split_modules = ["Block"]
+        self.attention_dropout = config.attention_dropout
+        self.use_flash_attention = config.use_flash_attention
 
-    def __init__(self, config, device_map=None):
-        super().__init__(config)
-        # Create embeddings on CPU initially
-        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
-        self.drop = nn.Dropout(config.dropout)
-
-        # Build all blocks
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-
-        # Final LayerNorm + output head
-        self.ln_f = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
-        self.post_init()
-
-        # For pipeline parallelism
-        self.pipeline_stages = None
-        self.devices = []
-        
-        # For gradient checkpointing
-        self._use_gradient_checkpointing = config.use_gradient_checkpointing
-        
-        # Handle device_map="auto" for inference
-        if device_map is not None:
-            self.setup_device_map(device_map)
-    
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """
-        Enable gradient checkpointing for the model.
-        
-        Args:
-            gradient_checkpointing_kwargs: Additional arguments for gradient checkpointing
-                (unused in this implementation)
-        """
-        self._use_gradient_checkpointing = True
-        
-    def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing for the model."""
-        self._use_gradient_checkpointing = False
-
-    def setup_device_map(self, device_map):
-        """
-        Set up the model on devices according to device_map.
-        If device_map="auto", use accelerate to automatically assign model parts to devices.
-        """
-        if device_map == "auto":
-            try:
-                from accelerate import dispatch_model
-                from accelerate.utils import infer_auto_device_map
-                
-                # Get device map automatically
-                auto_device_map = infer_auto_device_map(self)
-                # Dispatch model across devices
-                dispatch_model(self, device_map=auto_device_map)
-                
-                print(f"Model automatically distributed across devices with device_map: {auto_device_map}")
-                
-            except ImportError:
-                print("The 'accelerate' library is required for device_map='auto'. Please install it with 'pip install accelerate'.")
-                print("Continuing with model on CPU or default device.")
-        else:
-            # Handle custom device map
-            # This would be a more complex implementation where the user provides a specific mapping
-            # of model components to devices
-            pass
-
-    def distribute_model(self, device_ids=None):
-        """
-        Distribute the model blocks across multiple GPU devices in a pipeline style.
-        If 'device_ids' is None, we'll discover all available GPUs.
-        """
-        if device_ids is None:
-            num_gpus = torch.cuda.device_count()
-            if num_gpus < 1:
-                raise ValueError("No GPUs found—can't do pipeline parallel on CPU only.")
-            device_ids = [f"cuda:{i}" for i in range(num_gpus)]
-        
-        # Store them so the training loop can keep referencing model.devices
-        self.devices = [torch.device(d) for d in device_ids]
-
-        self.pipeline_stages = nn.ModuleList()
-        num_gpus = len(device_ids)
-        blocks_per_gpu = math.ceil(len(self.blocks) / num_gpus)
-
-        start_idx = 0
-        for i in range(num_gpus):
-            end_idx = min(start_idx + blocks_per_gpu, len(self.blocks))
-            stage_blocks = self.blocks[start_idx:end_idx]
-            stage = nn.Sequential(*stage_blocks).to(device_ids[i])
-            self.pipeline_stages.append(stage)
-            start_idx = end_idx
-            if end_idx >= len(self.blocks):
-                break
-
-        # Move embeddings to the first device
-        first_device = device_ids[0]
-        self.token_embedding = self.token_embedding.to(first_device)
-        # For nn.Parameter, we need to move the data, not replace the parameter
-        self.position_embedding.data = self.position_embedding.data.to(first_device)
-        self.drop = self.drop.to(first_device)
-
-        # Move final LayerNorm + head to the last device
-        last_device = device_ids[-1]
-        self.ln_f = self.ln_f.to(last_device)
-        self.head = self.head.to(last_device)
-
-        print(f"Model distributed across {len(device_ids)} devices")
-        print(f"First device: {first_device}, Last device: {last_device}")
-        print(f"Transformer layers per device: ~{blocks_per_gpu}")
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def prepare_for_compile(self):
-        """
-        Prepare model for torch.compile() by ensuring all components
-        are compatible with the compiler.
-        """
-        # Some models may need special handling for compilation
-        # For now, we'll just return self since our model structure should be compatible
-        return self
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_key_value_groups == 1:
+            return x
+        bsz, num_kv, seqlen, head_dim = x.shape
+        x = x[:, :, None, :, :].expand(bsz, num_kv, self.num_key_value_groups, seqlen, head_dim)
+        return x.reshape(bsz, num_kv * self.num_key_value_groups, seqlen, head_dim)
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        labels=None,
-        **kwargs
-    ):
-        """
-        HF-friendly forward method.
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = hidden_states.shape
 
-        Args:
-            input_ids (torch.LongTensor): Tokens to be fed to the model. [batch_size, seq_len].
-            attention_mask (torch.LongTensor, optional): Mask of shape [batch_size, seq_len],
-                with 1 for actual tokens and 0 for padding, if you want to incorporate it. 
-                Currently ignored in this minimal example.
-            labels (torch.LongTensor, optional): Targets for language modeling, same shape as `input_ids`.
-            **kwargs: Catch-all for any additional arguments (e.g. past_key_values) so we don't crash.
-        """
-        # 1) We'll rename the parameters from the old code
-        if input_ids is None:
-            raise ValueError("`input_ids` must be provided.")
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
 
-        # We used to call it 'idx'
-        idx = input_ids
-        # We used to call it 'targets'
-        targets = labels
+        query = query.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value = value.view(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # [Optional] If we want to handle single-dim input_ids
-        if idx.dim() == 1:
-            idx = idx.unsqueeze(0)
+        cos, sin = position_embeddings
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # 2) Now the rest of your old forward logic remains, just replacing references
-        #    to "idx" and "targets" with these new variables.
+        key = self._repeat_kv(key)
+        value = self._repeat_kv(value)
 
-        if self.pipeline_stages is None:
-            # Single-device forward pass
-            device = self.token_embedding.weight.device
-            idx = idx.to(device)
-            b, t = idx.size()
-            assert t <= self.config.block_size, "Sequence length exceeds block size"
-
-            token_embeddings = self.token_embedding(idx)
-            position_embeddings = self.position_embedding[:, :t, :]
-            hidden_states = self.drop(token_embeddings + position_embeddings)
-
-            # Use gradient checkpointing if enabled
-            if self._use_gradient_checkpointing and self.training:
-                # Define a custom forward function for checkpointing
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(inputs[0])
-                    return custom_forward
-                
-                # Apply each block with gradient checkpointing
-                for block in self.blocks:
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        hidden_states
-                    )
-            else:
-                # Standard forward pass through blocks
-                for block in self.blocks:
-                    hidden_states = block(hidden_states)
-
-            hidden_states = self.ln_f(hidden_states)
-            logits = self.head(hidden_states)
-
-            loss = None
-            if targets is not None:
-                targets = targets.to(device)
-                logits = logits.view(-1, logits.size(-1))
-                targets = targets.view(-1)
-                loss = F.cross_entropy(logits, targets)
-
-            return CausalLMOutput(
-                loss=loss,
-                logits=logits,
-                )
-
+        if hasattr(F, "scaled_dot_product_attention") and self.use_flash_attention:
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=attention_mask is None,
+            )
         else:
-            # Pipeline parallel forward
-            first_device = next(self.token_embedding.parameters()).device
-            last_device = next(self.ln_f.parameters()).device
-
-            x = idx.to(first_device)
-            b, t = x.size()
-            assert t <= self.config.block_size, "Sequence length exceeds block size"
-
-            token_embeddings = self.token_embedding(x)
-            position_embeddings = self.position_embedding[:, :t, :]
-            hidden_states = self.drop(token_embeddings + position_embeddings)
-
-            # For pipeline model, we apply gradient checkpointing to each stage if enabled
-            if self._use_gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(inputs[0])
-                    return custom_forward
-                
-                # Pass through each pipeline stage with gradient checkpointing if enabled
-                for stage_idx, stage in enumerate(self.pipeline_stages):
-                    device_stage = next(stage.parameters()).device
-                    hidden_states = hidden_states.to(device_stage)
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(stage),
-                        hidden_states
-                    )
-            else:
-                # Standard pipeline pass
-                for stage_idx, stage in enumerate(self.pipeline_stages):
-                    device_stage = next(stage.parameters()).device
-                    hidden_states = hidden_states.to(device_stage)
-                    hidden_states = stage(hidden_states)
-
-            # Move to last device before final ops
-            hidden_states = hidden_states.to(last_device)
-            hidden_states = self.ln_f(hidden_states)
-            logits = self.head(hidden_states)
-
-            loss = None
-            if targets is not None:
-                targets = targets.to(last_device)
-                logits = logits.view(-1, logits.size(-1))
-                targets = targets.view(-1)
-                loss = F.cross_entropy(logits, targets)
-
-            return CausalLMOutput(
-                loss=loss,
-                logits=logits,
+            scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is None:
+                causal_mask = torch.triu(
+                    torch.ones(seqlen, seqlen, dtype=torch.bool, device=hidden_states.device),
+                    diagonal=1,
                 )
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            else:
+                scores = scores + attention_mask
+            attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value)
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, self.hidden_size)
+        return self.o_proj(attn_output)
+
+
+class SwiGLUMLP(nn.Module):
+    def __init__(self, config: ArgonneConfig) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=config.mlp_bias,
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=config.mlp_bias,
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=config.mlp_bias,
+        )
+        self.down_proj._is_residual = True
+        self.dropout = nn.Dropout(config.hidden_dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
+class Block(nn.Module):
+    """Transformer block with GQA attention and SwiGLU feed-forward."""
+
+    def __init__(self, config: ArgonneConfig, layer_idx: int = 0) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn = GroupedQueryAttention(config)
+        self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = SwiGLUMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_norm(hidden_states)
+        hidden_states = self.attn(hidden_states, position_embeddings, attention_mask)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_norm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class ArgonneModel(PreTrainedModel):
+    config_class = ArgonneConfig
+    _no_split_modules = ["Block"]
+
+    def __init__(self, config: ArgonneConfig) -> None:
+        super().__init__(config)
+        self.config = config
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([Block(config, idx) for idx in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(
+            config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+        self.gradient_checkpointing = config.use_gradient_checkpointing
+        self.post_init()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            std = self.config.hidden_size ** -0.5
+            if hasattr(module, "_is_residual"):
+                std = (2 * self.config.num_hidden_layers) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.hidden_size ** -0.5)
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = enabled
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> CausalLMOutput:
+        batch_size, seq_length = input_ids.shape
+
+        hidden_states = self.embed_tokens(input_ids)
+        cos, sin = self.rotary_emb(hidden_states, seq_length)
+        rotary = (cos, sin)
+
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    rotary,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = layer(hidden_states, rotary, attention_mask)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return CausalLMOutput(logits=logits, loss=loss)
 
     @torch.no_grad()
     def generate(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        max_length: int = 50,            # Standard HF param
-        do_sample: bool = True,          # Replaces "sample=True/False"
+        input_ids: torch.Tensor,
+        max_length: int = 1024,
+        temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-        temperature: float = 0.7,
-        attention_mask: Optional[torch.Tensor] = None,
-        # Catch-all for additional HF params (e.g. num_beams) so it doesn't crash:
-        **kwargs
-    ):
-        """
-        A bridging generate method that accepts common HF arguments
-        but uses your custom GPT-style generation loop.
-
-        Args:
-            input_ids (Tensor): Starting prompt tokens [batch_size, seq_len].
-            max_length (int): The total length of the final sequence (seq_len + new tokens).
-            do_sample (bool): If True, sample from distribution; if False, do greedy.
-            top_k (int): Top-k filtering threshold.
-            top_p (float): Nucleus sampling threshold.
-            temperature (float): Sampling temperature.
-            attention_mask (Tensor): If you want to handle padding (unused in this minimal example).
-            **kwargs: Ignored extra arguments (e.g. num_beams) so they don't cause an error.
-        Returns:
-            Tensor of shape [batch_size, total_seq_len] with the generated tokens.
-        """
+        do_sample: bool = True,
+    ) -> torch.Tensor:
         self.eval()
+        device = input_ids.device
+        while input_ids.shape[1] < max_length:
+            chunk = input_ids[:, -self.config.max_position_embeddings :]
+            outputs = self.forward(chunk)
+            logits = outputs.logits[:, -1, :] / temperature
 
-        # 1) Figure out device
-        if self.pipeline_stages is not None and len(self.devices) > 0:
-            device = self.devices[0]
-        else:
-            device = next(self.parameters()).device
-
-        # 2) Sanity checks
-        if input_ids is None:
-            raise ValueError("`input_ids` must be provided for generation.")
-
-        batch_size, current_length = input_ids.shape
-        if current_length >= max_length:
-            raise ValueError(f"Current sequence length {current_length} >= max_length={max_length}")
-
-        # 3) Move to the correct device
-        generated = input_ids.to(device)
-
-        # We'll generate new tokens until length == max_length
-        total_new_tokens = max_length - current_length
-
-        for _ in range(total_new_tokens):
-            # Truncate if necessary to fit within the model's context window
-            if generated.shape[1] > self.config.block_size:
-                generated = generated[:, -self.config.block_size:]
-
-            # Forward pass
-            outputs = self.forward(generated)
-            logits = outputs.logits            # outputs is a CausalLMOutput
-            logits = logits[:, -1, :]          # get the last token's logits
-
-            # Temperature
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            # Greedy decode if do_sample=False
-            if not do_sample:
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                # top-k filtering
+            if do_sample:
                 if top_k is not None:
-                    threshold = torch.topk(logits, top_k)[0][..., -1, None]
-                    filter_mask = logits < threshold
-                    logits = logits.masked_fill(filter_mask, float('-inf'))
-
-                # top-p (nucleus) filtering
+                    top_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits = logits.masked_fill(logits < top_values[:, [-1]], float("-inf"))
                 if top_p is not None:
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
                     sorted_indices_to_remove = cumulative_probs > top_p
-                    # shift right to retain the first token above threshold
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-
-                    filter_mask = sorted_indices_to_remove.scatter(
-                        dim=1, index=sorted_indices, src=sorted_indices_to_remove
-                    )
-                    logits = logits.masked_fill(filter_mask, float('-inf'))
-
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits = logits.masked_fill(indices_to_remove, float("-inf"))
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-            # Append new token
-            generated = torch.cat([generated, next_token.to(device)], dim=1)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            if input_ids.shape[1] >= max_length:
+                break
+        return input_ids.to(device)
 
-        return generated
 
-# Register the model with Hugging Face's Auto classes
-AutoConfig.register("argonne", ArgonneConfig)
+AutoConfig.register("argonne2", ArgonneConfig)
 AutoModel.register(ArgonneConfig, ArgonneModel)
 AutoModelForCausalLM.register(ArgonneConfig, ArgonneModel)
+
+# Backwards compatibility exports
+CausalSelfAttention = GroupedQueryAttention
+MLP = SwiGLUMLP
