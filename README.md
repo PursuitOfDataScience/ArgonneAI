@@ -87,10 +87,6 @@ We trained the model on one DGX node with 8× A100 GPUs (80 GB HBM each).
 - Total training cost: **1248 GPU hours**.
 - Total training steps: **80,000 global steps**
 
-Below is the training loss curve over time:
-
-![](plots/v1.5_pretraining_loss_plot.png)
-
 ### Inference
 
 ```
