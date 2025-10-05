@@ -28,17 +28,23 @@ python training.py \
   --data-glob /raid/argonne2/shards/*.arrow \
   --tokenizer-path /raid/tokenizers/Qwen2-7B-tokenizer \
   --trust-remote-code \
+  --learning-rate 3e-4 \
+  --warmup-steps 2000 \
+  --max-steps 160000 \
+  --min-learning-rate 3e-5 \
   --no-streaming            # optional: load Arrow shards into memory instead of streaming
 ```
 
 Key checkpoints are automatically written every 300 pipeline steps (streaming mode) or every 2,000 steps (non-streaming). To resume, simply point the script at the most recent checkpoint saved under `pretrained/`.
+
+By default the launcher searches for shards in `../data/*.arrow`, falling back to `data/*.arrow` inside the repository if you keep the dataset next to the code checkout. The tokenizer directory is expected to contain the exported files from a pretrained model (e.g., a LLaMA-family tokenizer) and is validated before training begins.
 
 ### Feature summary
 
 - Full offline compatibility (`local_files_only=True` when loading tokenizers).
 - BF16 mixed precision with TF32 matmuls for peak throughput.
 - Automatic data streaming iterator that tracks file/offset position to support job restarts.
-- Weight tying, scaled residual initialization, and cosine LR schedule with warmup out-of-the-box.
+- Weight tying, scaled residual initialization, and a configurable cosine LR schedule with warmup out-of-the-box.
 
 ### Current status
 
@@ -86,10 +92,6 @@ We trained the model on one DGX node with 8× A100 GPUs (80 GB HBM each).
 
 - Total training cost: **1248 GPU hours**.
 - Total training steps: **80,000 global steps**
-
-Below is the training loss curve over time:
-
-![](plots/v1.5_pretraining_loss_plot.png)
 
 ### Inference
 

@@ -1,14 +1,20 @@
-import os
-import math
+import argparse
 import json
+import math
+import os
+
 import torch
-import torch.nn as nn
-from tqdm import tqdm
-import torch.nn.functional as F
-import glob
-from data_processing import collate_batch, load_bpe_tokenizer, load_nonstream_data
-from model import ArgonneConfig, ArgonneModel
 from datasets import Dataset
+from tqdm import tqdm
+
+from data_processing import collate_batch, load_nonstream_data, load_tokenizer
+from model import ArgonneConfig, ArgonneModel
+from training_utils import (
+    CosineWarmupScheduler,
+    log_dataset_plan,
+    resolve_data_files,
+    validate_tokenizer_path,
+)
 
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -151,42 +157,46 @@ class DataPosition:
                 self.shuffled_indices = torch.randperm(total_samples).tolist()
 
 def resume_training(
-    data_path="data/*.arrow",
-    checkpoint_path=None,
-    total_training_steps=160_000,
-    block_size=2048,
-    batch_size=320,
-    lr=3e-5,
-    use_streaming=False,   
-    num_proc=8
+    data_glob: str,
+    tokenizer_path: str,
+    checkpoint_path: str,
+    total_training_steps: int = 160_000,
+    block_size: int = 2048,
+    batch_size: int = 320,
+    lr: float = 3e-5,
+    min_lr: float = 3e-6,
+    warmup_steps: int = 2000,
+    use_streaming: bool = True,
+    num_proc: int = 8,
+    trust_remote_code: bool = False,
 ):
-    # Expand glob pattern to get actual data files
-    if isinstance(data_path, str) and ('*' in data_path or '?' in data_path):
-        data_files = glob.glob(data_path)
-        
-        # Sort the files numerically by extracting the number from the filename
-        # This assumes filenames like "fineweb-edu-train-00158-of-00218.arrow"
-        import re
-        def get_file_number(filename):
-            match = re.search(r'train-(\d+)-of', filename)
-            if match:
-                return int(match.group(1))
-            return 0  # Default case
-        
-        # Sort files by their numerical order
-        data_files = sorted(data_files, key=get_file_number)
-        print(f"Files will be processed in numerical order. First file: {data_files[0]}")
-    else:
-        data_files = [data_path] if isinstance(data_path, str) else data_path
-    
+    fallback_patterns = [
+        os.path.join("..", "data", "*.arrow"),
+        os.path.join("data", "*.arrow"),
+    ]
+    data_files, used_patterns = resolve_data_files(
+        data_glob, fallback_patterns=fallback_patterns
+    )
     print(f"Found {len(data_files)} data files")
-    
+    print("Data patterns contributing shards:")
+    for pattern in used_patterns:
+        print(f"  - {pattern}")
+    log_dataset_plan(data_files)
+
     # 1) Load tokenizer
-    hf_tokenizer = load_bpe_tokenizer()
+    validate_tokenizer_path(tokenizer_path)
+    hf_tokenizer = load_tokenizer(
+        tokenizer_path, trust_remote_code=trust_remote_code
+    )
+    if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
+        hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
+    hf_tokenizer.model_max_length = block_size
+
+    vocab_size = len(hf_tokenizer)
 
     # 2) Build config & base model
     config = ArgonneConfig(
-        vocab_size=12000,
+        vocab_size=vocab_size,
         block_size=block_size,
         n_layer=16,
         n_head=16,
@@ -221,7 +231,7 @@ def resume_training(
     
     # 5) NOW create optimizer with already-distributed parameters
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    
+
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     
@@ -237,6 +247,18 @@ def resume_training(
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
     total_tokens_processed = ckpt.get("tokens_processed", 0)
+    min_lr = min(min_lr, lr)
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        base_lr=lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_training_steps,
+        min_lr=min_lr,
+    )
+    if "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    else:
+        scheduler.step(global_step)
     print(f"Loaded checkpoint at global_step={global_step}, tokens_processed={total_tokens_processed:,}")
     
     # Initialize data position tracker and restore its state if available
@@ -319,7 +341,10 @@ def resume_training(
                     # If we've moved to a new file, log it
                     if file_idx != current_file_idx:
                         current_file_idx = file_idx
-                        print(f"Now processing file {file_idx}/{len(data_files)}: {data_files[file_idx]}")
+                        shard_name = os.path.basename(data_files[file_idx])
+                        print(
+                            f"Now processing file {file_idx}/{len(data_files)}: {shard_name}"
+                        )
 
                     if len(token_buffer) == batch_size:
                         x_tens, y_tens = collate_batch(token_buffer, block_size)
@@ -330,7 +355,9 @@ def resume_training(
                         # Count tokens in this batch
                         batch_tokens = x_tens.numel()
                         tokens_in_this_session += batch_tokens
-                        
+
+                        current_lr = scheduler.step(global_step)
+
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
 
@@ -350,6 +377,7 @@ def resume_training(
                         if global_step % 50 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
                             print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
+                            print(f"Current LR: {current_lr:.6e}")
                             print(f"File: {file_idx}/{len(data_files)}, Position: {position}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
@@ -365,7 +393,8 @@ def resume_training(
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
-                                "loss": loss.item(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "loss": loss.item() if loss is not None else None,
                                 "data_position": data_position.get_state()  # Save data position
                             }
                             os.makedirs("pretrained", exist_ok=True)
@@ -381,7 +410,11 @@ def resume_training(
                                 model=model,
                                 n_layer=config.n_layer,
                                 n_head=config.n_head,
-                                n_embd=config.n_embd
+                                n_embd=config.n_embd,
+                                base_lr=lr,
+                                min_lr=min_lr,
+                                warmup_steps=warmup_steps,
+                                max_steps=total_training_steps,
                             )
 
                 except StopIteration:
@@ -430,7 +463,9 @@ def resume_training(
                 # Count tokens in this batch
                 batch_tokens = x_tens.numel()
                 tokens_in_this_session += batch_tokens
-                
+
+                current_lr = scheduler.step(global_step)
+
                 x_tens = x_tens.to(first_device)
                 y_tens = y_tens.to(first_device)
 
@@ -450,6 +485,7 @@ def resume_training(
                 if global_step % 50 == 0:
                     current_total_tokens = total_tokens_processed + tokens_in_this_session
                     print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
+                    print(f"Current LR: {current_lr:.6e}")
                     print(f"Position in dataset: {data_position.current_position}/{total_samples}")
                     prompt_str = "Long long time ago, "
                     token_ids = hf_tokenizer.encode(prompt_str)
@@ -465,7 +501,8 @@ def resume_training(
                         "tokens_processed": current_total_tokens,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": loss.item(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "loss": loss.item() if loss is not None else None,
                         "data_position": data_position.get_state()  # Save data position
                     }
                     os.makedirs("pretrained", exist_ok=True)
@@ -481,7 +518,11 @@ def resume_training(
                         model=model,
                         n_layer=config.n_layer,
                         n_head=config.n_head,
-                        n_embd=config.n_embd
+                        n_embd=config.n_embd,
+                        base_lr=lr,
+                        min_lr=min_lr,
+                        warmup_steps=warmup_steps,
+                        max_steps=total_training_steps,
                     )
 
     # Final token count calculation
@@ -496,12 +537,21 @@ def resume_training(
         n_layer=config.n_layer,
         n_head=config.n_head,
         n_embd=config.n_embd,
-        final=True
+        base_lr=lr,
+        min_lr=min_lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_training_steps,
+        final=True,
     )
     
     print(f"\n===== TRAINING SUMMARY =====")
     print(f"Total tokens processed: {final_token_count:,}")
     print(f"Final step count: {global_step}")
+    print(
+        "Learning rate schedule: "
+        f"warmup {warmup_steps} steps | peak {lr:.6e} | min {min_lr:.6e}"
+    )
+    print(f"Configured max steps: {total_training_steps}")
     print(f"Training complete!")
 
     # Perform final save at the end of training
@@ -518,7 +568,21 @@ def resume_training(
         print(f"Failed to save final model: {e}")
 
 
-def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_embd, final=False):
+def update_training_stats(
+    tokens,
+    batch_size,
+    steps,
+    model,
+    n_layer,
+    n_head,
+    n_embd,
+    *,
+    base_lr: float | None = None,
+    min_lr: float | None = None,
+    warmup_steps: int | None = None,
+    max_steps: int | None = None,
+    final: bool = False,
+):
     """Update the training statistics file with current information"""
     # Calculate model parameters
     model_params = sum(p.numel() for p in model.parameters())
@@ -533,6 +597,15 @@ def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_e
         "model_params": model_params,
         "final_training": final
     }
+
+    if base_lr is not None:
+        training_stats["base_learning_rate"] = base_lr
+    if min_lr is not None:
+        training_stats["min_learning_rate"] = min_lr
+    if warmup_steps is not None:
+        training_stats["warmup_steps"] = warmup_steps
+    if max_steps is not None:
+        training_stats["max_steps"] = max_steps
     
     # Write stats to JSON file
     os.makedirs("stats", exist_ok=True)
@@ -553,16 +626,81 @@ def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_e
     return filename
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resume Argonne pretraining")
+    parser.add_argument(
+        "--data-glob",
+        type=str,
+        default=os.path.join("..", "data", "*.arrow"),
+        help="Glob pattern for Arrow shards (default: ../data/*.arrow)",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        required=True,
+        help="Filesystem directory containing the pretrained tokenizer to reuse.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        required=True,
+        help="Checkpoint to resume from.",
+    )
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=160_000,
+        help="Total number of training steps to run.",
+    )
+    parser.add_argument("--block-size", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=320)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=3e-5,
+        help="Peak learning rate used after warmup.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=3e-6,
+        help="Minimum learning rate applied at the beginning and end of training.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2000,
+        help="Number of optimizer steps reserved for linear LR warmup.",
+    )
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable streaming mode and load Arrow shards into memory.",
+    )
+    parser.add_argument("--num-proc", type=int, default=8)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading tokenizers that require custom code.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     resume_training(
-        data_path="data/*.arrow",
-        checkpoint_path="pretrained/streaming_checkpoint_step_33900.pth", # manually set
-        total_training_steps=80_000,
-        block_size=2048,
-        batch_size=756,
-        lr=5e-5,
-        use_streaming=True, 
-        num_proc=4
+        data_glob=args.data_glob,
+        tokenizer_path=args.tokenizer_path,
+        checkpoint_path=args.checkpoint_path,
+        total_training_steps=args.total_steps,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        lr=args.learning_rate,
+        min_lr=args.min_learning_rate,
+        warmup_steps=args.warmup_steps,
+        use_streaming=not args.no_streaming,
+        num_proc=args.num_proc,
+        trust_remote_code=args.trust_remote_code,
     )
 
 if __name__ == "__main__":
