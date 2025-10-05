@@ -9,7 +9,11 @@ from tqdm import tqdm
 
 from data_processing import collate_batch, load_nonstream_data, load_tokenizer
 from model import ArgonneConfig, ArgonneModel
-from training_utils import log_dataset_plan, resolve_data_files
+from training_utils import (
+    log_dataset_plan,
+    resolve_data_files,
+    validate_tokenizer_path,
+)
 
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -159,7 +163,7 @@ def resume_training(
     block_size: int = 2048,
     batch_size: int = 320,
     lr: float = 3e-5,
-    use_streaming: bool = False,
+    use_streaming: bool = True,
     num_proc: int = 8,
     trust_remote_code: bool = False,
 ):
@@ -177,6 +181,7 @@ def resume_training(
     log_dataset_plan(data_files)
 
     # 1) Load tokenizer
+    validate_tokenizer_path(tokenizer_path)
     hf_tokenizer = load_tokenizer(
         tokenizer_path, trust_remote_code=trust_remote_code
     )
@@ -570,7 +575,7 @@ def parse_args() -> argparse.Namespace:
         "--tokenizer-path",
         type=str,
         required=True,
-        help="Local path to a pretrained tokenizer to reuse.",
+        help="Filesystem directory containing the pretrained tokenizer to reuse.",
     )
     parser.add_argument(
         "--checkpoint-path",
@@ -588,9 +593,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=320)
     parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument(
-        "--streaming",
+        "--no-streaming",
         action="store_true",
-        help="Enable streaming mode instead of loading all data into memory.",
+        help="Disable streaming mode and load Arrow shards into memory.",
     )
     parser.add_argument("--num-proc", type=int, default=8)
     parser.add_argument(
@@ -611,7 +616,7 @@ def main():
         block_size=args.block_size,
         batch_size=args.batch_size,
         lr=args.learning_rate,
-        use_streaming=args.streaming,
+        use_streaming=not args.no_streaming,
         num_proc=args.num_proc,
         trust_remote_code=args.trust_remote_code,
     )

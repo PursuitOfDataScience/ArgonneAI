@@ -23,13 +23,22 @@ from data_processing import (
     streaming_token_generator,
 )
 from model import ArgonneConfig, ArgonneModel, Block
-from training_utils import log_dataset_plan, resolve_data_files
+from training_utils import (
+    log_dataset_plan,
+    resolve_data_files,
+    validate_tokenizer_path,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Argonne v2 FSDP pretraining entrypoint")
     parser.add_argument("--data-glob", type=str, required=True, help="Glob pattern pointing to pre-tokenization Arrow files")
-    parser.add_argument("--tokenizer-path", type=str, required=True, help="Local path to a pretrained tokenizer")
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        required=True,
+        help="Directory containing the pretrained tokenizer to load",
+    )
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to store checkpoints and logs")
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--micro-batch-size", type=int, default=4)
@@ -240,6 +249,7 @@ def run_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             print(f"  - {pattern}")
         log_dataset_plan(data_files)
 
+    validate_tokenizer_path(args.tokenizer_path)
     tokenizer = load_tokenizer(args.tokenizer_path, trust_remote_code=args.trust_remote_code)
     tokenizer_vocab_size = tokenizer.vocab_size
     if hasattr(tokenizer, "get_added_vocab"):

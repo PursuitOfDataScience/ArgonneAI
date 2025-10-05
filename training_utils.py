@@ -72,3 +72,15 @@ def log_dataset_plan(files: Sequence[str]) -> None:
     for idx, path in enumerate(files, start=1):
         print(f"  [{idx:03d}] {os.path.basename(path)}")
     print("===========================")
+
+
+def validate_tokenizer_path(path: str) -> str:
+    """Ensure that ``path`` points to a tokenizer directory on disk."""
+
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            "Tokenizer path must be a directory exported from a pretrained model. "
+            f"Received: {path}"
+        )
+
+    return path

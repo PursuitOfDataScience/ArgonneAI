@@ -14,7 +14,11 @@ from data_processing import (
     load_tokenizer,
 )
 from model import ArgonneConfig, ArgonneModel
-from training_utils import log_dataset_plan, resolve_data_files
+from training_utils import (
+    log_dataset_plan,
+    resolve_data_files,
+    validate_tokenizer_path,
+)
 
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -150,7 +154,7 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
 def train_model_parallel(
     data_files: List[str],
     tokenizer_path: str,
-    use_streaming: bool = False,
+    use_streaming: bool = True,
     trust_remote_code: bool = False,
 ):
     """
@@ -170,6 +174,7 @@ def train_model_parallel(
     min_batch_size = 12  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
     
+    validate_tokenizer_path(tokenizer_path)
     hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
 
     epochs = 3
@@ -554,7 +559,7 @@ def parse_args():
         "--tokenizer-path",
         type=str,
         required=True,
-        help="Local path to a pretrained tokenizer directory (e.g., a LLaMA or Qwen tokenizer).",
+        help="Directory on disk containing the pretrained tokenizer to load (e.g., a LLaMA or Qwen tokenizer).",
     )
     parser.add_argument(
         "--no-streaming",
