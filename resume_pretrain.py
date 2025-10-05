@@ -10,6 +10,7 @@ from tqdm import tqdm
 from data_processing import collate_batch, load_nonstream_data, load_tokenizer
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
+    CosineWarmupScheduler,
     log_dataset_plan,
     resolve_data_files,
     validate_tokenizer_path,
@@ -163,6 +164,8 @@ def resume_training(
     block_size: int = 2048,
     batch_size: int = 320,
     lr: float = 3e-5,
+    min_lr: float = 3e-6,
+    warmup_steps: int = 2000,
     use_streaming: bool = True,
     num_proc: int = 8,
     trust_remote_code: bool = False,
@@ -228,7 +231,7 @@ def resume_training(
     
     # 5) NOW create optimizer with already-distributed parameters
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    
+
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     
@@ -244,6 +247,18 @@ def resume_training(
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
     total_tokens_processed = ckpt.get("tokens_processed", 0)
+    min_lr = min(min_lr, lr)
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        base_lr=lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_training_steps,
+        min_lr=min_lr,
+    )
+    if "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    else:
+        scheduler.step(global_step)
     print(f"Loaded checkpoint at global_step={global_step}, tokens_processed={total_tokens_processed:,}")
     
     # Initialize data position tracker and restore its state if available
@@ -340,7 +355,9 @@ def resume_training(
                         # Count tokens in this batch
                         batch_tokens = x_tens.numel()
                         tokens_in_this_session += batch_tokens
-                        
+
+                        current_lr = scheduler.step(global_step)
+
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
 
@@ -360,6 +377,7 @@ def resume_training(
                         if global_step % 50 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
                             print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
+                            print(f"Current LR: {current_lr:.6e}")
                             print(f"File: {file_idx}/{len(data_files)}, Position: {position}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
@@ -375,7 +393,8 @@ def resume_training(
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
-                                "loss": loss.item(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "loss": loss.item() if loss is not None else None,
                                 "data_position": data_position.get_state()  # Save data position
                             }
                             os.makedirs("pretrained", exist_ok=True)
@@ -391,7 +410,11 @@ def resume_training(
                                 model=model,
                                 n_layer=config.n_layer,
                                 n_head=config.n_head,
-                                n_embd=config.n_embd
+                                n_embd=config.n_embd,
+                                base_lr=lr,
+                                min_lr=min_lr,
+                                warmup_steps=warmup_steps,
+                                max_steps=total_training_steps,
                             )
 
                 except StopIteration:
@@ -440,7 +463,9 @@ def resume_training(
                 # Count tokens in this batch
                 batch_tokens = x_tens.numel()
                 tokens_in_this_session += batch_tokens
-                
+
+                current_lr = scheduler.step(global_step)
+
                 x_tens = x_tens.to(first_device)
                 y_tens = y_tens.to(first_device)
 
@@ -460,6 +485,7 @@ def resume_training(
                 if global_step % 50 == 0:
                     current_total_tokens = total_tokens_processed + tokens_in_this_session
                     print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens: {current_total_tokens:,}")
+                    print(f"Current LR: {current_lr:.6e}")
                     print(f"Position in dataset: {data_position.current_position}/{total_samples}")
                     prompt_str = "Long long time ago, "
                     token_ids = hf_tokenizer.encode(prompt_str)
@@ -475,7 +501,8 @@ def resume_training(
                         "tokens_processed": current_total_tokens,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": loss.item(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "loss": loss.item() if loss is not None else None,
                         "data_position": data_position.get_state()  # Save data position
                     }
                     os.makedirs("pretrained", exist_ok=True)
@@ -491,7 +518,11 @@ def resume_training(
                         model=model,
                         n_layer=config.n_layer,
                         n_head=config.n_head,
-                        n_embd=config.n_embd
+                        n_embd=config.n_embd,
+                        base_lr=lr,
+                        min_lr=min_lr,
+                        warmup_steps=warmup_steps,
+                        max_steps=total_training_steps,
                     )
 
     # Final token count calculation
@@ -506,12 +537,21 @@ def resume_training(
         n_layer=config.n_layer,
         n_head=config.n_head,
         n_embd=config.n_embd,
-        final=True
+        base_lr=lr,
+        min_lr=min_lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_training_steps,
+        final=True,
     )
     
     print(f"\n===== TRAINING SUMMARY =====")
     print(f"Total tokens processed: {final_token_count:,}")
     print(f"Final step count: {global_step}")
+    print(
+        "Learning rate schedule: "
+        f"warmup {warmup_steps} steps | peak {lr:.6e} | min {min_lr:.6e}"
+    )
+    print(f"Configured max steps: {total_training_steps}")
     print(f"Training complete!")
 
     # Perform final save at the end of training
@@ -528,7 +568,21 @@ def resume_training(
         print(f"Failed to save final model: {e}")
 
 
-def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_embd, final=False):
+def update_training_stats(
+    tokens,
+    batch_size,
+    steps,
+    model,
+    n_layer,
+    n_head,
+    n_embd,
+    *,
+    base_lr: float | None = None,
+    min_lr: float | None = None,
+    warmup_steps: int | None = None,
+    max_steps: int | None = None,
+    final: bool = False,
+):
     """Update the training statistics file with current information"""
     # Calculate model parameters
     model_params = sum(p.numel() for p in model.parameters())
@@ -543,6 +597,15 @@ def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_e
         "model_params": model_params,
         "final_training": final
     }
+
+    if base_lr is not None:
+        training_stats["base_learning_rate"] = base_lr
+    if min_lr is not None:
+        training_stats["min_learning_rate"] = min_lr
+    if warmup_steps is not None:
+        training_stats["warmup_steps"] = warmup_steps
+    if max_steps is not None:
+        training_stats["max_steps"] = max_steps
     
     # Write stats to JSON file
     os.makedirs("stats", exist_ok=True)
@@ -591,7 +654,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=320)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=3e-5,
+        help="Peak learning rate used after warmup.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=3e-6,
+        help="Minimum learning rate applied at the beginning and end of training.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2000,
+        help="Number of optimizer steps reserved for linear LR warmup.",
+    )
     parser.add_argument(
         "--no-streaming",
         action="store_true",
@@ -616,6 +696,8 @@ def main():
         block_size=args.block_size,
         batch_size=args.batch_size,
         lr=args.learning_rate,
+        min_lr=args.min_learning_rate,
+        warmup_steps=args.warmup_steps,
         use_streaming=not args.no_streaming,
         num_proc=args.num_proc,
         trust_remote_code=args.trust_remote_code,

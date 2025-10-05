@@ -15,6 +15,7 @@ from data_processing import (
 )
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
+    CosineWarmupScheduler,
     log_dataset_plan,
     resolve_data_files,
     validate_tokenizer_path,
@@ -154,8 +155,14 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
 def train_model_parallel(
     data_files: List[str],
     tokenizer_path: str,
+    *,
     use_streaming: bool = True,
     trust_remote_code: bool = False,
+    learning_rate: float,
+    min_learning_rate: float,
+    warmup_steps: int,
+    max_steps: int,
+    weight_decay: float,
 ):
     """
     data_files should be a list of actual .arrow file paths, e.g.
@@ -168,6 +175,11 @@ def train_model_parallel(
         tokenizer_path: Local directory containing tokenizer files.
         use_streaming: Whether to use streaming mode or load all data in memory
         trust_remote_code: Allow tokenizers with custom code.
+        learning_rate: Peak learning rate applied after warmup.
+        min_learning_rate: Minimum learning rate reached at schedule boundaries.
+        warmup_steps: Number of optimizer steps spent linearly ramping the LR.
+        max_steps: Maximum number of optimizer steps before halting training.
+        weight_decay: AdamW weight decay coefficient.
     """
     # Initial batch size settings
     initial_batch_size = 512  # initial batch size
@@ -217,6 +229,8 @@ def train_model_parallel(
     final_batch_size = None
 
     # Main training loop with batch size adjustment
+    stop_training = False
+
     while True:
         print(f"\n=== Attempting training with batch_size = {batch_size} ===")
 
@@ -261,11 +275,22 @@ def train_model_parallel(
                     "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
                 )
             
-            optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.1) 
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=learning_rate, weight_decay=weight_decay
+            )
             scaler = torch.amp.GradScaler("cuda")
             global_step = 0
             tokens_in_current_attempt = 0  # Track tokens in this training attempt
             first_device = model.devices[0]  # Store the first device for consistency
+
+            min_lr = min(min_learning_rate, learning_rate)
+            scheduler = CosineWarmupScheduler(
+                optimizer,
+                base_lr=learning_rate,
+                warmup_steps=warmup_steps,
+                max_steps=max_steps,
+                min_lr=min_lr,
+            )
 
             if use_streaming:
                 ########################################################
@@ -274,10 +299,12 @@ def train_model_parallel(
                 loss = None
 
                 def run_training_step(x_tens, y_tens, shard_name, file_idx, position):
-                    nonlocal tokens_in_current_attempt, global_step, loss
+                    nonlocal tokens_in_current_attempt, global_step, loss, stop_training
 
                     batch_tokens = x_tens.numel()
                     tokens_in_current_attempt += batch_tokens
+
+                    current_lr = scheduler.step(global_step)
 
                     x_local = x_tens.to(first_device)
                     y_local = y_tens.to(first_device)
@@ -300,6 +327,7 @@ def train_model_parallel(
                         print(
                             f"Shard: {shard_name} | File index: {file_idx} | Position: {position}"
                         )
+                        print(f"Current LR: {current_lr:.6e}")
                         prompt_str = "Long long time ago, "
                         token_ids = hf_tokenizer.encode(prompt_str)
                         prompt_tensor = (
@@ -322,6 +350,7 @@ def train_model_parallel(
                             "tokens_processed": tokens_in_current_attempt,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
                             "loss": loss.item() if loss is not None else None,
                             "data_position": data_position.get_state(),
                         }
@@ -332,6 +361,13 @@ def train_model_parallel(
                         print(
                             f"Checkpoint saved at step {global_step} with data position tracking"
                         )
+
+                    if global_step >= max_steps:
+                        print(
+                            f"Reached configured max_steps={max_steps}. Stopping training loop."
+                        )
+                        stop_training = True
+                        return
 
                 for epoch in tqdm(range(epochs)):
                     print(f"==== STREAMING with batch_size={batch_size} ====")
@@ -394,6 +430,11 @@ def train_model_parallel(
                             continue
 
                         run_training_step(x_tens, y_tens, shard_name, file_idx, position)
+                        if stop_training:
+                            break
+
+                    if stop_training:
+                        break
 
             else:
                 ########################################################
@@ -413,7 +454,7 @@ def train_model_parallel(
                     for batch_idx in tqdm(range(batches_per_epoch)):
                         start_idx = batch_idx * batch_size
                         end_idx = start_idx + batch_size
-                        
+
                         # Update position in tracker
                         data_position.update_nonstreaming_position(end_idx)
                         
@@ -430,6 +471,8 @@ def train_model_parallel(
                         x_tens = x_tens.to(first_device)
                         y_tens = y_tens.to(first_device)
 
+                        current_lr = scheduler.step(global_step)
+
                         optimizer.zero_grad()
                         with torch.amp.autocast("cuda"):
                             outputs = model(input_ids=x_tens, labels=y_tens)
@@ -442,7 +485,10 @@ def train_model_parallel(
                         global_step += 1
 
                         if global_step % 50 == 0 and loss is not None:
-                            print(f"global_step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}")
+                            print(
+                                f"global_step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}"
+                            )
+                            print(f"Current LR: {current_lr:.6e}")
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
                             prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
@@ -460,13 +506,24 @@ def train_model_parallel(
                                 "tokens_processed": tokens_in_current_attempt,
                                 "model_state_dict": model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
                                 "loss": loss.item() if loss is not None else None,
                                 "data_position": data_position.get_state()  # Save position
                             }
                             os.makedirs("pretrained", exist_ok=True)
                             torch.save(checkpoint, f"pretrained/non_streaming_checkpoint_step_{global_step}.pth")
                             print(f"Checkpoint saved at step {global_step} with data position tracking")
-            
+
+                        if global_step >= max_steps:
+                            print(
+                                f"Reached configured max_steps={max_steps}. Stopping training loop."
+                            )
+                            stop_training = True
+                            break
+
+                    if stop_training:
+                        break
+
             # If we reach here, training completed successfully
             # Update total token count for successful training
             total_tokens_processed = tokens_in_current_attempt
@@ -516,6 +573,10 @@ def train_model_parallel(
         "model_params": sum(p.numel() for p in model.parameters()),
         "max_batch_size": final_batch_size,
         "data_shards_seen": sorted(data_position.files_processed),
+        "base_learning_rate": learning_rate,
+        "min_learning_rate": min_lr,
+        "warmup_steps": warmup_steps,
+        "max_steps": max_steps,
     }
     
     # Write stats to JSON file
@@ -531,6 +592,11 @@ def train_model_parallel(
     if final_batch_size is not None:
         print(f"Maximum stable batch size: {final_batch_size}")
     print(f"Training steps: {global_step}")
+    print(
+        "Learning rate schedule: "
+        f"warmup {warmup_steps} steps | peak {learning_rate:.6e} | min {min_lr:.6e}"
+    )
+    print(f"Configured max steps: {max_steps}")
     if training_stats["data_shards_seen"]:
         print("Shards processed this run:")
         for shard_name in training_stats["data_shards_seen"]:
@@ -571,6 +637,36 @@ def parse_args():
         action="store_true",
         help="Allow loading tokenizers that require custom code.",
     )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=3e-4,
+        help="Peak learning rate for AdamW during cosine schedule warmup.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=3e-5,
+        help="Minimum learning rate used at the start and end of the cosine schedule.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2000,
+        help="Number of optimizer steps used for linear warmup.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=160_000,
+        help="Total optimizer steps to schedule before halting training.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.1,
+        help="Weight decay coefficient passed to AdamW.",
+    )
     return parser.parse_args()
 
 
@@ -596,6 +692,11 @@ def main():
         tokenizer_path=args.tokenizer_path,
         use_streaming=not args.no_streaming,
         trust_remote_code=args.trust_remote_code,
+        learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
+        weight_decay=args.weight_decay,
     )
 
 if __name__ == "__main__":

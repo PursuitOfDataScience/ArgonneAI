@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
 from typing import Iterable, List, Sequence, Tuple
+
+import torch
 
 
 def _natural_key(path: str) -> List[object]:
@@ -84,3 +87,63 @@ def validate_tokenizer_path(path: str) -> str:
         )
 
     return path
+
+
+class CosineWarmupScheduler:
+    """Lightweight cosine decay scheduler with linear warmup."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        base_lr: float,
+        warmup_steps: int,
+        max_steps: int,
+        min_lr: float,
+    ) -> None:
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive for the cosine scheduler")
+
+        self.optimizer = optimizer
+        self.base_lr = max(base_lr, 0.0)
+        self.min_lr = min(max(min_lr, 0.0), self.base_lr)
+        self.warmup_steps = max(warmup_steps, 0)
+        self.max_steps = max_steps
+        self._step = 0
+        self.step(0)
+
+    def _lr_for_step(self, step: int) -> float:
+        step = max(0, step)
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            warmup_frac = step / max(1, self.warmup_steps)
+            return self.min_lr + (self.base_lr - self.min_lr) * warmup_frac
+
+        decay_progress = 0.0
+        if self.max_steps > self.warmup_steps:
+            decay_progress = (step - self.warmup_steps) / (
+                self.max_steps - self.warmup_steps
+            )
+        decay_progress = min(max(decay_progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return self.min_lr + (self.base_lr - self.min_lr) * cosine
+
+    def _apply_lr(self, lr: float) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
+    def step(self, step: int) -> float:
+        lr = self._lr_for_step(step)
+        self._apply_lr(lr)
+        self._step = step
+        return lr
+
+    def state_dict(self) -> dict:
+        return {"step": self._step}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        step = int(state_dict.get("step", 0))
+        self.step(step)
+
+    @property
+    def last_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
