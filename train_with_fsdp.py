@@ -1,5 +1,4 @@
 import argparse
-import glob
 import math
 import os
 from typing import Iterable, List
@@ -24,6 +23,7 @@ from data_processing import (
     streaming_token_generator,
 )
 from model import ArgonneConfig, ArgonneModel, Block
+from training_utils import log_dataset_plan, resolve_data_files
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,12 +225,20 @@ def run_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    data_files = sorted(glob.glob(args.data_glob))
-    if not data_files:
-        raise FileNotFoundError(f"No Arrow files matched glob: {args.data_glob}")
+    fallback_patterns = [
+        os.path.join("..", "data", "*.arrow"),
+        os.path.join("data", "*.arrow"),
+    ]
+    data_files, used_patterns = resolve_data_files(
+        args.data_glob, fallback_patterns=fallback_patterns
+    )
 
     if rank == 0:
         print(f"Discovered {len(data_files)} data files")
+        print("Data patterns contributing shards:")
+        for pattern in used_patterns:
+            print(f"  - {pattern}")
+        log_dataset_plan(data_files)
 
     tokenizer = load_tokenizer(args.tokenizer_path, trust_remote_code=args.trust_remote_code)
     tokenizer_vocab_size = tokenizer.vocab_size

@@ -1,14 +1,15 @@
-import os
-import math
+import argparse
 import json
+import math
+import os
+
 import torch
-import torch.nn as nn
-from tqdm import tqdm
-import torch.nn.functional as F
-import glob
-from data_processing import collate_batch, load_bpe_tokenizer, load_nonstream_data
-from model import ArgonneConfig, ArgonneModel
 from datasets import Dataset
+from tqdm import tqdm
+
+from data_processing import collate_batch, load_nonstream_data, load_tokenizer
+from model import ArgonneConfig, ArgonneModel
+from training_utils import log_dataset_plan, resolve_data_files
 
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -151,42 +152,43 @@ class DataPosition:
                 self.shuffled_indices = torch.randperm(total_samples).tolist()
 
 def resume_training(
-    data_path="data/*.arrow",
-    checkpoint_path=None,
-    total_training_steps=160_000,
-    block_size=2048,
-    batch_size=320,
-    lr=3e-5,
-    use_streaming=False,   
-    num_proc=8
+    data_glob: str,
+    tokenizer_path: str,
+    checkpoint_path: str,
+    total_training_steps: int = 160_000,
+    block_size: int = 2048,
+    batch_size: int = 320,
+    lr: float = 3e-5,
+    use_streaming: bool = False,
+    num_proc: int = 8,
+    trust_remote_code: bool = False,
 ):
-    # Expand glob pattern to get actual data files
-    if isinstance(data_path, str) and ('*' in data_path or '?' in data_path):
-        data_files = glob.glob(data_path)
-        
-        # Sort the files numerically by extracting the number from the filename
-        # This assumes filenames like "fineweb-edu-train-00158-of-00218.arrow"
-        import re
-        def get_file_number(filename):
-            match = re.search(r'train-(\d+)-of', filename)
-            if match:
-                return int(match.group(1))
-            return 0  # Default case
-        
-        # Sort files by their numerical order
-        data_files = sorted(data_files, key=get_file_number)
-        print(f"Files will be processed in numerical order. First file: {data_files[0]}")
-    else:
-        data_files = [data_path] if isinstance(data_path, str) else data_path
-    
+    fallback_patterns = [
+        os.path.join("..", "data", "*.arrow"),
+        os.path.join("data", "*.arrow"),
+    ]
+    data_files, used_patterns = resolve_data_files(
+        data_glob, fallback_patterns=fallback_patterns
+    )
     print(f"Found {len(data_files)} data files")
-    
+    print("Data patterns contributing shards:")
+    for pattern in used_patterns:
+        print(f"  - {pattern}")
+    log_dataset_plan(data_files)
+
     # 1) Load tokenizer
-    hf_tokenizer = load_bpe_tokenizer()
+    hf_tokenizer = load_tokenizer(
+        tokenizer_path, trust_remote_code=trust_remote_code
+    )
+    if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
+        hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
+    hf_tokenizer.model_max_length = block_size
+
+    vocab_size = len(hf_tokenizer)
 
     # 2) Build config & base model
     config = ArgonneConfig(
-        vocab_size=12000,
+        vocab_size=vocab_size,
         block_size=block_size,
         n_layer=16,
         n_head=16,
@@ -319,7 +321,10 @@ def resume_training(
                     # If we've moved to a new file, log it
                     if file_idx != current_file_idx:
                         current_file_idx = file_idx
-                        print(f"Now processing file {file_idx}/{len(data_files)}: {data_files[file_idx]}")
+                        shard_name = os.path.basename(data_files[file_idx])
+                        print(
+                            f"Now processing file {file_idx}/{len(data_files)}: {shard_name}"
+                        )
 
                     if len(token_buffer) == batch_size:
                         x_tens, y_tens = collate_batch(token_buffer, block_size)
@@ -553,16 +558,62 @@ def update_training_stats(tokens, batch_size, steps, model, n_layer, n_head, n_e
     return filename
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resume Argonne pretraining")
+    parser.add_argument(
+        "--data-glob",
+        type=str,
+        default=os.path.join("..", "data", "*.arrow"),
+        help="Glob pattern for Arrow shards (default: ../data/*.arrow)",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        required=True,
+        help="Local path to a pretrained tokenizer to reuse.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        required=True,
+        help="Checkpoint to resume from.",
+    )
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=160_000,
+        help="Total number of training steps to run.",
+    )
+    parser.add_argument("--block-size", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=320)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Enable streaming mode instead of loading all data into memory.",
+    )
+    parser.add_argument("--num-proc", type=int, default=8)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading tokenizers that require custom code.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     resume_training(
-        data_path="data/*.arrow",
-        checkpoint_path="pretrained/streaming_checkpoint_step_33900.pth", # manually set
-        total_training_steps=80_000,
-        block_size=2048,
-        batch_size=756,
-        lr=5e-5,
-        use_streaming=True, 
-        num_proc=4
+        data_glob=args.data_glob,
+        tokenizer_path=args.tokenizer_path,
+        checkpoint_path=args.checkpoint_path,
+        total_training_steps=args.total_steps,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        lr=args.learning_rate,
+        use_streaming=args.streaming,
+        num_proc=args.num_proc,
+        trust_remote_code=args.trust_remote_code,
     )
 
 if __name__ == "__main__":
