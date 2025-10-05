@@ -1,5 +1,4 @@
 import argparse
-import glob
 import json
 import os
 import time
@@ -15,6 +14,7 @@ from data_processing import (
     load_tokenizer,
 )
 from model import ArgonneConfig, ArgonneModel
+from training_utils import log_dataset_plan, resolve_data_files
 
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -49,15 +49,15 @@ class DataPosition:
             "position_in_file": self.position_in_file,
             "current_position": self.current_position,
             "epoch": self.epoch,
-            "files_processed": list(self.files_processed)
+            "files_processed": sorted(self.files_processed),
         }
-    
+
     def update_streaming_position(self, file_idx, position, file_path=None):
         """Update streaming position information"""
         self.current_file_idx = file_idx
         self.position_in_file = position
         if file_path:
-            self.files_processed.add(file_path)
+            self.files_processed.add(os.path.basename(file_path))
     
     def update_nonstreaming_position(self, position):
         """Update non-streaming position"""
@@ -100,7 +100,10 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
     while file_idx < len(data_files):
         try:
             file_path = data_files[file_idx]
-            print(f"Streaming from file {file_idx}/{len(data_files)}: {file_path}")
+            shard_name = os.path.basename(file_path)
+            print(
+                f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}"
+            )
             
             try:
                 # Use datasets library instead of pyarrow.parquet
@@ -126,7 +129,7 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
                         text = item['text']
                         tokens = tokenizer.encode(text, add_special_tokens=False)
                         processed_count += 1
-                        yield tokens, file_idx, position
+                        yield tokens, file_idx, position, shard_name
                     
                 except Exception as e:
                     print(f"Error processing item at position {position}: {e}")
@@ -142,7 +145,7 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
     print(f"Completed processing all available files. Processed {processed_count} samples.")
     
     # To be consistent with resume_pretrain.py, return sentinel value instead of raising StopIteration
-    return None, -1, -1
+    return None, -1, -1, ""
 
 def train_model_parallel(
     data_files: List[str],
@@ -263,99 +266,129 @@ def train_model_parallel(
                 ########################################################
                 # STREAMING MODE
                 ########################################################
-                steps_per_epoch = 50000
-                
+                loss = None
+
+                def run_training_step(x_tens, y_tens, shard_name, file_idx, position):
+                    nonlocal tokens_in_current_attempt, global_step, loss
+
+                    batch_tokens = x_tens.numel()
+                    tokens_in_current_attempt += batch_tokens
+
+                    x_local = x_tens.to(first_device)
+                    y_local = y_tens.to(first_device)
+
+                    optimizer.zero_grad()
+                    with torch.amp.autocast("cuda"):
+                        outputs = model(input_ids=x_local, labels=y_local)
+                        loss = outputs.loss.to(first_device)
+
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    global_step += 1
+
+                    if global_step % 50 == 0 and loss is not None:
+                        print(
+                            f"Step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}"
+                        )
+                        print(
+                            f"Shard: {shard_name} | File index: {file_idx} | Position: {position}"
+                        )
+                        prompt_str = "Long long time ago, "
+                        token_ids = hf_tokenizer.encode(prompt_str)
+                        prompt_tensor = (
+                            torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
+                        )
+
+                        generated = model.generate(
+                            prompt_tensor, max_length=prompt_tensor.shape[1] + 100
+                        )
+                        generated_text = hf_tokenizer.decode(generated[0].tolist())
+                        print(
+                            f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
+                        )
+
+                    if global_step % 300 == 0:
+                        checkpoint = {
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "batch_size": batch_size,
+                            "tokens_processed": tokens_in_current_attempt,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "loss": loss.item() if loss is not None else None,
+                            "data_position": data_position.get_state(),
+                        }
+                        os.makedirs("pretrained", exist_ok=True)
+                        torch.save(
+                            checkpoint, f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                        )
+                        print(
+                            f"Checkpoint saved at step {global_step} with data position tracking"
+                        )
+
                 for epoch in tqdm(range(epochs)):
                     print(f"==== STREAMING with batch_size={batch_size} ====")
-                    # Pass tracking info to the generator
                     token_gen = streaming_token_generator(
-                        data_files, 
-                        hf_tokenizer, 
+                        data_files,
+                        hf_tokenizer,
                         data_position.current_file_idx,
-                        data_position.position_in_file
+                        data_position.position_in_file,
                     )
-                    step_in_epoch = 0
-                    token_batch = []
+                    token_batch: List[List[int]] = []
+                    active_shard = None
+                    last_file_idx = data_position.current_file_idx
+                    last_position = data_position.position_in_file
+                    last_shard_name = active_shard
 
-                    while step_in_epoch < steps_per_epoch:
+                    while True:
                         try:
-                            # Check for end-of-data sentinel value
-                            tokens, file_idx, position = next(token_gen)
-                            
-                            # Check for end-of-data sentinel value
-                            if file_idx == -1:
-                                print("Reached end of dataset. Restarting from beginning.")
-                                # Update tracker for new pass
-                                data_position.next_epoch()
-                                print(f"Starting new data pass")
-                                token_gen = streaming_token_generator(data_files, hf_tokenizer)
-                                continue
-                                
-                            token_batch.append(tokens)
-                            
-                            # Update position tracker with current file and position
-                            data_position.update_streaming_position(
-                                file_idx, 
-                                position,
-                                data_files[file_idx]
-                            )
-
-                            if len(token_batch) == batch_size:
+                            tokens, file_idx, position, shard_name = next(token_gen)
+                        except StopIteration:
+                            if token_batch:
                                 x_tens, y_tens = collate_batch(token_batch, block_size)
                                 token_batch.clear()
-                                if x_tens is None:
-                                    continue
+                                if x_tens is not None:
+                                    run_training_step(
+                                        x_tens,
+                                        y_tens,
+                                        last_shard_name or active_shard or "final_shard",
+                                        last_file_idx,
+                                        last_position,
+                                    )
 
-                                # Count tokens processed in this batch
-                                batch_tokens = x_tens.numel()
-                                tokens_in_current_attempt += batch_tokens
-                                
-                                x_tens, y_tens = x_tens.to(first_device), y_tens.to(first_device)
-
-                                optimizer.zero_grad()
-                                with torch.amp.autocast("cuda"):
-                                    outputs = model(input_ids=x_tens, labels=y_tens)
-                                    loss = outputs.loss.to(first_device)
-
-                                scaler.scale(loss).backward()
-                                scaler.step(optimizer)
-                                scaler.update()
-
-                                global_step += 1
-                                step_in_epoch += 1
-                                
-                                if global_step % 50 == 0 and loss is not None:
-                                    print(f"Step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}")
-                                    print(f"File: {file_idx}/{len(data_files)}, Position: {position}")
-                                    prompt_str = "Long long time ago, "
-                                    token_ids = hf_tokenizer.encode(prompt_str)
-                                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
-                                   
-                                    generated = model.generate(prompt_tensor, max_length=prompt_tensor.shape[1] + 100)
-                                    generated_text = hf_tokenizer.decode(generated[0].tolist())
-                                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                                if global_step % 300 == 0:
-                                    # Include token count and data position in checkpoint
-                                    checkpoint = {
-                                        "epoch": epoch,
-                                        "global_step": global_step,
-                                        "batch_size": batch_size,
-                                        "tokens_processed": tokens_in_current_attempt,
-                                        "model_state_dict": model.state_dict(),
-                                        "optimizer_state_dict": optimizer.state_dict(),
-                                        "loss": loss.item() if loss is not None else None,
-                                        "data_position": data_position.get_state()  # Save position
-                                    }
-                                    os.makedirs("pretrained", exist_ok=True)
-                                    torch.save(checkpoint, f"pretrained/streaming_checkpoint_step_{global_step}.pth")
-                                    print(f"Checkpoint saved at step {global_step} with data position tracking")
-
-                        except StopIteration:
-                            print("Reached end of dataset (stream) before finishing this epoch.")
-                            # Update position tracker for next epoch
+                            print(
+                                "Completed streaming pass for this epoch. Restarting for next epoch."
+                            )
                             data_position.next_epoch()
                             break
+
+                        if shard_name != active_shard:
+                            print(
+                                f"--> Now training on shard {file_idx + 1}/{len(data_files)}: {shard_name}"
+                            )
+                            active_shard = shard_name
+
+                        token_batch.append(tokens)
+                        data_position.update_streaming_position(
+                            file_idx,
+                            position,
+                            data_files[file_idx],
+                        )
+                        last_file_idx = file_idx
+                        last_position = position
+                        last_shard_name = shard_name
+
+                        if len(token_batch) < batch_size:
+                            continue
+
+                        x_tens, y_tens = collate_batch(token_batch, block_size)
+                        token_batch.clear()
+                        if x_tens is None:
+                            continue
+
+                        run_training_step(x_tens, y_tens, shard_name, file_idx, position)
 
             else:
                 ########################################################
@@ -477,6 +510,7 @@ def train_model_parallel(
         "hidden_size": config_model.hidden_size,
         "model_params": sum(p.numel() for p in model.parameters()),
         "max_batch_size": final_batch_size,
+        "data_shards_seen": sorted(data_position.files_processed),
     }
     
     # Write stats to JSON file
@@ -492,6 +526,10 @@ def train_model_parallel(
     if final_batch_size is not None:
         print(f"Maximum stable batch size: {final_batch_size}")
     print(f"Training steps: {global_step}")
+    if training_stats["data_shards_seen"]:
+        print("Shards processed this run:")
+        for shard_name in training_stats["data_shards_seen"]:
+            print(f"  - {shard_name}")
     print(f"Stats saved to: stats/training_stats.json")
 
     # Save final model and tokenizer
@@ -509,8 +547,8 @@ def parse_args():
     parser.add_argument(
         "--data-glob",
         type=str,
-        default="data/*.arrow",
-        help="Glob pattern for Arrow files (default: data/*.arrow)",
+        default=os.path.join("..", "data", "*.arrow"),
+        help="Glob pattern for Arrow files (default: ../data/*.arrow)",
     )
     parser.add_argument(
         "--tokenizer-path",
@@ -534,20 +572,19 @@ def parse_args():
 def main():
     args = parse_args()
 
-    data_files = glob.glob(args.data_glob)
-    if not data_files:
-        raise ValueError(f"No files matched the pattern '{args.data_glob}'")
+    fallback_patterns = [os.path.join("data", "*.arrow")]
+    if args.data_glob != os.path.join("..", "data", "*.arrow"):
+        fallback_patterns.insert(0, os.path.join("..", "data", "*.arrow"))
 
-    import re
+    data_files, used_patterns = resolve_data_files(
+        args.data_glob, fallback_patterns=fallback_patterns
+    )
 
-    def get_file_number(filename: str) -> int:
-        match = re.search(r"train-(\d+)-of", filename)
-        if match:
-            return int(match.group(1))
-        return 0
+    print("Discovered dataset shards using patterns:")
+    for pattern in used_patterns:
+        print(f"  - {pattern}")
 
-    data_files = sorted(data_files, key=get_file_number)
-    print(f"Files will be processed in order. First file: {data_files[0]}")
+    log_dataset_plan(data_files)
 
     train_model_parallel(
         data_files=data_files,
