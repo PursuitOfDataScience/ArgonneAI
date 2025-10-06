@@ -1,11 +1,12 @@
 import os
 import json
-from typing import Iterable, List, Optional, Tuple
+import os
+from typing import Iterable, Iterator, List, Optional, Tuple
 
 import torch
 from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
-from datasets import load_dataset, load_from_disk
+from datasets import Dataset, load_dataset, load_from_disk
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 os.environ["HF_DATASETS_CACHE"] = "./.cache"
@@ -104,6 +105,7 @@ def load_tokenizer(tokenizer_name_or_path: str, trust_remote_code: bool = False)
 def streaming_token_generator(
     data_files: Iterable[str],
     hf_tokenizer,
+    block_size: int,
     min_length: int = 0,
 ) -> Iterable[List[int]]:
     dataset = load_dataset("arrow", data_files=list(data_files), streaming=True)
@@ -113,8 +115,9 @@ def streaming_token_generator(
     for example in dataset:
         text = example.get("text", "") if isinstance(example, dict) else ""
         token_ids = hf_tokenizer.encode(text, add_special_tokens=False)
-        if len(token_ids) > max(min_length, 0):
-            yield token_ids
+        for chunk in chunk_tokens(token_ids, block_size):
+            if len(chunk) > max(min_length, 0):
+                yield chunk
 
 
 def load_nonstream_data(
@@ -124,7 +127,7 @@ def load_nonstream_data(
     num_proc: int = 8,
     min_length: int = 0,
 ):
-    processed_dir = "processed_data/tokenized_data"
+    processed_dir = os.path.join("processed_data", f"tokenized_data_bs{block_size}")
     if os.path.exists(processed_dir):
         print(f"Loading cached dataset from '{processed_dir}'...")
         ds = load_from_disk(processed_dir)
@@ -134,24 +137,24 @@ def load_nonstream_data(
     ds_dict = load_dataset("arrow", data_files=list(data_files), streaming=False)
     ds = ds_dict["train"] if "train" in ds_dict else ds_dict
 
-    def tokenize_and_truncate(example):
+    all_chunks: List[List[int]] = []
+    for example in tqdm(ds, desc="Tokenizing", leave=False):
         text = example.get("text", "")
         token_ids = hf_tokenizer.encode(text, add_special_tokens=False)
-        if len(token_ids) < max(block_size + 1, min_length):
-            return {"token_ids": None}
-        token_ids = token_ids[: block_size + 1]
-        return {"token_ids": token_ids}
+        for chunk in chunk_tokens(token_ids, block_size):
+            if len(chunk) >= max(block_size + 1, min_length):
+                all_chunks.append(chunk)
 
-    ds = ds.map(tokenize_and_truncate, batched=False, num_proc=num_proc)
-    ds = ds.filter(lambda ex: ex["token_ids"] is not None, num_proc=num_proc)
+    if not all_chunks:
+        print("No sequences met the minimum length requirement after tokenization.")
+        return []
 
-    if "text" in ds.column_names:
-        ds = ds.remove_columns(["text"])
+    token_dataset = Dataset.from_dict({"token_ids": all_chunks})
 
     os.makedirs(os.path.dirname(processed_dir), exist_ok=True)
-    ds.save_to_disk(processed_dir)
+    token_dataset.save_to_disk(processed_dir)
     print(f"Processed dataset saved to '{processed_dir}'.")
-    return ds["token_ids"]
+    return token_dataset["token_ids"]
 
 
 def collate_batch(token_list_batch: Iterable[List[int]], block_size: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -170,3 +173,28 @@ def collate_batch(token_list_batch: Iterable[List[int]], block_size: int) -> Tup
     x_tensor = torch.tensor(x_list, dtype=torch.long)
     y_tensor = torch.tensor(y_list, dtype=torch.long)
     return x_tensor, y_tensor
+
+def chunk_tokens(
+    tokens: List[int],
+    block_size: int,
+    *,
+    stride: Optional[int] = None,
+) -> Iterator[List[int]]:
+    """Yield non-overlapping chunks of tokens with length block_size + 1."""
+
+    chunk_len = block_size + 1
+    if chunk_len <= 1 or len(tokens) < chunk_len:
+        return
+
+    if stride is None:
+        stride = block_size
+
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+
+    max_start = len(tokens) - chunk_len
+    for start in range(0, max_start + 1, stride):
+        chunk = tokens[start : start + chunk_len]
+        if len(chunk) == chunk_len:
+            yield chunk
+

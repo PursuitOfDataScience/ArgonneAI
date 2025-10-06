@@ -32,8 +32,12 @@ python training.py \
   --warmup-steps 2000 \
   --max-steps 160000 \
   --min-learning-rate 3e-5 \
-  --no-streaming            # optional: load Arrow shards into memory instead of streaming
+--no-streaming            # optional: load Arrow shards into memory instead of streaming
 ```
+
+> **About `torch.compile()`**
+>
+> The launcher now always attempts to wrap the distributed model with `torch.compile()`. PyTorch's dynamo front-end can only lower graphs that live on a single device. When the Argonne model is pipelined across several GPUs, dynamo encounters the cross-device transfers, prints the resulting error, and falls back to eager execution. You still get the fused kernels when running on a single GPU; in the multi-GPU case the runtime continues uncompiled.
 
 Key checkpoints are automatically written every 300 pipeline steps (streaming mode) or every 2,000 steps (non-streaming). To resume, simply point the script at the most recent checkpoint saved under `pretrained/`.
 

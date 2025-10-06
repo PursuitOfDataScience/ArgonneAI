@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 from datasets import Dataset
@@ -12,6 +12,7 @@ from data_processing import (
     collate_batch,
     load_nonstream_data,
     load_tokenizer,
+    chunk_tokens,
 )
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
@@ -33,10 +34,11 @@ class DataPosition:
     def __init__(self, streaming=True):
         """Track dataset position during training"""
         self.streaming = streaming
-        
+
         # For streaming mode
         self.current_file_idx = 0
         self.position_in_file = 0
+        self.chunk_offset = 0
         
         # For non-streaming mode
         self.shuffled_indices = None
@@ -52,15 +54,17 @@ class DataPosition:
             "streaming": self.streaming,
             "current_file_idx": self.current_file_idx,
             "position_in_file": self.position_in_file,
+            "chunk_offset": self.chunk_offset,
             "current_position": self.current_position,
             "epoch": self.epoch,
             "files_processed": sorted(self.files_processed),
         }
 
-    def update_streaming_position(self, file_idx, position, file_path=None):
+    def update_streaming_position(self, file_idx, position, chunk_offset=0, file_path=None):
         """Update streaming position information"""
         self.current_file_idx = file_idx
         self.position_in_file = position
+        self.chunk_offset = chunk_offset
         if file_path:
             self.files_processed.add(os.path.basename(file_path))
     
@@ -80,13 +84,21 @@ class DataPosition:
         if self.streaming:
             self.current_file_idx = 0
             self.position_in_file = 0
+            self.chunk_offset = 0
         else:
             self.current_position = 0
             if total_samples:
                 self.shuffled_indices = torch.randperm(total_samples).tolist()
 
 # Updated streaming token generator to use datasets library
-def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_position=0):
+def streaming_token_generator(
+    data_files,
+    tokenizer,
+    block_size,
+    start_file_idx=0,
+    start_position=0,
+    start_chunk_offset=0,
+):
     """
     Enhanced token generator that supports position tracking.
     
@@ -97,11 +109,13 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
         start_position: Starting position within file
         
     Yields:
-        (tokens, file_idx, position): Tokenized data with position info
+        (tokens, file_idx, position, shard_name, chunk_idx): tokenized chunk with
+        metadata used for resuming and logging
     """
     file_idx = start_file_idx
+    start_file_idx = max(start_file_idx, 0)
     processed_count = 0
-    
+
     while file_idx < len(data_files):
         try:
             file_path = data_files[file_idx]
@@ -121,10 +135,13 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
                 file_idx += 1
                 continue
                 
-            position = start_position  # Start from specified position
-            # Reset start_position for future files
+            position = start_position if file_idx == start_file_idx else 0
+            resume_position = position
+            # Reset resume markers for future files
+            resume_chunk_offset = start_chunk_offset if file_idx == start_file_idx else 0
             start_position = 0
-            
+            start_chunk_offset = 0
+
             # Process entries from current position
             while position < len(dataset):
                 try:
@@ -133,24 +150,36 @@ def streaming_token_generator(data_files, tokenizer, start_file_idx=0, start_pos
                     if 'text' in item and item['text'] and isinstance(item['text'], str):
                         text = item['text']
                         tokens = tokenizer.encode(text, add_special_tokens=False)
-                        processed_count += 1
-                        yield tokens, file_idx, position, shard_name
-                    
+
+                        skip_chunks = (
+                            resume_chunk_offset
+                            if (file_idx == start_file_idx and position == resume_position)
+                            else 0
+                        )
+
+                        for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
+                            if chunk_idx < skip_chunks:
+                                continue
+
+                            processed_count += 1
+                            yield chunk, file_idx, position, shard_name, chunk_idx
+
                 except Exception as e:
                     print(f"Error processing item at position {position}: {e}")
-                
+
+                resume_chunk_offset = 0
                 position += 1
-            
+
             file_idx += 1
-            
+
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
             file_idx += 1
-    
+
     print(f"Completed processing all available files. Processed {processed_count} samples.")
-    
+
     # To be consistent with resume_pretrain.py, return sentinel value instead of raising StopIteration
-    return None, -1, -1, ""
+    return None, -1, -1, "", -1
 
 def train_model_parallel(
     data_files: List[str],
@@ -195,7 +224,10 @@ def train_model_parallel(
     if hf_tokenizer.pad_token is None:
         hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
 
-    hf_tokenizer.model_max_length = block_size
+    current_max_length = getattr(hf_tokenizer, "model_max_length", None)
+    target_max_length = max(block_size + 1, block_size * 2)
+    if current_max_length is None or current_max_length < target_max_length:
+        hf_tokenizer.model_max_length = target_max_length
 
     config_model = ArgonneConfig(
         vocab_size=len(hf_tokenizer),
@@ -261,18 +293,20 @@ def train_model_parallel(
             print(f"Head on device: {model.lm_head.weight.device}")
             
             # Apply torch.compile() for speed optimization whenever possible
-            if len(model.devices) > 1:
-                print(
-                    "torch.compile() is skipped because the model spans multiple GPUs via pipeline parallelism."
-                )
-            elif hasattr(torch, "compile"):
-                print("Applying torch.compile() to optimize model execution...")
+            if hasattr(torch, "compile"):
+                print("Attempting to apply torch.compile() to the distributed model...")
                 try:
                     model = torch.compile(model, mode="default")
                     print("Model compilation successful!")
                 except Exception as e:
-                    print(f"Failed to compile model: {e}")
-                    print("Continuing with uncompiled model.")
+                    print(f"torch.compile failed: {e}")
+                    if len(model.devices) > 1:
+                        print(
+                            "PyTorch can only lower a graph that lives on a single device. "
+                            "Because the pipeline partitions span multiple GPUs, Dynamo "
+                            "breaks the graph and falls back to eager mode."
+                        )
+                    print("Continuing with the eager model implementation.")
             else:
                 print(
                     "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
@@ -301,7 +335,14 @@ def train_model_parallel(
                 ########################################################
                 loss = None
 
-                def run_training_step(x_tens, y_tens, shard_name, file_idx, position):
+                def run_training_step(
+                    x_tens,
+                    y_tens,
+                    shard_name,
+                    file_idx,
+                    position,
+                    chunk_offset,
+                ):
                     nonlocal tokens_in_current_attempt, global_step, loss, stop_training
 
                     batch_tokens = x_tens.numel()
@@ -328,7 +369,8 @@ def train_model_parallel(
                             f"Step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}"
                         )
                         print(
-                            f"Shard: {shard_name} | File index: {file_idx} | Position: {position}"
+                            "Shard: "
+                            f"{shard_name} | File index: {file_idx} | Position: {position} | Chunk: {chunk_offset}"
                         )
                         print(f"Current LR: {current_lr:.6e}")
                         prompt_str = "Long long time ago, "
@@ -377,29 +419,30 @@ def train_model_parallel(
                     token_gen = streaming_token_generator(
                         data_files,
                         hf_tokenizer,
+                        block_size,
                         data_position.current_file_idx,
                         data_position.position_in_file,
+                        data_position.chunk_offset,
                     )
                     token_batch: List[List[int]] = []
                     active_shard = None
-                    last_file_idx = data_position.current_file_idx
-                    last_position = data_position.position_in_file
-                    last_shard_name = active_shard
+                    last_meta: Optional[Tuple[str, int, int, int]] = None
 
                     while True:
                         try:
-                            tokens, file_idx, position, shard_name = next(token_gen)
+                            tokens, file_idx, position, shard_name, chunk_idx = next(token_gen)
                         except StopIteration:
                             if token_batch:
                                 x_tens, y_tens = collate_batch(token_batch, block_size)
                                 token_batch.clear()
-                                if x_tens is not None:
+                                if x_tens is not None and last_meta is not None:
                                     run_training_step(
                                         x_tens,
                                         y_tens,
-                                        last_shard_name or active_shard or "final_shard",
-                                        last_file_idx,
-                                        last_position,
+                                        last_meta[0],
+                                        last_meta[1],
+                                        last_meta[2],
+                                        last_meta[3],
                                     )
 
                             print(
@@ -415,14 +458,14 @@ def train_model_parallel(
                             active_shard = shard_name
 
                         token_batch.append(tokens)
+                        meta = (shard_name, file_idx, position, chunk_idx)
+                        last_meta = meta
                         data_position.update_streaming_position(
                             file_idx,
                             position,
+                            chunk_idx,
                             data_files[file_idx],
                         )
-                        last_file_idx = file_idx
-                        last_position = position
-                        last_shard_name = shard_name
 
                         if len(token_batch) < batch_size:
                             continue
@@ -432,7 +475,15 @@ def train_model_parallel(
                         if x_tens is None:
                             continue
 
-                        run_training_step(x_tens, y_tens, shard_name, file_idx, position)
+                        if last_meta is not None:
+                            run_training_step(
+                                x_tens,
+                                y_tens,
+                                last_meta[0],
+                                last_meta[1],
+                                last_meta[2],
+                                last_meta[3],
+                            )
                         if stop_training:
                             break
 
