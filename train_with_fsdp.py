@@ -78,9 +78,10 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
-def build_model(args: argparse.Namespace, tokenizer_vocab_size: int) -> ArgonneModel:
+def build_model(args: argparse.Namespace, tokenizer) -> ArgonneModel:
+    vocab_size = len(tokenizer)
     config = ArgonneConfig(
-        vocab_size=tokenizer_vocab_size,
+        vocab_size=vocab_size,
         max_position_embeddings=args.sequence_length,
         hidden_size=args.model_dim,
         num_hidden_layers=args.num_layers,
@@ -90,6 +91,9 @@ def build_model(args: argparse.Namespace, tokenizer_vocab_size: int) -> ArgonneM
         attention_dropout=args.dropout,
         rope_theta=args.rope_theta,
         use_gradient_checkpointing=args.gradient_checkpointing,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=getattr(tokenizer, "bos_token_id", None),
+        eos_token_id=tokenizer.eos_token_id,
     )
     model = ArgonneModel(config)
     if args.gradient_checkpointing:
@@ -251,11 +255,7 @@ def run_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     validate_tokenizer_path(args.tokenizer_path)
     tokenizer = load_tokenizer(args.tokenizer_path, trust_remote_code=args.trust_remote_code)
-    tokenizer_vocab_size = tokenizer.vocab_size
-    if hasattr(tokenizer, "get_added_vocab"):
-        tokenizer_vocab_size += len(tokenizer.get_added_vocab())
-
-    model = build_model(args, tokenizer_vocab_size=tokenizer_vocab_size)
+    model = build_model(args, tokenizer)
     device = torch.device(f"cuda:{rank}")
     model.to(device)
 

@@ -209,6 +209,9 @@ def train_model_parallel(
         attention_dropout=0.0,
         use_flash_attention=True,
         tie_word_embeddings=False,
+        pad_token_id=hf_tokenizer.pad_token_id,
+        bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
+        eos_token_id=hf_tokenizer.eos_token_id,
     )
     
     # Load non-streaming dataset once, outside the retry loop
