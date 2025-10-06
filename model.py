@@ -168,11 +168,11 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if position_ids is None:
-        cos = cos[:, None, None, :]
-        sin = sin[:, None, None, :]
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
     else:
-        cos = cos[position_ids].unsqueeze(2)
-        sin = sin[position_ids].unsqueeze(2)
+        cos = cos[position_ids].unsqueeze(1)
+        sin = sin[position_ids].unsqueeze(1)
 
     return (
         (q * cos) + (rotate_half(q) * sin),
