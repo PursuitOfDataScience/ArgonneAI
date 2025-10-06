@@ -265,6 +265,43 @@ def train_model_parallel(
 
     # Main training loop with batch size adjustment
     stop_training = False
+    min_lr = min(min_learning_rate, learning_rate)
+    global_step = 0
+    model = None
+    optimizer = None
+    scaler = None
+
+    def handle_oom_error(error: Exception) -> bool:
+        """Adjust batch size after an out-of-memory error.
+
+        Returns True if training should retry with a smaller batch size,
+        or False if training should abort because the minimum batch size was reached.
+        """
+
+        nonlocal batch_size, model, optimizer, scaler
+
+        error_message = str(error)
+        print("CUDA Out of Memory detected during training attempt.")
+        if error_message:
+            first_line = error_message.splitlines()[0]
+            print(f"Details: {first_line}")
+
+        model = None
+        optimizer = None
+        scaler = None
+        torch.cuda.empty_cache()
+
+        new_batch_size = max(batch_size - 12, min_batch_size)
+
+        if new_batch_size == batch_size:
+            print(f"Already at minimum batch size ({min_batch_size}). Training failed.")
+            return False
+
+        print(f"CUDA Out of Memory! Reducing batch size from {batch_size} to {new_batch_size}")
+        batch_size = new_batch_size
+
+        time.sleep(5)
+        return True
 
     while True:
         print(f"\n=== Attempting training with batch_size = {batch_size} ===")
@@ -320,7 +357,6 @@ def train_model_parallel(
             tokens_in_current_attempt = 0  # Track tokens in this training attempt
             first_device = model.devices[0]  # Store the first device for consistency
 
-            min_lr = min(min_learning_rate, learning_rate)
             scheduler = CosineWarmupScheduler(
                 optimizer,
                 base_lr=learning_rate,
@@ -590,32 +626,29 @@ def train_model_parallel(
             )
             break
             
-        except torch.cuda.OutOfMemoryError:
-            # Free memory
-            del model, optimizer, scaler
-            torch.cuda.empty_cache()
-            
-            # Reduce batch size
-            new_batch_size = max(batch_size - 12, min_batch_size)
-            
-            if new_batch_size == batch_size:
-                print(f"Already at minimum batch size ({min_batch_size}). Training failed.")
-                break
-                
-            print(f"CUDA Out of Memory! Reducing batch size from {batch_size} to {new_batch_size}")
-            batch_size = new_batch_size
-            
-            # Short pause to ensure memory is freed
-            time.sleep(5)
-        
+        except torch.cuda.OutOfMemoryError as e:
+            if handle_oom_error(e):
+                continue
+            break
+
         except RuntimeError as e:
-            print(f"Runtime error occurred: {str(e)}")
-            if "Expected all tensors to be on the same device" in str(e):
+            message = str(e)
+            if "out of memory" in message.lower():
+                if handle_oom_error(e):
+                    continue
+                break
+
+            print(f"Runtime error occurred: {message}")
+            if "Expected all tensors to be on the same device" in message:
                 print("\nDevice mismatch error detected. This might be due to improper tensor movement between pipeline stages.")
                 print("Check the error message for which devices are mismatched and verify the model distribution.")
             raise e  # Re-raise to see the full stack trace
 
     # Save token count to a file for reporting
+    if final_batch_size is None:
+        print("Training did not complete successfully. Exiting without saving stats or model.")
+        return
+
     training_stats = {
         "total_tokens": total_tokens_processed,
         "batch_size": batch_size,
@@ -731,13 +764,9 @@ def main():
     if args.data_glob != os.path.join("..", "data", "*.arrow"):
         fallback_patterns.insert(0, os.path.join("..", "data", "*.arrow"))
 
-    data_files, used_patterns = resolve_data_files(
+    data_files, _ = resolve_data_files(
         args.data_glob, fallback_patterns=fallback_patterns
     )
-
-    print("Discovered dataset shards using patterns:")
-    for pattern in used_patterns:
-        print(f"  - {pattern}")
 
     log_dataset_plan(data_files)
 
