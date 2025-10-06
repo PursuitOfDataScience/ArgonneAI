@@ -293,18 +293,20 @@ def train_model_parallel(
             print(f"Head on device: {model.lm_head.weight.device}")
             
             # Apply torch.compile() for speed optimization whenever possible
-            if len(model.devices) > 1:
-                print(
-                    "torch.compile() is skipped because the model spans multiple GPUs via pipeline parallelism."
-                )
-            elif hasattr(torch, "compile"):
-                print("Applying torch.compile() to optimize model execution...")
+            if hasattr(torch, "compile"):
+                print("Attempting to apply torch.compile() to the distributed model...")
                 try:
                     model = torch.compile(model, mode="default")
                     print("Model compilation successful!")
                 except Exception as e:
-                    print(f"Failed to compile model: {e}")
-                    print("Continuing with uncompiled model.")
+                    print(f"torch.compile failed: {e}")
+                    if len(model.devices) > 1:
+                        print(
+                            "PyTorch can only lower a graph that lives on a single device. "
+                            "Because the pipeline partitions span multiple GPUs, Dynamo "
+                            "breaks the graph and falls back to eager mode."
+                        )
+                    print("Continuing with the eager model implementation.")
             else:
                 print(
                     "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
