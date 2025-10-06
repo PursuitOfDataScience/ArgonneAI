@@ -138,7 +138,9 @@ def shard_streaming_generator(
     block_size: int,
 ) -> Iterable[List[int]]:
     for sample_index, tokens in enumerate(
-        streaming_token_generator(data_files, tokenizer, min_length=min_length)
+        streaming_token_generator(
+            data_files, tokenizer, block_size, min_length=min_length
+        )
     ):
         if sample_index % world_size != rank:
             continue
