@@ -38,9 +38,21 @@ class ArgonneConfig(PretrainedConfig):
         tie_word_embeddings: bool = True,
         attention_bias: bool = False,
         mlp_bias: bool = False,
+        pad_token_id: Optional[int] = None,
+        bos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        pad_token_id = pad_token_id if pad_token_id is not None else kwargs.pop("pad_token_id", None)
+        bos_token_id = bos_token_id if bos_token_id is not None else kwargs.pop("bos_token_id", None)
+        eos_token_id = eos_token_id if eos_token_id is not None else kwargs.pop("eos_token_id", None)
+
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
         # Backwards compatibility with Argonne 1.x naming.
         if "n_layer" in kwargs:
             num_hidden_layers = kwargs["n_layer"]
@@ -80,6 +92,9 @@ class ArgonneConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
+
+        if self.pad_token_id is None and self.eos_token_id is not None:
+            self.pad_token_id = self.eos_token_id
 
         # Backwards compatibility aliases
         self.n_embd = self.hidden_size
@@ -335,6 +350,27 @@ class ArgonneModel(PreTrainedModel):
         self.pipeline_partitions: Optional[List[Tuple[int, int, torch.device]]] = None
         self.devices: List[torch.device] = []
         self.post_init()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def set_input_embeddings(self, new_embeddings: nn.Embedding) -> None:
+        self.embed_tokens = new_embeddings
+        self.config.vocab_size = new_embeddings.num_embeddings
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+        if isinstance(new_embeddings, nn.Linear):
+            self.config.vocab_size = new_embeddings.out_features
+
+    def tie_weights(self) -> None:
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):

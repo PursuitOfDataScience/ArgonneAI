@@ -201,7 +201,10 @@ def resume_training(
         n_layer=16,
         n_head=16,
         n_embd=1296,
-        dropout=0.1
+        dropout=0.1,
+        pad_token_id=hf_tokenizer.pad_token_id,
+        bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
+        eos_token_id=hf_tokenizer.eos_token_id,
     )
     base_model = ArgonneModel(config)
     
