@@ -70,11 +70,6 @@ def log_dataset_plan(files: Sequence[str]) -> None:
         return
 
     common_root = os.path.commonpath(files)
-    print("=== Dataset shard order ===")
-    print(f"Root directory: {common_root}")
-    for idx, path in enumerate(files, start=1):
-        print(f"  [{idx:03d}] {os.path.basename(path)}")
-    print("===========================")
 
 
 def validate_tokenizer_path(path: str) -> str:
