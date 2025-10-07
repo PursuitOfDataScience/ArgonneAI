@@ -214,6 +214,10 @@ def train_model_parallel(
     initial_batch_size = 512  # initial batch size
     min_batch_size = 12  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
+
+    # Binary search bookkeeping for automatic batch-size discovery
+    largest_successful_batch = None  # highest batch size that trained without OOM
+    smallest_failed_batch = None  # lowest batch size that triggered OOM
     
     validate_tokenizer_path(tokenizer_path)
     hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
@@ -278,7 +282,7 @@ def train_model_parallel(
         or False if training should abort because the minimum batch size was reached.
         """
 
-        nonlocal batch_size, model, optimizer, scaler
+        nonlocal batch_size, model, optimizer, scaler, largest_successful_batch, smallest_failed_batch
 
         error_message = str(error)
         print("CUDA Out of Memory detected during training attempt.")
@@ -291,14 +295,32 @@ def train_model_parallel(
         scaler = None
         torch.cuda.empty_cache()
 
-        new_batch_size = max(batch_size - 12, min_batch_size)
+        # Update the binary-search upper bound with the newly failed batch size.
+        if smallest_failed_batch is None or batch_size < smallest_failed_batch:
+            smallest_failed_batch = batch_size
 
-        if new_batch_size == batch_size:
-            print(f"Already at minimum batch size ({min_batch_size}). Training failed.")
-            return False
+        if largest_successful_batch is None:
+            candidate = batch_size // 2
+        else:
+            candidate = (largest_successful_batch + smallest_failed_batch) // 2
 
-        print(f"CUDA Out of Memory! Reducing batch size from {batch_size} to {new_batch_size}")
-        batch_size = new_batch_size
+        candidate = max(candidate, min_batch_size)
+
+        if candidate == batch_size:
+            if candidate <= min_batch_size:
+                print(
+                    f"Already at minimum batch size ({min_batch_size}). Training failed."
+                )
+                return False
+
+            candidate = max(candidate - 1, min_batch_size)
+
+        print(
+            "CUDA Out of Memory! Reducing batch size from "
+            f"{batch_size} to {candidate} (search bounds: "
+            f"best_success={largest_successful_batch}, failed={smallest_failed_batch})"
+        )
+        batch_size = candidate
 
         time.sleep(5)
         return True
@@ -618,6 +640,11 @@ def train_model_parallel(
             # Update total token count for successful training
             total_tokens_processed = tokens_in_current_attempt
             final_batch_size = batch_size
+            if (
+                largest_successful_batch is None
+                or batch_size > largest_successful_batch
+            ):
+                largest_successful_batch = batch_size
             print(f"Training completed successfully with batch_size={batch_size}")
             print(f"Total tokens processed during training: {total_tokens_processed:,}")
             print(
