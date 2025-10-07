@@ -1,5 +1,5 @@
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from typing import List, Optional, Tuple
 
 import torch
@@ -452,13 +452,17 @@ class ArgonneModel(PreTrainedModel):
                 reserve = max(0, min(remaining_devices - 1, remaining_blocks - 1))
                 max_cut = prev_cut + (remaining_blocks - reserve)
                 lo = prev_cut + 1
-                hi = max_cut + 1
-                target_total = per_device_target * (idx + 1)
-                cut = bisect_left(block_cumsum, target_total, lo=lo, hi=hi)
-                if cut < lo:
+                device_overhead = 0
+                if idx == 0:
+                    device_overhead = embed_bytes + rotary_bytes
+                available_block_bytes = per_device_target - device_overhead
+                if available_block_bytes <= 0:
                     cut = lo
-                if cut > max_cut:
-                    cut = max_cut
+                else:
+                    target_total = block_cumsum[prev_cut] + available_block_bytes
+                    cut = bisect_right(block_cumsum, target_total, lo=lo, hi=max_cut + 1) - 1
+                    if cut < lo:
+                        cut = lo
             per_device_counts[idx] = cut - prev_cut
             prev_cut = cut
 
