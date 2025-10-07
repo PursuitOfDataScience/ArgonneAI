@@ -454,6 +454,17 @@ class ArgonneModel(PreTrainedModel):
             per_device_counts[idx] = cut - prev_cut
             prev_cut = cut
 
+        device_block_bytes: List[int] = []
+        cursor = 0
+        for block_count in per_device_counts:
+            if block_count <= 0:
+                device_block_bytes.append(0)
+                continue
+            next_cursor = min(cursor + block_count, num_blocks)
+            block_bytes = block_cumsum[next_cursor] - block_cumsum[cursor]
+            device_block_bytes.append(block_bytes)
+            cursor = next_cursor
+
         partitions: List[Tuple[int, int, torch.device]] = []
         start_idx = 0
         for device, block_count in zip(self.devices, per_device_counts):
@@ -469,9 +480,46 @@ class ArgonneModel(PreTrainedModel):
             partitions.append((0, num_blocks, self.devices[0]))
             if per_device_counts:
                 per_device_counts[0] = num_blocks
+                if not device_block_bytes:
+                    device_block_bytes.append(block_cumsum[num_blocks])
+            if not device_block_bytes:
+                device_block_bytes = [block_cumsum[num_blocks]]
+        else:
+            # Ensure the block byte accounting covers all devices, including those without partitions.
+            if len(device_block_bytes) < len(self.devices):
+                device_block_bytes.extend([0] * (len(self.devices) - len(device_block_bytes)))
 
         self.pipeline_partitions = partitions
         self.output_device = partitions[-1][2]
+
+        if len(self.devices) == 1:
+            output_device_idx = 0
+        else:
+            output_payload = norm_bytes + head_bytes
+            best_idx = 0
+            best_max_load: Optional[int] = None
+            best_load_with_output: Optional[int] = None
+
+            for idx, base_load in enumerate(device_block_bytes):
+                load_with_output = base_load + output_payload
+                max_load = load_with_output
+                for jdx, other_load in enumerate(device_block_bytes):
+                    if jdx == idx:
+                        continue
+                    if other_load > max_load:
+                        max_load = other_load
+                if best_max_load is None or max_load < best_max_load:
+                    best_max_load = max_load
+                    best_load_with_output = load_with_output
+                    best_idx = idx
+                elif max_load == best_max_load:
+                    if best_load_with_output is None or load_with_output < best_load_with_output:
+                        best_load_with_output = load_with_output
+                        best_idx = idx
+
+            output_device_idx = best_idx
+
+        self.output_device = self.devices[output_device_idx]
 
         first_device = partitions[0][2]
         self.embed_tokens = self.embed_tokens.to(first_device)
@@ -498,7 +546,10 @@ class ArgonneModel(PreTrainedModel):
             end = start + block_count
             running = end
             print(f"  Stage {idx}: layers {start}-{end - 1} on {device}")
-        print(f"  Final RMSNorm and LM head on {self.output_device}")
+        print(
+            "  Final RMSNorm and LM head on "
+            f"{self.output_device} (stage {output_device_idx})"
+        )
 
     def forward(
         self,
