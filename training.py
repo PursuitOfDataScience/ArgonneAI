@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from typing import List, Optional, Tuple
 
 import torch
@@ -287,8 +288,17 @@ def train_model_parallel(
         error_message = str(error)
         print("CUDA Out of Memory detected during training attempt.")
         if error_message:
-            first_line = error_message.splitlines()[0]
-            print(f"Details: {first_line}")
+            print("Full error message:")
+            print(error_message)
+
+        tb = getattr(error, "__traceback__", None)
+        if tb is not None:
+            formatted_traceback = "".join(
+                traceback.format_exception(type(error), error, tb)
+            ).rstrip()
+            if formatted_traceback:
+                print("Traceback:")
+                print(formatted_traceback)
 
         model = None
         optimizer = None

@@ -1,5 +1,5 @@
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from typing import List, Optional, Tuple
 
 import torch
@@ -421,13 +421,21 @@ class ArgonneModel(PreTrainedModel):
         for size in block_param_bytes:
             block_cumsum.append(block_cumsum[-1] + size)
 
+        embed_bytes = sum(p.numel() * p.element_size() for p in self.embed_tokens.parameters())
+        rotary_bytes = sum(p.numel() * p.element_size() for p in self.rotary_emb.parameters())
         norm_bytes = sum(p.numel() * p.element_size() for p in self.norm.parameters())
         head_dtype_size = self.embed_tokens.weight.element_size()
         head_bytes = self.config.hidden_size * self.config.vocab_size * head_dtype_size
         if self.config.tie_word_embeddings and len(self.devices) == 1:
             head_bytes = 0
 
-        total_bytes = block_cumsum[-1] + norm_bytes + head_bytes
+        total_bytes = (
+            block_cumsum[-1]
+            + norm_bytes
+            + head_bytes
+            + embed_bytes
+            + rotary_bytes
+        )
         per_device_target = total_bytes / len(self.devices)
 
         per_device_counts: List[int] = [0] * len(self.devices)
@@ -444,24 +452,34 @@ class ArgonneModel(PreTrainedModel):
                 reserve = max(0, min(remaining_devices - 1, remaining_blocks - 1))
                 max_cut = prev_cut + (remaining_blocks - reserve)
                 lo = prev_cut + 1
-                hi = max_cut + 1
-                target_total = per_device_target * (idx + 1)
-                cut = bisect_left(block_cumsum, target_total, lo=lo, hi=hi)
-                if cut < lo:
+                device_overhead = 0
+                if idx == 0:
+                    device_overhead = embed_bytes + rotary_bytes
+                available_block_bytes = per_device_target - device_overhead
+                if available_block_bytes <= 0:
                     cut = lo
-                if cut > max_cut:
-                    cut = max_cut
+                else:
+                    target_total = block_cumsum[prev_cut] + available_block_bytes
+                    cut = bisect_right(block_cumsum, target_total, lo=lo, hi=max_cut + 1) - 1
+                    if cut < lo:
+                        cut = lo
             per_device_counts[idx] = cut - prev_cut
             prev_cut = cut
 
         device_block_bytes: List[int] = []
         cursor = 0
-        for block_count in per_device_counts:
+        first_partition_idx = next(
+            (i for i, count in enumerate(per_device_counts) if count > 0),
+            0,
+        )
+        for idx, block_count in enumerate(per_device_counts):
             if block_count <= 0:
                 device_block_bytes.append(0)
                 continue
             next_cursor = min(cursor + block_count, num_blocks)
             block_bytes = block_cumsum[next_cursor] - block_cumsum[cursor]
+            if idx == first_partition_idx:
+                block_bytes += embed_bytes + rotary_bytes
             device_block_bytes.append(block_bytes)
             cursor = next_cursor
 
@@ -497,8 +515,17 @@ class ArgonneModel(PreTrainedModel):
         else:
             output_payload = norm_bytes + head_bytes
             best_idx = 0
-            best_max_load: Optional[int] = None
-            best_load_with_output: Optional[int] = None
+            best_score: Optional[Tuple[int, float]] = None
+            device_free_bytes: List[Optional[int]] = []
+            for device in self.devices:
+                try:
+                    free_bytes, total_bytes_device = torch.cuda.mem_get_info(device)
+                except Exception:
+                    free_bytes = None
+                    total_bytes_device = None
+                device_free_bytes.append(
+                    free_bytes if free_bytes is not None else total_bytes_device
+                )
 
             for idx, base_load in enumerate(device_block_bytes):
                 load_with_output = base_load + output_payload
@@ -508,14 +535,17 @@ class ArgonneModel(PreTrainedModel):
                         continue
                     if other_load > max_load:
                         max_load = other_load
-                if best_max_load is None or max_load < best_max_load:
-                    best_max_load = max_load
-                    best_load_with_output = load_with_output
+
+                capacity = device_free_bytes[idx]
+                if capacity and capacity > 0:
+                    utilization = load_with_output / capacity
+                else:
+                    utilization = float("inf")
+
+                score = (max_load, utilization)
+                if best_score is None or score < best_score:
+                    best_score = score
                     best_idx = idx
-                elif max_load == best_max_load:
-                    if best_load_with_output is None or load_with_output < best_load_with_output:
-                        best_load_with_output = load_with_output
-                        best_idx = idx
 
             output_device_idx = best_idx
 
@@ -546,10 +576,16 @@ class ArgonneModel(PreTrainedModel):
             end = start + block_count
             running = end
             print(f"  Stage {idx}: layers {start}-{end - 1} on {device}")
+            estimated_gb = device_block_bytes[idx] / (1024 ** 3)
+            print(f"           ≈{estimated_gb:.2f} GB of parameters")
         print(
             "  Final RMSNorm and LM head on "
             f"{self.output_device} (stage {output_device_idx})"
         )
+        output_gb = (device_block_bytes[output_device_idx] + norm_bytes + head_bytes) / (
+            1024 ** 3
+        )
+        print(f"           Estimated post-head load: ≈{output_gb:.2f} GB")
 
     def forward(
         self,
