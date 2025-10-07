@@ -659,7 +659,7 @@ class ArgonneModel(PreTrainedModel):
             else:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            input_ids = torch.cat([input_ids, next_token.to(input_ids.device)], dim=-1)
             if input_ids.shape[1] >= max_length:
                 break
         return input_ids.to(device)
