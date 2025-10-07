@@ -490,6 +490,7 @@ class ArgonneModel(PreTrainedModel):
                 device_block_bytes.extend([0] * (len(self.devices) - len(device_block_bytes)))
 
         self.pipeline_partitions = partitions
+        self.output_device = partitions[-1][2]
 
         if len(self.devices) == 1:
             output_device_idx = 0
