@@ -267,7 +267,11 @@ class GroupedQueryAttention(nn.Module):
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, self.hidden_size)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(bsz, seqlen, self.num_heads * self.head_dim)
+        )
         return self.o_proj(attn_output)
 
 
