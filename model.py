@@ -267,7 +267,11 @@ class GroupedQueryAttention(nn.Module):
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, self.hidden_size)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(bsz, seqlen, self.num_heads * self.head_dim)
+        )
         return self.o_proj(attn_output)
 
 
@@ -466,22 +470,62 @@ class ArgonneModel(PreTrainedModel):
             per_device_counts[idx] = cut - prev_cut
             prev_cut = cut
 
-        device_block_bytes: List[int] = []
-        cursor = 0
-        first_partition_idx = next(
-            (i for i, count in enumerate(per_device_counts) if count > 0),
-            0,
-        )
-        for idx, block_count in enumerate(per_device_counts):
-            if block_count <= 0:
-                device_block_bytes.append(0)
-                continue
-            next_cursor = min(cursor + block_count, num_blocks)
-            block_bytes = block_cumsum[next_cursor] - block_cumsum[cursor]
-            if idx == first_partition_idx:
-                block_bytes += embed_bytes + rotary_bytes
-            device_block_bytes.append(block_bytes)
-            cursor = next_cursor
+        def compute_device_block_bytes() -> List[int]:
+            device_block_bytes: List[int] = []
+            cursor = 0
+            first_partition_idx = next(
+                (i for i, count in enumerate(per_device_counts) if count > 0),
+                0,
+            )
+            for idx, block_count in enumerate(per_device_counts):
+                if block_count <= 0:
+                    device_block_bytes.append(0)
+                    continue
+                next_cursor = min(cursor + block_count, num_blocks)
+                block_bytes = block_cumsum[next_cursor] - block_cumsum[cursor]
+                if idx == first_partition_idx:
+                    block_bytes += embed_bytes + rotary_bytes
+                device_block_bytes.append(block_bytes)
+                cursor = next_cursor
+            if len(device_block_bytes) < len(self.devices):
+                device_block_bytes.extend(
+                    [0] * (len(self.devices) - len(device_block_bytes))
+                )
+            return device_block_bytes
+
+        output_payload = norm_bytes + head_bytes
+
+        device_block_bytes = compute_device_block_bytes()
+        positive_indices = [i for i, count in enumerate(per_device_counts) if count > 0]
+        if positive_indices:
+            last_idx = positive_indices[-1]
+            while True:
+                if per_device_counts[last_idx] <= 1:
+                    break
+                other_indices = positive_indices[:-1]
+                if not other_indices:
+                    break
+                other_loads = [device_block_bytes[i] for i in other_indices]
+                max_other = max(other_loads) if other_loads else 0
+                if max_other == 0:
+                    break
+                last_load_with_head = device_block_bytes[last_idx] + output_payload
+                if last_load_with_head <= max_other:
+                    break
+                prev_idx = other_indices[-1]
+                if per_device_counts[prev_idx] <= 0:
+                    break
+                per_device_counts[last_idx] -= 1
+                per_device_counts[prev_idx] += 1
+                device_block_bytes = compute_device_block_bytes()
+                positive_indices = [
+                    i for i, count in enumerate(per_device_counts) if count > 0
+                ]
+                last_idx = positive_indices[-1]
+
+        device_block_bytes = compute_device_block_bytes()
+        positive_indices = [i for i, count in enumerate(per_device_counts) if count > 0]
+        last_active_idx = positive_indices[-1] if positive_indices else 0
 
         partitions: List[Tuple[int, int, torch.device]] = []
         start_idx = 0
@@ -502,54 +546,10 @@ class ArgonneModel(PreTrainedModel):
                     device_block_bytes.append(block_cumsum[num_blocks])
             if not device_block_bytes:
                 device_block_bytes = [block_cumsum[num_blocks]]
-        else:
-            # Ensure the block byte accounting covers all devices, including those without partitions.
-            if len(device_block_bytes) < len(self.devices):
-                device_block_bytes.extend([0] * (len(self.devices) - len(device_block_bytes)))
 
         self.pipeline_partitions = partitions
         self.output_device = partitions[-1][2]
-
-        if len(self.devices) == 1:
-            output_device_idx = 0
-        else:
-            output_payload = norm_bytes + head_bytes
-            best_idx = 0
-            best_score: Optional[Tuple[int, float]] = None
-            device_free_bytes: List[Optional[int]] = []
-            for device in self.devices:
-                try:
-                    free_bytes, total_bytes_device = torch.cuda.mem_get_info(device)
-                except Exception:
-                    free_bytes = None
-                    total_bytes_device = None
-                device_free_bytes.append(
-                    free_bytes if free_bytes is not None else total_bytes_device
-                )
-
-            for idx, base_load in enumerate(device_block_bytes):
-                load_with_output = base_load + output_payload
-                max_load = load_with_output
-                for jdx, other_load in enumerate(device_block_bytes):
-                    if jdx == idx:
-                        continue
-                    if other_load > max_load:
-                        max_load = other_load
-
-                capacity = device_free_bytes[idx]
-                if capacity and capacity > 0:
-                    utilization = load_with_output / capacity
-                else:
-                    utilization = float("inf")
-
-                score = (max_load, utilization)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_idx = idx
-
-            output_device_idx = best_idx
-
-        self.output_device = self.devices[output_device_idx]
+        output_device_idx = last_active_idx
 
         first_device = partitions[0][2]
         self.embed_tokens = self.embed_tokens.to(first_device)
