@@ -236,7 +236,7 @@ def train_model_parallel(
     config_model = ArgonneConfig(
         vocab_size=len(hf_tokenizer),
         max_position_embeddings=block_size,
-        hidden_size=5120,
+        hidden_size=4096,
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=8,
