@@ -1,4 +1,5 @@
 import math
+from bisect import bisect_left
 from typing import List, Optional, Tuple
 
 import torch
@@ -349,6 +350,7 @@ class ArgonneModel(PreTrainedModel):
         self.gradient_checkpointing = config.use_gradient_checkpointing
         self.pipeline_partitions: Optional[List[Tuple[int, int, torch.device]]] = None
         self.devices: List[torch.device] = []
+        self.output_device: torch.device = self.embed_tokens.weight.device
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -404,14 +406,60 @@ class ArgonneModel(PreTrainedModel):
 
         self.devices = [torch.device(d) for d in device_ids]
         num_blocks = len(self.blocks)
-        blocks_per_device = math.ceil(num_blocks / len(self.devices))
+
+        if num_blocks == 0:
+            raise ValueError("The model has no transformer blocks to distribute.")
+
+        block_param_bytes: List[int] = []
+        for block in self.blocks:
+            size_bytes = 0
+            for param in block.parameters():
+                size_bytes += param.numel() * param.element_size()
+            block_param_bytes.append(size_bytes)
+
+        block_cumsum: List[int] = [0]
+        for size in block_param_bytes:
+            block_cumsum.append(block_cumsum[-1] + size)
+
+        norm_bytes = sum(p.numel() * p.element_size() for p in self.norm.parameters())
+        head_dtype_size = self.embed_tokens.weight.element_size()
+        head_bytes = self.config.hidden_size * self.config.vocab_size * head_dtype_size
+        if self.config.tie_word_embeddings and len(self.devices) == 1:
+            head_bytes = 0
+
+        total_bytes = block_cumsum[-1] + norm_bytes + head_bytes
+        per_device_target = total_bytes / len(self.devices)
+
+        per_device_counts: List[int] = [0] * len(self.devices)
+        prev_cut = 0
+        for idx, _ in enumerate(self.devices):
+            remaining_devices = len(self.devices) - idx
+            remaining_blocks = num_blocks - prev_cut
+            if remaining_blocks <= 0:
+                per_device_counts[idx] = 0
+                continue
+            if remaining_devices == 1:
+                cut = num_blocks
+            else:
+                reserve = max(0, min(remaining_devices - 1, remaining_blocks - 1))
+                max_cut = prev_cut + (remaining_blocks - reserve)
+                lo = prev_cut + 1
+                hi = max_cut + 1
+                target_total = per_device_target * (idx + 1)
+                cut = bisect_left(block_cumsum, target_total, lo=lo, hi=hi)
+                if cut < lo:
+                    cut = lo
+                if cut > max_cut:
+                    cut = max_cut
+            per_device_counts[idx] = cut - prev_cut
+            prev_cut = cut
 
         partitions: List[Tuple[int, int, torch.device]] = []
         start_idx = 0
-        for device in self.devices:
-            end_idx = min(start_idx + blocks_per_device, num_blocks)
-            if start_idx >= end_idx:
-                break
+        for device, block_count in zip(self.devices, per_device_counts):
+            if block_count <= 0 or start_idx >= num_blocks:
+                continue
+            end_idx = min(start_idx + block_count, num_blocks)
             for block in self.blocks[start_idx:end_idx]:
                 block.to(device)
             partitions.append((start_idx, end_idx, device))
@@ -419,28 +467,38 @@ class ArgonneModel(PreTrainedModel):
 
         if not partitions:
             partitions.append((0, num_blocks, self.devices[0]))
+            if per_device_counts:
+                per_device_counts[0] = num_blocks
 
         self.pipeline_partitions = partitions
+        self.output_device = partitions[-1][2]
 
-        first_device = self.devices[0]
-        last_device = self.devices[-1]
+        first_device = partitions[0][2]
         self.embed_tokens = self.embed_tokens.to(first_device)
         self.rotary_emb = self.rotary_emb.to(first_device)
-        self.norm = self.norm.to(last_device)
+        self.norm = self.norm.to(self.output_device)
 
         if self.config.tie_word_embeddings and len(self.devices) > 1:
             untied_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-            untied_head.to(last_device)
+            untied_head.to(self.output_device)
             with torch.no_grad():
-                untied_head.weight.copy_(self.embed_tokens.weight.to(last_device))
+                untied_head.weight.copy_(self.embed_tokens.weight.to(self.output_device))
             self.lm_head = untied_head
             self.config.tie_word_embeddings = False
         else:
-            self.lm_head = self.lm_head.to(last_device)
+            self.lm_head = self.lm_head.to(self.output_device)
 
         print(f"Model distributed across {len(self.devices)} devices.")
-        for idx, (start, end, device) in enumerate(self.pipeline_partitions):
+        running = 0
+        for idx, (block_count, device) in enumerate(zip(per_device_counts, self.devices)):
+            if block_count <= 0:
+                print(f"  Stage {idx}: no transformer blocks on {device}")
+                continue
+            start = running
+            end = start + block_count
+            running = end
             print(f"  Stage {idx}: layers {start}-{end - 1} on {device}")
+        print(f"  Final RMSNorm and LM head on {self.output_device}")
 
     def forward(
         self,
@@ -452,10 +510,11 @@ class ArgonneModel(PreTrainedModel):
         batch_size, seq_length = input_ids.shape
 
         if self.pipeline_partitions:
+            first_device = self.pipeline_partitions[0][2]
             if attention_mask is not None:
-                attention_mask = attention_mask.to(self.devices[0])
+                attention_mask = attention_mask.to(first_device)
 
-            hidden_states = self.embed_tokens(input_ids.to(self.devices[0]))
+            hidden_states = self.embed_tokens(input_ids.to(first_device))
             cos, sin = self.rotary_emb(hidden_states, seq_length)
 
             for start, end, device in self.pipeline_partitions:
@@ -476,7 +535,7 @@ class ArgonneModel(PreTrainedModel):
                     else:
                         hidden_states = layer(hidden_states, rotary, attn_mask)
 
-            hidden_states = hidden_states.to(self.devices[-1])
+            hidden_states = hidden_states.to(self.output_device)
         else:
             device = self.embed_tokens.weight.device
             if attention_mask is not None:
@@ -525,7 +584,7 @@ class ArgonneModel(PreTrainedModel):
         do_sample: bool = True,
     ) -> torch.Tensor:
         self.eval()
-        device = self.devices[0] if self.pipeline_partitions else self.embed_tokens.weight.device
+        device = self.pipeline_partitions[0][2] if self.pipeline_partitions else self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
         while input_ids.shape[1] < max_length:
             chunk = input_ids[:, -self.config.max_position_embeddings :]
