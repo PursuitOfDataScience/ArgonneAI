@@ -404,14 +404,28 @@ class ArgonneModel(PreTrainedModel):
 
         self.devices = [torch.device(d) for d in device_ids]
         num_blocks = len(self.blocks)
-        blocks_per_device = math.ceil(num_blocks / len(self.devices))
+
+        # Start with an even distribution but make sure the last stage doesn't
+        # become a hotspot. It already hosts the final RMSNorm and LM head, so
+        # we bias one additional transformer block toward the previous stage
+        # whenever possible to ease the memory footprint on the final GPU.
+        per_device_counts = [num_blocks // len(self.devices)] * len(self.devices)
+        for i in range(num_blocks % len(self.devices)):
+            per_device_counts[i] += 1
+
+        if len(self.devices) > 1:
+            last_idx = len(self.devices) - 1
+            penultimate_idx = last_idx - 1
+            if per_device_counts[last_idx] > 1:
+                per_device_counts[last_idx] -= 1
+                per_device_counts[penultimate_idx] += 1
 
         partitions: List[Tuple[int, int, torch.device]] = []
         start_idx = 0
-        for device in self.devices:
-            end_idx = min(start_idx + blocks_per_device, num_blocks)
-            if start_idx >= end_idx:
-                break
+        for device, block_count in zip(self.devices, per_device_counts):
+            if block_count <= 0 or start_idx >= num_blocks:
+                continue
+            end_idx = min(start_idx + block_count, num_blocks)
             for block in self.blocks[start_idx:end_idx]:
                 block.to(device)
             partitions.append((start_idx, end_idx, device))
