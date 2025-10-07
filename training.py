@@ -211,8 +211,8 @@ def train_model_parallel(
         weight_decay: AdamW weight decay coefficient.
     """
     # Initial batch size settings
-    initial_batch_size = 512  # initial batch size
-    min_batch_size = 12  # Minimum acceptable batch size
+    initial_batch_size = 256  # initial batch size
+    min_batch_size = 2  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
 
     # Binary search bookkeeping for automatic batch-size discovery
@@ -237,8 +237,8 @@ def train_model_parallel(
         vocab_size=len(hf_tokenizer),
         max_position_embeddings=block_size,
         hidden_size=4096,
-        num_hidden_layers=32,
-        num_attention_heads=32,
+        num_hidden_layers=24,
+        num_attention_heads=24,
         num_key_value_heads=8,
         rope_theta=500000.0,
         hidden_dropout=0.0,
