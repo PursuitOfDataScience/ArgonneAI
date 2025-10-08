@@ -245,10 +245,14 @@ def resume_training(
     num_proc: int = 8,
     trust_remote_code: bool = False,
 ):
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     fallback_patterns = [
+        os.path.join("data", "CC-MAIN-2025-26", "*.parquet"),
         os.path.join("..", "data", "*.arrow"),
         os.path.join("data", "*.arrow"),
     ]
+    if data_glob != default_data_glob:
+        fallback_patterns.insert(0, default_data_glob)
     data_files, used_patterns = resolve_data_files(
         data_glob, fallback_patterns=fallback_patterns
     )
@@ -819,11 +823,15 @@ def update_training_stats(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resume Argonne pretraining")
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     parser.add_argument(
         "--data-glob",
         type=str,
-        default=os.path.join("..", "data", "*.arrow"),
-        help="Glob pattern for Arrow shards (default: ../data/*.arrow)",
+        default=default_data_glob,
+        help=(
+            "Glob pattern for parquet shards "
+            "(default: ../data/CC-MAIN-2025-26/*.parquet)"
+        ),
     )
     parser.add_argument(
         "--tokenizer-path",
@@ -870,7 +878,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-streaming",
         action="store_true",
-        help="Disable streaming mode and load Arrow shards into memory.",
+        help="Disable streaming mode and load parquet shards into memory.",
     )
     parser.add_argument("--num-proc", type=int, default=8)
     parser.add_argument(

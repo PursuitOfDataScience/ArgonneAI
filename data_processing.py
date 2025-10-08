@@ -1,4 +1,3 @@
-import os
 import json
 import os
 from typing import Iterable, Iterator, List, Optional, Tuple
@@ -17,18 +16,43 @@ os.environ["HF_DATASETS_CACHE"] = "./.cache"
 #####################################
 
 
-def create_text_file_from_arrow(arrow_files: Iterable[str], output_file: str = "all_text_for_tokenizer.txt") -> None:
+def _prepare_data_files(data_files: Iterable[str]) -> Tuple[List[str], str]:
+    """Materialise ``data_files`` and infer the HF dataset builder to use."""
+
+    file_list = list(data_files)
+    if not file_list:
+        raise ValueError("No dataset shards were provided.")
+
+    extension = os.path.splitext(file_list[0])[1].lower()
+    if extension == ".parquet":
+        dataset_builder = "parquet"
+    elif extension == ".arrow":
+        dataset_builder = "arrow"
+    else:
+        raise ValueError(
+            "Unsupported dataset shard extension. Expected '.parquet' or '.arrow' but "
+            f"received '{extension}'."
+        )
+
+    return file_list, dataset_builder
+
+
+def create_text_file_from_arrow(
+    shard_files: Iterable[str], output_file: str = "all_text_for_tokenizer.txt"
+) -> None:
     """Utility kept for backwards compatibility when a fallback BPE tokenizer is required."""
 
-    print(f"Creating a combined text file '{output_file}' from Arrow files...")
+    files, dataset_builder = _prepare_data_files(shard_files)
+    print(
+        f"Creating a combined text file '{output_file}' from {dataset_builder} shards..."
+    )
     with open(output_file, "w", encoding="utf-8") as wf:
-        for arrow_path in tqdm(list(arrow_files)):
-            ds = load_dataset("arrow", data_files=[arrow_path], streaming=True)
-            if "train" in ds:
-                ds = ds["train"]
-            for example in ds:
-                text = example.get("text", "")
-                wf.write(text.replace("\n", " ") + "\n")
+        ds = load_dataset(dataset_builder, data_files=files, streaming=True)
+        if "train" in ds:
+            ds = ds["train"]
+        for example in ds:
+            text = example.get("text", "")
+            wf.write(text.replace("\n", " ") + "\n")
 
 
 def train_bpe_tokenizer(text_file: str, vocab_size: int = 12000) -> PreTrainedTokenizerFast:
@@ -108,7 +132,8 @@ def streaming_token_generator(
     block_size: int,
     min_length: int = 0,
 ) -> Iterable[List[int]]:
-    dataset = load_dataset("arrow", data_files=list(data_files), streaming=True)
+    files, dataset_builder = _prepare_data_files(data_files)
+    dataset = load_dataset(dataset_builder, data_files=files, streaming=True)
     if "train" in dataset:
         dataset = dataset["train"]
 
@@ -134,7 +159,8 @@ def load_nonstream_data(
         return ds["token_ids"]
 
     print("No cached dataset found. Processing in parallel...")
-    ds_dict = load_dataset("arrow", data_files=list(data_files), streaming=False)
+    files, dataset_builder = _prepare_data_files(data_files)
+    ds_dict = load_dataset(dataset_builder, data_files=files, streaming=False)
     ds = ds_dict["train"] if "train" in ds_dict else ds_dict
 
     all_chunks: List[List[int]] = []

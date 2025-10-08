@@ -199,13 +199,13 @@ def train_model_parallel(
     weight_decay: float,
 ):
     """
-    data_files should be a list of actual .arrow file paths, e.g.
-    ["data/file1.arrow", "data/file2.arrow", ...]
+    data_files should be a list of actual .parquet shard paths, e.g.
+    ["data/CC-MAIN-2025-26/000_00000.parquet", ...]
     
     Includes automatic batch size adjustment when OOM errors occur.
     
     Args:
-        data_files: List of .arrow file paths
+        data_files: List of dataset shard file paths
         tokenizer_path: Local directory containing tokenizer files.
         use_streaming: Whether to use streaming mode or load all data in memory
         trust_remote_code: Allow tokenizers with custom code.
@@ -871,12 +871,15 @@ def train_model_parallel(
         print(f"Failed to save final model: {e}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Argonne 2 model on offline Arrow shards.")
+    parser = argparse.ArgumentParser(
+        description="Train Argonne 2 model on offline parquet shards."
+    )
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     parser.add_argument(
         "--data-glob",
         type=str,
-        default=os.path.join("..", "data", "*.arrow"),
-        help="Glob pattern for Arrow files (default: ../data/*.arrow)",
+        default=default_data_glob,
+        help="Glob pattern for parquet files (default: ../data/CC-MAIN-2025-26/*.parquet)",
     )
     parser.add_argument(
         "--tokenizer-path",
@@ -887,7 +890,7 @@ def parse_args():
     parser.add_argument(
         "--no-streaming",
         action="store_true",
-        help="Disable streaming mode and load Arrow files into memory.",
+        help="Disable streaming mode and load parquet files into memory.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -930,9 +933,14 @@ def parse_args():
 def main():
     args = parse_args()
 
-    fallback_patterns = [os.path.join("data", "*.arrow")]
-    if args.data_glob != os.path.join("..", "data", "*.arrow"):
-        fallback_patterns.insert(0, os.path.join("..", "data", "*.arrow"))
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
+    fallback_patterns = [
+        os.path.join("data", "CC-MAIN-2025-26", "*.parquet"),
+        os.path.join("..", "data", "*.arrow"),
+        os.path.join("data", "*.arrow"),
+    ]
+    if args.data_glob != default_data_glob:
+        fallback_patterns.insert(0, default_data_glob)
 
     data_files, _ = resolve_data_files(
         args.data_glob, fallback_patterns=fallback_patterns
