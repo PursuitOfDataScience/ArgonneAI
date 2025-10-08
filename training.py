@@ -130,8 +130,19 @@ def streaming_token_generator(
             )
             
             try:
-                # Use datasets library instead of pyarrow.parquet
-                dataset = Dataset.from_file(file_path)
+                # Use an appropriate HF datasets loader based on the shard format.
+                extension = os.path.splitext(file_path)[1].lower()
+                if extension == ".parquet":
+                    dataset = Dataset.from_parquet(file_path)
+                elif extension == ".arrow":
+                    dataset = Dataset.from_file(file_path)
+                else:
+                    raise ValueError(
+                        "Unsupported dataset shard format. Expected '.parquet' or "
+                        "'.arrow' files but received: "
+                        f"{extension or 'unknown'}"
+                    )
+
                 print(f"Successfully loaded dataset with {len(dataset)} rows")
                 print(f"Dataset features: {list(dataset.features.keys())}")
             except Exception as file_error:
