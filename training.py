@@ -212,14 +212,55 @@ def train_model_parallel(
         weight_decay: AdamW weight decay coefficient.
     """
     # Initial batch size settings
-    initial_batch_size = 256  # initial batch size
+    # Based on recent runs the auto-tuner consistently converges to a
+    # micro-batch size of 4 before training can proceed without OOMs.
+    # Starting the search at this value avoids multiple failing retries
+    # and makes the warmup phase much faster.
+    initial_batch_size = 4  # initial batch size tuned from previous run logs
     min_batch_size = 2  # Minimum acceptable batch size
     batch_size = initial_batch_size  # Current working batch size
 
     # Binary search bookkeeping for automatic batch-size discovery
     largest_successful_batch = None  # highest batch size that trained without OOM
     smallest_failed_batch = None  # lowest batch size that triggered OOM
-    
+
+    # Record the originally requested scheduler hyperparameters so we can
+    # adapt them when the batch size changes. The defaults assume an
+    # eight-sample micro-batch, so we rescale the learning rates and the
+    # warmup horizon when the tuner settles on a smaller batch. This keeps
+    # the warmup token budget roughly constant and prevents the peak
+    # learning rate from being too aggressive for the noisier gradients.
+    reference_micro_batch = 8
+    requested_base_lr = learning_rate
+    requested_min_lr = min(min_learning_rate, learning_rate)
+    requested_warmup_steps = warmup_steps
+
+    schedule_base_lr = learning_rate
+    schedule_min_lr = requested_min_lr
+    schedule_warmup_steps = warmup_steps
+
+    def _compute_schedule_params(active_batch_size: int) -> Tuple[float, float, int]:
+        """Return lr schedule parameters adjusted for the active batch size."""
+
+        if active_batch_size <= 0:
+            return schedule_base_lr, schedule_min_lr, schedule_warmup_steps
+
+        # Scale the learning rates by the square-root of the batch ratio but
+        # never increase beyond the user provided values.
+        batch_ratio = active_batch_size / max(1, reference_micro_batch)
+        lr_scale = min(batch_ratio ** 0.5, 1.0)
+
+        scaled_base = max(requested_base_lr * lr_scale, 1e-8)
+        scaled_min = max(requested_min_lr * lr_scale, 0.0)
+
+        # Keep the warmup token count close to the reference setting. When the
+        # batch shrinks we stretch the warmup steps so the model still sees the
+        # same number of tokens before hitting the peak learning rate.
+        warmup_scale = max(1.0, reference_micro_batch / max(1, active_batch_size))
+        scaled_warmup = max(int(round(requested_warmup_steps * warmup_scale)), 1)
+
+        return scaled_base, scaled_min, scaled_warmup
+
     validate_tokenizer_path(tokenizer_path)
     hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
 
@@ -270,7 +311,6 @@ def train_model_parallel(
 
     # Main training loop with batch size adjustment
     stop_training = False
-    min_lr = min(min_learning_rate, learning_rate)
     global_step = 0
     model = None
     optimizer = None
@@ -381,8 +421,31 @@ def train_model_parallel(
                     "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
                 )
             
+            schedule_base_lr, schedule_min_lr, schedule_warmup_steps = _compute_schedule_params(
+                batch_size
+            )
+
+            if (
+                schedule_base_lr != requested_base_lr
+                or schedule_min_lr != requested_min_lr
+                or schedule_warmup_steps != requested_warmup_steps
+            ):
+                print(f"\nAdjusted schedule for micro-batch size {batch_size}:")
+                print(
+                    "  - peak lr: "
+                    f"{requested_base_lr:.6e} -> {schedule_base_lr:.6e}"
+                )
+                print(
+                    "  - min  lr: "
+                    f"{requested_min_lr:.6e} -> {schedule_min_lr:.6e}"
+                )
+                print(
+                    "  - warmup steps: "
+                    f"{requested_warmup_steps} -> {schedule_warmup_steps}"
+                )
+
             optimizer = torch.optim.AdamW(
-                model.parameters(), lr=learning_rate, weight_decay=weight_decay
+                model.parameters(), lr=schedule_base_lr, weight_decay=weight_decay
             )
             scaler = torch.amp.GradScaler("cuda")
             global_step = 0
@@ -391,10 +454,10 @@ def train_model_parallel(
 
             scheduler = CosineWarmupScheduler(
                 optimizer,
-                base_lr=learning_rate,
-                warmup_steps=warmup_steps,
+                base_lr=schedule_base_lr,
+                warmup_steps=schedule_warmup_steps,
                 max_steps=max_steps,
-                min_lr=min_lr,
+                min_lr=schedule_min_lr,
             )
 
             if use_streaming:
@@ -697,9 +760,9 @@ def train_model_parallel(
         "model_params": sum(p.numel() for p in model.parameters()),
         "max_batch_size": final_batch_size,
         "data_shards_seen": sorted(data_position.files_processed),
-        "base_learning_rate": learning_rate,
-        "min_learning_rate": min_lr,
-        "warmup_steps": warmup_steps,
+        "base_learning_rate": schedule_base_lr,
+        "min_learning_rate": schedule_min_lr,
+        "warmup_steps": schedule_warmup_steps,
         "max_steps": max_steps,
     }
     
@@ -718,7 +781,7 @@ def train_model_parallel(
     print(f"Training steps: {global_step}")
     print(
         "Learning rate schedule: "
-        f"warmup {warmup_steps} steps | peak {learning_rate:.6e} | min {min_lr:.6e}"
+        f"warmup {schedule_warmup_steps} steps | peak {schedule_base_lr:.6e} | min {schedule_min_lr:.6e}"
     )
     print(f"Configured max steps: {max_steps}")
     if training_stats["data_shards_seen"]:
