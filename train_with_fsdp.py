@@ -32,7 +32,16 @@ from training_utils import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Argonne v2 FSDP pretraining entrypoint")
-    parser.add_argument("--data-glob", type=str, required=True, help="Glob pattern pointing to pre-tokenization Arrow files")
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
+    parser.add_argument(
+        "--data-glob",
+        type=str,
+        default=default_data_glob,
+        help=(
+            "Glob pattern pointing to pre-tokenisation parquet shards "
+            "(default: ../data/CC-MAIN-2025-26/*.parquet)"
+        ),
+    )
     parser.add_argument(
         "--tokenizer-path",
         type=str,
@@ -54,7 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--rope-theta", type=float, default=100000.0)
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
-    parser.add_argument("--no-streaming", action="store_true", help="Disable streaming and load dataset into memory")
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable streaming and load dataset into memory",
+    )
     parser.add_argument("--trust-remote-code", action="store_true", help="Allow custom tokenizer code")
     parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--resume", type=str, default=None)
@@ -240,10 +253,14 @@ def run_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     fallback_patterns = [
+        os.path.join("data", "CC-MAIN-2025-26", "*.parquet"),
         os.path.join("..", "data", "*.arrow"),
         os.path.join("data", "*.arrow"),
     ]
+    if args.data_glob != default_data_glob:
+        fallback_patterns.insert(0, default_data_glob)
     data_files, used_patterns = resolve_data_files(
         args.data_glob, fallback_patterns=fallback_patterns
     )
