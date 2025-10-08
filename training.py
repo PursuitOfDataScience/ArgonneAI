@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import time
 import traceback
@@ -29,6 +30,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
 
 # Simple data tracking class to keep position information
 class DataPosition:
@@ -239,24 +243,22 @@ def train_model_parallel(
     schedule_min_lr = requested_min_lr
     schedule_warmup_steps = warmup_steps
 
-    def _compute_schedule_params(active_batch_size: int) -> Tuple[float, float, int]:
+    def _compute_schedule_params(
+        active_batch_size: int, accum_steps: int
+    ) -> Tuple[float, float, int]:
         """Return lr schedule parameters adjusted for the active batch size."""
 
         if active_batch_size <= 0:
-            return schedule_base_lr, schedule_min_lr, schedule_warmup_steps
+            return requested_base_lr, requested_min_lr, requested_warmup_steps
 
-        # Scale the learning rates by the square-root of the batch ratio but
-        # never increase beyond the user provided values.
-        batch_ratio = active_batch_size / max(1, reference_micro_batch)
-        lr_scale = min(batch_ratio ** 0.5, 1.0)
+        effective_batch = max(active_batch_size * max(1, accum_steps), 1)
+        batch_ratio = min(effective_batch / max(1, reference_micro_batch), 1.0)
+        lr_scale = batch_ratio ** 0.5
 
         scaled_base = max(requested_base_lr * lr_scale, 1e-8)
         scaled_min = max(requested_min_lr * lr_scale, 0.0)
 
-        # Keep the warmup token count close to the reference setting. When the
-        # batch shrinks we stretch the warmup steps so the model still sees the
-        # same number of tokens before hitting the peak learning rate.
-        warmup_scale = max(1.0, reference_micro_batch / max(1, active_batch_size))
+        warmup_scale = max(1.0, reference_micro_batch / max(1, effective_batch))
         scaled_warmup = max(int(round(requested_warmup_steps * warmup_scale)), 1)
 
         return scaled_base, scaled_min, scaled_warmup
@@ -266,6 +268,12 @@ def train_model_parallel(
 
     epochs = 3
     block_size = 4096
+
+    active_grad_accum_steps = 1
+    effective_micro_batch = batch_size
+    effective_tokens_per_step = block_size * effective_micro_batch
+    active_amp_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    fused_optimizer_used = False
 
     if hf_tokenizer.pad_token is None:
         hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
@@ -299,7 +307,7 @@ def train_model_parallel(
         tokenized_data = load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=128)
         total_samples = len(tokenized_data)
         print(f"Total tokenized samples: {total_samples}")
-    
+
     # Token counting variables
     total_tokens_processed = 0
     
@@ -421,8 +429,13 @@ def train_model_parallel(
                     "torch.compile() not available in this PyTorch version. Continuing with uncompiled model."
                 )
             
+            grad_accum_steps = max(1, math.ceil(reference_micro_batch / max(1, batch_size)))
+            effective_micro_batch = batch_size * grad_accum_steps
+            active_grad_accum_steps = grad_accum_steps
+            effective_tokens_per_step = effective_micro_batch * block_size
+
             schedule_base_lr, schedule_min_lr, schedule_warmup_steps = _compute_schedule_params(
-                batch_size
+                batch_size, grad_accum_steps
             )
 
             if (
@@ -430,7 +443,7 @@ def train_model_parallel(
                 or schedule_min_lr != requested_min_lr
                 or schedule_warmup_steps != requested_warmup_steps
             ):
-                print(f"\nAdjusted schedule for micro-batch size {batch_size}:")
+                print(f"\nAdjusted schedule for effective micro-batch size {effective_micro_batch}:")
                 print(
                     "  - peak lr: "
                     f"{requested_base_lr:.6e} -> {schedule_base_lr:.6e}"
@@ -444,10 +457,66 @@ def train_model_parallel(
                     f"{requested_warmup_steps} -> {schedule_warmup_steps}"
                 )
 
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=schedule_base_lr, weight_decay=weight_decay
+            fused_optimizer = False
+            if torch.cuda.is_available():
+                try:
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(),
+                        lr=schedule_base_lr,
+                        weight_decay=weight_decay,
+                        fused=True,
+                    )
+                    fused_optimizer = True
+                except (TypeError, RuntimeError):
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(), lr=schedule_base_lr, weight_decay=weight_decay
+                    )
+            else:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(), lr=schedule_base_lr, weight_decay=weight_decay
+                )
+
+            fused_optimizer_used = fused_optimizer
+
+            supports_bf16 = False
+            amp_dtype = torch.float16
+            if torch.cuda.is_available():
+                device_index = torch.cuda.current_device()
+                major, _minor = torch.cuda.get_device_capability(device_index)
+                supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+                amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+            else:
+                amp_dtype = torch.float32
+
+            active_amp_dtype = amp_dtype
+            use_grad_scaler = amp_dtype == torch.float16
+            scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
+
+            if supports_bf16:
+                print("Using torch.bfloat16 autocast for mixed precision on Ampere/Hopper GPUs.")
+            elif amp_dtype == torch.float16:
+                print("Using torch.float16 autocast with GradScaler for mixed precision.")
+            else:
+                print("Running without CUDA mixed precision (fallback precision).")
+
+            if fused_optimizer:
+                print("Fused AdamW optimizer enabled.")
+            else:
+                print("Fused AdamW unavailable; using standard AdamW implementation.")
+
+            if grad_accum_steps > 1:
+                print(
+                    "Gradient accumulation: "
+                    f"{grad_accum_steps} micro-batches per optimizer step (effective micro-batch = {effective_micro_batch})."
+                )
+            else:
+                print("Gradient accumulation disabled (one micro-batch per optimizer step).")
+
+            print(
+                "Effective tokens per optimizer step: "
+                f"{effective_tokens_per_step:,} (block_size={block_size})"
             )
-            scaler = torch.amp.GradScaler("cuda")
+
             global_step = 0
             tokens_in_current_attempt = 0  # Track tokens in this training attempt
             first_device = model.devices[0]  # Store the first device for consistency
@@ -460,91 +529,119 @@ def train_model_parallel(
                 min_lr=schedule_min_lr,
             )
 
-            if use_streaming:
-                ########################################################
-                # STREAMING MODE
-                ########################################################
-                loss = None
+            optimizer.zero_grad(set_to_none=True)
 
-                def run_training_step(
-                    x_tens,
-                    y_tens,
-                    shard_name,
-                    file_idx,
-                    position,
-                    chunk_offset,
-                ):
-                    nonlocal tokens_in_current_attempt, global_step, loss, stop_training
+            micro_step = 0
+            current_lr = scheduler.last_lr
+            last_loss_value: Optional[float] = None
 
-                    batch_tokens = x_tens.numel()
-                    tokens_in_current_attempt += batch_tokens
+            def run_training_step(
+                x_tens,
+                y_tens,
+                shard_name="",
+                file_idx=-1,
+                position=-1,
+                chunk_offset=-1,
+                *,
+                checkpoint_interval: Optional[int] = 300,
+                checkpoint_prefix: str = "streaming",
+            ) -> None:
+                nonlocal tokens_in_current_attempt, global_step, stop_training, micro_step
+                nonlocal current_lr, last_loss_value
 
+                if stop_training or global_step >= max_steps:
+                    stop_training = True
+                    return
+
+                batch_tokens = x_tens.numel()
+                tokens_in_current_attempt += batch_tokens
+
+                if micro_step == 0:
                     current_lr = scheduler.step(global_step)
 
-                    x_local = x_tens.to(first_device)
-                    y_local = y_tens.to(first_device)
+                x_local = x_tens.to(first_device)
+                y_local = y_tens.to(first_device)
 
-                    optimizer.zero_grad()
-                    with torch.amp.autocast("cuda"):
-                        outputs = model(input_ids=x_local, labels=y_local)
-                        loss = outputs.loss.to(first_device)
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    outputs = model(input_ids=x_local, labels=y_local)
+                    loss_tensor = outputs.loss.to(first_device)
 
-                    scaler.scale(loss).backward()
+                last_loss_value = float(loss_tensor.detach().cpu().item())
+                loss_for_backward = loss_tensor / grad_accum_steps
+
+                if use_grad_scaler:
+                    scaler.scale(loss_for_backward).backward()
+                else:
+                    loss_for_backward.backward()
+
+                micro_step += 1
+
+                if micro_step < grad_accum_steps:
+                    return
+
+                if use_grad_scaler:
                     scaler.step(optimizer)
                     scaler.update()
+                else:
+                    optimizer.step()
 
-                    global_step += 1
+                optimizer.zero_grad(set_to_none=True)
+                micro_step = 0
+                global_step += 1
 
-                    if global_step % 50 == 0 and loss is not None:
-                        print(
-                            f"Step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}"
-                        )
+                if global_step % 50 == 0 and last_loss_value is not None:
+                    print(
+                        f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens processed: {tokens_in_current_attempt:,}"
+                    )
+                    if shard_name:
                         print(
                             "Shard: "
                             f"{shard_name} | File index: {file_idx} | Position: {position} | Chunk: {chunk_offset}"
                         )
-                        print(f"Current LR: {current_lr:.6e}")
-                        prompt_str = "Long long time ago, "
-                        token_ids = hf_tokenizer.encode(prompt_str)
-                        prompt_tensor = (
-                            torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
-                        )
+                    print(f"Current LR: {current_lr:.6e}")
+                    prompt_str = "Long long time ago, "
+                    token_ids = hf_tokenizer.encode(prompt_str)
+                    prompt_tensor = (
+                        torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
+                    )
+                    extra_tokens = 100 if checkpoint_prefix == "streaming" else 50
+                    generated = model.generate(
+                        prompt_tensor, max_length=prompt_tensor.shape[1] + extra_tokens
+                    )
+                    generated_text = hf_tokenizer.decode(generated[0].tolist())
+                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                        generated = model.generate(
-                            prompt_tensor, max_length=prompt_tensor.shape[1] + 100
-                        )
-                        generated_text = hf_tokenizer.decode(generated[0].tolist())
-                        print(
-                            f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
-                        )
+                if checkpoint_interval and global_step % checkpoint_interval == 0:
+                    checkpoint = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "batch_size": batch_size,
+                        "tokens_processed": tokens_in_current_attempt,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "loss": last_loss_value,
+                        "data_position": data_position.get_state(),
+                    }
+                    os.makedirs("pretrained", exist_ok=True)
+                    torch.save(
+                        checkpoint,
+                        f"pretrained/{checkpoint_prefix}_checkpoint_step_{global_step}.pth",
+                    )
+                    print(
+                        f"Checkpoint saved at step {global_step} with data position tracking"
+                    )
 
-                    if global_step % 300 == 0:
-                        checkpoint = {
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "batch_size": batch_size,
-                            "tokens_processed": tokens_in_current_attempt,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "loss": loss.item() if loss is not None else None,
-                            "data_position": data_position.get_state(),
-                        }
-                        os.makedirs("pretrained", exist_ok=True)
-                        torch.save(
-                            checkpoint, f"pretrained/streaming_checkpoint_step_{global_step}.pth"
-                        )
-                        print(
-                            f"Checkpoint saved at step {global_step} with data position tracking"
-                        )
+                if global_step >= max_steps:
+                    print(
+                        f"Reached configured max_steps={max_steps}. Stopping training loop."
+                    )
+                    stop_training = True
 
-                    if global_step >= max_steps:
-                        print(
-                            f"Reached configured max_steps={max_steps}. Stopping training loop."
-                        )
-                        stop_training = True
-                        return
-
+            if use_streaming:
+                ########################################################
+                # STREAMING MODE
+                ########################################################
                 for epoch in tqdm(range(epochs)):
                     print(f"==== STREAMING with batch_size={batch_size} ====")
                     token_gen = streaming_token_generator(
@@ -563,10 +660,10 @@ def train_model_parallel(
                         try:
                             tokens, file_idx, position, shard_name, chunk_idx = next(token_gen)
                         except StopIteration:
-                            if token_batch:
+                            if token_batch and last_meta is not None:
                                 x_tens, y_tens = collate_batch(token_batch, block_size)
                                 token_batch.clear()
-                                if x_tens is not None and last_meta is not None:
+                                if x_tens is not None:
                                     run_training_step(
                                         x_tens,
                                         y_tens,
@@ -574,6 +671,8 @@ def train_model_parallel(
                                         last_meta[1],
                                         last_meta[2],
                                         last_meta[3],
+                                        checkpoint_interval=300,
+                                        checkpoint_prefix="streaming",
                                     )
 
                             print(
@@ -603,18 +702,20 @@ def train_model_parallel(
 
                         x_tens, y_tens = collate_batch(token_batch, block_size)
                         token_batch.clear()
-                        if x_tens is None:
+                        if x_tens is None or last_meta is None:
                             continue
 
-                        if last_meta is not None:
-                            run_training_step(
-                                x_tens,
-                                y_tens,
-                                last_meta[0],
-                                last_meta[1],
-                                last_meta[2],
-                                last_meta[3],
-                            )
+                        run_training_step(
+                            x_tens,
+                            y_tens,
+                            last_meta[0],
+                            last_meta[1],
+                            last_meta[2],
+                            last_meta[3],
+                            checkpoint_interval=300,
+                            checkpoint_prefix="streaming",
+                        )
+
                         if stop_training:
                             break
 
@@ -625,85 +726,38 @@ def train_model_parallel(
                 ########################################################
                 # NON-STREAMING MODE: full pass each epoch
                 ########################################################
-                batches_per_epoch = total_samples // batch_size
+                batches_per_epoch = total_samples // batch_size if batch_size else 0
 
                 for epoch in tqdm(range(epochs)):
                     print(f"==== Starting epoch {epoch} (NON-STREAMING) with batch_size={batch_size} ====")
-                    
-                    # Get shuffled indices for this epoch
+
                     indices = data_position.generate_shuffled_indices(total_samples)
-                    
-                    # Update epoch in position tracker
                     data_position.epoch = epoch
-                    
+
                     for batch_idx in tqdm(range(batches_per_epoch)):
                         start_idx = batch_idx * batch_size
                         end_idx = start_idx + batch_size
 
-                        # Update position in tracker
                         data_position.update_nonstreaming_position(end_idx)
-                        
+
                         batch_token_lists = tokenized_data[start_idx:end_idx]
 
                         x_tens, y_tens = collate_batch(batch_token_lists, block_size)
                         if x_tens is None:
                             continue
 
-                        # Count tokens processed in this batch
-                        batch_tokens = x_tens.numel()
-                        tokens_in_current_attempt += batch_tokens
-                        
-                        x_tens = x_tens.to(first_device)
-                        y_tens = y_tens.to(first_device)
+                        run_training_step(
+                            x_tens,
+                            y_tens,
+                            shard_name=f"epoch_{epoch}",
+                            file_idx=-1,
+                            position=end_idx,
+                            chunk_offset=batch_idx,
+                            checkpoint_interval=2000,
+                            checkpoint_prefix="non_streaming",
+                        )
 
-                        current_lr = scheduler.step(global_step)
-
-                        optimizer.zero_grad()
-                        with torch.amp.autocast("cuda"):
-                            outputs = model(input_ids=x_tens, labels=y_tens)
-                            loss = outputs.loss.to(first_device)
-
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-
-                        global_step += 1
-
-                        if global_step % 50 == 0 and loss is not None:
-                            print(
-                                f"global_step {global_step} | Loss: {loss.item():.4f} | Tokens processed: {tokens_in_current_attempt:,}"
-                            )
-                            print(f"Current LR: {current_lr:.6e}")
-                            prompt_str = "Long long time ago, "
-                            token_ids = hf_tokenizer.encode(prompt_str)
-                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
-                            
-                            generated = model.generate(prompt_tensor, max_length=prompt_tensor.shape[1] + 50)
-                            generated_text = hf_tokenizer.decode(generated[0].tolist())
-                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                        if global_step % 2000 == 0:
-                            # Include token count and data position in checkpoint
-                            checkpoint = {
-                                "epoch": epoch,
-                                "global_step": global_step,
-                                "batch_size": batch_size,
-                                "tokens_processed": tokens_in_current_attempt,
-                                "model_state_dict": model.state_dict(),
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "loss": loss.item() if loss is not None else None,
-                                "data_position": data_position.get_state()  # Save position
-                            }
-                            os.makedirs("pretrained", exist_ok=True)
-                            torch.save(checkpoint, f"pretrained/non_streaming_checkpoint_step_{global_step}.pth")
-                            print(f"Checkpoint saved at step {global_step} with data position tracking")
-
-                        if global_step >= max_steps:
-                            print(
-                                f"Reached configured max_steps={max_steps}. Stopping training loop."
-                            )
-                            stop_training = True
+                        if stop_training:
                             break
 
                     if stop_training:
@@ -764,6 +818,11 @@ def train_model_parallel(
         "min_learning_rate": schedule_min_lr,
         "warmup_steps": schedule_warmup_steps,
         "max_steps": max_steps,
+        "gradient_accumulation_steps": active_grad_accum_steps,
+        "effective_micro_batch_size": effective_micro_batch,
+        "effective_tokens_per_step": effective_tokens_per_step,
+        "amp_dtype": getattr(active_amp_dtype, "name", str(active_amp_dtype)),
+        "fused_adamw": fused_optimizer_used,
     }
     
     # Write stats to JSON file
@@ -779,11 +838,22 @@ def train_model_parallel(
     if final_batch_size is not None:
         print(f"Maximum stable batch size: {final_batch_size}")
     print(f"Training steps: {global_step}")
+    print(f"Gradient accumulation steps: {active_grad_accum_steps}")
+    print(f"Effective micro-batch size: {effective_micro_batch}")
+    print(
+        "Effective tokens per optimizer step: "
+        f"{effective_tokens_per_step:,}"
+    )
     print(
         "Learning rate schedule: "
         f"warmup {schedule_warmup_steps} steps | peak {schedule_base_lr:.6e} | min {schedule_min_lr:.6e}"
     )
     print(f"Configured max steps: {max_steps}")
+    print(
+        "Autocast dtype: "
+        f"{getattr(active_amp_dtype, 'name', str(active_amp_dtype))}"
+    )
+    print(f"Fused AdamW: {'enabled' if fused_optimizer_used else 'disabled'}")
     if training_stats["data_shards_seen"]:
         print("Shards processed this run:")
         for shard_name in training_stats["data_shards_seen"]:
