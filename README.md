@@ -7,6 +7,23 @@
 ## Project overview
 This repository hosts the in-progress training stack for the Argonne 2.0 language model family. The codebase focuses on large-scale pretraining with distributed data processing, pipeline parallelism, and robust recovery utilities so that long jobs can survive hardware interruptions.
 
+## Model architecture
+The Argonne 2.0 configuration that is currently exercised by the training scripts is a decoder-only transformer with the following key hyperparameters:
+
+- **Depth:** 24 transformer blocks with grouped-query attention (24 query heads, 8 key/value heads) and SwiGLU feed-forward layers.【F:training.py†L286-L301】【F:model.py†L67-L313】
+- **Width:** 4,096 hidden dimensions with a 8/3 × expansion (rounded to 256) in the SwiGLU MLP, yielding an 11,008-unit intermediate width.【F:training.py†L286-L301】【F:model.py†L79-L301】
+- **Context length:** 4,096 token context window per block, with rotary position embeddings parameterised by a 500,000 base theta to extend extrapolation headroom.【F:training.py†L286-L301】【F:model.py†L121-L142】
+- **Normalization & dropout:** Pre- and post-attention RMSNorm layers with dropout kept at 0.0 in both attention and MLP modules for baseline pretraining stability.【F:training.py†L286-L295】【F:model.py†L107-L319】
+- **Efficiency features:** Flash attention is enabled when available, residual projection weights are marked for fused residual kernels, and word embeddings remain untied to allow custom output heads.【F:training.py†L286-L301】【F:model.py†L200-L276】
+
+## Tokenizer
+Argonne 2.0 pretraining uses the **Qwen2.5-3B-Instruct** tokenizer. Important characteristics of this tokenizer include:
+
+- 151,936 token vocabulary with dedicated `<|im_start|>`, `<|im_end|>`, and multimodal delimiters for future tool-use and vision extensions.
+- Special tokens covering conversational (`<|endoftext|>`, `<|im_*|>`), tool calling (`<tool_call>`), and multimodal padding markers (`<|vision_pad|>`, `<|image_pad|>`, `<|video_pad|>`).
+- Model max length set to 131,072 tokens, allowing us to safely expand beyond the 4,096-token training window if longer-context finetuning is required.
+- Uses the Qwen chat template for tool-aware prompts; training scripts ensure a pad token is present and adapt `model_max_length` to match the 4,096-token block size.
+
 ## Repository layout
 - `model.py` – Defines the `ArgonneModel` transformer architecture and its `ArgonneConfig`, including rotary attention, RMSNorm layers, and backwards-compatible aliases for Argonne 1.x checkpoints.
 - `data_processing.py` – Handles tokenizer loading/fallback training, streaming parquet datasets, cached offline preprocessing, and assembling fixed-length token chunks for training.
