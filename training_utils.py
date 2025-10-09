@@ -76,10 +76,10 @@ def log_dataset_plan(files: Sequence[str]) -> None:
         common_root = ""
 
     digits = len(str(len(files)))
-    print("Dataset shards will be processed in the following order:")
+
     for index, path in enumerate(files, start=1):
         display_path = os.path.relpath(path, common_root) if common_root else path
-        print(f"  {index:>{digits}}. {display_path}")
+
 
 
 def validate_tokenizer_path(path: str) -> str:
