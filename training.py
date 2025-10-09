@@ -7,7 +7,6 @@ import traceback
 from typing import List, Optional, Tuple
 
 import torch
-from datasets import Dataset
 from tqdm import tqdm
 
 from data_processing import (
@@ -19,6 +18,7 @@ from data_processing import (
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
+    load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
     validate_tokenizer_path,
@@ -130,18 +130,7 @@ def streaming_token_generator(
             )
             
             try:
-                # Use an appropriate HF datasets loader based on the shard format.
-                extension = os.path.splitext(file_path)[1].lower()
-                if extension == ".parquet":
-                    dataset = Dataset.from_parquet(file_path)
-                elif extension == ".arrow":
-                    dataset = Dataset.from_file(file_path)
-                else:
-                    raise ValueError(
-                        "Unsupported dataset shard format. Expected '.parquet' or "
-                        "'.arrow' files but received: "
-                        f"{extension or 'unknown'}"
-                    )
+                dataset = load_streaming_shard(file_path)
 
                 print(f"Successfully loaded dataset with {len(dataset)} rows")
                 print(f"Dataset features: {list(dataset.features.keys())}")
