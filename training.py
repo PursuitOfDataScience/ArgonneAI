@@ -918,7 +918,7 @@ def parse_args():
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=160_000,
+        default=4_000_000,
         help="Total optimizer steps to schedule before halting training.",
     )
     parser.add_argument(
