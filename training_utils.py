@@ -8,6 +8,7 @@ import re
 from typing import Iterable, List, Sequence, Tuple
 
 import torch
+from datasets import Dataset
 
 
 def _natural_key(path: str) -> List[object]:
@@ -151,3 +152,18 @@ class CosineWarmupScheduler:
     @property
     def last_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
+
+
+def load_streaming_shard(file_path: str) -> Dataset:
+    """Load a streaming dataset shard based on file extension."""
+
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension == ".parquet":
+        return Dataset.from_parquet(file_path)
+    if extension == ".arrow":
+        return Dataset.from_file(file_path)
+
+    raise ValueError(
+        "Unsupported dataset shard format. Expected '.parquet' or '.arrow' "
+        f"files but received: {extension or 'unknown'}"
+    )

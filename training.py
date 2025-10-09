@@ -7,7 +7,6 @@ import traceback
 from typing import List, Optional, Tuple
 
 import torch
-from datasets import Dataset
 from tqdm import tqdm
 
 from data_processing import (
@@ -19,6 +18,7 @@ from data_processing import (
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
+    load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
     validate_tokenizer_path,
@@ -130,8 +130,8 @@ def streaming_token_generator(
             )
             
             try:
-                # Use datasets library instead of pyarrow.parquet
-                dataset = Dataset.from_file(file_path)
+                dataset = load_streaming_shard(file_path)
+
                 print(f"Successfully loaded dataset with {len(dataset)} rows")
                 print(f"Dataset features: {list(dataset.features.keys())}")
             except Exception as file_error:
