@@ -39,7 +39,7 @@ from resume_pretrain import (
 # Distributed setup utilities
 # ---------------------------------------------------------------------------
 
-def setup_distributed() -> Tuple[int, int]:
+def setup_distributed() -> Tuple[int, int, int]:
     """Initialise the default NCCL process group using environment variables."""
 
     if not dist.is_available():  # pragma: no cover - defensive guard
@@ -53,10 +53,11 @@ def setup_distributed() -> Tuple[int, int]:
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    return rank, world_size
+    return rank, world_size, local_rank
 
 
 def cleanup_distributed() -> None:
@@ -161,7 +162,7 @@ def save_checkpoint(
     model: FSDP,
     optimizer: torch.optim.Optimizer,
     scheduler: CosineWarmupScheduler,
-    data_position: DataPosition,
+    data_state: Optional[dict],
     output_dir: str,
     rank: int,
     tag: str,
@@ -180,7 +181,7 @@ def save_checkpoint(
             "model_state_dict": state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "data_position": data_position.get_state(),
+            "data_position": data_state,
             "format": "fsdp_full_state",
         }
         safe_torch_save(payload, checkpoint_path)
@@ -420,8 +421,8 @@ def parse_args() -> argparse.Namespace:
 
 def train() -> None:
     args = parse_args()
-    rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{rank}")
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
 
     if args.bf16 and args.fp16:
         raise ValueError("Cannot enable both bf16 and fp16 modes simultaneously")
@@ -508,25 +509,27 @@ def train() -> None:
     if ckpt_state.data_position:
         data_position.restore_state(ckpt_state.data_position)
 
-    if args.no_streaming:
-        provider = NonStreamingBatchProvider(
-            data_files,
-            tokenizer,
-            args.block_size,
-            args.batch_size,
-            world_size,
-            data_position,
-            args.num_proc,
-        )
-    else:
-        provider = StreamingBatchProvider(
-            data_files,
-            tokenizer,
-            args.block_size,
-            args.batch_size,
-            world_size,
-            data_position,
-        )
+    provider: Optional[object] = None
+    if rank == 0:
+        if args.no_streaming:
+            provider = NonStreamingBatchProvider(
+                data_files,
+                tokenizer,
+                args.block_size,
+                args.batch_size,
+                world_size,
+                data_position,
+                args.num_proc,
+            )
+        else:
+            provider = StreamingBatchProvider(
+                data_files,
+                tokenizer,
+                args.block_size,
+                args.batch_size,
+                world_size,
+                data_position,
+            )
 
     start_step = ckpt_state.step
     total_tokens_processed = ckpt_state.tokens
@@ -560,9 +563,9 @@ def train() -> None:
 
     while step < args.total_steps:
         if rank == 0:
+            assert provider is not None
             inputs_all, labels_all = provider.next_batch(device)
             batch_tokens = inputs_all.numel()
-            tokens_this_session += batch_tokens
         else:
             shape = (world_size, args.batch_size, args.block_size)
             inputs_all = torch.empty(shape, dtype=torch.long, device=device)
@@ -574,6 +577,7 @@ def train() -> None:
         tokens_tensor = torch.tensor(batch_tokens, device=device, dtype=torch.long)
         dist.broadcast(tokens_tensor, src=0)
         batch_tokens = int(tokens_tensor.item())
+        tokens_this_session += batch_tokens
 
         inputs_local = inputs_all[rank]
         labels_local = labels_all[rank]
@@ -618,13 +622,14 @@ def train() -> None:
 
         if args.save_interval > 0 and step > start_step and step % args.save_interval == 0:
             total_tokens = total_tokens_processed + tokens_this_session
+            data_state = data_position.get_state() if rank == 0 else None
             save_checkpoint(
                 step,
                 total_tokens,
                 fsdp_model,
                 optimizer,
                 scheduler,
-                data_position,
+                data_state,
                 args.output_dir,
                 rank,
                 "fsdp",
@@ -635,17 +640,29 @@ def train() -> None:
         step += 1
 
     total_tokens = total_tokens_processed + tokens_this_session
-    save_checkpoint(step - 1, total_tokens, fsdp_model, optimizer, scheduler, data_position, args.output_dir, rank, "final")
+    data_state = data_position.get_state() if rank == 0 else None
+    save_checkpoint(
+        step - 1,
+        total_tokens,
+        fsdp_model,
+        optimizer,
+        scheduler,
+        data_state,
+        args.output_dir,
+        rank,
+        "final",
+    )
 
     if rank == 0:
+        model_ref = fsdp_model.module if hasattr(fsdp_model, "module") else fsdp_model
         update_training_stats(
             tokens=total_tokens,
             batch_size=args.batch_size * world_size,
             steps=step - 1,
-            model=fsdp_model,
-            n_layer=fsdp_model.module.config.num_hidden_layers,
-            n_head=fsdp_model.module.config.num_attention_heads,
-            n_embd=fsdp_model.module.config.hidden_size,
+            model=model_ref,
+            n_layer=model_ref.config.num_hidden_layers,
+            n_head=model_ref.config.num_attention_heads,
+            n_embd=model_ref.config.hidden_size,
             base_lr=args.learning_rate,
             min_lr=args.min_learning_rate,
             warmup_steps=args.warmup_steps,

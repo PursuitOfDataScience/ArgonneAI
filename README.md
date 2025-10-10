@@ -33,14 +33,14 @@ Argonne 2.0 pretraining uses the **Qwen2.5-3B-Instruct** tokenizer. Important ch
 - `resume_pretrain.py` – Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
 
 ## Running the FSDP continuation script
-On a single DGX node you should launch `train_with_fsdp.py` with `torchrun` so that all eight GPUs participate as individual FSDP ranks. A minimal command matching the resume workflow is:
+On a single DGX node you should launch `train_with_fsdp.py` with `torchrun` so that all eight GPUs participate as individual FSDP ranks. The script follows the exact same resume logic as `resume_pretrain.py`—it restores checkpoints written by the legacy flow, reuses the shared `DataPosition` tracker, and advances the cosine schedule in lockstep—while letting every GPU process its own micro-batch concurrently for higher throughput. A minimal command matching the resume workflow is:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train_with_fsdp.py \
   --tokenizer-path ../Qwen2.5-3B-Instruct
 ```
 
-Additional flags exposed by the script include `--data-glob` for alternate shard locations, `--batch-size` for the per-rank batch, and precision options like `--bf16`/`--fp16`. The script automatically discovers the latest checkpoint (or accepts `--checkpoint-path`) and restores the tokenizer/training step metadata before continuing. 【F:train_with_fsdp.py†L340-L427】【F:train_with_fsdp.py†L452-L526】
+Additional flags exposed by the script include `--data-glob` for alternate shard locations, `--batch-size` for the per-rank batch, and precision options like `--bf16`/`--fp16`. Only rank 0 performs dataset/tokeniser work; batches are broadcast to the other ranks, which means you can scale to multi-node runs by exporting the usual rendezvous variables (`MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`) before invoking `torchrun`. The script automatically discovers the latest checkpoint (or accepts `--checkpoint-path`) and restores the tokenizer/training step metadata before continuing. 【F:train_with_fsdp.py†L340-L427】【F:train_with_fsdp.py†L452-L610】
 
 ## Default dataset location
 - Training scripts now target the Common Crawl derived shards stored at `../data/CC-MAIN-2025-26/*.parquet`. Shards are consumed in natural numeric order so `000_00000.parquet` is seen before `000_00001.parquet`, ensuring deterministic sequential coverage of the crawl export.
