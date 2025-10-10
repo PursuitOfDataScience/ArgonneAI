@@ -18,9 +18,11 @@ from data_processing import (
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
+    DEFAULT_MAX_TRAINING_STEPS,
     load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
+    safe_torch_save,
     validate_tokenizer_path,
 )
 
@@ -624,10 +626,10 @@ def train_model_parallel(
                         "data_position": data_position.get_state(),
                     }
                     os.makedirs("pretrained", exist_ok=True)
-                    torch.save(
-                        checkpoint,
-                        f"pretrained/{checkpoint_prefix}_checkpoint_step_{global_step}.pth",
+                    checkpoint_path = (
+                        f"pretrained/{checkpoint_prefix}_checkpoint_step_{global_step}.pth"
                     )
+                    safe_torch_save(checkpoint, checkpoint_path)
                     print(
                         f"Checkpoint saved at step {global_step} with data position tracking"
                     )
@@ -918,7 +920,7 @@ def parse_args():
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=4_000_000,
+        default=DEFAULT_MAX_TRAINING_STEPS,
         help="Total optimizer steps to schedule before halting training.",
     )
     parser.add_argument(
