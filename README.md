@@ -32,6 +32,16 @@ Argonne 2.0 pretraining uses the **Qwen2.5-3B-Instruct** tokenizer. Important ch
 - `train_with_fsdp.py` – Alternative Fully Sharded Data Parallel (FSDP) launcher for multi-GPU jobs that prefer sharded data parallelism over pipeline stages.
 - `resume_pretrain.py` – Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
 
+## Running the FSDP continuation script
+On a single DGX node you should launch `train_with_fsdp.py` with `torchrun` so that all eight GPUs participate as individual FSDP ranks. A minimal command matching the resume workflow is:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train_with_fsdp.py \
+  --tokenizer-path ../Qwen2.5-3B-Instruct
+```
+
+Additional flags exposed by the script include `--data-glob` for alternate shard locations, `--batch-size` for the per-rank batch, and precision options like `--bf16`/`--fp16`. The script automatically discovers the latest checkpoint (or accepts `--checkpoint-path`) and restores the tokenizer/training step metadata before continuing. 【F:train_with_fsdp.py†L340-L427】【F:train_with_fsdp.py†L452-L526】
+
 ## Default dataset location
 - Training scripts now target the Common Crawl derived shards stored at `../data/CC-MAIN-2025-26/*.parquet`. Shards are consumed in natural numeric order so `000_00000.parquet` is seen before `000_00001.parquet`, ensuring deterministic sequential coverage of the crawl export.
 
