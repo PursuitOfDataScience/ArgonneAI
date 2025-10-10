@@ -192,6 +192,43 @@ def streaming_token_generator(
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)\.pth$")
 
 
+def cleanup_old_checkpoints(directory: str, keep: int = 3) -> None:
+    """Keep only the most recent checkpoint files in a directory."""
+
+    if keep <= 0:
+        return
+
+    if not os.path.isdir(directory):
+        return
+
+    checkpoints: List[Tuple[int, str]] = []
+    for name in os.listdir(directory):
+        match = CHECKPOINT_PATTERN.search(name)
+        if not match:
+            continue
+
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+
+        step = int(match.group(1))
+        checkpoints.append((step, path))
+
+    if len(checkpoints) <= keep:
+        return
+
+    checkpoints.sort(key=lambda item: item[0], reverse=True)
+    for _, path in checkpoints[keep:]:
+        try:
+            os.remove(path)
+            print(f"Removed old checkpoint: {os.path.basename(path)}")
+        except OSError as exc:
+            print(f"WARNING: Failed to remove checkpoint '{path}': {exc}")
+
+
+cleanup_old_checkpoints(os.path.join(os.getcwd(), "pretrained"), keep=3)
+
+
 def _resolve_checkpoint_path(checkpoint_path: Optional[str]) -> str:
     """Resolve the checkpoint path, auto-selecting the highest step if needed."""
 
