@@ -1,14 +1,20 @@
 """Utility helpers shared across ArgonneAI training scripts."""
 from __future__ import annotations
 
+import contextlib
 import glob
 import math
 import os
 import re
+import tempfile
 from typing import Iterable, List, Sequence, Tuple
 
 import torch
 from datasets import Dataset
+
+
+# Shared constant to keep the default training horizon consistent across scripts.
+DEFAULT_MAX_TRAINING_STEPS = 4_000_000
 
 
 def _natural_key(path: str) -> List[object]:
@@ -80,6 +86,56 @@ def log_dataset_plan(files: Sequence[str]) -> None:
     for index, path in enumerate(files, start=1):
         display_path = os.path.relpath(path, common_root) if common_root else path
 
+
+
+def safe_torch_save(obj, path: str) -> str:
+    """Persist ``obj`` to ``path`` with fallbacks for large checkpoints.
+
+    Some network file systems used on large HPC clusters exhibit unreliable
+    behaviour when PyTorch's default zip-based serialization writes very large
+    archives (multi-gigabyte optimizer states).  The symptom can surface as
+    runtime write failures *or* as truncated archives that only raise an error
+    when reloading.
+
+    To make checkpointing resilient, we first try the legacy (non-zip)
+    serializer which streams data sequentially and avoids the problematic code
+    path altogether.  If that fails with an unrelated error, we fall back to the
+    default zip writer.  Every attempt uses a temporary file and ``os.replace``
+    to keep the operation atomic, and any intermediate artefacts are cleaned up
+    on failure.
+    """
+
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    base = os.path.basename(path)
+    retryable_signatures = (
+        "PytorchStreamWriter failed writing file",
+        "unexpected pos",
+    )
+
+    def _save(use_zipfile: bool) -> None:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=f".{base}.", suffix=".tmp")
+        os.close(fd)
+        try:
+            save_kwargs = {}
+            if not use_zipfile:
+                save_kwargs["_use_new_zipfile_serialization"] = False
+            torch.save(obj, tmp_path, **save_kwargs)
+            os.replace(tmp_path, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
+
+    try:
+        _save(use_zipfile=False)
+        return path
+    except RuntimeError as err:
+        message = str(err)
+        if not any(signature in message for signature in retryable_signatures):
+            raise
+        _save(use_zipfile=True)
+        return path
 
 
 def validate_tokenizer_path(path: str) -> str:
