@@ -17,8 +17,10 @@ from data_processing import (
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
+    DEFAULT_MAX_TRAINING_STEPS,
     load_streaming_shard,
     log_dataset_plan,
+    safe_torch_save,
     resolve_data_files,
     validate_tokenizer_path,
 )
@@ -234,7 +236,7 @@ def resume_training(
     data_glob: str,
     tokenizer_path: str,
     checkpoint_path: Optional[str] = None,
-    total_training_steps: int = 160_000,
+    total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
     lr: float = 3e-4,
@@ -563,7 +565,7 @@ def resume_training(
                         save_path = (
                             f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                         )
-                        torch.save(checkpoint_state, save_path)
+                        safe_torch_save(checkpoint_state, save_path)
                         print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                         update_training_stats(
@@ -703,7 +705,7 @@ def resume_training(
                     save_path = (
                         f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
                     )
-                    torch.save(checkpoint_state, save_path)
+                    safe_torch_save(checkpoint_state, save_path)
                     print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                     update_training_stats(
@@ -852,7 +854,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--total-steps",
         type=int,
-        default=160_000,
+        default=DEFAULT_MAX_TRAINING_STEPS,
         help="Total number of training steps to run.",
     )
     parser.add_argument("--block-size", type=int, default=4096)
