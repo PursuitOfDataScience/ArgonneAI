@@ -93,16 +93,16 @@ def safe_torch_save(obj, path: str) -> str:
 
     Some network file systems used on large HPC clusters exhibit unreliable
     behaviour when PyTorch's default zip-based serialization writes very large
-    archives (multi-gigabyte optimizer states).  The symptom typically surfaces
-    as ``RuntimeError: PytorchStreamWriter failed writing file`` or an
-    "unexpected pos" mismatch similar to the one reported in the regression.
+    archives (multi-gigabyte optimizer states).  The symptom can surface as
+    runtime write failures *or* as truncated archives that only raise an error
+    when reloading.
 
-    To make checkpointing resilient, we attempt an atomic save via a temporary
-    file.  If the default writer fails with one of the known signatures, we
-    automatically retry using the legacy (non-zip) serializer which writes the
-    tensor payload sequentially and avoids the problematic code path.  The
-    temporary file is cleaned up on error, and the final save is performed with
-    ``os.replace`` to remain atomic.
+    To make checkpointing resilient, we first try the legacy (non-zip)
+    serializer which streams data sequentially and avoids the problematic code
+    path altogether.  If that fails with an unrelated error, we fall back to the
+    default zip writer.  Every attempt uses a temporary file and ``os.replace``
+    to keep the operation atomic, and any intermediate artefacts are cleaned up
+    on failure.
     """
 
     directory = os.path.dirname(path) or "."
@@ -128,13 +128,13 @@ def safe_torch_save(obj, path: str) -> str:
                 os.remove(tmp_path)
 
     try:
-        _save(use_zipfile=True)
+        _save(use_zipfile=False)
         return path
     except RuntimeError as err:
         message = str(err)
         if not any(signature in message for signature in retryable_signatures):
             raise
-        _save(use_zipfile=False)
+        _save(use_zipfile=True)
         return path
 
 
