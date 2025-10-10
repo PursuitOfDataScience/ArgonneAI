@@ -150,20 +150,33 @@ def safe_torch_load(path: str, *, map_location=None, **kwargs):
     PyTorch can transparently handle legacy pickled checkpoints.
     """
 
+    legacy_signatures = (
+        "PytorchStreamReader failed reading zip archive",
+        "failed finding central directory",
+    )
+
     try:
         return torch.load(path, map_location=map_location, **kwargs)
     except RuntimeError as err:
         message = str(err)
-        legacy_signatures = (
-            "PytorchStreamReader failed reading zip archive",
-            "failed finding central directory",
-        )
         if not any(signature in message for signature in legacy_signatures):
             raise
 
         retry_kwargs = dict(kwargs)
         retry_kwargs.pop("weights_only", None)
-        return torch.load(path, map_location=map_location, **retry_kwargs)
+
+        try:
+            return torch.load(path, map_location=map_location, **retry_kwargs)
+        except RuntimeError as retry_err:
+            retry_message = str(retry_err)
+            if any(signature in retry_message for signature in legacy_signatures):
+                raise RuntimeError(
+                    "Failed to load checkpoint "
+                    f"'{path}'. The file appears to be truncated or was written "
+                    "with an unsupported format. Please verify that the checkpoint "
+                    "was fully written and retry from a valid file."
+                ) from retry_err
+            raise
 
 
 def validate_tokenizer_path(path: str) -> str:
