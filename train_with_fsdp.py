@@ -26,6 +26,8 @@ from model import ArgonneConfig, ArgonneModel, Block
 from training_utils import (
     log_dataset_plan,
     resolve_data_files,
+    safe_torch_load,
+    safe_torch_save,
     validate_tokenizer_path,
 )
 
@@ -225,7 +227,7 @@ def save_checkpoint(
             "step": step,
             "tokens_seen": tokens_seen,
         }
-        torch.save(payload, checkpoint_path)
+        safe_torch_save(payload, checkpoint_path)
         print(f"Saved checkpoint to {checkpoint_path}")
 
 
@@ -236,7 +238,7 @@ def load_checkpoint(
     path: str,
     rank: int,
 ) -> tuple[int, int]:
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = safe_torch_load(path, map_location="cpu")
     full_state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_config):
         model.load_state_dict(checkpoint["model"])

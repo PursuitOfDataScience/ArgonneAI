@@ -138,6 +138,34 @@ def safe_torch_save(obj, path: str) -> str:
         return path
 
 
+def safe_torch_load(path: str, *, map_location=None, **kwargs):
+    """Load a checkpoint while automatically retrying without ``weights_only``.
+
+    When ``safe_torch_save`` falls back to the legacy serializer the resulting
+    archive is not a zip container.  ``torch.load(..., weights_only=True)``
+    always expects the zip-based format and therefore raises
+    ``failed finding central directory``.  To make resume scripts robust across
+    both formats we first try the caller-provided arguments and, upon hitting
+    this specific error class, retry without the ``weights_only`` flag so that
+    PyTorch can transparently handle legacy pickled checkpoints.
+    """
+
+    try:
+        return torch.load(path, map_location=map_location, **kwargs)
+    except RuntimeError as err:
+        message = str(err)
+        legacy_signatures = (
+            "PytorchStreamReader failed reading zip archive",
+            "failed finding central directory",
+        )
+        if not any(signature in message for signature in legacy_signatures):
+            raise
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.pop("weights_only", None)
+        return torch.load(path, map_location=map_location, **retry_kwargs)
+
+
 def validate_tokenizer_path(path: str) -> str:
     """Ensure that ``path`` points to a tokenizer directory on disk."""
 

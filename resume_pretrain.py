@@ -20,6 +20,7 @@ from training_utils import (
     DEFAULT_MAX_TRAINING_STEPS,
     load_streaming_shard,
     log_dataset_plan,
+    safe_torch_load,
     safe_torch_save,
     resolve_data_files,
     validate_tokenizer_path,
@@ -298,7 +299,7 @@ def resume_training(
     resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
     print(f"Resuming from: {resolved_checkpoint}")
 
-    ckpt = torch.load(resolved_checkpoint, map_location="cpu", weights_only=True)
+    ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
 
     # Convert compiled model state dict to regular model format
     if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
