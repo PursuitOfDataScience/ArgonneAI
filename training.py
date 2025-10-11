@@ -281,9 +281,11 @@ def train_model_parallel(
         hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
 
     current_max_length = getattr(hf_tokenizer, "model_max_length", None)
-    target_max_length = max(block_size + 1, block_size * 2)
+    target_max_length = max(block_size + 1, 1_000_000_000)
     if current_max_length is None or current_max_length < target_max_length:
         hf_tokenizer.model_max_length = target_max_length
+        if hasattr(hf_tokenizer, "init_kwargs"):
+            hf_tokenizer.init_kwargs["model_max_length"] = target_max_length
 
     config_model = ArgonneConfig(
         vocab_size=len(hf_tokenizer),

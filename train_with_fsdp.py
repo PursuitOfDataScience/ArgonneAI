@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
@@ -71,9 +72,13 @@ def cleanup_distributed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_model(block_size: int, vocab_size: int) -> ArgonneModel:
+def build_model(
+    block_size: int,
+    tokenizer,
+    use_gradient_checkpointing: bool,
+) -> ArgonneModel:
     config = ArgonneConfig(
-        vocab_size=vocab_size,
+        vocab_size=len(tokenizer),
         max_position_embeddings=block_size,
         hidden_size=4096,
         num_hidden_layers=24,
@@ -84,8 +89,17 @@ def build_model(block_size: int, vocab_size: int) -> ArgonneModel:
         attention_dropout=0.0,
         use_flash_attention=True,
         tie_word_embeddings=False,
+        pad_token_id=getattr(tokenizer, "pad_token_id", None),
+        bos_token_id=getattr(tokenizer, "bos_token_id", None),
+        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
-    return ArgonneModel(config)
+    model = ArgonneModel(config)
+    if use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    else:
+        model.gradient_checkpointing_disable()
+    return model
 
 
 def create_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -193,8 +207,9 @@ def load_initial_state(
     rank: int,
     block_size: int,
     tokenizer,
+    use_gradient_checkpointing: bool,
 ) -> Tuple[ArgonneModel, CheckpointState]:
-    model = build_model(block_size, len(tokenizer))
+    model = build_model(block_size, tokenizer, use_gradient_checkpointing)
     state = CheckpointState(step=0, tokens=0, data_position=None, optimizer_state=None, scheduler_state=None)
 
     resolved = _resolve_checkpoint_path(checkpoint_path)
@@ -322,6 +337,10 @@ class StreamingBatchProvider:
         return _collate_for_rank0(buffer, self.block_size, self.batch_size, self.world_size, device)
 
 
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+
+
 class NonStreamingBatchProvider:
     def __init__(
         self,
@@ -378,6 +397,25 @@ class NonStreamingBatchProvider:
         return _collate_for_rank0(batch_tokens, self.block_size, self.batch_size, self.world_size, device)
 
 
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+
+
+def _round_down_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    if value < multiple:
+        return multiple
+    return max(multiple, (value // multiple) * multiple)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "cuda oom" in message
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -409,8 +447,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision")
+    parser.add_argument(
+        "--no-mixed-precision",
+        action="store_true",
+        help="Disable mixed precision (useful for debugging at the cost of much higher memory)",
+    )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile where available")
     parser.add_argument("--checkpoint-keep", type=int, default=3, help="Number of recent checkpoints to keep")
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing (enabled by default to reduce activation memory)",
+    )
+    parser.add_argument(
+        "--auto-batch-max",
+        type=int,
+        default=512,
+        help="Start automatic OOM backoff from this per-rank batch size (<=0 disables)",
+    )
+    parser.add_argument(
+        "--auto-batch-min",
+        type=int,
+        default=None,
+        help="Minimum per-rank batch size auto backoff can reach (defaults to --batch-size)",
+    )
+    parser.add_argument(
+        "--disable-auto-batch",
+        action="store_true",
+        help="Disable automatic per-rank batch size reduction on OOM",
+    )
     return parser.parse_args()
 
 
@@ -426,9 +491,6 @@ def train() -> None:
 
     if args.bf16 and args.fp16:
         raise ValueError("Cannot enable both bf16 and fp16 modes simultaneously")
-
-    if rank == 0:
-        print(f"FSDP training using world_size={world_size} | per-rank batch={args.batch_size}")
 
     # Resolve datasets
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
@@ -453,10 +515,32 @@ def train() -> None:
     tokenizer = load_tokenizer(args.tokenizer_path, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
-    tokenizer.model_max_length = max(args.block_size + 1, args.block_size * 2)
+
+    # ``encode`` is used on raw documents before we chunk to ``block_size``.
+    # Some shards can easily exceed the tokenizer's baked-in ``model_max_length``
+    # (often 8k), which only serves to emit noisy warnings even though we never
+    # feed those full sequences into the model. Lift the limit to a very large
+    # sentinel value so encoding huge documents stays warning-free while the
+    # actual training batches remain bounded by ``block_size``.
+    tokenizer.model_max_length = max(args.block_size + 1, 1_000_000_000)
+    if hasattr(tokenizer, "init_kwargs"):
+        tokenizer.init_kwargs["model_max_length"] = tokenizer.model_max_length
 
     # Model + checkpoint
-    base_model, ckpt_state = load_initial_state(args.checkpoint_path, rank, args.block_size, tokenizer)
+    use_gradient_checkpointing = not args.no_gradient_checkpointing
+    base_model, ckpt_state = load_initial_state(
+        args.checkpoint_path,
+        rank,
+        args.block_size,
+        tokenizer,
+        use_gradient_checkpointing,
+    )
+
+    if rank == 0:
+        if use_gradient_checkpointing:
+            print("Enabled gradient checkpointing to reduce activation memory.")
+        else:
+            print("Gradient checkpointing disabled; activation memory usage will be higher.")
 
     if args.compile and hasattr(torch, "compile"):
         try:
@@ -465,14 +549,46 @@ def train() -> None:
             if rank == 0:
                 print(f"torch.compile failed ({exc}); continuing without compilation")
 
-    base_model.to(device)
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
 
-    auto_wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={Block})
+    if args.no_mixed_precision and (args.bf16 or args.fp16):
+        raise ValueError("Cannot combine explicit mixed precision flags with --no-mixed-precision")
+
     mp_policy = None
-    if args.bf16:
-        mp_policy = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
-    elif args.fp16:
-        mp_policy = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float32, buffer_dtype=torch.float16)
+    amp_dtype = None
+    if not args.no_mixed_precision and torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(device_index)
+        supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+
+        if args.bf16:
+            if not supports_bf16:
+                raise RuntimeError("Requested bf16 mixed precision but the current GPU does not support it")
+            amp_dtype = torch.bfloat16
+        elif args.fp16:
+            amp_dtype = torch.float16
+        else:
+            if supports_bf16:
+                amp_dtype = torch.bfloat16
+                if rank == 0:
+                    print("Auto-enabled bf16 mixed precision for improved memory usage")
+            else:
+                amp_dtype = torch.float16
+                if rank == 0:
+                    print("Auto-enabled fp16 mixed precision for improved memory usage")
+
+        if amp_dtype == torch.bfloat16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.bfloat16,
+            )
+        elif amp_dtype == torch.float16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float16,
+            )
 
     fsdp_model = FSDP(
         base_model,
@@ -503,7 +619,34 @@ def train() -> None:
     grad_accum = max(args.gradient_accumulation_steps, 1)
     if args.batch_size % grad_accum != 0:
         raise ValueError("Per-rank batch size must be divisible by gradient accumulation steps")
-    micro_batch = args.batch_size // grad_accum
+
+    base_batch_size = args.batch_size
+    min_auto_batch = args.auto_batch_min if args.auto_batch_min and args.auto_batch_min > 0 else base_batch_size
+    min_auto_batch = max(min_auto_batch, base_batch_size)
+    min_auto_batch = _round_down_to_multiple(min_auto_batch, grad_accum)
+    if min_auto_batch < base_batch_size:
+        min_auto_batch = base_batch_size
+
+    if args.disable_auto_batch or args.auto_batch_max <= 0:
+        current_batch_size = base_batch_size
+    else:
+        start_candidate = max(args.auto_batch_max, base_batch_size)
+        start_candidate = _round_down_to_multiple(start_candidate, grad_accum)
+        if start_candidate < base_batch_size:
+            start_candidate = base_batch_size
+        current_batch_size = start_candidate
+
+    current_micro_batch = current_batch_size // grad_accum
+    if current_micro_batch <= 0:
+        raise ValueError("Per-rank batch size must be at least gradient accumulation steps")
+
+    if rank == 0:
+        msg = (
+            f"FSDP training using world_size={world_size} | per-rank batch target={current_batch_size}"
+        )
+        if not args.disable_auto_batch and args.auto_batch_max > 0:
+            msg += f" (floor={min_auto_batch}, baseline={base_batch_size})"
+        print(msg)
 
     data_position = DataPosition(streaming=not args.no_streaming)
     if ckpt_state.data_position:
@@ -516,7 +659,7 @@ def train() -> None:
                 data_files,
                 tokenizer,
                 args.block_size,
-                args.batch_size,
+                current_batch_size,
                 world_size,
                 data_position,
                 args.num_proc,
@@ -526,31 +669,29 @@ def train() -> None:
                 data_files,
                 tokenizer,
                 args.block_size,
-                args.batch_size,
+                current_batch_size,
                 world_size,
                 data_position,
             )
+
+        # Ensure rank0 provider reflects the dynamically chosen batch size
+        provider.set_batch_size(current_batch_size)
 
     start_step = ckpt_state.step
     total_tokens_processed = ckpt_state.tokens
 
     fsdp_model.train()
 
-    if args.fp16 and torch.cuda.is_available():
-        scaler = torch.amp.GradScaler("cuda")
-    else:
+    if args.no_mixed_precision or not torch.cuda.is_available():
         scaler = None
-
-    amp_dtype = None
-    if args.bf16:
-        amp_dtype = torch.bfloat16
-    elif args.fp16:
-        amp_dtype = torch.float16
+        amp_dtype = None
+    else:
+        scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
 
     if rank == 0:
         print(
             "Starting/resuming training at step "
-            f"{start_step} | target steps {args.total_steps} | micro_batch {micro_batch} | grad_accum {grad_accum}"
+            f"{start_step} | target steps {args.total_steps} | micro_batch {current_micro_batch} | grad_accum {grad_accum}"
         )
 
     step = start_step
@@ -561,23 +702,31 @@ def train() -> None:
         else contextlib.nullcontext()
     )
 
-    while step < args.total_steps:
-        if rank == 0:
-            assert provider is not None
-            inputs_all, labels_all = provider.next_batch(device)
-            batch_tokens = inputs_all.numel()
-        else:
-            shape = (world_size, args.batch_size, args.block_size)
-            inputs_all = torch.empty(shape, dtype=torch.long, device=device)
-            labels_all = torch.empty(shape, dtype=torch.long, device=device)
-            batch_tokens = 0
+    sample_prompt = "Long long time ago, "
+    sample_interval = 50
+    sample_new_tokens = 100
 
-        dist.broadcast(inputs_all, src=0)
-        dist.broadcast(labels_all, src=0)
-        tokens_tensor = torch.tensor(batch_tokens, device=device, dtype=torch.long)
-        dist.broadcast(tokens_tensor, src=0)
-        batch_tokens = int(tokens_tensor.item())
-        tokens_this_session += batch_tokens
+    pending_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    while step < args.total_steps:
+        if pending_batch is not None:
+            inputs_all, labels_all = pending_batch
+            pending_batch = None
+        else:
+            if rank == 0:
+                assert provider is not None
+                inputs_all, labels_all = provider.next_batch(device)
+            else:
+                shape = (world_size, current_batch_size, args.block_size)
+                inputs_all = torch.empty(shape, dtype=torch.long, device=device)
+                labels_all = torch.empty(shape, dtype=torch.long, device=device)
+
+            dist.broadcast(inputs_all, src=0)
+            dist.broadcast(labels_all, src=0)
+
+        inputs_all = inputs_all[:, :current_batch_size, :]
+        labels_all = labels_all[:, :current_batch_size, :]
+        batch_tokens = inputs_all.numel()
 
         inputs_local = inputs_all[rank]
         labels_local = labels_all[rank]
@@ -586,39 +735,130 @@ def train() -> None:
         scheduler.step(step)
         optimizer.zero_grad(set_to_none=True)
 
-        for micro_idx in range(grad_accum):
-            start = micro_idx * micro_batch
-            end = start + micro_batch
-            micro_inputs = inputs_local[start:end]
-            micro_labels = labels_local[start:end]
+        oom_tensor = torch.zeros(1, device=device)
 
-            with autocast_ctx:
-                outputs = fsdp_model(micro_inputs, labels=micro_labels)
-                loss = outputs.loss / grad_accum
+        try:
+            for micro_idx in range(grad_accum):
+                start = micro_idx * current_micro_batch
+                end = start + current_micro_batch
+                micro_inputs = inputs_local[start:end]
+                micro_labels = labels_local[start:end]
 
+                with autocast_ctx:
+                    outputs = fsdp_model(micro_inputs, labels=micro_labels)
+                    loss = outputs.loss / grad_accum
+
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                local_loss += loss.detach()
+
+            torch.nn.utils.clip_grad_norm_(fsdp_model.parameters(), 1.0)
             if scaler is not None:
-                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
-            local_loss += loss.detach()
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        torch.nn.utils.clip_grad_norm_(fsdp_model.parameters(), 1.0)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        except RuntimeError as exc:
+            if _is_oom_error(exc):
+                oom_tensor.fill_(1)
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.update()
+            else:
+                raise
 
         loss_tensor = local_loss.clone()
+
+        dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
+        if oom_tensor.item():
+            if args.disable_auto_batch or args.auto_batch_max <= 0:
+                torch.cuda.empty_cache()
+                if rank == 0:
+                    print(
+                        "OOM encountered with automatic batch scaling disabled. "
+                        "Please lower --batch-size or adjust other memory-intensive settings."
+                    )
+                raise RuntimeError("OOM encountered with auto-batch disabled")
+
+            new_candidate = _round_down_to_multiple(current_batch_size // 2, grad_accum)
+            new_candidate = max(new_candidate, min_auto_batch)
+            if new_candidate < min_auto_batch or new_candidate == current_batch_size:
+                if rank == 0:
+                    print(
+                        "Encountered OOM at minimal batch size; unable to continue. "
+                        "Consider reducing gradient accumulation or block size."
+                    )
+                raise RuntimeError("OOM encountered at minimal batch size")
+
+            current_batch_size = new_candidate
+            current_micro_batch = current_batch_size // grad_accum
+            if rank == 0:
+                print(
+                    "OOM detected; reducing per-rank batch to "
+                    f"{current_batch_size} (micro_batch={current_micro_batch})."
+                )
+            if provider is not None:
+                provider.set_batch_size(current_batch_size)
+            inputs_all = inputs_all[:, :current_batch_size, :].contiguous()
+            labels_all = labels_all[:, :current_batch_size, :].contiguous()
+            pending_batch = (inputs_all, labels_all)
+            torch.cuda.empty_cache()
+            dist.barrier()
+            continue
+
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         loss_avg = loss_tensor.item() / max(1, world_size)
+
+        tokens_this_session += batch_tokens
 
         if rank == 0 and step % 10 == 0:
             total_tokens = total_tokens_processed + tokens_this_session
             print(
                 f"step={step:06d} | loss={loss_avg:.4f} | tokens={total_tokens:,} | lr={scheduler.last_lr:.3e}"
             )
+
+        if step % sample_interval == 0:
+            fsdp_was_training = fsdp_model.training
+            fsdp_model.eval()
+            generated_tokens: Optional[List[int]] = None
+            try:
+                prompt_ids = tokenizer.encode(sample_prompt)
+                if not prompt_ids:
+                    prompt_ids = [getattr(tokenizer, "bos_token_id", 0)]
+
+                prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+                if prompt_tensor.size(1) > args.block_size:
+                    prompt_tensor = prompt_tensor[:, : args.block_size]
+                max_append = max(0, min(sample_new_tokens, args.block_size - prompt_tensor.size(1)))
+
+                with torch.no_grad():
+                    generated = prompt_tensor
+                    for _ in range(max_append):
+                        with (
+                            torch.amp.autocast("cuda", dtype=amp_dtype)
+                            if amp_dtype is not None and torch.cuda.is_available()
+                            else contextlib.nullcontext()
+                        ):
+                            outputs = fsdp_model(generated)
+                            logits = outputs.logits[:, -1, :]
+                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                        generated = torch.cat([generated, next_token], dim=-1)
+
+                    if rank == 0:
+                        generated_tokens = generated[0].detach().cpu().tolist()
+            except Exception as exc:  # pragma: no cover - generation is best-effort
+                if rank == 0:
+                    print(f"[generation] Failed to produce sample text: {exc}")
+            finally:
+                fsdp_model.train(fsdp_was_training)
+
+            if rank == 0 and generated_tokens is not None:
+                generated_text = tokenizer.decode(generated_tokens)
+                print(f"\n--- Generated text at step {step} ---\n{generated_text}\n")
 
         if args.save_interval > 0 and step > start_step and step % args.save_interval == 0:
             total_tokens = total_tokens_processed + tokens_this_session
@@ -657,7 +897,7 @@ def train() -> None:
         model_ref = fsdp_model.module if hasattr(fsdp_model, "module") else fsdp_model
         update_training_stats(
             tokens=total_tokens,
-            batch_size=args.batch_size * world_size,
+            batch_size=current_batch_size * world_size,
             steps=step - 1,
             model=model_ref,
             n_layer=model_ref.config.num_hidden_layers,

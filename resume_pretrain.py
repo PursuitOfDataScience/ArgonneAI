@@ -309,7 +309,9 @@ def resume_training(
     )
     if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
         hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
-    hf_tokenizer.model_max_length = max(block_size + 1, block_size * 2)
+    hf_tokenizer.model_max_length = max(block_size + 1, 1_000_000_000)
+    if hasattr(hf_tokenizer, "init_kwargs"):
+        hf_tokenizer.init_kwargs["model_max_length"] = hf_tokenizer.model_max_length
 
     vocab_size = len(hf_tokenizer)
 
