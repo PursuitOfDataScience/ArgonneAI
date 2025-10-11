@@ -31,6 +31,7 @@ Argonne 2.0 pretraining uses the **Qwen2.5-3B-Instruct** tokenizer. Important ch
 - `training.py` – Pipeline-parallel training entrypoint with dataset streaming, resumable shard tracking, and automatic batch-size backoff when CUDA or compilation OOMs occur.
 - `train_with_fsdp.py` – Alternative Fully Sharded Data Parallel (FSDP) launcher for multi-GPU jobs that prefer sharded data parallelism over pipeline stages.
 - `resume_pretrain.py` – Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
+- `resume_pretrain_tensor.py` – **NEW**: Tensor parallelism training script that mirrors `resume_pretrain.py` but replaces pipeline parallelism with tensor parallelism, allowing all GPUs to work in parallel on the same layer.
 
 ## Running the FSDP continuation script
 On a single DGX node you should launch `train_with_fsdp.py` with `torchrun` so that all eight GPUs participate as individual FSDP ranks. The script follows the exact same resume logic as `resume_pretrain.py`—it restores checkpoints written by the legacy flow, reuses the shared `DataPosition` tracker, and advances the cosine schedule in lockstep—while letting every GPU process its own micro-batch concurrently for higher throughput. A minimal command matching the resume workflow is:
@@ -41,6 +42,38 @@ torchrun --standalone --nproc_per_node=8 train_with_fsdp.py \
 ```
 
 Additional flags exposed by the script include `--data-glob` for alternate shard locations, `--batch-size` for the per-rank batch, and precision options like `--bf16`/`--fp16`. Only rank 0 performs dataset/tokeniser work; batches are broadcast to the other ranks, which means you can scale to multi-node runs by exporting the usual rendezvous variables (`MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`) before invoking `torchrun`. The script automatically discovers the latest checkpoint (or accepts `--checkpoint-path`) and restores the tokenizer/training step metadata before continuing. 【F:train_with_fsdp.py†L340-L427】【F:train_with_fsdp.py†L452-L610】
+
+## Running the Tensor Parallelism continuation script
+The new `resume_pretrain_tensor.py` script implements **tensor parallelism** as an alternative to pipeline parallelism. Unlike pipeline parallelism where different layers are distributed across GPUs sequentially, tensor parallelism shards individual layers (attention and feed-forward) across multiple GPUs, enabling all GPUs to work in parallel on the same layer.
+
+**Key Features:**
+- **Tensor Sharding:** Splits attention projections (Q, K, V) and MLP layers horizontally across GPUs
+- **Synchronized Computation:** Uses `torch.distributed.all_reduce()` to combine partial results from all GPUs
+- **Compatible Checkpoints:** Can resume from checkpoints created by `resume_pretrain.py` or other training scripts
+- **Identical Training Logic:** Mirrors the exact workflow, data position tracking, and hyperparameters of `resume_pretrain.py`
+- **Multi-GPU Support:** Requires NCCL backend and distributed launch via `torchrun`
+
+**Launch Command:**
+```bash
+torchrun --standalone --nproc_per_node=8 resume_pretrain_tensor.py \
+  --tokenizer-path ../Qwen2.5-3B-Instruct \
+  --checkpoint-path pretrained/streaming_checkpoint_step_XXXX.pth
+```
+
+**How Tensor Parallelism Works:**
+1. Each GPU receives the full batch of inputs
+2. Linear layers are sharded across GPUs:
+   - **Column-parallel:** Q, K, V projections and gate/up projections split output features
+   - **Row-parallel:** Output projections and down projections split input features
+3. After each sharded layer, `all_reduce` combines results from all GPUs
+4. All GPUs maintain synchronized copies of embeddings, norms, and the LM head
+
+**When to Use Tensor Parallelism vs Pipeline Parallelism:**
+- **Tensor Parallelism:** Better for models where communication overhead is low and you want maximum parallelism within each layer
+- **Pipeline Parallelism:** Better for very large models where layer-wise staging reduces memory per GPU
+- **Data Parallelism (FSDP):** Better for scaling to many GPUs with minimal code changes
+
+The script uses the same command-line arguments as `resume_pretrain.py`, including `--data-glob`, `--batch-size`, `--learning-rate`, `--block-size`, and all scheduling parameters. Checkpoints are saved with a `tensor_parallel_` prefix to distinguish them from pipeline-parallel checkpoints.
 
 ## Default dataset location
 - Training scripts now target the Common Crawl derived shards stored at `../data/CC-MAIN-2025-26/*.parquet`. Shards are consumed in natural numeric order so `000_00000.parquet` is seen before `000_00001.parquet`, ensuring deterministic sequential coverage of the crawl export.
