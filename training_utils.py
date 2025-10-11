@@ -7,7 +7,7 @@ import math
 import os
 import re
 import tempfile
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import torch
 from datasets import Dataset
@@ -177,6 +177,27 @@ def safe_torch_load(path: str, *, map_location=None, **kwargs):
                     "was fully written and retry from a valid file."
                 ) from retry_err
             raise
+
+
+def cast_state_dict_to_dtype(
+    state_dict: Mapping[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> Dict[str, torch.Tensor]:
+    """Return a CPU-based copy of ``state_dict`` cast to ``dtype`` when safe."""
+
+    target_is_fp16 = dtype in (torch.float16, torch.bfloat16)
+    converted: Dict[str, torch.Tensor] = {}
+
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().to("cpu")
+            if target_is_fp16 and torch.is_floating_point(tensor):
+                tensor = tensor.to(dtype=dtype)
+            converted[key] = tensor
+        else:
+            converted[key] = value
+
+    return converted
 
 
 def validate_tokenizer_path(path: str) -> str:
