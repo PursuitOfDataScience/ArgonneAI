@@ -488,7 +488,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--no-streaming", action="store_true")
     parser.add_argument("--num-proc", type=int, default=8)
-    parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision")
