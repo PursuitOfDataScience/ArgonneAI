@@ -37,6 +37,51 @@ from resume_pretrain import (
 
 
 # ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Return token indices sampled from ``logits`` with temperature/top-k/p."""
+
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0 for sampling")
+
+    scaled_logits = logits / temperature
+
+    if top_k > 0 and top_k < scaled_logits.size(-1):
+        values, _ = torch.topk(scaled_logits, top_k)
+        threshold = values[..., -1, None]
+        scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
+
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(scaled_logits, dim=-1, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        cutoff = cumulative_probs > top_p
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
+
+        scaled_logits = torch.full_like(scaled_logits, float("-inf"))
+        scaled_logits.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
+
+    probs = torch.softmax(scaled_logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    probs = torch.where(probs_sum > 0, probs / probs_sum, torch.zeros_like(probs))
+
+    return torch.multinomial(probs, num_samples=1, generator=generator)
+
+
+# ---------------------------------------------------------------------------
 # Distributed setup utilities
 # ---------------------------------------------------------------------------
 
@@ -476,6 +521,37 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable automatic per-rank batch size reduction on OOM",
     )
+    parser.add_argument("--sample-interval", type=int, default=50, help="Steps between text samples")
+    parser.add_argument(
+        "--sample-new-tokens",
+        type=int,
+        default=100,
+        help="Maximum number of new tokens to append during qualitative sampling",
+    )
+    parser.add_argument(
+        "--sample-temperature",
+        type=float,
+        default=0.8,
+        help="Softmax temperature used when drawing qualitative samples",
+    )
+    parser.add_argument(
+        "--sample-top-k",
+        type=int,
+        default=50,
+        help="Top-k filter applied when generating qualitative samples (0 disables)",
+    )
+    parser.add_argument(
+        "--sample-top-p",
+        type=float,
+        default=0.95,
+        help="Top-p nucleus filter for qualitative samples (>=1 disables)",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="Optional base seed for qualitative sampling to keep outputs reproducible",
+    )
     return parser.parse_args()
 
 
@@ -609,6 +685,12 @@ def train() -> None:
         min_lr=args.min_learning_rate,
     )
 
+    sample_interval = max(1, args.sample_interval)
+    sample_new_tokens = max(0, args.sample_new_tokens)
+    sample_temperature = max(args.sample_temperature, 1e-5)
+    sample_top_k = max(0, args.sample_top_k)
+    sample_top_p = max(0.0, min(args.sample_top_p, 1.0))
+
     if ckpt_state.scheduler_state:
         scheduler.load_state_dict(ckpt_state.scheduler_state)
         scheduler.step(ckpt_state.scheduler_state.get("step", ckpt_state.step))
@@ -703,8 +785,7 @@ def train() -> None:
     )
 
     sample_prompt = "Long long time ago, "
-    sample_interval = 50
-    sample_new_tokens = 100
+    sample_seed_base = args.sample_seed
 
     pending_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
@@ -821,7 +902,7 @@ def train() -> None:
                 f"step={step:06d} | loss={loss_avg:.4f} | tokens={total_tokens:,} | lr={scheduler.last_lr:.3e}"
             )
 
-        if step % sample_interval == 0:
+        if step % sample_interval == 0 and sample_new_tokens > 0:
             fsdp_was_training = fsdp_model.training
             fsdp_model.eval()
             generated_tokens: Optional[List[int]] = None
@@ -837,6 +918,11 @@ def train() -> None:
 
                 with torch.no_grad():
                     generated = prompt_tensor
+                    sample_generator: Optional[torch.Generator] = None
+                    if sample_seed_base is not None:
+                        sample_generator = torch.Generator(device=device)
+                        sample_generator.manual_seed(sample_seed_base + step)
+
                     for _ in range(max_append):
                         with (
                             torch.amp.autocast("cuda", dtype=amp_dtype)
@@ -845,7 +931,13 @@ def train() -> None:
                         ):
                             outputs = fsdp_model(generated)
                             logits = outputs.logits[:, -1, :]
-                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                        next_token = _sample_next_token(
+                            logits,
+                            temperature=sample_temperature,
+                            top_k=sample_top_k,
+                            top_p=sample_top_p,
+                            generator=sample_generator,
+                        )
                         generated = torch.cat([generated, next_token], dim=-1)
 
                     if rank == 0:
