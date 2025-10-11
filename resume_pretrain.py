@@ -18,6 +18,7 @@ from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
+    cast_state_dict_to_dtype,
     load_streaming_shard,
     log_dataset_plan,
     safe_torch_load,
@@ -339,6 +340,34 @@ def resume_training(
     print(f"Resuming from: {resolved_checkpoint}")
 
     ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
+    stored_model_dtype = ckpt.get("model_dtype")
+
+    supports_bf16 = False
+    amp_dtype = torch.float32
+    if torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+
+        requested_dtype: Optional[torch.dtype] = None
+        if isinstance(stored_model_dtype, str):
+            if stored_model_dtype == str(torch.bfloat16):
+                if supports_bf16:
+                    requested_dtype = torch.bfloat16
+                else:
+                    print(
+                        "Checkpoint was saved in bf16 but the current GPU does not support bf16. "
+                        "Falling back to fp16 parameters for this session."
+                    )
+            elif stored_model_dtype == str(torch.float16):
+                requested_dtype = torch.float16
+
+        if requested_dtype is not None:
+            amp_dtype = requested_dtype
+        else:
+            amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+
+    target_dtype = amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
 
     # Convert compiled model state dict to regular model format
     if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
@@ -351,8 +380,10 @@ def resume_training(
         ckpt["model_state_dict"] = new_state_dict
         print("Checkpoint parameter names converted successfully")
 
-    base_model.load_state_dict(ckpt["model_state_dict"])
-    
+    converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
+    base_model.to(dtype=target_dtype)
+    base_model.load_state_dict(converted_state)
+
     # 4) Distribute model BEFORE creating optimizer
     base_model.distribute_model()  # Make sure model is distributed across GPUs first
     model = base_model  # Keep reference to distributed model
@@ -430,19 +461,15 @@ def resume_training(
     for i in range(num_gpus):
         print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
 
-    # Determine AMP dtype and scaler usage
-    supports_bf16 = False
-    amp_dtype = torch.float16
-    if torch.cuda.is_available():
-        device_index = torch.cuda.current_device()
-        major, _minor = torch.cuda.get_device_capability(device_index)
-        supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
-        amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
-    else:
-        amp_dtype = torch.float32
-
     use_grad_scaler = amp_dtype == torch.float16 and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
+
+    if supports_bf16:
+        print("Using torch.bfloat16 autocast for mixed precision on Ampere/Hopper GPUs.")
+    elif amp_dtype == torch.float16:
+        print("Using torch.float16 autocast with GradScaler for mixed precision.")
+    else:
+        print("Running without CUDA mixed precision (fallback precision).")
 
     # Try to apply torch.compile() if available
     if hasattr(torch, "compile"):
@@ -591,15 +618,17 @@ def resume_training(
                         current_total_tokens = (
                             total_tokens_processed + tokens_in_this_session
                         )
+                        model_state = cast_state_dict_to_dtype(model.state_dict(), amp_dtype)
                         checkpoint_state = {
                             "global_step": global_step,
                             "tokens_processed": current_total_tokens,
-                            "model_state_dict": model.state_dict(),
+                            "model_state_dict": model_state,
                             "optimizer_state_dict": optimizer.state_dict(),
                             "scheduler_state_dict": scheduler.state_dict(),
                             "loss": last_loss_value,
                             "data_position": data_position.get_state(),
                             "fused_optimizer": fused_optimizer,
+                            "model_dtype": str(amp_dtype),
                         }
                         os.makedirs("pretrained", exist_ok=True)
                         save_path = (
@@ -731,15 +760,17 @@ def resume_training(
                     current_total_tokens = (
                         total_tokens_processed + tokens_in_this_session
                     )
+                    model_state = cast_state_dict_to_dtype(model.state_dict(), amp_dtype)
                     checkpoint_state = {
                         "global_step": global_step,
                         "tokens_processed": current_total_tokens,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": model_state,
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "loss": last_loss_value,
                         "data_position": data_position.get_state(),
                         "fused_optimizer": fused_optimizer,
+                        "model_dtype": str(amp_dtype),
                     }
                     os.makedirs("pretrained", exist_ok=True)
                     save_path = (
@@ -793,8 +824,10 @@ def resume_training(
 
     # Perform final save at the end of training
     try:
-        # Convert to FP16 or keep in FP32 as needed
-        model = model.half()
+        target_dtype = (
+            amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
+        )
+        model = model.to(dtype=target_dtype)
         # Move entire model to CPU to avoid cross-device references
         model = model.to("cpu")
         # Disable safe_serialization to allow shared tensor references

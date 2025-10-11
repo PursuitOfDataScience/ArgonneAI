@@ -19,6 +19,7 @@ from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
+    cast_state_dict_to_dtype,
     load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
@@ -274,7 +275,7 @@ def train_model_parallel(
     active_grad_accum_steps = 1
     effective_micro_batch = batch_size
     effective_tokens_per_step = block_size * effective_micro_batch
-    active_amp_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    active_amp_dtype = torch.float32
     fused_optimizer_used = False
 
     if hf_tokenizer.pad_token is None:
@@ -399,7 +400,18 @@ def train_model_parallel(
             print(f"Available GPUs: {num_gpus}")
             for i in range(num_gpus):
                 print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-            
+
+            supports_bf16 = False
+            amp_dtype = torch.float32
+            if torch.cuda.is_available():
+                device_index = torch.cuda.current_device()
+                major, _minor = torch.cuda.get_device_capability(device_index)
+                supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+                amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+
+            if amp_dtype in (torch.float16, torch.bfloat16):
+                model = model.to(dtype=amp_dtype)
+
             # Distribute model across GPUs
             model.distribute_model()  # chunks across all visible GPUs
 
@@ -482,18 +494,8 @@ def train_model_parallel(
 
             fused_optimizer_used = fused_optimizer
 
-            supports_bf16 = False
-            amp_dtype = torch.float16
-            if torch.cuda.is_available():
-                device_index = torch.cuda.current_device()
-                major, _minor = torch.cuda.get_device_capability(device_index)
-                supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
-                amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
-            else:
-                amp_dtype = torch.float32
-
             active_amp_dtype = amp_dtype
-            use_grad_scaler = amp_dtype == torch.float16
+            use_grad_scaler = amp_dtype == torch.float16 and torch.cuda.is_available()
             scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
 
             if supports_bf16:
@@ -616,16 +618,18 @@ def train_model_parallel(
                     print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                 if checkpoint_interval and global_step % checkpoint_interval == 0:
+                    model_state = cast_state_dict_to_dtype(model.state_dict(), amp_dtype)
                     checkpoint = {
                         "epoch": epoch,
                         "global_step": global_step,
                         "batch_size": batch_size,
                         "tokens_processed": tokens_in_current_attempt,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": model_state,
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "loss": last_loss_value,
                         "data_position": data_position.get_state(),
+                        "model_dtype": str(amp_dtype),
                     }
                     os.makedirs("pretrained", exist_ok=True)
                     checkpoint_path = (
@@ -866,7 +870,12 @@ def train_model_parallel(
 
     # Save final model and tokenizer
     try:
-        model = model.half()
+        target_dtype = (
+            active_amp_dtype
+            if active_amp_dtype in (torch.float16, torch.bfloat16)
+            else torch.float32
+        )
+        model = model.to(dtype=target_dtype)
         model = model.to("cpu")
         model.save_pretrained("Argonne_LLM", safe_serialization=False)
         hf_tokenizer.save_pretrained("Argonne_LLM")
