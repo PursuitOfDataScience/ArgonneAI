@@ -478,7 +478,16 @@ def train() -> None:
     tokenizer = load_tokenizer(args.tokenizer_path, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
-    tokenizer.model_max_length = max(args.block_size + 1, args.block_size * 2)
+
+    # ``encode`` is used on raw documents before we chunk to ``block_size``.
+    # Some shards can easily exceed the tokenizer's baked-in ``model_max_length``
+    # (often 8k), which only serves to emit noisy warnings even though we never
+    # feed those full sequences into the model. Lift the limit to a very large
+    # sentinel value so encoding huge documents stays warning-free while the
+    # actual training batches remain bounded by ``block_size``.
+    tokenizer.model_max_length = max(args.block_size + 1, 1_000_000_000)
+    if hasattr(tokenizer, "init_kwargs"):
+        tokenizer.init_kwargs["model_max_length"] = tokenizer.model_max_length
 
     # Model + checkpoint
     use_gradient_checkpointing = not args.no_gradient_checkpointing
@@ -626,6 +635,10 @@ def train() -> None:
         else contextlib.nullcontext()
     )
 
+    sample_prompt = "Long long time ago, "
+    sample_interval = 50
+    sample_new_tokens = 100
+
     while step < args.total_steps:
         if rank == 0:
             assert provider is not None
@@ -684,6 +697,45 @@ def train() -> None:
             print(
                 f"step={step:06d} | loss={loss_avg:.4f} | tokens={total_tokens:,} | lr={scheduler.last_lr:.3e}"
             )
+
+        if step % sample_interval == 0:
+            fsdp_was_training = fsdp_model.training
+            fsdp_model.eval()
+            generated_tokens: Optional[List[int]] = None
+            try:
+                prompt_ids = tokenizer.encode(sample_prompt)
+                if not prompt_ids:
+                    prompt_ids = [getattr(tokenizer, "bos_token_id", 0)]
+
+                prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+                if prompt_tensor.size(1) > args.block_size:
+                    prompt_tensor = prompt_tensor[:, : args.block_size]
+                max_append = max(0, min(sample_new_tokens, args.block_size - prompt_tensor.size(1)))
+
+                with torch.no_grad():
+                    generated = prompt_tensor
+                    for _ in range(max_append):
+                        with (
+                            torch.amp.autocast("cuda", dtype=amp_dtype)
+                            if amp_dtype is not None and torch.cuda.is_available()
+                            else contextlib.nullcontext()
+                        ):
+                            outputs = fsdp_model(generated)
+                            logits = outputs.logits[:, -1, :]
+                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                        generated = torch.cat([generated, next_token], dim=-1)
+
+                    if rank == 0:
+                        generated_tokens = generated[0].detach().cpu().tolist()
+            except Exception as exc:  # pragma: no cover - generation is best-effort
+                if rank == 0:
+                    print(f"[generation] Failed to produce sample text: {exc}")
+            finally:
+                fsdp_model.train(fsdp_was_training)
+
+            if rank == 0 and generated_tokens is not None:
+                generated_text = tokenizer.decode(generated_tokens)
+                print(f"\n--- Generated text at step {step} ---\n{generated_text}\n")
 
         if args.save_interval > 0 and step > start_step and step % args.save_interval == 0:
             total_tokens = total_tokens_processed + tokens_this_session
