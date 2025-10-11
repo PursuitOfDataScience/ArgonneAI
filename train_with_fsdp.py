@@ -337,6 +337,10 @@ class StreamingBatchProvider:
         return _collate_for_rank0(buffer, self.block_size, self.batch_size, self.world_size, device)
 
 
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+
+
 class NonStreamingBatchProvider:
     def __init__(
         self,
@@ -393,6 +397,25 @@ class NonStreamingBatchProvider:
         return _collate_for_rank0(batch_tokens, self.block_size, self.batch_size, self.world_size, device)
 
 
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+
+
+def _round_down_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    if value < multiple:
+        return multiple
+    return max(multiple, (value // multiple) * multiple)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "cuda oom" in message
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -436,6 +459,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable gradient checkpointing (enabled by default to reduce activation memory)",
     )
+    parser.add_argument(
+        "--auto-batch-max",
+        type=int,
+        default=512,
+        help="Start automatic OOM backoff from this per-rank batch size (<=0 disables)",
+    )
+    parser.add_argument(
+        "--auto-batch-min",
+        type=int,
+        default=None,
+        help="Minimum per-rank batch size auto backoff can reach (defaults to --batch-size)",
+    )
+    parser.add_argument(
+        "--disable-auto-batch",
+        action="store_true",
+        help="Disable automatic per-rank batch size reduction on OOM",
+    )
     return parser.parse_args()
 
 
@@ -451,9 +491,6 @@ def train() -> None:
 
     if args.bf16 and args.fp16:
         raise ValueError("Cannot enable both bf16 and fp16 modes simultaneously")
-
-    if rank == 0:
-        print(f"FSDP training using world_size={world_size} | per-rank batch={args.batch_size}")
 
     # Resolve datasets
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
@@ -582,7 +619,34 @@ def train() -> None:
     grad_accum = max(args.gradient_accumulation_steps, 1)
     if args.batch_size % grad_accum != 0:
         raise ValueError("Per-rank batch size must be divisible by gradient accumulation steps")
-    micro_batch = args.batch_size // grad_accum
+
+    base_batch_size = args.batch_size
+    min_auto_batch = args.auto_batch_min if args.auto_batch_min and args.auto_batch_min > 0 else base_batch_size
+    min_auto_batch = max(min_auto_batch, base_batch_size)
+    min_auto_batch = _round_down_to_multiple(min_auto_batch, grad_accum)
+    if min_auto_batch < base_batch_size:
+        min_auto_batch = base_batch_size
+
+    if args.disable_auto_batch or args.auto_batch_max <= 0:
+        current_batch_size = base_batch_size
+    else:
+        start_candidate = max(args.auto_batch_max, base_batch_size)
+        start_candidate = _round_down_to_multiple(start_candidate, grad_accum)
+        if start_candidate < base_batch_size:
+            start_candidate = base_batch_size
+        current_batch_size = start_candidate
+
+    current_micro_batch = current_batch_size // grad_accum
+    if current_micro_batch <= 0:
+        raise ValueError("Per-rank batch size must be at least gradient accumulation steps")
+
+    if rank == 0:
+        msg = (
+            f"FSDP training using world_size={world_size} | per-rank batch target={current_batch_size}"
+        )
+        if not args.disable_auto_batch and args.auto_batch_max > 0:
+            msg += f" (floor={min_auto_batch}, baseline={base_batch_size})"
+        print(msg)
 
     data_position = DataPosition(streaming=not args.no_streaming)
     if ckpt_state.data_position:
@@ -595,7 +659,7 @@ def train() -> None:
                 data_files,
                 tokenizer,
                 args.block_size,
-                args.batch_size,
+                current_batch_size,
                 world_size,
                 data_position,
                 args.num_proc,
@@ -605,10 +669,13 @@ def train() -> None:
                 data_files,
                 tokenizer,
                 args.block_size,
-                args.batch_size,
+                current_batch_size,
                 world_size,
                 data_position,
             )
+
+        # Ensure rank0 provider reflects the dynamically chosen batch size
+        provider.set_batch_size(current_batch_size)
 
     start_step = ckpt_state.step
     total_tokens_processed = ckpt_state.tokens
@@ -624,7 +691,7 @@ def train() -> None:
     if rank == 0:
         print(
             "Starting/resuming training at step "
-            f"{start_step} | target steps {args.total_steps} | micro_batch {micro_batch} | grad_accum {grad_accum}"
+            f"{start_step} | target steps {args.total_steps} | micro_batch {current_micro_batch} | grad_accum {grad_accum}"
         )
 
     step = start_step
@@ -639,23 +706,27 @@ def train() -> None:
     sample_interval = 50
     sample_new_tokens = 100
 
-    while step < args.total_steps:
-        if rank == 0:
-            assert provider is not None
-            inputs_all, labels_all = provider.next_batch(device)
-            batch_tokens = inputs_all.numel()
-        else:
-            shape = (world_size, args.batch_size, args.block_size)
-            inputs_all = torch.empty(shape, dtype=torch.long, device=device)
-            labels_all = torch.empty(shape, dtype=torch.long, device=device)
-            batch_tokens = 0
+    pending_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
-        dist.broadcast(inputs_all, src=0)
-        dist.broadcast(labels_all, src=0)
-        tokens_tensor = torch.tensor(batch_tokens, device=device, dtype=torch.long)
-        dist.broadcast(tokens_tensor, src=0)
-        batch_tokens = int(tokens_tensor.item())
-        tokens_this_session += batch_tokens
+    while step < args.total_steps:
+        if pending_batch is not None:
+            inputs_all, labels_all = pending_batch
+            pending_batch = None
+        else:
+            if rank == 0:
+                assert provider is not None
+                inputs_all, labels_all = provider.next_batch(device)
+            else:
+                shape = (world_size, current_batch_size, args.block_size)
+                inputs_all = torch.empty(shape, dtype=torch.long, device=device)
+                labels_all = torch.empty(shape, dtype=torch.long, device=device)
+
+            dist.broadcast(inputs_all, src=0)
+            dist.broadcast(labels_all, src=0)
+
+        inputs_all = inputs_all[:, :current_batch_size, :]
+        labels_all = labels_all[:, :current_batch_size, :]
+        batch_tokens = inputs_all.numel()
 
         inputs_local = inputs_all[rank]
         labels_local = labels_all[rank]
@@ -664,33 +735,85 @@ def train() -> None:
         scheduler.step(step)
         optimizer.zero_grad(set_to_none=True)
 
-        for micro_idx in range(grad_accum):
-            start = micro_idx * micro_batch
-            end = start + micro_batch
-            micro_inputs = inputs_local[start:end]
-            micro_labels = labels_local[start:end]
+        oom_tensor = torch.zeros(1, device=device)
 
-            with autocast_ctx:
-                outputs = fsdp_model(micro_inputs, labels=micro_labels)
-                loss = outputs.loss / grad_accum
+        try:
+            for micro_idx in range(grad_accum):
+                start = micro_idx * current_micro_batch
+                end = start + current_micro_batch
+                micro_inputs = inputs_local[start:end]
+                micro_labels = labels_local[start:end]
 
+                with autocast_ctx:
+                    outputs = fsdp_model(micro_inputs, labels=micro_labels)
+                    loss = outputs.loss / grad_accum
+
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                local_loss += loss.detach()
+
+            torch.nn.utils.clip_grad_norm_(fsdp_model.parameters(), 1.0)
             if scaler is not None:
-                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
-            local_loss += loss.detach()
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        torch.nn.utils.clip_grad_norm_(fsdp_model.parameters(), 1.0)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        except RuntimeError as exc:
+            if _is_oom_error(exc):
+                oom_tensor.fill_(1)
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.update()
+            else:
+                raise
 
         loss_tensor = local_loss.clone()
+
+        dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
+        if oom_tensor.item():
+            if args.disable_auto_batch or args.auto_batch_max <= 0:
+                torch.cuda.empty_cache()
+                if rank == 0:
+                    print(
+                        "OOM encountered with automatic batch scaling disabled. "
+                        "Please lower --batch-size or adjust other memory-intensive settings."
+                    )
+                raise RuntimeError("OOM encountered with auto-batch disabled")
+
+            new_candidate = _round_down_to_multiple(current_batch_size // 2, grad_accum)
+            new_candidate = max(new_candidate, min_auto_batch)
+            if new_candidate < min_auto_batch or new_candidate == current_batch_size:
+                if rank == 0:
+                    print(
+                        "Encountered OOM at minimal batch size; unable to continue. "
+                        "Consider reducing gradient accumulation or block size."
+                    )
+                raise RuntimeError("OOM encountered at minimal batch size")
+
+            current_batch_size = new_candidate
+            current_micro_batch = current_batch_size // grad_accum
+            if rank == 0:
+                print(
+                    "OOM detected; reducing per-rank batch to "
+                    f"{current_batch_size} (micro_batch={current_micro_batch})."
+                )
+            if provider is not None:
+                provider.set_batch_size(current_batch_size)
+            inputs_all = inputs_all[:, :current_batch_size, :].contiguous()
+            labels_all = labels_all[:, :current_batch_size, :].contiguous()
+            pending_batch = (inputs_all, labels_all)
+            torch.cuda.empty_cache()
+            dist.barrier()
+            continue
+
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         loss_avg = loss_tensor.item() / max(1, world_size)
+
+        tokens_this_session += batch_tokens
 
         if rank == 0 and step % 10 == 0:
             total_tokens = total_tokens_processed + tokens_this_session
@@ -774,7 +897,7 @@ def train() -> None:
         model_ref = fsdp_model.module if hasattr(fsdp_model, "module") else fsdp_model
         update_training_stats(
             tokens=total_tokens,
-            batch_size=args.batch_size * world_size,
+            batch_size=current_batch_size * world_size,
             steps=step - 1,
             model=model_ref,
             n_layer=model_ref.config.num_hidden_layers,
