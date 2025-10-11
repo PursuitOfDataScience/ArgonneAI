@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
@@ -467,7 +468,7 @@ def train() -> None:
 
     base_model.to(device)
 
-    auto_wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={Block})
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
     mp_policy = None
     if args.bf16:
         mp_policy = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
