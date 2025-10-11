@@ -608,6 +608,10 @@ def resume_training(
                         generated = model.generate(
                             prompt_tensor,
                             max_length=prompt_tensor.shape[1] + 100,
+                            do_sample=True,
+                            temperature=0.7,
+                            top_k=50,
+                            top_p=0.9,
                         )
                         generated_text = hf_tokenizer.decode(generated[0].tolist())
                         print(
@@ -750,6 +754,10 @@ def resume_training(
                     generated = model.generate(
                         prompt_tensor,
                         max_length=prompt_tensor.shape[1] + 50,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_k=50,
+                        top_p=0.9,
                     )
                     generated_text = hf_tokenizer.decode(generated[0].tolist())
                     print(

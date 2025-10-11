@@ -612,7 +612,12 @@ def train_model_parallel(
                     )
                     extra_tokens = 100 if checkpoint_prefix == "streaming" else 50
                     generated = model.generate(
-                        prompt_tensor, max_length=prompt_tensor.shape[1] + extra_tokens
+                        prompt_tensor,
+                        max_length=prompt_tensor.shape[1] + extra_tokens,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_k=50,
+                        top_p=0.9,
                     )
                     generated_text = hf_tokenizer.decode(generated[0].tolist())
                     print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
