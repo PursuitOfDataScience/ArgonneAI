@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
@@ -71,9 +72,13 @@ def cleanup_distributed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_model(block_size: int, vocab_size: int) -> ArgonneModel:
+def build_model(
+    block_size: int,
+    tokenizer,
+    use_gradient_checkpointing: bool,
+) -> ArgonneModel:
     config = ArgonneConfig(
-        vocab_size=vocab_size,
+        vocab_size=len(tokenizer),
         max_position_embeddings=block_size,
         hidden_size=4096,
         num_hidden_layers=24,
@@ -84,8 +89,17 @@ def build_model(block_size: int, vocab_size: int) -> ArgonneModel:
         attention_dropout=0.0,
         use_flash_attention=True,
         tie_word_embeddings=False,
+        pad_token_id=getattr(tokenizer, "pad_token_id", None),
+        bos_token_id=getattr(tokenizer, "bos_token_id", None),
+        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
-    return ArgonneModel(config)
+    model = ArgonneModel(config)
+    if use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    else:
+        model.gradient_checkpointing_disable()
+    return model
 
 
 def create_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -193,8 +207,9 @@ def load_initial_state(
     rank: int,
     block_size: int,
     tokenizer,
+    use_gradient_checkpointing: bool,
 ) -> Tuple[ArgonneModel, CheckpointState]:
-    model = build_model(block_size, len(tokenizer))
+    model = build_model(block_size, tokenizer, use_gradient_checkpointing)
     state = CheckpointState(step=0, tokens=0, data_position=None, optimizer_state=None, scheduler_state=None)
 
     resolved = _resolve_checkpoint_path(checkpoint_path)
@@ -409,8 +424,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision")
+    parser.add_argument(
+        "--no-mixed-precision",
+        action="store_true",
+        help="Disable mixed precision (useful for debugging at the cost of much higher memory)",
+    )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile where available")
     parser.add_argument("--checkpoint-keep", type=int, default=3, help="Number of recent checkpoints to keep")
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing (enabled by default to reduce activation memory)",
+    )
     return parser.parse_args()
 
 
@@ -456,7 +481,20 @@ def train() -> None:
     tokenizer.model_max_length = max(args.block_size + 1, args.block_size * 2)
 
     # Model + checkpoint
-    base_model, ckpt_state = load_initial_state(args.checkpoint_path, rank, args.block_size, tokenizer)
+    use_gradient_checkpointing = not args.no_gradient_checkpointing
+    base_model, ckpt_state = load_initial_state(
+        args.checkpoint_path,
+        rank,
+        args.block_size,
+        tokenizer,
+        use_gradient_checkpointing,
+    )
+
+    if rank == 0:
+        if use_gradient_checkpointing:
+            print("Enabled gradient checkpointing to reduce activation memory.")
+        else:
+            print("Gradient checkpointing disabled; activation memory usage will be higher.")
 
     if args.compile and hasattr(torch, "compile"):
         try:
@@ -465,14 +503,46 @@ def train() -> None:
             if rank == 0:
                 print(f"torch.compile failed ({exc}); continuing without compilation")
 
-    base_model.to(device)
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
 
-    auto_wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={Block})
+    if args.no_mixed_precision and (args.bf16 or args.fp16):
+        raise ValueError("Cannot combine explicit mixed precision flags with --no-mixed-precision")
+
     mp_policy = None
-    if args.bf16:
-        mp_policy = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
-    elif args.fp16:
-        mp_policy = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float32, buffer_dtype=torch.float16)
+    amp_dtype = None
+    if not args.no_mixed_precision and torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(device_index)
+        supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+
+        if args.bf16:
+            if not supports_bf16:
+                raise RuntimeError("Requested bf16 mixed precision but the current GPU does not support it")
+            amp_dtype = torch.bfloat16
+        elif args.fp16:
+            amp_dtype = torch.float16
+        else:
+            if supports_bf16:
+                amp_dtype = torch.bfloat16
+                if rank == 0:
+                    print("Auto-enabled bf16 mixed precision for improved memory usage")
+            else:
+                amp_dtype = torch.float16
+                if rank == 0:
+                    print("Auto-enabled fp16 mixed precision for improved memory usage")
+
+        if amp_dtype == torch.bfloat16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.bfloat16,
+            )
+        elif amp_dtype == torch.float16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float16,
+            )
 
     fsdp_model = FSDP(
         base_model,
@@ -536,16 +606,11 @@ def train() -> None:
 
     fsdp_model.train()
 
-    if args.fp16 and torch.cuda.is_available():
-        scaler = torch.amp.GradScaler("cuda")
-    else:
+    if args.no_mixed_precision or not torch.cuda.is_available():
         scaler = None
-
-    amp_dtype = None
-    if args.bf16:
-        amp_dtype = torch.bfloat16
-    elif args.fp16:
-        amp_dtype = torch.float16
+        amp_dtype = None
+    else:
+        scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
 
     if rank == 0:
         print(
