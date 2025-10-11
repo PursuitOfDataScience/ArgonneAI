@@ -85,9 +85,17 @@ The script automatically:
 
 ### Expected Performance
 
-- **Communication Overhead:** ~10-20% due to all-reduce operations
-- **Scaling Efficiency:** 80-90% on NVLink-connected GPUs
+These are approximate values that vary based on model size, batch size, and hardware configuration:
+
+- **Communication Overhead:** ~10-20% (typical) due to all-reduce operations after each sharded layer
+- **Scaling Efficiency:** 80-90% (typical on NVLink-connected GPUs like A100/H100 in single-node configurations)
 - **Memory Usage:** More balanced across GPUs compared to pipeline parallelism
+
+Performance characteristics depend heavily on:
+- Hardware interconnect bandwidth (NVLink >> PCIe)
+- Model architecture (number of layers, hidden size)
+- Batch size and sequence length
+- GPU compute capability
 
 ## Environment Variables
 
