@@ -121,28 +121,33 @@ def streaming_token_generator(
     start_file_idx: int = 0,
     start_position: int = 0,
     start_chunk_offset: int = 0,
+    rank: int = 0,
 ):
     """Generator with chunk-level resume support matching training.py"""
 
     file_idx = start_file_idx
     start_file_idx = max(start_file_idx, 0)
     processed_count = 0
+    is_main_process = (rank == 0)
 
     while file_idx < len(data_files):
         try:
             file_path = data_files[file_idx]
             shard_name = os.path.basename(file_path)
-            print(
-                f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}"
-            )
+            if is_main_process:
+                print(
+                    f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}"
+                )
 
             try:
                 dataset = load_streaming_shard(file_path)
-                print(f"Successfully loaded dataset with {len(dataset)} rows")
-                print(f"Dataset features: {list(dataset.features.keys())}")
+                if is_main_process:
+                    print(f"Successfully loaded dataset with {len(dataset)} rows")
+                    print(f"Dataset features: {list(dataset.features.keys())}")
             except Exception as file_error:
-                print(f"ERROR: Could not read file {file_path}: {file_error}")
-                print("Skipping problematic file and moving to next one.")
+                if is_main_process:
+                    print(f"ERROR: Could not read file {file_path}: {file_error}")
+                    print("Skipping problematic file and moving to next one.")
                 file_idx += 1
                 continue
 
@@ -177,7 +182,8 @@ def streaming_token_generator(
                             yield chunk, file_idx, position, shard_name, chunk_idx
 
                 except Exception as e:
-                    print(f"Error processing item at position {position}: {e}")
+                    if is_main_process:
+                        print(f"Error processing item at position {position}: {e}")
 
                 resume_chunk_offset = 0
                 position += 1
@@ -185,18 +191,24 @@ def streaming_token_generator(
             file_idx += 1
 
         except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
+            if is_main_process:
+                print(f"Error processing file {file_path}: {e}")
             file_idx += 1
 
-    print(f"Completed processing all available files. Processed {processed_count} samples.")
+    if is_main_process:
+        print(f"Completed processing all available files. Processed {processed_count} samples.")
 
     return None, -1, -1, "", -1
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)\.pth$")
 
 
-def cleanup_old_checkpoints(directory: str, keep: int = 3) -> None:
+def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> None:
     """Keep only the most recent checkpoint files in a directory."""
+    
+    # Only rank 0 performs cleanup
+    if rank != 0:
+        return
 
     if keep <= 0:
         return
@@ -229,10 +241,7 @@ def cleanup_old_checkpoints(directory: str, keep: int = 3) -> None:
             print(f"WARNING: Failed to remove checkpoint '{path}': {exc}")
 
 
-cleanup_old_checkpoints(os.path.join(os.getcwd(), "pretrained"), keep=3)
-
-
-def _resolve_checkpoint_path(checkpoint_path: Optional[str]) -> str:
+def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> str:
     """Resolve the checkpoint path, auto-selecting the highest step if needed."""
 
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -267,9 +276,10 @@ def _resolve_checkpoint_path(checkpoint_path: Optional[str]) -> str:
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     latest_step, latest_path = candidates[0]
-    print(
-        f"Auto-selected checkpoint '{os.path.basename(latest_path)}' (step {latest_step})"
-    )
+    if rank == 0:
+        print(
+            f"Auto-selected checkpoint '{os.path.basename(latest_path)}' (step {latest_step})"
+        )
     return latest_path
 
 
@@ -282,7 +292,9 @@ def init_tensor_parallel_group(world_size: int, rank: int) -> None:
             world_size=world_size,
             rank=rank
         )
-    print(f"Initialized tensor parallel group: rank {rank}/{world_size}")
+    # Only rank 0 prints initialization message
+    if rank == 0:
+        print(f"Initialized tensor parallel group: rank {rank}/{world_size}")
 
 
 def shard_tensor_parallel(module, world_size: int, rank: int) -> None:
@@ -354,6 +366,23 @@ def shard_tensor_parallel(module, world_size: int, rank: int) -> None:
                 if parent_name:
                     parent = dict(module.named_modules())[parent_name]
                     setattr(parent, child_name, new_layer)
+    
+    # Update attention module configurations after sharding
+    # The num_heads and num_kv_heads need to be divided by world_size
+    for name, attn_module in module.named_modules():
+        if hasattr(attn_module, 'num_heads') and hasattr(attn_module, 'head_dim'):
+            # This is an attention module - update its configuration
+            original_num_heads = attn_module.num_heads
+            original_num_kv_heads = getattr(attn_module, 'num_kv_heads', original_num_heads)
+            
+            # Shard the heads across GPUs
+            attn_module.num_heads = original_num_heads // world_size
+            if hasattr(attn_module, 'num_kv_heads'):
+                attn_module.num_kv_heads = original_num_kv_heads // world_size
+            
+            # Update num_key_value_groups if present
+            if hasattr(attn_module, 'num_key_value_groups'):
+                attn_module.num_key_value_groups = attn_module.num_heads // attn_module.num_kv_heads
 
 
 class TensorParallelModel(torch.nn.Module):
@@ -374,7 +403,9 @@ class TensorParallelModel(torch.nn.Module):
         # Apply tensor parallel sharding
         shard_tensor_parallel(self.base_model, world_size, rank)
         
-        print(f"Rank {rank}: Model sharded for tensor parallelism on {self.device}")
+        # Only rank 0 prints model sharding message
+        if rank == 0:
+            print(f"Model sharded for tensor parallelism across {world_size} GPUs")
     
     def forward(self, input_ids, labels=None, attention_mask=None):
         """
@@ -557,7 +588,7 @@ def resume_training(
     base_model = ArgonneModel(config)
 
     # 3) Load checkpoint
-    resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
+    resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path, rank)
     if is_main_process:
         print(f"Resuming from: {resolved_checkpoint}")
 
@@ -728,6 +759,7 @@ def resume_training(
             data_position.current_file_idx,
             data_position.position_in_file,
             data_position.chunk_offset,
+            rank,
         )
         token_buffer: List[List[int]] = []
         active_shard: Optional[str] = None
@@ -757,7 +789,7 @@ def resume_training(
                         if is_main_process:
                             print(f"Starting new data pass at step {global_step}")
                         token_gen = streaming_token_generator(
-                            data_files, hf_tokenizer, block_size
+                            data_files, hf_tokenizer, block_size, rank=rank
                         )
                         continue
 
@@ -900,7 +932,7 @@ def resume_training(
                     if is_main_process:
                         print(f"Starting new data pass at step {global_step}")
                     token_gen = streaming_token_generator(
-                        data_files, hf_tokenizer, block_size
+                        data_files, hf_tokenizer, block_size, rank=rank
                     )
                     continue
         finally:
