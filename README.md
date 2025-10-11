@@ -75,6 +75,8 @@ torchrun --standalone --nproc_per_node=8 resume_pretrain_tensor.py \
 
 The script uses the same command-line arguments as `resume_pretrain.py`, including `--data-glob`, `--batch-size`, `--learning-rate`, `--block-size`, and all scheduling parameters. Checkpoints are saved with a `tensor_parallel_` prefix to distinguish them from pipeline-parallel checkpoints.
 
+For detailed usage instructions, examples, and troubleshooting, see **[TENSOR_PARALLEL_USAGE.md](TENSOR_PARALLEL_USAGE.md)**. A convenience launch script is also provided: `./launch_tensor_parallel.sh [num_gpus] [checkpoint_path]`
+
 ## Default dataset location
 - Training scripts now target the Common Crawl derived shards stored at `../data/CC-MAIN-2025-26/*.parquet`. Shards are consumed in natural numeric order so `000_00000.parquet` is seen before `000_00001.parquet`, ensuring deterministic sequential coverage of the crawl export.
 
