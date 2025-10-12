@@ -175,15 +175,17 @@ def streaming_token_generator(
     start_chunk_offset: int = 0,
     rank: int = 0,
 ):
-    """Generator with chunk-level resume support matching training.py"""
+    """Generator with chunk-level resume support"""
 
     # Ensure file_idx starts at a valid position
     file_idx = max(start_file_idx, 0)
     processed_count = 0
     is_main_process = (rank == 0)
     
-    # Track the initial file index for resume logic
+    # Track the INITIAL file index for resume logic (don't modify this!)
     initial_file_idx = file_idx
+    initial_position = start_position
+    initial_chunk_offset = start_chunk_offset
 
     while file_idx < len(data_files):
         try:
@@ -206,22 +208,15 @@ def streaming_token_generator(
                 file_idx += 1
                 continue
 
-            # Only use start_position and start_chunk_offset for the initial file
-            position = start_position if file_idx == initial_file_idx else 0
-            resume_position = position
-            resume_chunk_offset = (
-                start_chunk_offset if file_idx == initial_file_idx else 0
-            )
-            
-            # Log resume information for the initial file
-            if file_idx == initial_file_idx and (position > 0 or resume_chunk_offset > 0):
-                if is_main_process:
-                    print(f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}")
-            
-            # Clear these after first use so they don't apply to subsequent files
+            # Only use start_position and start_chunk_offset for the INITIAL file
             if file_idx == initial_file_idx:
-                start_position = 0
-                start_chunk_offset = 0
+                position = initial_position
+                resume_chunk_offset = initial_chunk_offset
+                if is_main_process and (position > 0 or resume_chunk_offset > 0):
+                    print(f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}")
+            else:
+                position = 0
+                resume_chunk_offset = 0
 
             while position < len(dataset):
                 try:
@@ -230,18 +225,12 @@ def streaming_token_generator(
                         text = item["text"]
                         tokens = tokenizer.encode(text, add_special_tokens=False)
 
-                        skip_chunks = (
-                            resume_chunk_offset
-                            if (file_idx == start_file_idx and position == resume_position)
-                            else 0
-                        )
-
-                        for chunk_idx, chunk in enumerate(
-                            chunk_tokens(tokens, block_size)
-                        ):
-                            if chunk_idx < skip_chunks:
-                                continue
-
+                        for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
+                            # Skip chunks only if we're at the resume position in the initial file
+                            if file_idx == initial_file_idx and position == initial_position:
+                                if chunk_idx < resume_chunk_offset:
+                                    continue
+                            
                             processed_count += 1
                             yield chunk, file_idx, position, shard_name, chunk_idx
 
@@ -249,7 +238,6 @@ def streaming_token_generator(
                     if is_main_process:
                         print(f"Error processing item at position {position}: {e}")
 
-                resume_chunk_offset = 0
                 position += 1
 
             file_idx += 1
@@ -262,6 +250,7 @@ def streaming_token_generator(
     if is_main_process:
         print(f"Completed processing all available files. Processed {processed_count} samples.")
 
+    # Return sentinel value to indicate end of data
     return None, -1, -1, "", -1
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)\.pth$")
@@ -330,7 +319,7 @@ def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> s
             step = int(match.group(1))
             full_path = os.path.join(directory, name)
             if os.path.isfile(full_path):
-                candidates.append((step, full_path))
+                candidates.append((step, full_pgradath))
 
     if not candidates:
         search_desc = ", ".join(search_dirs)
@@ -466,12 +455,6 @@ class TensorParallelModel(torch.nn.Module):
         # Move model to this GPU
         self.base_model = self.base_model.to(self.device)
         
-        # Store original layer dimensions before sharding for reconstruction
-        self._original_dims = {}
-        for name, module in self.base_model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                self._original_dims[name] = (module.in_features, module.out_features)
-        
         # Apply tensor parallel sharding
         shard_tensor_parallel(self.base_model, world_size, rank)
         
@@ -595,88 +578,6 @@ class TensorParallelModel(torch.nn.Module):
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing"""
         self.gradient_checkpointing = False
-    
-    def gather_full_state_dict(self):
-        """
-        Gather the full unsharded model state from all ranks.
-        Only rank 0 will have the complete state dict after this operation.
-        
-        This method must be called on all ranks simultaneously for proper synchronization.
-        """
-        import torch.nn as nn
-        
-        state_dict = self.base_model.state_dict()
-        full_state_dict = {}
-        
-        # Synchronize all ranks before gathering
-        if self.world_size > 1:
-            dist.barrier()
-        
-        for key, tensor in state_dict.items():
-            # Check if this is a sharded parameter
-            is_sharded = False
-            is_column_parallel = False
-            is_row_parallel = False
-            module_name = '.'.join(key.split('.')[:-1])  # e.g., "blocks.0.attn.q_proj"
-            param_name = key.split('.')[-1]  # e.g., "weight"
-            
-            if module_name in self._original_dims and param_name == 'weight':
-                original_in, original_out = self._original_dims[module_name]
-                current_shape = tensor.shape
-                
-                # Determine sharding type based on dimension changes
-                is_column_parallel = (
-                    len(current_shape) == 2 and 
-                    current_shape[0] != original_out and 
-                    current_shape[1] == original_in
-                )
-                is_row_parallel = (
-                    len(current_shape) == 2 and 
-                    current_shape[0] == original_out and 
-                    current_shape[1] != original_in
-                )
-                
-                if is_column_parallel or is_row_parallel:
-                    is_sharded = True
-            
-            # Also check for bias terms in row-parallel layers (only rank 0 has them)
-            if param_name == 'bias' and module_name in self._original_dims:
-                # Check if this is a row-parallel layer
-                for suffix in ['o_proj', 'down_proj']:
-                    if suffix in module_name:
-                        is_sharded = True
-                        is_row_parallel = True  # Bias is treated as row-parallel
-                        break
-            
-            if is_sharded:
-                # Gather sharded parameters from all ranks
-                if self.world_size > 1:
-                    # Collect from all ranks to rank 0
-                    if is_column_parallel:
-                        # For column-parallel, concatenate along dim 0
-                        gathered = [torch.zeros_like(tensor) for _ in range(self.world_size)]
-                        dist.all_gather(gathered, tensor)
-                        if self.rank == 0:
-                            full_state_dict[key] = torch.cat(gathered, dim=0)
-                    elif is_row_parallel:
-                        # For row-parallel weights, concatenate along dim 1
-                        if param_name == 'weight':
-                            gathered = [torch.zeros_like(tensor) for _ in range(self.world_size)]
-                            dist.all_gather(gathered, tensor)
-                            if self.rank == 0:
-                                full_state_dict[key] = torch.cat(gathered, dim=1)
-                        else:
-                            # For bias in row-parallel, only rank 0 has it
-                            if self.rank == 0:
-                                full_state_dict[key] = tensor
-                else:
-                    full_state_dict[key] = tensor
-            else:
-                # Not sharded - replicated on all ranks, just use rank 0's copy
-                if self.rank == 0:
-                    full_state_dict[key] = tensor
-        
-        return full_state_dict if self.rank == 0 else {}
 
 
 def resume_training(
@@ -822,37 +723,8 @@ def resume_training(
 
     converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
     base_model.to(dtype=target_dtype)
-    
-    # Check if checkpoint contains sharded weights from tensor parallelism
-    # by looking for reduced dimensions in attention/MLP layers
-    is_sharded_checkpoint = False
-    for key in converted_state.keys():
-        if 'q_proj.weight' in key or 'k_proj.weight' in key or 'v_proj.weight' in key:
-            checkpoint_shape = converted_state[key].shape
-            # For q_proj, output dimension should be num_heads * head_dim
-            # If it's significantly smaller, it's likely sharded
-            expected_dim = config.num_attention_heads * (config.hidden_size // config.num_attention_heads)
-            if checkpoint_shape[0] < expected_dim * 0.5:  # Less than half means it's sharded
-                is_sharded_checkpoint = True
-                if is_main_process:
-                    print(f"ERROR: Detected sharded checkpoint from tensor parallelism")
-                    print(f"  Example: {key} has shape {checkpoint_shape}, expected ~{expected_dim}")
-                    print(f"\nThis checkpoint was saved with sharded weights from an older version.")
-                    print(f"The current version saves full unsharded weights for better compatibility.")
-                    print(f"\nTo fix this issue:")
-                    print(f"  1. If you have the original non-tensor-parallel checkpoint, use that instead")
-                    print(f"  2. Or, save a new checkpoint using the updated code that saves full weights")
-                    print(f"  3. Or, manually reconstruct the full checkpoint by gathering weights from all ranks")
-                raise ValueError(
-                    "Cannot load checkpoint with sharded tensor-parallel weights. "
-                    "Please use a checkpoint with full unsharded weights."
-                )
-    
-    # Checkpoint contains full (unsharded) weights - load normally then shard
-    if is_main_process:
-        print("Checkpoint contains full unsharded model weights - loading...")
     base_model.load_state_dict(converted_state)
-    
+
     # 4) Wrap model with tensor parallelism
     model = TensorParallelModel(base_model, world_size, rank)
     
@@ -861,31 +733,14 @@ def resume_training(
     if is_main_process:
         print("Gradient checkpointing enabled for memory optimization")
     
-    # 5) Create optimizer BEFORE loading state
-    # For tensor parallelism, we CANNOT reuse the old optimizer state because:
-    # 1. The checkpoint may have been saved with fused=True which has strict requirements
-    # 2. The model parameters have been sharded differently across GPUs
-    # 3. The parameter shapes and organization have changed due to tensor parallelism
-    # Therefore, we create a fresh optimizer and conditionally load the checkpoint optimizer state
+    # 5) Create optimizer with fresh state for tensor parallelism
     if is_main_process:
-        print("Creating fresh optimizer for tensor parallelism compatibility")
+        print("Creating fresh optimizer for tensor parallelism (not loading checkpoint optimizer state)")
+        print("This is necessary because model parameters have been resharded across GPUs")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay, fused=False
     )
     fused_optimizer = False
-
-    # 6) Load optimizer state conditionally
-    # Only load optimizer state if the checkpoint wasn't saved with fused optimizer
-    # (since fused optimizer state has strict dtype/device requirements that break with tensor parallelism)
-    if not ckpt.get("fused_optimizer", True):  # Default to True for old checkpoints without this flag
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        _realign_optimizer_state(optimizer, model)
-        if is_main_process:
-            print("Loaded optimizer state from checkpoint")
-    else:
-        if is_main_process:
-            print("Skipping optimizer state loading from checkpoint (was saved with fused optimizer)")
-            print("Optimizer will start with fresh state")
 
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
@@ -1105,40 +960,28 @@ def resume_training(
                             f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
                         )
 
-                    if global_step % 300 == 0:
+                    if global_step % 300 == 0 and is_main_process:
                         current_total_tokens = (
                             total_tokens_processed + tokens_in_this_session
                         )
-                        
-                        # Gather full model state from all ranks (only rank 0 gets the full state)
-                        if is_main_process:
-                            print("Gathering full model state from all ranks for checkpoint...")
-                        full_model_state = model.gather_full_state_dict()
-                        
-                        # Only rank 0 saves the checkpoint
-                        if is_main_process:
-                            model_state = cast_state_dict_to_dtype(full_model_state, amp_dtype)
-                            checkpoint_state = {
-                                "global_step": global_step,
-                                "tokens_processed": current_total_tokens,
-                                "model_state_dict": model_state,
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "loss": last_loss_value,
-                                "data_position": data_position.get_state(),
-                                "fused_optimizer": fused_optimizer,
-                                "model_dtype": str(amp_dtype),
-                            }
-                            os.makedirs("pretrained", exist_ok=True)
-                            save_path = (
-                                f"pretrained/tensor_parallel_checkpoint_step_{global_step}.pth"
-                            )
-                            safe_torch_save(checkpoint_state, save_path)
-                            print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                        
-                        # Wait for rank 0 to finish saving before continuing
-                        if world_size > 1:
-                            dist.barrier()
+                        model_state = cast_state_dict_to_dtype(model.state_dict(), amp_dtype)
+                        checkpoint_state = {
+                            "global_step": global_step,
+                            "tokens_processed": current_total_tokens,
+                            "model_state_dict": model_state,
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "loss": last_loss_value,
+                            "data_position": data_position.get_state(),
+                            "fused_optimizer": fused_optimizer,
+                            "model_dtype": str(amp_dtype),
+                        }
+                        os.makedirs("pretrained", exist_ok=True)
+                        save_path = (
+                            f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                        )
+                        safe_torch_save(checkpoint_state, save_path)
+                        print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                         update_training_stats(
                             tokens=current_total_tokens,
@@ -1155,8 +998,6 @@ def resume_training(
                         )
 
                 except StopIteration:
-                    # This shouldn't happen with our updated generator approach using sentinel values
-                    # But keep as a fallback
                     if is_main_process:
                         print("Reached end of dataset via StopIteration. Restarting data generator.")
                     data_position.next_epoch()
@@ -1279,40 +1120,28 @@ def resume_training(
                         f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
                     )
 
-                if global_step % 2000 == 0:
+                if global_step % 2000 == 0 and is_main_process:
                     current_total_tokens = (
                         total_tokens_processed + tokens_in_this_session
                     )
-                    
-                    # Gather full model state from all ranks (only rank 0 gets the full state)
-                    if is_main_process:
-                        print("Gathering full model state from all ranks for checkpoint...")
-                    full_model_state = model.gather_full_state_dict()
-                    
-                    # Only rank 0 saves the checkpoint
-                    if is_main_process:
-                        model_state = cast_state_dict_to_dtype(full_model_state, amp_dtype)
-                        checkpoint_state = {
-                            "global_step": global_step,
-                            "tokens_processed": current_total_tokens,
-                            "model_state_dict": model_state,
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "loss": last_loss_value,
-                            "data_position": data_position.get_state(),
-                            "fused_optimizer": fused_optimizer,
-                            "model_dtype": str(amp_dtype),
-                        }
-                        os.makedirs("pretrained", exist_ok=True)
-                        save_path = (
-                            f"pretrained/tensor_parallel_non_streaming_checkpoint_step_{global_step}.pth"
-                        )
-                        safe_torch_save(checkpoint_state, save_path)
-                        print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                    
-                    # Wait for rank 0 to finish saving before continuing
-                    if world_size > 1:
-                        dist.barrier()
+                    model_state = cast_state_dict_to_dtype(model.state_dict(), amp_dtype)
+                    checkpoint_state = {
+                        "global_step": global_step,
+                        "tokens_processed": current_total_tokens,
+                        "model_state_dict": model_state,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "loss": last_loss_value,
+                        "data_position": data_position.get_state(),
+                        "fused_optimizer": fused_optimizer,
+                        "model_dtype": str(amp_dtype),
+                    }
+                    os.makedirs("pretrained", exist_ok=True)
+                    save_path = (
+                        f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
+                    )
+                    safe_torch_save(checkpoint_state, save_path)
+                    print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                     update_training_stats(
                         tokens=current_total_tokens,
@@ -1341,9 +1170,9 @@ def resume_training(
             batch_size=batch_size,
             steps=global_step,
             model=model,
-            n_layer=config.n_layer,
-            n_head=config.n_head,
-            n_embd=config.n_embd,
+            n_layer=config.num_hidden_layers,
+            n_head=config.num_attention_heads,
+            n_embd=config.hidden_size,
             base_lr=lr,
             min_lr=min_lr,
             warmup_steps=warmup_steps,
