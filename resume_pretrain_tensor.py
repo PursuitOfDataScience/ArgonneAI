@@ -177,10 +177,13 @@ def streaming_token_generator(
 ):
     """Generator with chunk-level resume support matching training.py"""
 
-    file_idx = start_file_idx
-    start_file_idx = max(start_file_idx, 0)
+    # Ensure file_idx starts at a valid position
+    file_idx = max(start_file_idx, 0)
     processed_count = 0
     is_main_process = (rank == 0)
+    
+    # Track the initial file index for resume logic
+    initial_file_idx = file_idx
 
     while file_idx < len(data_files):
         try:
@@ -203,13 +206,22 @@ def streaming_token_generator(
                 file_idx += 1
                 continue
 
-            position = start_position if file_idx == start_file_idx else 0
+            # Only use start_position and start_chunk_offset for the initial file
+            position = start_position if file_idx == initial_file_idx else 0
             resume_position = position
             resume_chunk_offset = (
-                start_chunk_offset if file_idx == start_file_idx else 0
+                start_chunk_offset if file_idx == initial_file_idx else 0
             )
-            start_position = 0
-            start_chunk_offset = 0
+            
+            # Log resume information for the initial file
+            if file_idx == initial_file_idx and (position > 0 or resume_chunk_offset > 0):
+                if is_main_process:
+                    print(f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}")
+            
+            # Clear these after first use so they don't apply to subsequent files
+            if file_idx == initial_file_idx:
+                start_position = 0
+                start_chunk_offset = 0
 
             while position < len(dataset):
                 try:
@@ -597,6 +609,8 @@ class TensorParallelModel(torch.nn.Module):
         for key, tensor in state_dict.items():
             # Check if this is a sharded parameter
             is_sharded = False
+            is_column_parallel = False
+            is_row_parallel = False
             module_name = '.'.join(key.split('.')[:-1])  # e.g., "blocks.0.attn.q_proj"
             param_name = key.split('.')[-1]  # e.g., "weight"
             
@@ -625,19 +639,20 @@ class TensorParallelModel(torch.nn.Module):
                 for suffix in ['o_proj', 'down_proj']:
                     if suffix in module_name:
                         is_sharded = True
+                        is_row_parallel = True  # Bias is treated as row-parallel
                         break
             
             if is_sharded:
                 # Gather sharded parameters from all ranks
                 if self.world_size > 1:
                     # Collect from all ranks to rank 0
-                    if is_column_parallel or (param_name == 'weight' and is_sharded):
+                    if is_column_parallel:
                         # For column-parallel, concatenate along dim 0
                         gathered = [torch.zeros_like(tensor) for _ in range(self.world_size)]
                         dist.all_gather(gathered, tensor)
                         if self.rank == 0:
                             full_state_dict[key] = torch.cat(gathered, dim=0)
-                    elif is_row_parallel or (param_name == 'bias' and is_sharded):
+                    elif is_row_parallel:
                         # For row-parallel weights, concatenate along dim 1
                         if param_name == 'weight':
                             gathered = [torch.zeros_like(tensor) for _ in range(self.world_size)]
