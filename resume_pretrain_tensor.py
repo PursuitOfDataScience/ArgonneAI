@@ -39,6 +39,35 @@ def _ensure_gradient_dtype_matches_params(model: torch.nn.Module) -> None:
         if grad.dtype != param.dtype or grad.device != param.device:
             param.grad = grad.to(device=param.device, dtype=param.dtype)
 
+
+def _realign_optimizer_state(optimizer: torch.optim.Optimizer, model: torch.nn.Module) -> None:
+    """Ensure optimizer states share dtype/device with their owning parameters."""
+
+    id_to_param = {id(param): param for param in model.parameters()}
+
+    for param_key, state in optimizer.state.items():
+        if isinstance(param_key, torch.nn.Parameter):
+            owning_param = param_key
+        else:
+            owning_param = id_to_param.get(param_key)
+
+        if owning_param is None:
+            continue
+
+        for state_name, state_value in state.items():
+            if not isinstance(state_value, torch.Tensor):
+                continue
+
+            target_dtype = (
+                owning_param.dtype
+                if state_value.is_floating_point()
+                else state_value.dtype
+            )
+            state[state_name] = state_value.to(
+                device=owning_param.device,
+                dtype=target_dtype,
+            )
+
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -710,17 +739,9 @@ def resume_training(
 
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    
+
     # 7) Move optimizer states to match parameter devices AND dtypes
-    for param_group in optimizer.param_groups:
-        for param in param_group["params"]:
-            if param in optimizer.state:
-                for state_key, state_val in optimizer.state[param].items():
-                    if isinstance(state_val, torch.Tensor):
-                        # Move to correct device AND dtype to prevent dtype mismatch
-                        optimizer.state[param][state_key] = state_val.to(
-                            device=param.device, dtype=param.dtype
-                        )
+    _realign_optimizer_state(optimizer, model)
 
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
