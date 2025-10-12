@@ -28,6 +28,17 @@ from training_utils import (
     validate_tokenizer_path,
 )
 
+
+def _ensure_gradient_dtype_matches_params(model: torch.nn.Module) -> None:
+    """Cast gradients to match their parameter's dtype/device for fused optimizers."""
+
+    for param in model.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        if grad.dtype != param.dtype or grad.device != param.device:
+            param.grad = grad.to(device=param.device, dtype=param.dtype)
+
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -884,10 +895,13 @@ def resume_training(
 
                     if scaler is not None:
                         scaler.scale(loss_tensor).backward()
+                        scaler.unscale_(optimizer)
+                        _ensure_gradient_dtype_matches_params(model)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss_tensor.backward()
+                        _ensure_gradient_dtype_matches_params(model)
                         optimizer.step()
 
                     global_step += 1
@@ -1044,10 +1058,13 @@ def resume_training(
 
                 if scaler is not None:
                     scaler.scale(loss_tensor).backward()
+                    scaler.unscale_(optimizer)
+                    _ensure_gradient_dtype_matches_params(model)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss_tensor.backward()
+                    _ensure_gradient_dtype_matches_params(model)
                     optimizer.step()
 
                 global_step += 1
