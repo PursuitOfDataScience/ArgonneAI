@@ -396,6 +396,7 @@ class TensorParallelModel(torch.nn.Module):
         self.world_size = world_size
         self.rank = rank
         self.device = torch.device(f"cuda:{rank}")
+        # Gradient checkpointing trades compute for memory by recomputing activations during backward pass
         self.gradient_checkpointing = False
         
         # Move model to this GPU
@@ -468,6 +469,7 @@ class TensorParallelModel(torch.nn.Module):
         for block in self.base_model.blocks:
             if self.gradient_checkpointing and self.training:
                 # Use gradient checkpointing to reduce memory usage
+                # use_reentrant=False is required for compatibility with distributed operations (all_reduce)
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     self._block_forward,
                     block,
