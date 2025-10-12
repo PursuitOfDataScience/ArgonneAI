@@ -43,8 +43,11 @@ def _ensure_gradient_dtype_matches_params(model: torch.nn.Module) -> None:
 def _realign_optimizer_state(optimizer: torch.optim.Optimizer, model: torch.nn.Module) -> None:
     """Ensure optimizer states share dtype/device with their owning parameters."""
 
+    # Build a mapping from parameter id to the actual parameter
     id_to_param = {id(param): param for param in model.parameters()}
-
+    
+    # Create a new state dict with properly aligned states
+    new_state = {}
     for param_key, state in optimizer.state.items():
         if isinstance(param_key, torch.nn.Parameter):
             owning_param = param_key
@@ -54,19 +57,28 @@ def _realign_optimizer_state(optimizer: torch.optim.Optimizer, model: torch.nn.M
         if owning_param is None:
             continue
 
+        new_param_state = {}
         for state_name, state_value in state.items():
             if not isinstance(state_value, torch.Tensor):
+                new_param_state[state_name] = state_value
                 continue
 
+            # For floating point states, match parameter dtype
+            # For integer states (like step), keep the original dtype
             target_dtype = (
                 owning_param.dtype
                 if state_value.is_floating_point()
                 else state_value.dtype
             )
-            state[state_name] = state_value.to(
+            new_param_state[state_name] = state_value.to(
                 device=owning_param.device,
                 dtype=target_dtype,
             )
+        
+        new_state[owning_param] = new_param_state
+    
+    # Replace the optimizer state with the aligned version
+    optimizer.state = new_state
 
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -720,28 +732,31 @@ def resume_training(
     if is_main_process:
         print("Gradient checkpointing enabled for memory optimization")
     
-    # 5) NOW create optimizer
+    # 5) Create optimizer BEFORE loading state
+    # For tensor parallelism, we CANNOT reuse the old optimizer state because:
+    # 1. The checkpoint may have been saved with fused=True which has strict requirements
+    # 2. The model parameters have been sharded differently across GPUs
+    # 3. The parameter shapes and organization have changed due to tensor parallelism
+    # Therefore, we create a fresh optimizer and conditionally load the checkpoint optimizer state
+    if is_main_process:
+        print("Creating fresh optimizer for tensor parallelism compatibility")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay, fused=False
+    )
     fused_optimizer = False
-    if torch.cuda.is_available():
-        try:
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, weight_decay=weight_decay, fused=True
-            )
-            fused_optimizer = True
-        except (TypeError, RuntimeError):
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, weight_decay=weight_decay
-            )
+
+    # 6) Load optimizer state conditionally
+    # Only load optimizer state if the checkpoint wasn't saved with fused optimizer
+    # (since fused optimizer state has strict dtype/device requirements that break with tensor parallelism)
+    if not ckpt.get("fused_optimizer", True):  # Default to True for old checkpoints without this flag
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        _realign_optimizer_state(optimizer, model)
+        if is_main_process:
+            print("Loaded optimizer state from checkpoint")
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-
-    # 6) Load optimizer state
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-
-    # 7) Move optimizer states to match parameter devices AND dtypes
-    _realign_optimizer_state(optimizer, model)
+        if is_main_process:
+            print("Skipping optimizer state loading from checkpoint (was saved with fused optimizer)")
+            print("Optimizer will start with fresh state")
 
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
