@@ -396,6 +396,7 @@ class TensorParallelModel(torch.nn.Module):
         self.world_size = world_size
         self.rank = rank
         self.device = torch.device(f"cuda:{rank}")
+        self.gradient_checkpointing = False
         
         # Move model to this GPU
         self.base_model = self.base_model.to(self.device)
@@ -406,6 +407,42 @@ class TensorParallelModel(torch.nn.Module):
         # Only rank 0 prints model sharding message
         if rank == 0:
             print(f"Model sharded for tensor parallelism across {world_size} GPUs")
+    
+    def _block_forward(self, block, hidden_states, position_embeddings, attention_mask):
+        """
+        Forward pass for a single block with tensor parallelism.
+        This is a separate method to enable gradient checkpointing.
+        """
+        # Each rank computes its shard
+        residual = hidden_states
+        
+        # Attention with tensor parallelism
+        normed = block.input_norm(hidden_states)
+        
+        # Column-parallel attention (q, k, v projections)
+        # Each GPU computes a subset of heads
+        attn_output = block.attn(normed, position_embeddings, attention_mask)
+        
+        # All-reduce to combine results from all GPUs (row-parallel output)
+        if self.world_size > 1:
+            dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
+        
+        hidden_states = residual + attn_output
+        
+        # MLP with tensor parallelism
+        residual = hidden_states
+        normed = block.post_norm(hidden_states)
+        
+        # Column-parallel MLP (gate and up projections)
+        # Each GPU computes a subset of intermediate features
+        mlp_output = block.mlp(normed)
+        
+        # All-reduce to combine results from all GPUs (row-parallel output)
+        if self.world_size > 1:
+            dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
+        
+        hidden_states = residual + mlp_output
+        return hidden_states
     
     def forward(self, input_ids, labels=None, attention_mask=None):
         """
@@ -429,35 +466,20 @@ class TensorParallelModel(torch.nn.Module):
         
         # Process through blocks with tensor parallelism
         for block in self.base_model.blocks:
-            # Each rank computes its shard
-            residual = hidden_states
-            
-            # Attention with tensor parallelism
-            normed = block.input_norm(hidden_states)
-            
-            # Column-parallel attention (q, k, v projections)
-            # Each GPU computes a subset of heads
-            attn_output = block.attn(normed, position_embeddings, attention_mask)
-            
-            # All-reduce to combine results from all GPUs (row-parallel output)
-            if self.world_size > 1:
-                dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
-            
-            hidden_states = residual + attn_output
-            
-            # MLP with tensor parallelism
-            residual = hidden_states
-            normed = block.post_norm(hidden_states)
-            
-            # Column-parallel MLP (gate and up projections)
-            # Each GPU computes a subset of intermediate features
-            mlp_output = block.mlp(normed)
-            
-            # All-reduce to combine results from all GPUs (row-parallel output)
-            if self.world_size > 1:
-                dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
-            
-            hidden_states = residual + mlp_output
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing to reduce memory usage
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    self._block_forward,
+                    block,
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = self._block_forward(
+                    block, hidden_states, position_embeddings, attention_mask
+                )
         
         # Final layer norm and head
         hidden_states = self.base_model.norm(hidden_states)
@@ -493,6 +515,14 @@ class TensorParallelModel(torch.nn.Module):
     def parameters(self):
         """Get parameters from base model"""
         return self.base_model.parameters()
+    
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing to reduce memory usage"""
+        self.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing"""
+        self.gradient_checkpointing = False
 
 
 def resume_training(
@@ -643,6 +673,11 @@ def resume_training(
     # 4) Wrap model with tensor parallelism
     model = TensorParallelModel(base_model, world_size, rank)
     
+    # Enable gradient checkpointing to reduce memory usage
+    model.gradient_checkpointing_enable()
+    if is_main_process:
+        print("Gradient checkpointing enabled for memory optimization")
+    
     # 5) NOW create optimizer
     fused_optimizer = False
     if torch.cuda.is_available():
@@ -663,13 +698,16 @@ def resume_training(
     # 6) Load optimizer state
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     
-    # 7) Move optimizer states to match parameter devices
+    # 7) Move optimizer states to match parameter devices AND dtypes
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             if param in optimizer.state:
                 for state_key, state_val in optimizer.state[param].items():
                     if isinstance(state_val, torch.Tensor):
-                        optimizer.state[param][state_key] = state_val.to(param.device)
+                        # Move to correct device AND dtype to prevent dtype mismatch
+                        optimizer.state[param][state_key] = state_val.to(
+                            device=param.device, dtype=param.dtype
+                        )
 
     # Get global step and token count from checkpoint
     global_step = ckpt.get("global_step", 0)
