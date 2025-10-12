@@ -600,11 +600,17 @@ class TensorParallelModel(torch.nn.Module):
         """
         Gather the full unsharded model state from all ranks.
         Only rank 0 will have the complete state dict after this operation.
+        
+        This method must be called on all ranks simultaneously for proper synchronization.
         """
         import torch.nn as nn
         
         state_dict = self.base_model.state_dict()
         full_state_dict = {}
+        
+        # Synchronize all ranks before gathering
+        if self.world_size > 1:
+            dist.barrier()
         
         for key, tensor in state_dict.items():
             # Check if this is a sharded parameter
@@ -829,36 +835,26 @@ def resume_training(
             if checkpoint_shape[0] < expected_dim * 0.5:  # Less than half means it's sharded
                 is_sharded_checkpoint = True
                 if is_main_process:
-                    print(f"Detected sharded checkpoint from tensor parallelism")
+                    print(f"ERROR: Detected sharded checkpoint from tensor parallelism")
                     print(f"  Example: {key} has shape {checkpoint_shape}, expected ~{expected_dim}")
-                break
+                    print(f"\nThis checkpoint was saved with sharded weights from an older version.")
+                    print(f"The current version saves full unsharded weights for better compatibility.")
+                    print(f"\nTo fix this issue:")
+                    print(f"  1. If you have the original non-tensor-parallel checkpoint, use that instead")
+                    print(f"  2. Or, save a new checkpoint using the updated code that saves full weights")
+                    print(f"  3. Or, manually reconstruct the full checkpoint by gathering weights from all ranks")
+                raise ValueError(
+                    "Cannot load checkpoint with sharded tensor-parallel weights. "
+                    "Please use a checkpoint with full unsharded weights."
+                )
     
-    if is_sharded_checkpoint:
-        # Checkpoint contains sharded weights - we need to load them AFTER sharding the model
-        if is_main_process:
-            print("Checkpoint contains tensor-parallel sharded weights")
-            print("Will shard the model first, then load the checkpoint weights")
-        
-        # 4) First wrap model with tensor parallelism (which shards it)
-        model = TensorParallelModel(base_model, world_size, rank)
-        
-        # Now load the sharded checkpoint weights
-        # We need to be careful here - we can only load if world_size matches
-        # For now, try to load and let PyTorch handle mismatches with strict=False
-        missing_keys, unexpected_keys = model.base_model.load_state_dict(converted_state, strict=False)
-        if is_main_process:
-            if missing_keys:
-                print(f"Warning: {len(missing_keys)} keys not found in checkpoint (expected for sharding changes)")
-            if unexpected_keys:
-                print(f"Warning: {len(unexpected_keys)} unexpected keys in checkpoint")
-    else:
-        # Checkpoint contains full (unsharded) weights - load normally then shard
-        if is_main_process:
-            print("Checkpoint contains full unsharded model weights")
-        base_model.load_state_dict(converted_state)
-        
-        # 4) Wrap model with tensor parallelism
-        model = TensorParallelModel(base_model, world_size, rank)
+    # Checkpoint contains full (unsharded) weights - load normally then shard
+    if is_main_process:
+        print("Checkpoint contains full unsharded model weights - loading...")
+    base_model.load_state_dict(converted_state)
+    
+    # 4) Wrap model with tensor parallelism
+    model = TensorParallelModel(base_model, world_size, rank)
     
     # Enable gradient checkpointing to reduce memory usage
     model.gradient_checkpointing_enable()
@@ -1139,6 +1135,10 @@ def resume_training(
                             )
                             safe_torch_save(checkpoint_state, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                        
+                        # Wait for rank 0 to finish saving before continuing
+                        if world_size > 1:
+                            dist.barrier()
 
                         update_training_stats(
                             tokens=current_total_tokens,
@@ -1309,6 +1309,10 @@ def resume_training(
                         )
                         safe_torch_save(checkpoint_state, save_path)
                         print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                    
+                    # Wait for rank 0 to finish saving before continuing
+                    if world_size > 1:
+                        dist.barrier()
 
                     update_training_stats(
                         tokens=current_total_tokens,
