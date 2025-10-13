@@ -113,15 +113,35 @@ class DataPosition:
 
 
 def streaming_token_generator(data_files: List[str], tokenizer, block_size: int, start_file_idx: int = 0, start_position: int = 0, start_chunk_offset: int = 0, rank: int = 0):
-    """Generator with chunk-level resume support"""
+    """
+    Generator with chunk-level resume support and proper resource cleanup.
+    
+    Args:
+        data_files: List of parquet file paths
+        tokenizer: HuggingFace tokenizer
+        block_size: Maximum sequence length
+        start_file_idx: Index of file to start from
+        start_position: Position within file to start from
+        start_chunk_offset: Chunk offset to start from
+        rank: Process rank for distributed training
+        
+    Yields:
+        Tuple of (chunk, file_idx, position, shard_name, chunk_idx)
+    """
+    import gc
+    
     file_idx = max(start_file_idx, 0)
     processed_count = 0
     is_main_process = (rank == 0)
     initial_file_idx = file_idx
     initial_position = start_position
     initial_chunk_offset = start_chunk_offset
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
 
     while file_idx < len(data_files):
+        dataset = None  # Initialize to None for proper cleanup
+        
         try:
             file_path = data_files[file_idx]
             shard_name = os.path.basename(file_path)
@@ -132,12 +152,31 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                 dataset = load_streaming_shard(file_path)
                 if is_main_process:
                     print(f"Successfully loaded dataset with {len(dataset)} rows")
+                consecutive_errors = 0  # Reset on success
+                
             except Exception as file_error:
+                consecutive_errors += 1
                 if is_main_process:
                     print(f"ERROR: Could not read file {file_path}: {file_error}")
+                    print(f"Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+                
+                # If too many consecutive errors, force cleanup and stop
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    if is_main_process:
+                        print(f"⚠ Too many consecutive errors. Forcing cleanup and restarting...")
+                    
+                    # Aggressive cleanup
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # Reset error counter and skip ahead
+                    consecutive_errors = 0
+                
                 file_idx += 1
                 continue
 
+            # Determine starting position for this file
             if file_idx == initial_file_idx:
                 position = initial_position
                 resume_chunk_offset = initial_chunk_offset
@@ -147,32 +186,88 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                 position = 0
                 resume_chunk_offset = 0
 
+            # Process all items in this file
             while position < len(dataset):
                 try:
                     item = dataset[position]
                     if "text" in item and item["text"] and isinstance(item["text"], str):
                         text = item["text"]
+                        
+                        # Optional: Data quality filter (skip number-heavy content)
+                        if len(text) > 50:
+                            alpha_count = sum(c.isalpha() or c.isspace() for c in text)
+                            digit_count = sum(c.isdigit() for c in text)
+                            
+                            # Skip if more than 50% digits or less than 30% letters
+                            if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
+                                if is_main_process and position % 10000 == 0:
+                                    print(f"⚠ Skipping low-quality text at position {position}")
+                                position += 1
+                                continue
+                        
                         tokens = tokenizer.encode(text, add_special_tokens=False)
+                        
+                        # Skip very short sequences
+                        if len(tokens) < 10:
+                            position += 1
+                            continue
+                        
+                        # Yield chunks from this text
                         for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
+                            # Skip chunks we've already processed during resume
                             if file_idx == initial_file_idx and position == initial_position:
                                 if chunk_idx < resume_chunk_offset:
                                     continue
+                            
                             processed_count += 1
                             yield chunk, file_idx, position, shard_name, chunk_idx
+                            
                 except Exception as e:
                     if is_main_process:
                         print(f"Error processing item at position {position}: {e}")
+                
                 position += 1
+            
+            # ====== CRITICAL: CLEANUP AFTER EACH FILE ======
+            if is_main_process:
+                print(f"Finished processing {shard_name}, cleaning up resources...")
+            
+            # Delete the dataset to free memory
+            del dataset
+            dataset = None
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Small delay to ensure cleanup completes
+            import time
+            time.sleep(0.1)
+            
+            # Move to next file
             file_idx += 1
+            
         except Exception as e:
             if is_main_process:
-                print(f"Error processing file {file_path}: {e}")
+                print(f"Error processing file {data_files[file_idx]}: {e}")
+            
+            # Cleanup even on error
+            if dataset is not None:
+                del dataset
+                dataset = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             file_idx += 1
 
     if is_main_process:
         print(f"Completed processing all available files. Processed {processed_count} samples.")
+    
     return None, -1, -1, "", -1
-
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
