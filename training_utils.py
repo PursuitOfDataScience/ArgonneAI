@@ -271,17 +271,51 @@ class CosineWarmupScheduler:
     def last_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 
-
-def load_streaming_shard(file_path: str) -> Dataset:
-    """Load a streaming dataset shard based on file extension."""
-
-    extension = os.path.splitext(file_path)[1].lower()
-    if extension == ".parquet":
-        return Dataset.from_parquet(file_path)
-    if extension == ".arrow":
-        return Dataset.from_file(file_path)
-
-    raise ValueError(
-        "Unsupported dataset shard format. Expected '.parquet' or '.arrow' "
-        f"files but received: {extension or 'unknown'}"
-    )
+def load_streaming_shard(file_path: str):
+    """
+    Load a single parquet shard with proper resource management.
+    Loads data into memory and immediately closes file handles.
+    
+    Args:
+        file_path: Path to the parquet or arrow file
+        
+    Returns:
+        Dataset: HuggingFace Dataset object with data in memory
+        
+    Raises:
+        RuntimeError: If file cannot be loaded
+    """
+    from datasets import Dataset
+    import pyarrow.parquet as pq
+    import pyarrow as pa
+    
+    try:
+        if file_path.endswith('.parquet'):
+            # Read parquet file completely into memory
+            table = pq.read_table(file_path)
+            
+            # Convert to Dataset (creates in-memory copy)
+            dataset = Dataset(table)
+            
+            # Explicitly delete table to free file handle immediately
+            del table
+            
+        elif file_path.endswith('.arrow'):
+            # For Arrow files, use memory map but load into memory
+            with pa.memory_map(file_path, 'r') as source:
+                loaded_table = pa.ipc.open_file(source).read_all()
+            
+            dataset = Dataset(loaded_table)
+            del loaded_table
+            
+        else:
+            raise ValueError(f"Unsupported file format: {file_path}")
+        
+        # Validate dataset has required columns
+        if 'text' not in dataset.column_names:
+            raise ValueError(f"Dataset missing 'text' column. Found: {dataset.column_names}")
+        
+        return dataset
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to load {file_path}: {type(e).__name__}: {str(e)}")
