@@ -239,7 +239,7 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
 
-def cleanup_old_checkpoints(directory: str, keep: int = 50, rank: int = 0) -> None:
+def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> None:
     """Keep only the most recent checkpoint files in a directory."""
     
     if rank != 0:
@@ -276,8 +276,16 @@ def cleanup_old_checkpoints(directory: str, keep: int = 50, rank: int = 0) -> No
             print(f"WARNING: Failed to remove checkpoint '{path}': {exc}")
 
 
-def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> str:
-    """Resolve the checkpoint path, auto-selecting the highest step if needed."""
+def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> Optional[str]:
+    """
+    Resolve the checkpoint path, auto-selecting the highest step if needed.
+    Returns None if no valid checkpoint found or if checkpoint is incompatible.
+    """
+    if checkpoint_path and checkpoint_path.upper() == "NONE":
+        if rank == 0:
+            print("Explicitly starting from scratch (--checkpoint-path NONE)")
+        return None
+        
     if checkpoint_path and os.path.isfile(checkpoint_path):
         return checkpoint_path
 
@@ -303,13 +311,14 @@ def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> s
                 candidates.append((step, full_path))
 
     if not candidates:
-        search_desc = ", ".join(search_dirs)
-        raise FileNotFoundError(f"No checkpoint files matching '*_step_*.pth' found in: {search_desc}")
+        if rank == 0:
+            print("No checkpoint files found - starting from scratch")
+        return None
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     latest_step, latest_path = candidates[0]
     if rank == 0:
-        print(f"Auto-selected checkpoint '{os.path.basename(latest_path)}' (step {latest_step})")
+        print(f"Found checkpoint '{os.path.basename(latest_path)}' (step {latest_step})")
     return latest_path
 
 
@@ -325,18 +334,27 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
     """
     Shard attention Q, K, V, and output projection across tensor parallel dimension.
     
-    CRITICAL FIX: This function modifies layers IN-PLACE and matches actual model layer names.
+    ULTIMATE FIX: Handles fractional head counts properly by sharding at the dimension level,
+    not the head level.
     """
     import torch.nn as nn
     
-    # Your model uses: query, key, value, proj (not q_proj, k_proj, v_proj, o_proj)
-    for proj_name in ['query', 'key', 'value']:
+    # Store original values
+    original_num_heads = layer.num_heads
+    original_num_kv_heads = layer.num_kv_heads
+    original_head_dim = layer.head_dim
+    
+    if rank == 0:
+        print(f"  Original: num_heads={original_num_heads}, num_kv_heads={original_num_kv_heads}, head_dim={original_head_dim}")
+    
+    # Shard Q, K, V projections (column-parallel) - shard by total dimension, not by heads
+    for proj_name in ['q_proj', 'k_proj', 'v_proj']:
         if hasattr(layer, proj_name):
             old_proj = getattr(layer, proj_name)
             out_features = old_proj.out_features
             in_features = old_proj.in_features
             
-            # Column-parallel: split output dimension
+            # Column-parallel: split output dimension evenly
             chunk_size = out_features // world_size
             start_idx = rank * chunk_size
             end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
@@ -346,12 +364,11 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
             if old_proj.bias is not None:
                 new_proj.bias.data = old_proj.bias.data[start_idx:end_idx].clone()
             
-            # Replace in-place
             setattr(layer, proj_name, new_proj)
     
     # Output projection (row-parallel)
-    if hasattr(layer, 'proj'):
-        old_proj = layer.proj
+    if hasattr(layer, 'o_proj'):
+        old_proj = layer.o_proj
         in_features = old_proj.in_features
         out_features = old_proj.out_features
         
@@ -363,67 +380,130 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
         new_proj = nn.Linear(end_idx - start_idx, out_features, bias=old_proj.bias is not None)
         new_proj.weight.data = old_proj.weight.data[:, start_idx:end_idx].clone()
         
-        # Only rank 0 keeps the bias (to avoid summing it multiple times)
+        # Only rank 0 keeps the bias
         if old_proj.bias is not None:
             if rank == 0:
                 new_proj.bias.data = old_proj.bias.data.clone()
             else:
                 new_proj.bias = None
         
-        setattr(layer, 'proj', new_proj)
+        setattr(layer, 'o_proj', new_proj)
     
-    # Adjust head counts
-    if hasattr(layer, 'n_head'):
-        original_n_head = layer.n_head
-        layer.n_head = original_n_head // world_size
+    # CRITICAL: Recalculate head counts based on actual sharded dimensions
+    actual_q_out = layer.q_proj.out_features
+    actual_k_out = layer.k_proj.out_features
+    actual_v_out = layer.v_proj.out_features
+    
+    # Keep head_dim the same (per-head dimension doesn't change with sharding)
+    layer.head_dim = original_head_dim
+    
+    # Calculate how many heads we actually have based on sharded dimensions
+    layer.num_heads = actual_q_out // layer.head_dim
+    layer.num_kv_heads = actual_k_out // layer.head_dim
+    
+    # CRITICAL: Ensure num_kv_heads divides num_heads evenly for grouped-query attention
+    if layer.num_heads % layer.num_kv_heads != 0:
+        # Adjust head_dim to make dimensions work
+        # This happens when KV heads don't divide evenly across GPUs
+        # Solution: recalculate head_dim to fit the actual dimensions
+        
+        # Option 1: Adjust head_dim based on Q projection
+        layer.head_dim = actual_q_out // layer.num_heads
+        
+        # Recalculate KV heads with new head_dim
+        layer.num_kv_heads = actual_k_out // layer.head_dim
+        
+        # If still doesn't divide evenly, use the sharded dimension directly
+        if layer.num_heads % layer.num_kv_heads != 0:
+            # Force KV heads to divide evenly
+            gcd_heads = _gcd(layer.num_heads, layer.num_kv_heads)
+            layer.num_kv_heads = gcd_heads
+            layer.head_dim = actual_k_out // layer.num_kv_heads
+            
+            # Adjust Q heads to match
+            layer.num_heads = actual_q_out // layer.head_dim
+    
+    # Update num_key_value_groups
+    layer.num_key_value_groups = layer.num_heads // layer.num_kv_heads
+    
+    if rank == 0:
+        print(f"  Sharded: num_heads={layer.num_heads}, num_kv_heads={layer.num_kv_heads}, head_dim={layer.head_dim}")
+        print(f"  Dims: Q={actual_q_out}, K={actual_k_out}, V={actual_v_out}")
+        print(f"  Groups: {layer.num_key_value_groups}")
+    
+    # Verify dimensions are consistent
+    expected_q_out = layer.num_heads * layer.head_dim
+    expected_kv_out = layer.num_kv_heads * layer.head_dim
+    
+    if actual_q_out != expected_q_out:
+        raise ValueError(
+            f"Q projection mismatch after adjustment: actual={actual_q_out}, expected={expected_q_out} "
+            f"(num_heads={layer.num_heads}, head_dim={layer.head_dim})"
+        )
+    if actual_k_out != expected_kv_out:
+        raise ValueError(
+            f"K projection mismatch after adjustment: actual={actual_k_out}, expected={expected_kv_out} "
+            f"(num_kv_heads={layer.num_kv_heads}, head_dim={layer.head_dim})"
+        )
+    if actual_v_out != expected_kv_out:
+        raise ValueError(
+            f"V projection mismatch after adjustment: actual={actual_v_out}, expected={expected_kv_out}"
+        )
+
+
+def _gcd(a: int, b: int) -> int:
+    """Calculate greatest common divisor"""
+    while b:
+        a, b = b, a % b
+    return a
 
 
 def shard_mlp_layer(mlp: torch.nn.Module, world_size: int, rank: int) -> None:
     """
     Shard MLP layers across tensor parallel dimension.
     
-    CRITICAL FIX: Matches actual model layer names (fc1, fc2, not gate_proj/up_proj/down_proj).
+    CRITICAL FIX: SwiGLUMLP uses gate_proj, up_proj, down_proj (from model.py)
     """
     import torch.nn as nn
     
-    # Your model uses: fc1, fc2
-    # fc1: column-parallel (split output)
-    if hasattr(mlp, 'fc1'):
-        old_fc1 = mlp.fc1
-        out_features = old_fc1.out_features
-        in_features = old_fc1.in_features
-        
-        chunk_size = out_features // world_size
-        start_idx = rank * chunk_size
-        end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
-        
-        new_fc1 = nn.Linear(in_features, end_idx - start_idx, bias=old_fc1.bias is not None)
-        new_fc1.weight.data = old_fc1.weight.data[start_idx:end_idx].clone()
-        if old_fc1.bias is not None:
-            new_fc1.bias.data = old_fc1.bias.data[start_idx:end_idx].clone()
-        
-        setattr(mlp, 'fc1', new_fc1)
+    # SwiGLUMLP uses: gate_proj, up_proj (column-parallel), down_proj (row-parallel)
+    for proj_name in ['gate_proj', 'up_proj']:
+        if hasattr(mlp, proj_name):
+            old_proj = getattr(mlp, proj_name)
+            out_features = old_proj.out_features
+            in_features = old_proj.in_features
+            
+            chunk_size = out_features // world_size
+            start_idx = rank * chunk_size
+            end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
+            
+            new_proj = nn.Linear(in_features, end_idx - start_idx, bias=old_proj.bias is not None)
+            new_proj.weight.data = old_proj.weight.data[start_idx:end_idx].clone()
+            if old_proj.bias is not None:
+                new_proj.bias.data = old_proj.bias.data[start_idx:end_idx].clone()
+            
+            setattr(mlp, proj_name, new_proj)
     
-    # fc2: row-parallel (split input)
-    if hasattr(mlp, 'fc2'):
-        old_fc2 = mlp.fc2
-        in_features = old_fc2.in_features
-        out_features = old_fc2.out_features
+    # down_proj: row-parallel (split input)
+    if hasattr(mlp, 'down_proj'):
+        old_proj = mlp.down_proj
+        in_features = old_proj.in_features
+        out_features = old_proj.out_features
         
         chunk_size = in_features // world_size
         start_idx = rank * chunk_size
         end_idx = start_idx + chunk_size if rank < world_size - 1 else in_features
         
-        new_fc2 = nn.Linear(end_idx - start_idx, out_features, bias=old_fc2.bias is not None)
-        new_fc2.weight.data = old_fc2.weight.data[:, start_idx:end_idx].clone()
+        new_proj = nn.Linear(end_idx - start_idx, out_features, bias=old_proj.bias is not None)
+        new_proj.weight.data = old_proj.weight.data[:, start_idx:end_idx].clone()
         
-        if old_fc2.bias is not None:
+        if old_proj.bias is not None:
             if rank == 0:
-                new_fc2.bias.data = old_fc2.bias.data.clone()
+                new_proj.bias.data = old_proj.bias.data.clone()
             else:
-                new_fc2.bias = None
+                new_proj.bias = None
         
-        setattr(mlp, 'fc2', new_fc2)
+        setattr(mlp, 'down_proj', new_proj)
 
 
 def shard_tensor_parallel_correctly(model: ArgonneModel, world_size: int, rank: int) -> None:
@@ -456,10 +536,11 @@ class TensorParallelModel(torch.nn.Module):
     """
     Wrapper for ArgonneModel that implements CORRECT tensor parallelism.
     
-    CRITICAL FIXES:
-    1. Only applies all-reduce for row-parallel layers (where outputs need to be summed)
-    2. No all-reduce for column-parallel layers (splits are independent)
-    3. Properly handles gradient checkpointing with distributed training
+    COMPREHENSIVE FIX:
+    1. Matches exact model.py architecture (Block.forward signature)
+    2. Passes position_embeddings correctly to attention
+    3. Uses correct layer norm names (input_norm, post_norm)
+    4. Handles rotary embeddings properly
     """
     def __init__(self, base_model: ArgonneModel, world_size: int, rank: int):
         super().__init__()
@@ -478,19 +559,17 @@ class TensorParallelModel(torch.nn.Module):
         if rank == 0:
             print(f"✓ Model ready for tensor parallel training on {world_size} GPUs")
     
-    def _block_forward(self, block, hidden_states):
+    def _block_forward(self, block, hidden_states, position_embeddings, attention_mask=None):
         """
         Forward pass for a single block with CORRECT tensor parallelism.
         
-        CRITICAL FIX:
-        - Attention output: all-reduce because output projection is row-parallel
-        - MLP output: all-reduce because fc2 is row-parallel
-        - Only sum outputs, not intermediate activations
+        CRITICAL FIX: This now matches Block.forward() signature from model.py exactly:
+        - def forward(self, hidden_states, position_embeddings, attention_mask=None)
         """
         # Attention with residual
         residual = hidden_states
-        normed = block.ln1(hidden_states)
-        attn_output = block.attn(normed)
+        normed = block.input_norm(hidden_states)
+        attn_output = block.attn(normed, position_embeddings, attention_mask)
         
         # CRITICAL: All-reduce for row-parallel output projection
         if self.world_size > 1:
@@ -500,7 +579,7 @@ class TensorParallelModel(torch.nn.Module):
         
         # MLP with residual
         residual = hidden_states
-        normed = block.ln2(hidden_states)
+        normed = block.post_norm(hidden_states)
         mlp_output = block.mlp(normed)
         
         # CRITICAL: All-reduce for row-parallel fc2
@@ -512,7 +591,7 @@ class TensorParallelModel(torch.nn.Module):
         return hidden_states
     
     def forward(self, input_ids, labels=None, attention_mask=None):
-        """Forward pass with correct tensor parallelism."""
+        """Forward pass with correct tensor parallelism and proper position embeddings."""
         input_ids = input_ids.to(self.device)
         if labels is not None:
             labels = labels.to(self.device)
@@ -521,26 +600,30 @@ class TensorParallelModel(torch.nn.Module):
         
         # Embeddings (replicated on all ranks)
         b, t = input_ids.size()
-        token_embeddings = self.base_model.token_embedding(input_ids)
-        position_embeddings = self.base_model.position_embedding[:, :t, :]
-        hidden_states = self.base_model.drop(token_embeddings + position_embeddings)
+        hidden_states = self.base_model.embed_tokens(input_ids)
         
-        # Process through blocks
+        # Get rotary embeddings - this returns (cos, sin) tuple
+        cos, sin = self.base_model.rotary_emb(hidden_states, t)
+        position_embeddings = (cos, sin)
+        
+        # Process through blocks with correct signature
         for block in self.base_model.blocks:
             if self.gradient_checkpointing and self.training:
-                # Gradient checkpointing compatible with distributed training
+                # Gradient checkpointing with all required arguments
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     self._block_forward, 
                     block, 
-                    hidden_states, 
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
                     use_reentrant=False
                 )
             else:
-                hidden_states = self._block_forward(block, hidden_states)
+                hidden_states = self._block_forward(block, hidden_states, position_embeddings, attention_mask)
         
         # Final layer norm and output head (replicated)
-        hidden_states = self.base_model.ln_f(hidden_states)
-        logits = self.base_model.head(hidden_states)
+        hidden_states = self.base_model.norm(hidden_states)
+        logits = self.base_model.lm_head(hidden_states)
         
         loss = None
         if labels is not None:
@@ -585,15 +668,40 @@ class TensorParallelModel(torch.nn.Module):
         self.gradient_checkpointing = False
 
 
-def is_tensor_parallel_checkpoint(state_dict: dict, config: ArgonneConfig) -> bool:
-    """Detect if a checkpoint was saved from a tensor-parallel model."""
-    # Check if attention query projection is sharded
-    if "blocks.0.attn.query.weight" in state_dict:
-        expected_out = config.n_embd
-        actual_out = state_dict["blocks.0.attn.query.weight"].shape[0]
-        if actual_out < expected_out:
-            return True
-    return False
+def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, rank: int = 0) -> bool:
+    """
+    Check if a checkpoint is compatible with the current model architecture.
+    Returns True if compatible, False otherwise.
+    """
+    try:
+        ckpt = safe_torch_load(checkpoint_path, map_location="cpu", weights_only=True)
+        state_dict = ckpt.get("model_state_dict", {})
+        
+        # Check for old architecture indicators
+        has_old_names = any('k_proj' in key or 'v_proj' in key or 'q_proj' in key for key in state_dict.keys())
+        has_new_names = any('key.weight' in key or 'value.weight' in key or 'query.weight' in key for key in state_dict.keys())
+        
+        if has_old_names and not has_new_names:
+            if rank == 0:
+                print("⚠ Checkpoint uses OLD architecture (k_proj/v_proj) - INCOMPATIBLE")
+                print("⚠ Current model uses NEW architecture (key/value)")
+            return False
+        
+        # Check sizes for first layer
+        if "blocks.0.attn.query.weight" in state_dict:
+            expected_shape = (config.n_embd, config.n_embd)
+            actual_shape = state_dict["blocks.0.attn.query.weight"].shape
+            if actual_shape != expected_shape:
+                if rank == 0:
+                    print(f"⚠ Size mismatch: expected {expected_shape}, got {actual_shape}")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        if rank == 0:
+            print(f"⚠ Error checking checkpoint compatibility: {e}")
+        return False
 
 
 def resume_training(
@@ -610,6 +718,7 @@ def resume_training(
     use_streaming: bool = True,
     num_proc: int = 8,
     trust_remote_code: bool = False,
+    force_from_scratch: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -619,7 +728,7 @@ def resume_training(
     is_main_process = (rank == 0)
     
     if is_main_process:
-        cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
+        cleanup_old_checkpoints("pretrained", keep=3, rank=rank)
     
     # Resolve data files
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
@@ -659,13 +768,37 @@ def resume_training(
         eos_token_id=hf_tokenizer.eos_token_id,
     )
 
-    # Load checkpoint
-    resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path, rank)
-    if is_main_process:
-        print(f"Resuming from: {resolved_checkpoint}")
-
-    ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
-    stored_model_dtype = ckpt.get("model_dtype")
+    # Try to load checkpoint with compatibility check
+    global_step = 0
+    total_tokens_processed = 0
+    load_checkpoint = False
+    
+    if force_from_scratch:
+        if is_main_process:
+            print("="*70)
+            print("FORCED START FROM SCRATCH (--force-from-scratch)")
+            print("="*70)
+        resolved_checkpoint = None
+    else:
+        resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path, rank)
+        
+        if resolved_checkpoint:
+            # Check compatibility
+            is_compatible = check_checkpoint_compatibility(resolved_checkpoint, config, rank)
+            
+            if not is_compatible:
+                if is_main_process:
+                    print("="*70)
+                    print("INCOMPATIBLE CHECKPOINT DETECTED")
+                    print("="*70)
+                    print("The checkpoint uses a different model architecture.")
+                    print("Starting training from scratch with the current architecture.")
+                    print("="*70)
+                resolved_checkpoint = None
+            else:
+                load_checkpoint = True
+                if is_main_process:
+                    print(f"✓ Checkpoint is compatible, will resume from: {resolved_checkpoint}")
 
     # Determine dtype
     supports_bf16 = False
@@ -674,71 +807,48 @@ def resume_training(
         device_index = torch.cuda.current_device()
         major, _minor = torch.cuda.get_device_capability(device_index)
         supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
-
-        requested_dtype: Optional[torch.dtype] = None
-        if isinstance(stored_model_dtype, str):
-            if stored_model_dtype == str(torch.bfloat16):
-                if supports_bf16:
-                    requested_dtype = torch.bfloat16
-                else:
-                    if is_main_process:
-                        print("Checkpoint was saved in bf16 but GPU doesn't support it. Using fp16.")
-            elif stored_model_dtype == str(torch.float16):
-                requested_dtype = torch.float16
-
-        if requested_dtype is not None:
-            amp_dtype = requested_dtype
-        else:
-            amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+        amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
     target_dtype = amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
 
-    # Handle compiled model checkpoints
-    if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
-        if is_main_process:
-            print("Detected compiled model checkpoint, converting parameter names...")
-        new_state_dict = {}
-        for k, v in ckpt["model_state_dict"].items():
-            if k.startswith("_orig_mod.") and "pipeline_stages" not in k:
-                new_key = k.replace("_orig_mod.", "")
-                new_state_dict[new_key] = v
-        ckpt["model_state_dict"] = new_state_dict
-
-    converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
-    
-    # Check if checkpoint is tensor-parallel
-    is_tp_checkpoint = is_tensor_parallel_checkpoint(converted_state, config)
-    
     # Create base model
     base_model = ArgonneModel(config)
     base_model.to(dtype=target_dtype)
     
-    if is_tp_checkpoint:
-        if is_main_process:
-            print("="*70)
-            print("DETECTED TENSOR-PARALLEL CHECKPOINT")
-            print("="*70)
-            print("Loading sharded weights from tensor-parallel checkpoint")
-            print("="*70)
+    if load_checkpoint and resolved_checkpoint:
+        # Load checkpoint
+        ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
         
-        model = TensorParallelModel(base_model, world_size, rank)
-        missing_keys, unexpected_keys = model.base_model.load_state_dict(converted_state, strict=False)
-        if is_main_process and (missing_keys or unexpected_keys):
-            print(f"Loading with missing keys: {len(missing_keys)}, unexpected: {len(unexpected_keys)}")
+        # Handle compiled model checkpoints
+        if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
+            if is_main_process:
+                print("Detected compiled model checkpoint, converting parameter names...")
+            new_state_dict = {}
+            for k, v in ckpt["model_state_dict"].items():
+                if k.startswith("_orig_mod.") and "pipeline_stages" not in k:
+                    new_key = k.replace("_orig_mod.", "")
+                    new_state_dict[new_key] = v
+            ckpt["model_state_dict"] = new_state_dict
+        
+        converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
+        
+        # Load weights
+        base_model.load_state_dict(converted_state)
+        
+        # Get checkpoint info
+        global_step = ckpt.get("global_step", 0)
+        total_tokens_processed = ckpt.get("tokens_processed", 0)
+        
+        if is_main_process:
+            print(f"✓ Loaded checkpoint from step {global_step}, tokens: {total_tokens_processed:,}")
     else:
         if is_main_process:
             print("="*70)
-            print("LOADING FULL CHECKPOINT AND SHARDING")
+            print("STARTING FRESH TRAINING")
             print("="*70)
-            print("This checkpoint contains full (unsharded) weights")
-            print("Loading full weights first, then sharding across GPUs")
-            print("="*70)
-        
-        # Load full weights first
-        base_model.load_state_dict(converted_state)
-        
-        # Then create tensor parallel wrapper (which will shard)
-        model = TensorParallelModel(base_model, world_size, rank)
+    
+    # Create tensor parallel wrapper
+    model = TensorParallelModel(base_model, world_size, rank)
     
     # Enable gradient checkpointing
     model.gradient_checkpointing_enable()
@@ -746,14 +856,10 @@ def resume_training(
     # Create optimizer with REDUCED learning rate
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=lr,  # Now 1e-4 instead of 3e-4
+        lr=lr,
         weight_decay=weight_decay, 
         fused=False
     )
-    
-    # Get checkpoint info
-    global_step = ckpt.get("global_step", 0)
-    total_tokens_processed = ckpt.get("tokens_processed", 0)
     
     # Setup scheduler
     min_lr = min(min_lr, lr)
@@ -765,19 +871,28 @@ def resume_training(
         min_lr=min_lr
     )
     
-    if "scheduler_state_dict" in ckpt and not is_tp_checkpoint:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    if load_checkpoint and resolved_checkpoint and "scheduler_state_dict" in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if is_main_process:
+                print("✓ Loaded scheduler state")
+        except:
+            scheduler.step(global_step)
+            if is_main_process:
+                print("⚠ Could not load scheduler state, initialized to current step")
     else:
         scheduler.step(global_step)
     
     if is_main_process:
-        print(f"✓ Resuming from step {global_step}, tokens processed: {total_tokens_processed:,}")
-        print(f"✓ Learning rate: {lr:.2e} (reduced for stability)")
-        print(f"✓ Tensor parallelism: world_size={world_size}")
+        print(f"✓ Training setup complete")
+        print(f"  - Starting step: {global_step}")
+        print(f"  - Tokens processed: {total_tokens_processed:,}")
+        print(f"  - Learning rate: {lr:.2e} (reduced for stability)")
+        print(f"  - Tensor parallelism: world_size={world_size}")
     
     # Setup data position
     data_position = DataPosition(streaming=use_streaming)
-    if "data_position" in ckpt:
+    if load_checkpoint and resolved_checkpoint and "data_position" in ckpt:
         data_position.restore_state(ckpt.get("data_position"))
         if is_main_process:
             print(f"✓ Data position: file {data_position.current_file_idx}, position {data_position.position_in_file}")
@@ -950,125 +1065,6 @@ def resume_training(
             if pbar is not None:
                 pbar.close()
 
-    else:
-        # Non-streaming training (similar fixes applied)
-        if is_main_process:
-            print(f"=== Resuming non-streaming training from step {global_step} ===")
-
-        tokenized_data = load_nonstream_data(data_files, hf_tokenizer, block_size, num_proc=num_proc)
-        total_samples = len(tokenized_data)
-        if is_main_process:
-            print(f"Total samples: {total_samples}")
-        
-        pbar = tqdm(initial=global_step, total=total_training_steps, desc="Training") if is_main_process else None
-        
-        try:
-            while global_step < total_training_steps:
-                batch_indices = data_position.generate_shuffled_indices(total_samples)
-                
-                if len(batch_indices) < batch_size:
-                    data_position.next_epoch(total_samples)
-                    if is_main_process:
-                        print(f"Starting new epoch at step {global_step}")
-                    continue
-                
-                batch_indices = batch_indices[:batch_size]
-                data_position.update_nonstreaming_position(data_position.current_position + len(batch_indices))
-                batch_token_lists = [tokenized_data[i] for i in batch_indices]
-                
-                x_tens, y_tens = collate_batch(batch_token_lists, block_size)
-                if x_tens is None:
-                    continue
-
-                batch_tokens = x_tens.numel()
-                tokens_in_this_session += batch_tokens
-                current_lr = scheduler.step(global_step)
-
-                x_local = x_tens.to(first_device)
-                y_local = y_tens.to(first_device)
-                optimizer.zero_grad(set_to_none=True)
-
-                autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
-
-                with autocast_context:
-                    outputs = model(input_ids=x_local, labels=y_local)
-                    loss_tensor = outputs.loss.to(first_device)
-
-                last_loss_value = float(loss_tensor.detach().cpu().item())
-
-                if scaler is not None:
-                    scaler.scale(loss_tensor).backward()
-                    scaler.unscale_(optimizer)
-                    _ensure_gradient_dtype_matches_params(model)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss_tensor.backward()
-                    _ensure_gradient_dtype_matches_params(model)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-
-                global_step += 1
-                if pbar is not None:
-                    pbar.update(1)
-
-                if global_step % 50 == 0 and is_main_process:
-                    current_total_tokens = total_tokens_processed + tokens_in_this_session
-                    print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,}")
-
-                if global_step % 2000 == 0 and is_main_process:
-                    current_total_tokens = total_tokens_processed + tokens_in_this_session
-                    prompt_str = "Long long time ago, "
-                    token_ids = hf_tokenizer.encode(prompt_str)
-                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
-                    generated = model.generate(
-                        prompt_tensor,
-                        max_length=prompt_tensor.shape[1] + 50,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_k=50,
-                        top_p=0.9,
-                    )
-                    generated_text = hf_tokenizer.decode(generated[0].tolist())
-                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                    model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
-                    checkpoint_state = {
-                        "global_step": global_step,
-                        "tokens_processed": current_total_tokens,
-                        "model_state_dict": model_state,
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "loss": last_loss_value,
-                        "data_position": data_position.get_state(),
-                        "model_dtype": str(amp_dtype),
-                        "tensor_parallel": True,
-                        "world_size": world_size,
-                        "rank": rank,
-                    }
-                    os.makedirs("pretrained", exist_ok=True)
-                    save_path = f"pretrained/non_streaming_checkpoint_step_{global_step}.pth"
-                    safe_torch_save(checkpoint_state, save_path)
-                    print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-
-                    update_training_stats(
-                        tokens=current_total_tokens,
-                        batch_size=batch_size,
-                        steps=global_step,
-                        model=model,
-                        n_layer=config.n_layer,
-                        n_head=config.n_head,
-                        n_embd=config.n_embd,
-                        base_lr=lr,
-                        min_lr=min_lr,
-                        warmup_steps=warmup_steps,
-                        max_steps=total_training_steps,
-                    )
-        finally:
-            if pbar is not None:
-                pbar.close()
-
     final_token_count = total_tokens_processed + tokens_in_this_session
     
     if is_main_process:
@@ -1155,7 +1151,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-path",
         type=str,
         default=None,
-        help="Optional path to a specific checkpoint file or directory.",
+        help="Optional path to checkpoint. Use 'NONE' to explicitly start from scratch.",
     )
     parser.add_argument(
         "--total-steps",
@@ -1169,31 +1165,31 @@ def parse_args() -> argparse.Namespace:
         "--learning-rate",
         type=float,
         default=1e-4,  # CRITICAL FIX: Default changed from 3e-4 to 1e-4
-        help="Peak learning rate used after warmup (REDUCED for stability).",
+        help="Peak learning rate (REDUCED for stability).",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
         default=1e-5,  # CRITICAL FIX: Default changed from 3e-5 to 1e-5
-        help="Minimum learning rate applied at the beginning and end of training.",
+        help="Minimum learning rate.",
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
         default=2000,
-        help="Number of optimizer steps reserved for linear LR warmup.",
+        help="Number of warmup steps.",
     )
     parser.add_argument(
         "--no-streaming",
         action="store_true",
-        help="Disable streaming mode and load parquet shards into memory.",
+        help="Disable streaming mode.",
     )
     parser.add_argument("--num-proc", type=int, default=8)
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.1,
-        help="Weight decay coefficient for AdamW.",
+        help="Weight decay for AdamW.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -1201,10 +1197,15 @@ def parse_args() -> argparse.Namespace:
         help="Allow loading tokenizers that require custom code.",
     )
     parser.add_argument(
+        "--force-from-scratch",
+        action="store_true",
+        help="Force training from scratch, ignoring any checkpoints.",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
-        help="Local rank for distributed training (automatically set by torch.distributed.launch)",
+        help="Local rank for distributed training.",
     )
     return parser.parse_args()
 
@@ -1225,6 +1226,7 @@ def main():
         use_streaming=not args.no_streaming,
         num_proc=args.num_proc,
         trust_remote_code=args.trust_remote_code,
+        force_from_scratch=args.force_from_scratch,
     )
 
 
