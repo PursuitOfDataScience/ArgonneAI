@@ -115,18 +115,6 @@ class DataPosition:
 def streaming_token_generator(data_files: List[str], tokenizer, block_size: int, start_file_idx: int = 0, start_position: int = 0, start_chunk_offset: int = 0, rank: int = 0):
     """
     Generator with chunk-level resume support and proper resource cleanup.
-    
-    Args:
-        data_files: List of parquet file paths
-        tokenizer: HuggingFace tokenizer
-        block_size: Maximum sequence length
-        start_file_idx: Index of file to start from
-        start_position: Position within file to start from
-        start_chunk_offset: Chunk offset to start from
-        rank: Process rank for distributed training
-        
-    Yields:
-        Tuple of (chunk, file_idx, position, shard_name, chunk_idx)
     """
     import gc
     
@@ -140,7 +128,7 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
     MAX_CONSECUTIVE_ERRORS = 5
 
     while file_idx < len(data_files):
-        dataset = None  # Initialize to None for proper cleanup
+        dataset = None
         
         try:
             file_path = data_files[file_idx]
@@ -152,7 +140,7 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                 dataset = load_streaming_shard(file_path)
                 if is_main_process:
                     print(f"Successfully loaded dataset with {len(dataset)} rows")
-                consecutive_errors = 0  # Reset on success
+                consecutive_errors = 0
                 
             except Exception as file_error:
                 consecutive_errors += 1
@@ -160,23 +148,17 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                     print(f"ERROR: Could not read file {file_path}: {file_error}")
                     print(f"Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
                 
-                # If too many consecutive errors, force cleanup and stop
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     if is_main_process:
                         print(f"⚠ Too many consecutive errors. Forcing cleanup and restarting...")
-                    
-                    # Aggressive cleanup
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    
-                    # Reset error counter and skip ahead
                     consecutive_errors = 0
                 
                 file_idx += 1
                 continue
 
-            # Determine starting position for this file
             if file_idx == initial_file_idx:
                 position = initial_position
                 resume_chunk_offset = initial_chunk_offset
@@ -186,35 +168,28 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                 position = 0
                 resume_chunk_offset = 0
 
-            # Process all items in this file
             while position < len(dataset):
                 try:
                     item = dataset[position]
                     if "text" in item and item["text"] and isinstance(item["text"], str):
                         text = item["text"]
                         
-                        # Optional: Data quality filter (skip number-heavy content)
+                        # Data quality filter
                         if len(text) > 50:
                             alpha_count = sum(c.isalpha() or c.isspace() for c in text)
                             digit_count = sum(c.isdigit() for c in text)
                             
-                            # Skip if more than 50% digits or less than 30% letters
                             if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
-                                if is_main_process and position % 10000 == 0:
-                                    print(f"⚠ Skipping low-quality text at position {position}")
                                 position += 1
                                 continue
                         
                         tokens = tokenizer.encode(text, add_special_tokens=False)
                         
-                        # Skip very short sequences
                         if len(tokens) < 10:
                             position += 1
                             continue
                         
-                        # Yield chunks from this text
                         for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
-                            # Skip chunks we've already processed during resume
                             if file_idx == initial_file_idx and position == initial_position:
                                 if chunk_idx < resume_chunk_offset:
                                     continue
@@ -228,33 +203,24 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                 
                 position += 1
             
-            # ====== CRITICAL: CLEANUP AFTER EACH FILE ======
             if is_main_process:
                 print(f"Finished processing {shard_name}, cleaning up resources...")
             
-            # Delete the dataset to free memory
             del dataset
             dataset = None
-            
-            # Force garbage collection
             gc.collect()
-            
-            # Clear CUDA cache if available
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # Small delay to ensure cleanup completes
             import time
             time.sleep(0.1)
             
-            # Move to next file
             file_idx += 1
             
         except Exception as e:
             if is_main_process:
                 print(f"Error processing file {data_files[file_idx]}: {e}")
             
-            # Cleanup even on error
             if dataset is not None:
                 del dataset
                 dataset = None
@@ -269,13 +235,13 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
     
     return None, -1, -1, "", -1
 
+
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
 
-def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> None:
+def cleanup_old_checkpoints(directory: str, keep: int = 50, rank: int = 0) -> None:
     """Keep only the most recent checkpoint files in a directory."""
     
-    # Only rank 0 performs cleanup
     if rank != 0:
         return
 
@@ -355,65 +321,146 @@ def init_tensor_parallel_group(world_size: int, rank: int) -> None:
         print(f"Initialized tensor parallel group: rank {rank}/{world_size}")
 
 
-def shard_tensor_parallel(module, world_size: int, rank: int) -> None:
-    """Shard linear layers across GPUs for tensor parallelism."""
+def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) -> None:
+    """
+    Shard attention Q, K, V, and output projection across tensor parallel dimension.
+    
+    CRITICAL FIX: This function modifies layers IN-PLACE and matches actual model layer names.
+    """
     import torch.nn as nn
     
-    for name, layer in module.named_modules():
-        if isinstance(layer, nn.Linear):
-            is_column_parallel = any(suffix in name for suffix in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj'])
-            is_row_parallel = any(suffix in name for suffix in ['o_proj', 'down_proj'])
+    # Your model uses: query, key, value, proj (not q_proj, k_proj, v_proj, o_proj)
+    for proj_name in ['query', 'key', 'value']:
+        if hasattr(layer, proj_name):
+            old_proj = getattr(layer, proj_name)
+            out_features = old_proj.out_features
+            in_features = old_proj.in_features
             
-            if is_column_parallel:
-                out_features = layer.out_features
-                chunk_size = out_features // world_size
-                start_idx = rank * chunk_size
-                end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
-                
-                new_layer = nn.Linear(layer.in_features, end_idx - start_idx, bias=layer.bias is not None)
-                new_layer.weight.data = layer.weight.data[start_idx:end_idx].clone()
-                if layer.bias is not None:
-                    new_layer.bias.data = layer.bias.data[start_idx:end_idx].clone()
-                
-                parent_name = '.'.join(name.split('.')[:-1])
-                child_name = name.split('.')[-1]
-                if parent_name:
-                    parent = dict(module.named_modules())[parent_name]
-                    setattr(parent, child_name, new_layer)
-                
-            elif is_row_parallel:
-                in_features = layer.in_features
-                chunk_size = in_features // world_size
-                start_idx = rank * chunk_size
-                end_idx = start_idx + chunk_size if rank < world_size - 1 else in_features
-                
-                new_layer = nn.Linear(end_idx - start_idx, layer.out_features, bias=layer.bias is not None)
-                new_layer.weight.data = layer.weight.data[:, start_idx:end_idx].clone()
-                if layer.bias is not None:
-                    if rank == 0:
-                        new_layer.bias.data = layer.bias.data.clone()
-                    else:
-                        new_layer.bias = None
-                
-                parent_name = '.'.join(name.split('.')[:-1])
-                child_name = name.split('.')[-1]
-                if parent_name:
-                    parent = dict(module.named_modules())[parent_name]
-                    setattr(parent, child_name, new_layer)
+            # Column-parallel: split output dimension
+            chunk_size = out_features // world_size
+            start_idx = rank * chunk_size
+            end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
+            
+            new_proj = nn.Linear(in_features, end_idx - start_idx, bias=old_proj.bias is not None)
+            new_proj.weight.data = old_proj.weight.data[start_idx:end_idx].clone()
+            if old_proj.bias is not None:
+                new_proj.bias.data = old_proj.bias.data[start_idx:end_idx].clone()
+            
+            # Replace in-place
+            setattr(layer, proj_name, new_proj)
     
-    for name, attn_module in module.named_modules():
-        if hasattr(attn_module, 'num_heads') and hasattr(attn_module, 'head_dim'):
-            original_num_heads = attn_module.num_heads
-            original_num_kv_heads = getattr(attn_module, 'num_kv_heads', original_num_heads)
-            attn_module.num_heads = original_num_heads // world_size
-            if hasattr(attn_module, 'num_kv_heads'):
-                attn_module.num_kv_heads = original_num_kv_heads // world_size
-            if hasattr(attn_module, 'num_key_value_groups'):
-                attn_module.num_key_value_groups = attn_module.num_heads // attn_module.num_kv_heads
+    # Output projection (row-parallel)
+    if hasattr(layer, 'proj'):
+        old_proj = layer.proj
+        in_features = old_proj.in_features
+        out_features = old_proj.out_features
+        
+        # Row-parallel: split input dimension
+        chunk_size = in_features // world_size
+        start_idx = rank * chunk_size
+        end_idx = start_idx + chunk_size if rank < world_size - 1 else in_features
+        
+        new_proj = nn.Linear(end_idx - start_idx, out_features, bias=old_proj.bias is not None)
+        new_proj.weight.data = old_proj.weight.data[:, start_idx:end_idx].clone()
+        
+        # Only rank 0 keeps the bias (to avoid summing it multiple times)
+        if old_proj.bias is not None:
+            if rank == 0:
+                new_proj.bias.data = old_proj.bias.data.clone()
+            else:
+                new_proj.bias = None
+        
+        setattr(layer, 'proj', new_proj)
+    
+    # Adjust head counts
+    if hasattr(layer, 'n_head'):
+        original_n_head = layer.n_head
+        layer.n_head = original_n_head // world_size
+
+
+def shard_mlp_layer(mlp: torch.nn.Module, world_size: int, rank: int) -> None:
+    """
+    Shard MLP layers across tensor parallel dimension.
+    
+    CRITICAL FIX: Matches actual model layer names (fc1, fc2, not gate_proj/up_proj/down_proj).
+    """
+    import torch.nn as nn
+    
+    # Your model uses: fc1, fc2
+    # fc1: column-parallel (split output)
+    if hasattr(mlp, 'fc1'):
+        old_fc1 = mlp.fc1
+        out_features = old_fc1.out_features
+        in_features = old_fc1.in_features
+        
+        chunk_size = out_features // world_size
+        start_idx = rank * chunk_size
+        end_idx = start_idx + chunk_size if rank < world_size - 1 else out_features
+        
+        new_fc1 = nn.Linear(in_features, end_idx - start_idx, bias=old_fc1.bias is not None)
+        new_fc1.weight.data = old_fc1.weight.data[start_idx:end_idx].clone()
+        if old_fc1.bias is not None:
+            new_fc1.bias.data = old_fc1.bias.data[start_idx:end_idx].clone()
+        
+        setattr(mlp, 'fc1', new_fc1)
+    
+    # fc2: row-parallel (split input)
+    if hasattr(mlp, 'fc2'):
+        old_fc2 = mlp.fc2
+        in_features = old_fc2.in_features
+        out_features = old_fc2.out_features
+        
+        chunk_size = in_features // world_size
+        start_idx = rank * chunk_size
+        end_idx = start_idx + chunk_size if rank < world_size - 1 else in_features
+        
+        new_fc2 = nn.Linear(end_idx - start_idx, out_features, bias=old_fc2.bias is not None)
+        new_fc2.weight.data = old_fc2.weight.data[:, start_idx:end_idx].clone()
+        
+        if old_fc2.bias is not None:
+            if rank == 0:
+                new_fc2.bias.data = old_fc2.bias.data.clone()
+            else:
+                new_fc2.bias = None
+        
+        setattr(mlp, 'fc2', new_fc2)
+
+
+def shard_tensor_parallel_correctly(model: ArgonneModel, world_size: int, rank: int) -> None:
+    """
+    Properly shard the model for tensor parallelism.
+    
+    CRITICAL FIXES:
+    1. Matches actual model architecture (Block -> attn/mlp)
+    2. Modifies layers in-place without breaking module tree
+    3. Handles head dimension adjustments correctly
+    """
+    if rank == 0:
+        print(f"Sharding model for tensor parallelism (world_size={world_size}, rank={rank})")
+    
+    # Iterate through blocks and shard their components
+    for block_idx, block in enumerate(model.blocks):
+        # Shard attention
+        if hasattr(block, 'attn'):
+            shard_attention_layer(block.attn, world_size, rank)
+        
+        # Shard MLP
+        if hasattr(block, 'mlp'):
+            shard_mlp_layer(block.mlp, world_size, rank)
+    
+    if rank == 0:
+        print(f"✓ Successfully sharded {len(model.blocks)} transformer blocks")
 
 
 class TensorParallelModel(torch.nn.Module):
-    """Wrapper for ArgonneModel that implements tensor parallelism."""
+    """
+    Wrapper for ArgonneModel that implements CORRECT tensor parallelism.
+    
+    CRITICAL FIXES:
+    1. Only applies all-reduce for row-parallel layers (where outputs need to be summed)
+    2. No all-reduce for column-parallel layers (splits are independent)
+    3. Properly handles gradient checkpointing with distributed training
+    """
     def __init__(self, base_model: ArgonneModel, world_size: int, rank: int):
         super().__init__()
         self.base_model = base_model
@@ -421,50 +468,79 @@ class TensorParallelModel(torch.nn.Module):
         self.rank = rank
         self.device = torch.device(f"cuda:{rank}")
         self.gradient_checkpointing = False
+        
+        # Move model to device first
         self.base_model = self.base_model.to(self.device)
-        shard_tensor_parallel(self.base_model, world_size, rank)
+        
+        # Then shard it
+        shard_tensor_parallel_correctly(self.base_model, world_size, rank)
+        
         if rank == 0:
-            print(f"Model sharded for tensor parallelism across {world_size} GPUs")
+            print(f"✓ Model ready for tensor parallel training on {world_size} GPUs")
     
-    def _block_forward(self, block, hidden_states, position_embeddings, attention_mask):
-        """Forward pass for a single block with tensor parallelism."""
+    def _block_forward(self, block, hidden_states):
+        """
+        Forward pass for a single block with CORRECT tensor parallelism.
+        
+        CRITICAL FIX:
+        - Attention output: all-reduce because output projection is row-parallel
+        - MLP output: all-reduce because fc2 is row-parallel
+        - Only sum outputs, not intermediate activations
+        """
+        # Attention with residual
         residual = hidden_states
-        normed = block.input_norm(hidden_states)
-        attn_output = block.attn(normed, position_embeddings, attention_mask)
+        normed = block.ln1(hidden_states)
+        attn_output = block.attn(normed)
+        
+        # CRITICAL: All-reduce for row-parallel output projection
         if self.world_size > 1:
             dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
+        
         hidden_states = residual + attn_output
+        
+        # MLP with residual
         residual = hidden_states
-        normed = block.post_norm(hidden_states)
+        normed = block.ln2(hidden_states)
         mlp_output = block.mlp(normed)
+        
+        # CRITICAL: All-reduce for row-parallel fc2
         if self.world_size > 1:
             dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
+        
         hidden_states = residual + mlp_output
+        
         return hidden_states
     
     def forward(self, input_ids, labels=None, attention_mask=None):
-        """Forward pass with tensor parallelism."""
+        """Forward pass with correct tensor parallelism."""
         input_ids = input_ids.to(self.device)
         if labels is not None:
             labels = labels.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         
-        hidden_states = self.base_model.embed_tokens(input_ids)
-        batch_size, seq_length = input_ids.shape
-        cos, sin = self.base_model.rotary_emb(hidden_states, seq_length)
-        position_embeddings = (cos, sin)
+        # Embeddings (replicated on all ranks)
+        b, t = input_ids.size()
+        token_embeddings = self.base_model.token_embedding(input_ids)
+        position_embeddings = self.base_model.position_embedding[:, :t, :]
+        hidden_states = self.base_model.drop(token_embeddings + position_embeddings)
         
+        # Process through blocks
         for block in self.base_model.blocks:
             if self.gradient_checkpointing and self.training:
+                # Gradient checkpointing compatible with distributed training
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    self._block_forward, block, hidden_states, position_embeddings, attention_mask, use_reentrant=False
+                    self._block_forward, 
+                    block, 
+                    hidden_states, 
+                    use_reentrant=False
                 )
             else:
-                hidden_states = self._block_forward(block, hidden_states, position_embeddings, attention_mask)
+                hidden_states = self._block_forward(block, hidden_states)
         
-        hidden_states = self.base_model.norm(hidden_states)
-        logits = self.base_model.lm_head(hidden_states)
+        # Final layer norm and output head (replicated)
+        hidden_states = self.base_model.ln_f(hidden_states)
+        logits = self.base_model.head(hidden_states)
         
         loss = None
         if labels is not None:
@@ -481,7 +557,14 @@ class TensorParallelModel(torch.nn.Module):
     
     def generate(self, input_ids, max_length=1024, temperature=1.0, top_k=None, top_p=None, do_sample=True):
         """Generation method matching ArgonneModel interface"""
-        return self.base_model.generate(input_ids, max_length=max_length, temperature=temperature, top_k=top_k, top_p=top_p, do_sample=do_sample)
+        return self.base_model.generate(
+            input_ids, 
+            max_length=max_length, 
+            temperature=temperature, 
+            top_k=top_k, 
+            top_p=top_p, 
+            do_sample=do_sample
+        )
     
     def state_dict(self, *args, **kwargs):
         """Get state dict from base model"""
@@ -494,6 +577,8 @@ class TensorParallelModel(torch.nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing to reduce memory usage"""
         self.gradient_checkpointing = True
+        if self.rank == 0:
+            print("✓ Gradient checkpointing enabled")
     
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing"""
@@ -502,10 +587,11 @@ class TensorParallelModel(torch.nn.Module):
 
 def is_tensor_parallel_checkpoint(state_dict: dict, config: ArgonneConfig) -> bool:
     """Detect if a checkpoint was saved from a tensor-parallel model."""
-    expected_q_proj_out = config.num_attention_heads * (config.hidden_size // config.num_attention_heads)
-    if "blocks.0.attn.q_proj.weight" in state_dict:
-        actual_shape = state_dict["blocks.0.attn.q_proj.weight"].shape
-        if actual_shape[0] < expected_q_proj_out:
+    # Check if attention query projection is sharded
+    if "blocks.0.attn.query.weight" in state_dict:
+        expected_out = config.n_embd
+        actual_out = state_dict["blocks.0.attn.query.weight"].shape[0]
+        if actual_out < expected_out:
             return True
     return False
 
@@ -517,8 +603,8 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
-    lr: float = 3e-4,
-    min_lr: float = 3e-5,
+    lr: float = 1e-4,  # CRITICAL FIX: Reduced from 3e-4
+    min_lr: float = 1e-5,  # CRITICAL FIX: Reduced from 3e-5
     warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     use_streaming: bool = True,
@@ -532,9 +618,8 @@ def resume_training(
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
     
-    # Clean up old checkpoints at startup (only once)
     if is_main_process:
-        cleanup_old_checkpoints("pretrained", keep=3, rank=rank)
+        cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
     
     # Resolve data files
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
@@ -559,19 +644,16 @@ def resume_training(
     hf_tokenizer.model_max_length = max(block_size + 1, 1_000_000_000)
     vocab_size = len(hf_tokenizer)
 
-    # Build config
+    # Build config - MATCHES YOUR ACTUAL MODEL ARCHITECTURE
     config = ArgonneConfig(
         vocab_size=vocab_size,
-        max_position_embeddings=block_size,
-        hidden_size=4096,
-        num_hidden_layers=24,
-        num_attention_heads=24,
-        num_key_value_heads=8,
-        rope_theta=500000.0,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        use_flash_attention=True,
-        tie_word_embeddings=False,
+        block_size=block_size,
+        n_layer=24,
+        n_head=24,
+        n_embd=4096,
+        dropout=0.0,
+        use_flash_attn=True,
+        use_gradient_checkpointing=False,
         pad_token_id=hf_tokenizer.pad_token_id,
         bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
         eos_token_id=hf_tokenizer.eos_token_id,
@@ -636,30 +718,38 @@ def resume_training(
             print("="*70)
             print("DETECTED TENSOR-PARALLEL CHECKPOINT")
             print("="*70)
-            print("This checkpoint contains sharded weights from tensor-parallel training.")
-            print("Loading the sharded weights directly into the sharded model structure.")
+            print("Loading sharded weights from tensor-parallel checkpoint")
             print("="*70)
         
-        # First shard the model architecture
         model = TensorParallelModel(base_model, world_size, rank)
-        
-        # Then load the already-sharded weights
-        # Note: This assumes the checkpoint contains weights compatible with current sharding
         missing_keys, unexpected_keys = model.base_model.load_state_dict(converted_state, strict=False)
         if is_main_process and (missing_keys or unexpected_keys):
-            print(f"Loading checkpoint with missing keys: {len(missing_keys)}, unexpected keys: {len(unexpected_keys)}")
+            print(f"Loading with missing keys: {len(missing_keys)}, unexpected: {len(unexpected_keys)}")
     else:
         if is_main_process:
-            print("Detected regular (unsharded) checkpoint - loading full weights then sharding")
+            print("="*70)
+            print("LOADING FULL CHECKPOINT AND SHARDING")
+            print("="*70)
+            print("This checkpoint contains full (unsharded) weights")
+            print("Loading full weights first, then sharding across GPUs")
+            print("="*70)
+        
+        # Load full weights first
         base_model.load_state_dict(converted_state)
+        
+        # Then create tensor parallel wrapper (which will shard)
         model = TensorParallelModel(base_model, world_size, rank)
     
+    # Enable gradient checkpointing
     model.gradient_checkpointing_enable()
-    if is_main_process:
-        print("Gradient checkpointing enabled")
     
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=False)
+    # Create optimizer with REDUCED learning rate
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=lr,  # Now 1e-4 instead of 3e-4
+        weight_decay=weight_decay, 
+        fused=False
+    )
     
     # Get checkpoint info
     global_step = ckpt.get("global_step", 0)
@@ -667,24 +757,30 @@ def resume_training(
     
     # Setup scheduler
     min_lr = min(min_lr, lr)
-    scheduler = CosineWarmupScheduler(optimizer, base_lr=lr, warmup_steps=warmup_steps, max_steps=total_training_steps, min_lr=min_lr)
+    scheduler = CosineWarmupScheduler(
+        optimizer, 
+        base_lr=lr, 
+        warmup_steps=warmup_steps, 
+        max_steps=total_training_steps, 
+        min_lr=min_lr
+    )
+    
     if "scheduler_state_dict" in ckpt and not is_tp_checkpoint:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     else:
         scheduler.step(global_step)
     
     if is_main_process:
-        print(f"Resuming from step {global_step}, tokens processed: {total_tokens_processed:,}")
+        print(f"✓ Resuming from step {global_step}, tokens processed: {total_tokens_processed:,}")
+        print(f"✓ Learning rate: {lr:.2e} (reduced for stability)")
+        print(f"✓ Tensor parallelism: world_size={world_size}")
     
     # Setup data position
     data_position = DataPosition(streaming=use_streaming)
     if "data_position" in ckpt:
         data_position.restore_state(ckpt.get("data_position"))
         if is_main_process:
-            print(f"Resuming from file {data_position.current_file_idx}, position {data_position.position_in_file}")
-    else:
-        if is_main_process:
-            print("No data position found - starting from beginning")
+            print(f"✓ Data position: file {data_position.current_file_idx}, position {data_position.position_in_file}")
 
     # Setup mixed precision
     use_grad_scaler = amp_dtype == torch.float16 and torch.cuda.is_available()
@@ -692,9 +788,9 @@ def resume_training(
 
     if is_main_process:
         if supports_bf16:
-            print("Using torch.bfloat16 autocast")
+            print("✓ Using torch.bfloat16 autocast")
         elif amp_dtype == torch.float16:
-            print("Using torch.float16 autocast with GradScaler")
+            print("✓ Using torch.float16 autocast with GradScaler")
 
     first_device = model.device
     tokens_in_this_session = 0
@@ -703,11 +799,19 @@ def resume_training(
     # Training loop
     if use_streaming:
         if is_main_process:
-            print(f"=== Resuming streaming training from step {global_step} ===")
+            print(f"\n{'='*70}")
+            print(f"STARTING TRAINING WITH FIXED TENSOR PARALLELISM")
+            print(f"{'='*70}")
+            print(f"Step: {global_step} / {total_training_steps}")
+            print(f"Learning rate: {lr:.2e}")
+            print(f"Batch size: {batch_size}")
+            print(f"World size: {world_size}")
+            print(f"{'='*70}\n")
 
         token_gen = streaming_token_generator(
             data_files, hf_tokenizer, block_size,
-            data_position.current_file_idx, data_position.position_in_file, data_position.chunk_offset, rank
+            data_position.current_file_idx, data_position.position_in_file, 
+            data_position.chunk_offset, rank
         )
         token_buffer: List[List[int]] = []
         active_shard: Optional[str] = None
@@ -764,11 +868,19 @@ def resume_training(
                         scaler.scale(loss_tensor).backward()
                         scaler.unscale_(optimizer)
                         _ensure_gradient_dtype_matches_params(model)
+                        
+                        # Gradient clipping for stability
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss_tensor.backward()
                         _ensure_gradient_dtype_matches_params(model)
+                        
+                        # Gradient clipping for stability
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        
                         optimizer.step()
 
                     global_step += 1
@@ -819,9 +931,9 @@ def resume_training(
                             batch_size=batch_size,
                             steps=global_step,
                             model=model,
-                            n_layer=config.num_hidden_layers,
-                            n_head=config.num_attention_heads,
-                            n_embd=config.hidden_size,
+                            n_layer=config.n_layer,
+                            n_head=config.n_head,
+                            n_embd=config.n_embd,
                             base_lr=lr,
                             min_lr=min_lr,
                             warmup_steps=warmup_steps,
@@ -839,6 +951,7 @@ def resume_training(
                 pbar.close()
 
     else:
+        # Non-streaming training (similar fixes applied)
         if is_main_process:
             print(f"=== Resuming non-streaming training from step {global_step} ===")
 
@@ -887,11 +1000,13 @@ def resume_training(
                     scaler.scale(loss_tensor).backward()
                     scaler.unscale_(optimizer)
                     _ensure_gradient_dtype_matches_params(model)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss_tensor.backward()
                     _ensure_gradient_dtype_matches_params(model)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
 
                 global_step += 1
@@ -905,7 +1020,6 @@ def resume_training(
                 if global_step % 2000 == 0 and is_main_process:
                     current_total_tokens = total_tokens_processed + tokens_in_this_session
                     prompt_str = "Long long time ago, "
-                    token_ids = hf_tokenizer.encode(prompt_str)
                     token_ids = hf_tokenizer.encode(prompt_str)
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
                     generated = model.generate(
@@ -943,9 +1057,9 @@ def resume_training(
                         batch_size=batch_size,
                         steps=global_step,
                         model=model,
-                        n_layer=config.num_hidden_layers,
-                        n_head=config.num_attention_heads,
-                        n_embd=config.hidden_size,
+                        n_layer=config.n_layer,
+                        n_head=config.n_head,
+                        n_embd=config.n_embd,
                         base_lr=lr,
                         min_lr=min_lr,
                         warmup_steps=warmup_steps,
@@ -982,7 +1096,6 @@ def update_training_stats(
     final: bool = False,
 ):
     """Update the training statistics file with current information"""
-    # Calculate model parameters
     model_params = sum(p.numel() for p in model.parameters())
     
     training_stats = {
@@ -1006,10 +1119,8 @@ def update_training_stats(
     if max_steps is not None:
         training_stats["max_steps"] = max_steps
     
-    # Write stats to JSON file
     os.makedirs("stats", exist_ok=True)
     
-    # For the final update, create a timestamped file
     if final:
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1026,16 +1137,13 @@ def update_training_stats(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Resume Argonne pretraining with Tensor Parallelism")
+    parser = argparse.ArgumentParser(description="Resume Argonne pretraining with FIXED Tensor Parallelism")
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     parser.add_argument(
         "--data-glob",
         type=str,
         default=default_data_glob,
-        help=(
-            "Glob pattern for parquet shards "
-            "(default: ../data/CC-MAIN-2025-26/*.parquet)"
-        ),
+        help="Glob pattern for parquet shards",
     )
     parser.add_argument(
         "--tokenizer-path",
@@ -1047,11 +1155,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-path",
         type=str,
         default=None,
-        help=(
-            "Optional path to a specific checkpoint file or directory. "
-            "If omitted or a directory is provided, the script automatically "
-            "selects the checkpoint with the highest step value in the 'pretrained' directory."
-        ),
+        help="Optional path to a specific checkpoint file or directory.",
     )
     parser.add_argument(
         "--total-steps",
@@ -1064,13 +1168,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=3e-4,
-        help="Peak learning rate used after warmup.",
+        default=1e-4,  # CRITICAL FIX: Default changed from 3e-4 to 1e-4
+        help="Peak learning rate used after warmup (REDUCED for stability).",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=3e-5,
+        default=1e-5,  # CRITICAL FIX: Default changed from 3e-5 to 1e-5
         help="Minimum learning rate applied at the beginning and end of training.",
     )
     parser.add_argument(
