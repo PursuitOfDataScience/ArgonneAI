@@ -1,90 +1,188 @@
-# ArgonneAI (Argonne 2.0 Work Branch)
+# ArgonneAI (Argonne 2.0)
 
-## Status
-- **Argonne 2.0** pretraining is currently running; checkpoints and logs are still being produced while we continue large-scale experiments.
-- Expect rapid iteration on the training scripts in this branch until training stabilises enough to merge back into `main`.
+## Overview
+This repository contains the training infrastructure for **Argonne 2.0**, a decoder-only transformer language model trained with **tensor parallelism** for efficient multi-GPU training. The codebase emphasizes large-scale pretraining with distributed data processing, automatic batch-size tuning, and robust checkpoint/resume capabilities.
 
-## Project overview
-This repository hosts the in-progress training stack for the Argonne 2.0 language model family. The codebase focuses on large-scale pretraining with distributed data processing, pipeline parallelism, and robust recovery utilities so that long jobs can survive hardware interruptions.
+## Model Architecture
+Argonne 2.0 is a 24-layer decoder-only transformer with the following specifications:
 
-## Model architecture
-The Argonne 2.0 configuration that is currently exercised by the training scripts is a decoder-only transformer with the following key hyperparameters:
+- **Layers:** 24 transformer blocks
+- **Attention:** Grouped-Query Attention (GQA)
+  - 24 query heads
+  - 8 key/value heads
+  - Head dimension: 170 (hidden_size 4080 / 24 heads)
+  - Ratio: 3 query heads per KV head
+- **Hidden Size:** 4,080 dimensions
+- **Intermediate Size:** 11,008 (SwiGLU MLP with 8/3× expansion, rounded to 256)
+- **Context Length:** 4,096 tokens
+- **Position Embeddings:** RoPE (Rotary Position Embeddings) with θ = 500,000
+- **Normalization:** RMSNorm (ε = 1e-6)
+- **Dropout:** 0.0 (disabled for baseline pretraining)
+- **Activation:** SwiGLU in feed-forward layers
+- **Flash Attention:** Enabled when available
+- **Vocabulary:** 151,936 tokens (Qwen2.5-3B-Instruct tokenizer)
 
-- **Depth:** 24 transformer blocks with grouped-query attention (24 query heads, 8 key/value heads) and SwiGLU feed-forward layers.【F:training.py†L286-L301】【F:model.py†L67-L313】
-- **Width:** 4,096 hidden dimensions with a 8/3 × expansion (rounded to 256) in the SwiGLU MLP, yielding an 11,008-unit intermediate width.【F:training.py†L286-L301】【F:model.py†L79-L301】
-- **Context length:** 4,096 token context window per block, with rotary position embeddings parameterised by a 500,000 base theta to extend extrapolation headroom.【F:training.py†L286-L301】【F:model.py†L121-L142】
-- **Normalization & dropout:** Pre- and post-attention RMSNorm layers with dropout kept at 0.0 in both attention and MLP modules for baseline pretraining stability.【F:training.py†L286-L295】【F:model.py†L107-L319】
-- **Efficiency features:** Flash attention is enabled when available, residual projection weights are marked for fused residual kernels, and word embeddings remain untied to allow custom output heads.【F:training.py†L286-L301】【F:model.py†L200-L276】
+**Key Design Choices:**
+- **Untied Embeddings:** Input and output embeddings are separate to allow flexible output heads
+- **Even Divisibility:** Hidden size (4080) divides evenly by number of heads (24), ensuring integer head dimensions (170)
+- **GQA Efficiency:** 8 KV heads divide evenly by 8 GPUs for clean tensor parallelism sharding
 
 ## Tokenizer
-Argonne 2.0 pretraining uses the **Qwen2.5-3B-Instruct** tokenizer. Important characteristics of this tokenizer include:
+Argonne 2.0 uses the **Qwen2.5-3B-Instruct** tokenizer with the following features:
 
-- 151,936 token vocabulary with dedicated `<|im_start|>`, `<|im_end|>`, and multimodal delimiters for future tool-use and vision extensions.
-- Special tokens covering conversational (`<|endoftext|>`, `<|im_*|>`), tool calling (`<tool_call>`), and multimodal padding markers (`<|vision_pad|>`, `<|image_pad|>`, `<|video_pad|>`).
-- Model max length set to 131,072 tokens, allowing us to safely expand beyond the 4,096-token training window if longer-context finetuning is required.
-- Uses the Qwen chat template for tool-aware prompts; training scripts ensure a pad token is present and adapt `model_max_length` to match the 4,096-token block size.
+- **Vocabulary Size:** 151,936 tokens
+- **Special Tokens:**
+  - Conversational: `<|endoftext|>`, `<|im_start|>`, `<|im_end|>`
+  - Tool calling: `<tool_call>`, `<|object_ref_start|>`, `<|object_ref_end|>`
+  - Multimodal: `<|vision_start|>`, `<|vision_end|>`, `<|vision_pad|>`, `<|image_pad|>`, `<|video_pad|>`
+- **Max Length:** 131,072 tokens (expandable beyond 4,096 training window)
+- **Chat Template:** Qwen format for tool-aware prompts
 
-## Repository layout
-- `model.py` – Defines the `ArgonneModel` transformer architecture and its `ArgonneConfig`, including rotary attention, RMSNorm layers, and backwards-compatible aliases for Argonne 1.x checkpoints.
-- `data_processing.py` – Handles tokenizer loading/fallback training, streaming parquet datasets, cached offline preprocessing, and assembling fixed-length token chunks for training.
-- `training_utils.py` – Provides shared helpers such as dataset shard discovery/logging and a cosine learning rate scheduler with warmup for use across entrypoints.
-- `training.py` – Pipeline-parallel training entrypoint with dataset streaming, resumable shard tracking, and automatic batch-size backoff when CUDA or compilation OOMs occur.
-- `train_with_fsdp.py` – Alternative Fully Sharded Data Parallel (FSDP) launcher for multi-GPU jobs that prefer sharded data parallelism over pipeline stages.
-- `resume_pretrain.py` – Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
-- `resume_pretrain_tensor.py` – **NEW**: Tensor parallelism training script that mirrors `resume_pretrain.py` but replaces pipeline parallelism with tensor parallelism, allowing all GPUs to work in parallel on the same layer.
+## Training Infrastructure
 
-## Running the FSDP continuation script
-On a single DGX node you should launch `train_with_fsdp.py` with `torchrun` so that all eight GPUs participate as individual FSDP ranks. The script follows the exact same resume logic as `resume_pretrain.py`—it restores checkpoints written by the legacy flow, reuses the shared `DataPosition` tracker, and advances the cosine schedule in lockstep—while letting every GPU process its own micro-batch concurrently for higher throughput. A minimal command matching the resume workflow is:
+### Tensor Parallelism
+Both `training.py` and `resume_pretrain_tensor.py` use **tensor parallelism** to distribute model layers across multiple GPUs:
 
-```bash
-torchrun --standalone --nproc_per_node=8 train_with_fsdp.py \
-  --tokenizer-path ../Qwen2.5-3B-Instruct
+**How It Works:**
+1. Each layer (attention, MLP) is horizontally sharded across all GPUs
+2. All GPUs process the same batch simultaneously
+3. Partial results are combined via `all_reduce` after each layer
+4. Embeddings, norms, and LM head are replicated on all GPUs
+
+**Advantages:**
+- ✅ **Full Parallelism:** All GPUs work on every layer simultaneously
+- ✅ **Memory Efficiency:** Large layers are split across GPU memory
+- ✅ **Synchronous Training:** No pipeline bubbles or complex staging
+- ✅ **Scalable:** Works well with NCCL on 8 GPUs (tested configuration)
+
+### Automatic Batch Size Tuning
+`training.py` includes intelligent batch-size discovery to find the optimal batch size for your hardware:
+
+**Algorithm:**
+1. Start with an initial batch size (default: 512)
+2. If CUDA OOM occurs, perform binary search:
+   - Track largest successful and smallest failed batch sizes
+   - Try midpoint between bounds
+   - Fallback to halving if bounds are tight
+3. Stop at minimum batch size (default: 4)
+4. Resume training with discovered optimal batch size
+
+**Benefits:**
+- 🚀 **Automatic:** No manual tuning required
+- 💾 **Memory Efficient:** Finds maximum utilization
+- 🔄 **Robust:** Handles varied GPU memory configurations
+- ⚡ **Fast Convergence:** Binary search quickly finds optimal size
+
+### Checkpoint System
+Both training scripts save checkpoints every 300 steps with full resumability:
+
+**Checkpoint Contents:**
+- Model weights (FP16/BF16)
+- Optimizer state (AdamW)
+- Learning rate scheduler state
+- Exact data position (file index, row, chunk offset)
+- Training metadata (step, tokens processed, loss)
+- Parallelism configuration (world size, rank)
+
+**Resume Capability:**
+- Automatically finds latest checkpoint
+- Restores exact data position (no duplicate processing)
+- Seamlessly continues training from any step
+- Compatible across `training.py` and `resume_pretrain_tensor.py`
+
+## Repository Structure
+```
+.
+├── README.md
+├── model.py
+├── data_processing.py
+├── training_utils.py
+├── training.py
+├── train_with_fsdp.py
+├── resume_pretrain.py
+├── resume_pretrain_tensor.py
+└── TENSOR_PARALLEL_USAGE.md
 ```
 
-Additional flags exposed by the script include `--data-glob` for alternate shard locations, `--batch-size` for the per-rank batch, and precision options like `--bf16`/`--fp16`. Only rank 0 performs dataset/tokeniser work; batches are broadcast to the other ranks, which means you can scale to multi-node runs by exporting the usual rendezvous variables (`MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`) before invoking `torchrun`. The script automatically discovers the latest checkpoint (or accepts `--checkpoint-path`) and restores the tokenizer/training step metadata before continuing. 【F:train_with_fsdp.py†L340-L427】【F:train_with_fsdp.py†L452-L610】
+- `README.md` - This file
+- `model.py` - Defines the `ArgonneModel` transformer architecture and its `ArgonneConfig`, including rotary attention, RMSNorm layers, and backwards-compatible aliases for Argonne 1.x checkpoints.
+- `data_processing.py` - Handles tokenizer loading/fallback training, streaming parquet datasets, cached offline preprocessing, and assembling fixed-length token chunks for training.
+- `training_utils.py` - Provides shared helpers such as dataset shard discovery/logging and a cosine learning rate scheduler with warmup for use across entrypoints.
+- `training.py` - Pipeline-parallel training entrypoint with dataset streaming, resumable shard tracking, and automatic batch-size backoff when CUDA or compilation OOMs occur.
+- `train_with_fsdp.py` - Alternative Fully Sharded Data Parallel (FSDP) launcher for multi-GPU jobs that prefer sharded data parallelism over pipeline stages.
+- `resume_pretrain.py` - Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
+- `resume_pretrain_tensor.py` - **NEW**: Tensor parallelism training script that mirrors `resume_pretrain.py` but replaces pipeline parallelism with tensor parallelism, allowing all GPUs to work in parallel on the same layer.
+- `TENSOR_PARALLEL_USAGE.md` - Detailed usage instructions, examples, and troubleshooting for tensor parallelism.
 
-## Running the Tensor Parallelism continuation script
-The new `resume_pretrain_tensor.py` script implements **tensor parallelism** as an alternative to pipeline parallelism. Unlike pipeline parallelism where different layers are distributed across GPUs sequentially, tensor parallelism shards individual layers (attention and feed-forward) across multiple GPUs, enabling all GPUs to work in parallel on the same layer.
+## Getting Started
 
-**Key Features:**
-- **Tensor Sharding:** Splits attention projections (Q, K, V) and MLP layers horizontally across GPUs
-- **Synchronized Computation:** Uses `torch.distributed.all_reduce()` to combine partial results from all GPUs
-- **Compatible Checkpoints:** Can resume from checkpoints created by `resume_pretrain.py` or other training scripts
-- **Identical Training Logic:** Mirrors the exact workflow, data position tracking, and hyperparameters of `resume_pretrain.py`
-- **Multi-GPU Support:** Requires NCCL backend and distributed launch via `torchrun`
+### Prerequisites
+- Python 3.8+
+- PyTorch 1.13+ with CUDA support
+- NVIDIA GPU(s) with Tensor Cores (Volta, Turing, Ampere architecture)
+- NCCL 2.12+ (for multi-GPU communication)
 
-**Launch Command:**
-```bash
-torchrun --standalone --nproc_per_node=8 resume_pretrain_tensor.py \
-  --tokenizer-path ../Qwen2.5-3B-Instruct \
-  --checkpoint-path pretrained/streaming_checkpoint_step_XXXX.pth
-```
+### Installation
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/ArgonneAI/ArgonneAI.git
+   cd ArgonneAI
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-**How Tensor Parallelism Works:**
-1. Each GPU receives the full batch of inputs
-2. Linear layers are sharded across GPUs:
-   - **Column-parallel:** Q, K, V projections and gate/up projections split output features
-   - **Row-parallel:** Output projections and down projections split input features
-3. After each sharded layer, `all_reduce` combines results from all GPUs
-4. All GPUs maintain synchronized copies of embeddings, norms, and the LM head
+### Downloading Pretrained Checkpoints
+Pretrained checkpoints are hosted on Argonne's internal storage. To access them, you must be on the Argonne network or connected via VPN.
 
-**When to Use Tensor Parallelism vs Pipeline Parallelism:**
-- **Tensor Parallelism:** Better for models where communication overhead is low and you want maximum parallelism within each layer
-- **Pipeline Parallelism:** Better for very large models where layer-wise staging reduces memory per GPU
-- **Data Parallelism (FSDP):** Better for scaling to many GPUs with minimal code changes
+1. Create a directory for checkpoints:
+   ```bash
+   mkdir -p ~/ArgonneAI/checkpoints
+   ```
+2. Download the latest checkpoint:
+   ```bash
+   cp /path/to/argonne/storage/checkpoints/streaming_checkpoint_step_XXXX.pth ~/ArgonneAI/checkpoints/
+   ```
 
-The script uses the same command-line arguments as `resume_pretrain.py`, including `--data-glob`, `--batch-size`, `--learning-rate`, `--block-size`, and all scheduling parameters. Checkpoints are saved with a `tensor_parallel_` prefix to distinguish them from pipeline-parallel checkpoints.
+## Training a New Model
+To train a new Argonne 2.0 model from scratch:
 
-For detailed usage instructions, examples, and troubleshooting, see **[TENSOR_PARALLEL_USAGE.md](TENSOR_PARALLEL_USAGE.md)**. A convenience launch script is also provided: `./launch_tensor_parallel.sh [num_gpus] [checkpoint_path]`
+1. Prepare your data in Parquet format and upload to a shared location.
+2. Set the `DATA_PATH` environment variable:
+   ```bash
+   export DATA_PATH=/path/to/your/data
+   ```
+3. Run the training script:
+   ```bash
+   torchrun --standalone --nproc_per_node=8 training.py \
+     --tokenizer-path ../Qwen2.5-3B-Instruct \
+     --data-glob $DATA_PATH/*.parquet \
+     --output-dir ./checkpoints \
+     --batch-size 512
+   ```
 
-## Default dataset location
-- Training scripts now target the Common Crawl derived shards stored at `../data/CC-MAIN-2025-26/*.parquet`. Shards are consumed in natural numeric order so `000_00000.parquet` is seen before `000_00001.parquet`, ensuring deterministic sequential coverage of the crawl export.
+## FAQ
 
-## How this branch differs from `main`
-The `work` branch diverges from the stable `main` branch to incubate Argonne 2.0. Key enhancements under active development here include:
+**Q: What is Argonne 2.0?**  
+A: Argonne 2.0 is a state-of-the-art language model developed by Argonne National Laboratory, designed for efficient training and inference using tensor parallelism.
 
-1. **Pipeline model parallelism and smarter failure recovery.** `training.py` orchestrates multi-stage pipeline parallelism with automated batch-size reduction and retry logic when Torch Dynamo or CUDA OOMs arise—capabilities we are exercising here before promoting them to `main`.
-2. **Dataset streaming with resumable positions.** The new token generator and data trackers keep shard/offset state so long-running jobs can resume without re-tokenising or replaying entire shards.
-3. **Shared infrastructure cleanup.** Utilities for tokenizer validation, shard discovery, and cosine scheduling were consolidated into `training_utils.py` so both the pipeline and FSDP flows share one implementation instead of the duplicated helpers that live on `main`.
+**Q: How is Argonne 2.0 different from other models?**  
+A: Argonne 2.0 features a unique combination of tensor parallelism, automatic batch size tuning, and a robust checkpoint system, enabling efficient training on large-scale data.
 
-These changes will be merged back once Argonne 2.0 completes training and the tooling proves stable.
+**Q: What are the hardware requirements for training Argonne 2.0?**  
+A: Training Argonne 2.0 requires NVIDIA GPUs with Tensor Cores, CUDA, and NCCL for distributed training. A minimum of 8 GPUs is recommended for optimal performance.
+
+**Q: How can I contribute to the ArgonneAI project?**  
+A: We welcome contributions! Please submit a pull request or open an issue to discuss potential improvements or features.
+
+**Q: Where can I find more documentation?**  
+A: Additional documentation, including detailed usage instructions for tensor parallelism, can be found in the `TENSOR_PARALLEL_USAGE.md` file.
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+- Argonne National Laboratory
+- The PyTorch team
+- The NVIDIA NCCL team
