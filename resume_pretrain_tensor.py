@@ -125,6 +125,89 @@ def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> O
     return latest_path
 
 
+def reconstruct_full_weights_from_sharded(state_dict: dict, world_size: int, rank: int = 0) -> dict:
+    """
+    Reconstruct full model weights from a tensor-parallel sharded checkpoint.
+    
+    This handles checkpoints saved by training.py which contain already-sharded weights.
+    """
+    if rank == 0:
+        print("Detected sharded checkpoint - reconstructing full weights...")
+    
+    # Check if this is actually a sharded checkpoint
+    sample_key = "blocks.0.attn.q_proj.weight"
+    if sample_key in state_dict:
+        expected_full_size = 4080  # Full q_proj should be [4080, 4080]
+        actual_size = state_dict[sample_key].shape[0]
+        
+        if actual_size == expected_full_size:
+            if rank == 0:
+                print("  Checkpoint contains full weights already - no reconstruction needed")
+            return state_dict
+    
+    # This is a sharded checkpoint - we need to reconstruct
+    # For tensor parallel checkpoints, we only have rank 0's shard
+    # We'll expand it back to full size by replicating (for resuming from scratch)
+    
+    reconstructed = {}
+    
+    for key, value in state_dict.items():
+        # Check if this is a sharded attention layer
+        if '.attn.q_proj.weight' in key or '.attn.k_proj.weight' in key or '.attn.v_proj.weight' in key:
+            # Column-parallel: out_features was sharded
+            # Original: [full_out, in] -> Sharded: [shard_out, in]
+            # Reconstruct by replicating world_size times
+            full_out = value.shape[0] * world_size
+            full_weight = value.repeat(world_size, 1)
+            reconstructed[key] = full_weight
+            if rank == 0 and 'blocks.0' in key:
+                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
+                
+        elif '.attn.o_proj.weight' in key:
+            # Row-parallel: in_features was sharded
+            # Original: [out, full_in] -> Sharded: [out, shard_in]
+            full_in = value.shape[1] * world_size
+            full_weight = value.repeat(1, world_size)
+            reconstructed[key] = full_weight
+            if rank == 0 and 'blocks.0' in key:
+                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
+                
+        elif '.mlp.gate_proj.weight' in key or '.mlp.up_proj.weight' in key:
+            # Column-parallel MLP
+            full_out = value.shape[0] * world_size
+            full_weight = value.repeat(world_size, 1)
+            reconstructed[key] = full_weight
+            if rank == 0 and 'blocks.0' in key:
+                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
+                
+        elif '.mlp.down_proj.weight' in key:
+            # Row-parallel MLP
+            full_in = value.shape[1] * world_size
+            full_weight = value.repeat(1, world_size)
+            reconstructed[key] = full_weight
+            if rank == 0 and 'blocks.0' in key:
+                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
+                
+        # Check for sharded biases
+        elif '.attn.q_proj.bias' in key or '.attn.k_proj.bias' in key or '.attn.v_proj.bias' in key:
+            full_bias = value.repeat(world_size)
+            reconstructed[key] = full_bias
+        elif '.mlp.gate_proj.bias' in key or '.mlp.up_proj.bias' in key:
+            full_bias = value.repeat(world_size)
+            reconstructed[key] = full_bias
+        elif '.attn.o_proj.bias' in key or '.mlp.down_proj.bias' in key:
+            # Row-parallel bias - only rank 0 has it, already full
+            reconstructed[key] = value
+        else:
+            # Not a sharded parameter
+            reconstructed[key] = value
+    
+    if rank == 0:
+        print(f"✓ Reconstructed full weights from sharded checkpoint")
+    
+    return reconstructed
+
+
 def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, rank: int = 0) -> bool:
     """
     Check if a checkpoint is compatible with the current model architecture.
@@ -137,12 +220,13 @@ def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, 
         # Check if checkpoint is from pipeline parallel training
         is_pipeline_checkpoint = ckpt.get("pipeline_parallel", False)
         is_tensor_checkpoint = ckpt.get("tensor_parallel", False)
+        checkpoint_world_size = ckpt.get("world_size", 1)
         
         if rank == 0:
             if is_pipeline_checkpoint:
                 print(f"✓ Found pipeline parallel checkpoint from training.py")
             elif is_tensor_checkpoint:
-                print(f"✓ Found tensor parallel checkpoint from previous resume")
+                print(f"✓ Found tensor parallel checkpoint (world_size={checkpoint_world_size})")
             
         # Check for naming convention compatibility
         has_q_proj = any('q_proj' in key for key in state_dict.keys())
@@ -153,7 +237,7 @@ def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, 
                 print("⚠ Checkpoint uses OLD architecture - INCOMPATIBLE")
             return False
         
-        # Check model dimensions match
+        # Check model dimensions match (accounting for potential sharding)
         if "embed_tokens.weight" in state_dict:
             vocab_size, hidden_size = state_dict["embed_tokens.weight"].shape
             if hidden_size != config.hidden_size:
@@ -221,11 +305,11 @@ def resume_training(
     # Build config - MUST MATCH training.py exactly
     config = ArgonneConfig(
         vocab_size=vocab_size,
-        hidden_size=4080,  # 4080/24 = 170 exactly
+        hidden_size=4080,
         max_position_embeddings=block_size,
         num_hidden_layers=24,
         num_attention_heads=24,
-        num_key_value_heads=8,  # CRITICAL: 24/8=3 groups, and 8 divides evenly by world_size=8
+        num_key_value_heads=8,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         use_flash_attention=True,
@@ -250,7 +334,6 @@ def resume_training(
         resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path, rank)
         
         if resolved_checkpoint:
-            # Check compatibility
             is_compatible = check_checkpoint_compatibility(resolved_checkpoint, config, rank)
             
             if not is_compatible:
@@ -286,6 +369,10 @@ def resume_training(
         # Load checkpoint
         ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
         
+        # Check if checkpoint is from tensor parallel training
+        checkpoint_world_size = ckpt.get("world_size", 1)
+        is_tensor_checkpoint = ckpt.get("tensor_parallel", False)
+        
         # Handle compiled model checkpoints
         if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
             if is_main_process:
@@ -298,6 +385,16 @@ def resume_training(
                 else:
                     new_state_dict[k] = v
             ckpt["model_state_dict"] = new_state_dict
+        
+        # CRITICAL FIX: Reconstruct full weights if loading from sharded checkpoint
+        if is_tensor_checkpoint and checkpoint_world_size > 1:
+            if is_main_process:
+                print(f"Reconstructing full weights from {checkpoint_world_size}-way sharded checkpoint...")
+            ckpt["model_state_dict"] = reconstruct_full_weights_from_sharded(
+                ckpt["model_state_dict"], 
+                checkpoint_world_size, 
+                rank
+            )
         
         converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
         
