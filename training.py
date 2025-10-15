@@ -519,9 +519,9 @@ def train_from_scratch_tensor_parallel(
     block_size: int = 4096,
     initial_batch_size: int = 512,
     min_batch_size: int = 4,
-    lr: float = 1e-4,
-    min_lr: float = 1e-5,
-    warmup_steps: int = 2000,
+    lr: float = 2e-4,        # CHANGED: Increased from 1e-4
+    min_lr: float = 2e-5,    # CHANGED: Increased from 1e-5
+    warmup_steps: int = 500, # CHANGED: Reduced from 2000
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
 ):
@@ -910,19 +910,19 @@ def parse_args():
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-4,
+        default=2e-4,  # CHANGED: Increased from 1e-4
         help="Peak learning rate.",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=1e-5,
+        default=2e-5,  # CHANGED: Increased from 1e-5
         help="Minimum learning rate.",
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=2000,
+        default=500,  # CHANGED: Reduced from 2000
         help="Number of warmup steps.",
     )
     parser.add_argument(
