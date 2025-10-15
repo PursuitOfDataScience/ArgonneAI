@@ -593,7 +593,7 @@ def resume_training(
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
                         print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                    if global_step % 300 == 0 and is_main_process:
+                    if global_step % 300 == 0:
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
                         prompt_str = "Long long time ago, "
                         token_ids = hf_tokenizer.encode(prompt_str)
@@ -606,27 +606,29 @@ def resume_training(
                             top_k=50,
                             top_p=0.9,
                         )
-                        generated_text = hf_tokenizer.decode(generated[0].tolist())
-                        print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                        model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
-                        checkpoint_state = {
-                            "global_step": global_step,
-                            "tokens_processed": current_total_tokens,
-                            "model_state_dict": model_state,
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "loss": last_loss_value,
-                            "data_position": data_position.get_state(),
-                            "model_dtype": str(amp_dtype),
-                            "tensor_parallel": True,
-                            "world_size": world_size,
-                            "rank": rank,
-                        }
-                        os.makedirs("pretrained", exist_ok=True)
-                        save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
-                        safe_torch_save(checkpoint_state, save_path)
-                        print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                        if is_main_process:
+                            generated_text = hf_tokenizer.decode(generated[0].tolist())
+                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                            model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+                            checkpoint_state = {
+                                "global_step": global_step,
+                                "tokens_processed": current_total_tokens,
+                                "model_state_dict": model_state,
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "loss": last_loss_value,
+                                "data_position": data_position.get_state(),
+                                "model_dtype": str(amp_dtype),
+                                "tensor_parallel": True,
+                                "world_size": world_size,
+                                "rank": rank,
+                            }
+                            os.makedirs("pretrained", exist_ok=True)
+                            save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                            safe_torch_save(checkpoint_state, save_path)
+                            print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                         update_training_stats(
                             tokens=current_total_tokens,
