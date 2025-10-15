@@ -260,14 +260,15 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
-    lr: float = 2e-4,        # CHANGED: Increased from 1e-4
-    min_lr: float = 2e-5,    # CHANGED: Increased from 1e-5
-    warmup_steps: int = 500, # CHANGED: Reduced from 2000
+    lr: float = 2e-4,
+    min_lr: float = 2e-5,
+    warmup_steps: int = 500,
     weight_decay: float = 0.1,
     use_streaming: bool = True,
     num_proc: int = 8,
     trust_remote_code: bool = False,
     force_from_scratch: bool = False,
+    rewarmup_steps: int = 100,  # NEW: Re-warmup after resume
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -441,42 +442,31 @@ def resume_training(
     
     # Setup scheduler
     min_lr = min(min_lr, lr)
+    
+    # CRITICAL: If resuming, use shorter re-warmup to stabilize
+    effective_warmup = warmup_steps
+    if load_checkpoint and resolved_checkpoint and global_step > 0:
+        effective_warmup = rewarmup_steps  # Much shorter re-warmup
+        if is_main_process:
+            print(f"⚠ Using {rewarmup_steps}-step re-warmup for resume stability")
+    
     scheduler = CosineWarmupScheduler(
         optimizer, 
         base_lr=lr, 
-        warmup_steps=warmup_steps, 
+        warmup_steps=effective_warmup,  # Use re-warmup if resuming
         max_steps=total_training_steps, 
-        min_lr=min_lr
+        min_lr=min_lr,
     )
     
-    # CRITICAL FIX: Load optimizer state BEFORE scheduler
+    # Do NOT load optimizer state (incompatible across parallelism schemes)
     if load_checkpoint and resolved_checkpoint:
-        # Load optimizer state
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                if is_main_process:
-                    print("✓ Loaded optimizer state (momentum, learning rates)")
-            except Exception as e:
-                if is_main_process:
-                    print(f"⚠ Could not load optimizer state: {e}")
-                    print("  Starting with fresh optimizer (may cause loss spike)")
-        else:
-            if is_main_process:
-                print("⚠ No optimizer state in checkpoint - starting fresh")
-        
-        # Load scheduler state
-        if "scheduler_state_dict" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                if is_main_process:
-                    print("✓ Loaded scheduler state")
-            except:
-                scheduler.step(global_step)
-                if is_main_process:
-                    print("⚠ Could not load scheduler state, initialized to current step")
-        else:
-            scheduler.step(global_step)
+        if is_main_process:
+            print("⚠ Note: Optimizer state not restored (incompatible with tensor parallelism)")
+            print("  Using fresh AdamW optimizer - expect small loss spike initially")
+            print(f"  Re-warming up learning rate over {effective_warmup} steps")
+
+        # Don't load scheduler state - we're intentionally re-warming
+        # The effective_warmup setting above handles the restart
     else:
         scheduler.step(global_step)
     
@@ -774,6 +764,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of warmup steps.",
     )
     parser.add_argument(
+        "--rewarmup-steps",
+        type=int,
+        default=100,
+        help="Number of re-warmup steps when resuming.",
+    )
+    parser.add_argument(
         "--no-streaming",
         action="store_true",
         help="Disable streaming mode.",
@@ -816,6 +812,7 @@ def main():
         lr=args.learning_rate,
         min_lr=args.min_learning_rate,
         warmup_steps=args.warmup_steps,
+        rewarmup_steps=args.rewarmup_steps,
         weight_decay=args.weight_decay,
         use_streaming=not args.no_streaming,
         num_proc=args.num_proc,
