@@ -261,9 +261,9 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
-    lr: float = 2e-4,
-    min_lr: float = 2e-5,
-    warmup_steps: int = 500,
+    lr: float = 1e-4,
+    min_lr: float = 1e-5,
+    warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     use_streaming: bool = True,
     num_proc: int = 8,
@@ -361,12 +361,9 @@ def resume_training(
         supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
-    target_dtype = amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
-
-    # Create base model
+    # Create base model (keep parameters in FP32 for stable optimizer state)
     base_model = ArgonneModel(config)
-    base_model.to(dtype=target_dtype)
-    
+
     if load_checkpoint and resolved_checkpoint:
         # Load checkpoint
         ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
@@ -398,7 +395,7 @@ def resume_training(
                 rank
             )
         
-        converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
+        converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], torch.float32)
         
         # Load weights
         try:
@@ -754,19 +751,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=2e-4,  # CHANGED: Increased from 1e-4
+        default=1e-4,
         help="Peak learning rate.",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=2e-5,  # CHANGED: Increased from 1e-5
+        default=1e-5,
         help="Minimum learning rate.",
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=500,  # CHANGED: Reduced from 2000
+        default=2000,
         help="Number of warmup steps.",
     )
     parser.add_argument(

@@ -76,15 +76,15 @@ Both `training.py` and `resume_pretrain_tensor.py` use **tensor parallelism** to
 ### Learning Rate Schedule
 Both scripts use a cosine decay schedule with warmup:
 
-- **Peak Learning Rate:** 2e-4 (optimized for tensor parallelism)
-- **Minimum Learning Rate:** 2e-5 (10x lower than peak)
-- **Warmup Steps:** 500 (faster convergence to peak LR)
+- **Peak Learning Rate:** 1e-4 (stable for small-batch tensor parallelism)
+- **Minimum Learning Rate:** 1e-5 (10x lower than peak)
+- **Warmup Steps:** 2000 (gradual ramp to avoid early divergence)
 - **Scheduler:** Cosine annealing with linear warmup
 
 **Rationale:**
-- Shorter warmup (500 vs 2000) allows model to reach peak LR faster
-- Higher peak LR (2e-4 vs 1e-4) accelerates learning with tensor parallelism
-- Tensor parallel communication overhead is compensated by aggressive LR
+- Longer warmup protects against optimizer spikes when batch sizes are small
+- Peak LR aligned with proven 3B-scale training runs (1e-4) to maintain stability
+- Conservative schedule reduces loss oscillations seen with 2e-4 defaults
 
 ### Checkpoint System
 Both training scripts save checkpoints every 300 steps with full resumability:

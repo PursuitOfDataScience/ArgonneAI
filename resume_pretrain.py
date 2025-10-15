@@ -335,6 +335,7 @@ def resume_training(
         eos_token_id=hf_tokenizer.eos_token_id,
     )
     base_model = ArgonneModel(config)
+    # Keep parameters in FP32 so AdamW maintains high-precision optimizer statistics
 
     # 3) Load checkpoint
     resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
@@ -368,8 +369,6 @@ def resume_training(
         else:
             amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
-    target_dtype = amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
-
     # Convert compiled model state dict to regular model format
     if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
         print("Detected compiled model checkpoint, converting parameter names...")
@@ -381,8 +380,7 @@ def resume_training(
         ckpt["model_state_dict"] = new_state_dict
         print("Checkpoint parameter names converted successfully")
 
-    converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], target_dtype)
-    base_model.to(dtype=target_dtype)
+    converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], torch.float32)
     base_model.load_state_dict(converted_state)
 
     # 4) Distribute model BEFORE creating optimizer
