@@ -449,15 +449,34 @@ def resume_training(
         min_lr=min_lr
     )
     
-    if load_checkpoint and resolved_checkpoint and "scheduler_state_dict" in ckpt:
-        try:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    # CRITICAL FIX: Load optimizer state BEFORE scheduler
+    if load_checkpoint and resolved_checkpoint:
+        # Load optimizer state
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                if is_main_process:
+                    print("✓ Loaded optimizer state (momentum, learning rates)")
+            except Exception as e:
+                if is_main_process:
+                    print(f"⚠ Could not load optimizer state: {e}")
+                    print("  Starting with fresh optimizer (may cause loss spike)")
+        else:
             if is_main_process:
-                print("✓ Loaded scheduler state")
-        except:
+                print("⚠ No optimizer state in checkpoint - starting fresh")
+        
+        # Load scheduler state
+        if "scheduler_state_dict" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                if is_main_process:
+                    print("✓ Loaded scheduler state")
+            except:
+                scheduler.step(global_step)
+                if is_main_process:
+                    print("⚠ Could not load scheduler state, initialized to current step")
+        else:
             scheduler.step(global_step)
-            if is_main_process:
-                print("⚠ Could not load scheduler state, initialized to current step")
     else:
         scheduler.step(global_step)
     
