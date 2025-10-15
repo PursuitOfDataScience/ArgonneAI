@@ -898,7 +898,7 @@ def parse_args():
     parser.add_argument(
         "--initial-batch-size",
         type=int,
-        default=512,
+        default=4,
         help="Initial batch size to try (will be reduced on OOM).",
     )
     parser.add_argument(
