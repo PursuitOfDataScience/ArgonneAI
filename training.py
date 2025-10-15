@@ -7,6 +7,7 @@ import traceback
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from tqdm import tqdm
 
@@ -718,8 +719,13 @@ def train_from_scratch_tensor_parallel(
                         autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
 
                         with autocast_context:
-                            outputs = model(input_ids=x_local, labels=y_local)
-                            loss_tensor = outputs.loss.to(first_device)
+                            outputs = model(input_ids=x_local)
+                            logits = outputs.logits
+                            loss_tensor = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                y_local.view(-1),
+                                ignore_index=-100,
+                            )
 
                         last_loss_value = float(loss_tensor.detach().cpu().item())
 
