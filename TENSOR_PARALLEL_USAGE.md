@@ -128,8 +128,8 @@ CUDA_VISIBLE_DEVICES=3 RANK=3 LOCAL_RANK=3 WORLD_SIZE=4 python resume_pretrain_t
 ### Training Configuration
 - `--batch-size`: Batch size per GPU (default: 4)
 - `--block-size`: Sequence length (default: 4096)
-- `--learning-rate`: Peak learning rate (default: 3e-4)
-- `--min-learning-rate`: Minimum learning rate (default: 3e-5)
+- `--learning-rate`: Peak learning rate (default: 1e-4)
+- `--min-learning-rate`: Minimum learning rate (default: 1e-5)
 - `--warmup-steps`: Number of warmup steps (default: 2000)
 - `--total-steps`: Total training steps (default: 4,000,000)
 - `--weight-decay`: Weight decay coefficient (default: 0.1)

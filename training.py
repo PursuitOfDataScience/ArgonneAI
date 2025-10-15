@@ -520,9 +520,9 @@ def train_from_scratch_tensor_parallel(
     block_size: int = 4096,
     initial_batch_size: int = 512,
     min_batch_size: int = 4,
-    lr: float = 2e-4,        # CHANGED: Increased from 1e-4
-    min_lr: float = 2e-5,    # CHANGED: Increased from 1e-5
-    warmup_steps: int = 500, # CHANGED: Reduced from 2000
+    lr: float = 1e-4,
+    min_lr: float = 1e-5,
+    warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
 ):
@@ -593,8 +593,6 @@ def train_from_scratch_tensor_parallel(
         supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
-    target_dtype = amp_dtype if amp_dtype in (torch.float16, torch.bfloat16) else torch.float32
-
     # Batch size auto-tuning variables
     batch_size = initial_batch_size
     largest_successful_batch = None
@@ -620,7 +618,7 @@ def train_from_scratch_tensor_parallel(
         try:
             # Create fresh model for each attempt
             base_model = ArgonneModel(config)
-            base_model = base_model.to(dtype=target_dtype)
+            # Keep master weights in FP32 so AdamW maintains full-precision optimizer state
             
             # Create tensor parallel wrapper
             model = TensorParallelModel(base_model, world_size, rank)
@@ -916,19 +914,19 @@ def parse_args():
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=2e-4,  # CHANGED: Increased from 1e-4
+        default=1e-4,
         help="Peak learning rate.",
     )
     parser.add_argument(
         "--min-learning-rate",
         type=float,
-        default=2e-5,  # CHANGED: Increased from 1e-5
+        default=1e-5,
         help="Minimum learning rate.",
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=500,  # CHANGED: Reduced from 2000
+        default=2000,
         help="Number of warmup steps.",
     )
     parser.add_argument(
