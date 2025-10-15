@@ -484,15 +484,77 @@ class TensorParallelModel(torch.nn.Module):
         return CausalLMOutput(logits=logits, loss=loss)
     
     def generate(self, input_ids, max_length=1024, temperature=1.0, top_k=None, top_p=None, do_sample=True):
-        """Generation method matching ArgonneModel interface"""
-        return self.base_model.generate(
-            input_ids, 
-            max_length=max_length, 
-            temperature=temperature, 
-            top_k=top_k, 
-            top_p=top_p, 
-            do_sample=do_sample
-        )
+        """Distributed text generation that respects tensor parallel sharding."""
+        was_training = self.training
+        self.eval()
+
+        try:
+            if not torch.is_tensor(input_ids):
+                raise TypeError("input_ids must be a torch.Tensor")
+
+            input_ids = input_ids.to(self.device)
+
+            # Make sure all ranks start with the same prompt when using tensor parallelism
+            if self.world_size > 1 and dist.is_initialized():
+                # Broadcast prompt length first to avoid shape mismatches
+                prompt_length = torch.tensor([input_ids.shape[1]], device=self.device, dtype=torch.long)
+                dist.broadcast(prompt_length, src=0)
+
+                if input_ids.shape[1] != int(prompt_length.item()):
+                    # Resize tensor for non-src ranks and broadcast prompt contents
+                    new_prompt = torch.zeros(input_ids.shape[0], prompt_length.item(), dtype=input_ids.dtype, device=self.device)
+                    if self.rank == 0:
+                        new_prompt.copy_(input_ids[:, :prompt_length.item()])
+                    dist.broadcast(new_prompt, src=0)
+                    input_ids = new_prompt
+                else:
+                    dist.broadcast(input_ids, src=0)
+
+            generated = input_ids
+
+            with torch.no_grad():
+                while generated.shape[1] < max_length:
+                    context_window = generated[:, -self.base_model.config.max_position_embeddings :]
+                    outputs = self.forward(context_window)
+                    logits = outputs.logits[:, -1, :] / temperature
+
+                    next_token: torch.Tensor
+                    if do_sample:
+                        if top_k is not None:
+                            top_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                            logits = logits.masked_fill(logits < top_values[:, [-1]], float("-inf"))
+                        if top_p is not None:
+                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > top_p
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                            logits = logits.masked_fill(indices_to_remove, float("-inf"))
+
+                        if self.rank == 0:
+                            probs = F.softmax(logits, dim=-1)
+                            next_token = torch.multinomial(probs, num_samples=1)
+                        else:
+                            next_token = torch.empty((generated.size(0), 1), dtype=torch.long, device=self.device)
+                    else:
+                        if self.rank == 0:
+                            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                        else:
+                            next_token = torch.empty((generated.size(0), 1), dtype=torch.long, device=self.device)
+
+                    if self.world_size > 1 and dist.is_initialized():
+                        dist.broadcast(next_token, src=0)
+
+                    generated = torch.cat([generated, next_token], dim=-1)
+
+                    if generated.shape[1] >= max_length:
+                        break
+
+            return generated
+        finally:
+            if was_training:
+                self.train()
     
     def state_dict(self, *args, **kwargs):
         """Get state dict from base model"""
@@ -748,10 +810,11 @@ def train_from_scratch_tensor_parallel(
                             print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {tokens_processed:,} | LR: {current_lr:.6e}")
 
                         # Save checkpoint
-                        if global_step % 300 == 0 and is_main_process:
-                            print(f"\nSaving checkpoint at step {global_step}...")
-                            
-                            # Generate sample text
+                        if global_step % 300 == 0:
+                            if is_main_process:
+                                print(f"\nSaving checkpoint at step {global_step}...")
+
+                            # Generate sample text on all ranks so tensor parallel reductions stay in sync
                             prompt_str = "Long long time ago, "
                             token_ids = hf_tokenizer.encode(prompt_str)
                             prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
@@ -763,30 +826,33 @@ def train_from_scratch_tensor_parallel(
                                 top_k=50,
                                 top_p=0.9,
                             )
-                            generated_text = hf_tokenizer.decode(generated[0].tolist())
-                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                            # Save checkpoint with format compatible with resume script
-                            model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
-                            checkpoint_state = {
-                                "global_step": global_step,
-                                "tokens_processed": tokens_processed,
-                                "model_state_dict": model_state,
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "loss": last_loss_value,
-                                "data_position": data_position.get_state(),
-                                "model_dtype": str(amp_dtype),
-                                "tensor_parallel": True,
-                                "world_size": world_size,
-                                "rank": rank,
-                                "batch_size": batch_size,
-                            }
-                            os.makedirs("pretrained", exist_ok=True)
-                            save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
-                            safe_torch_save(checkpoint_state, save_path)
-                            print(f"✓ Checkpoint saved: {save_path}")
-                            print(f"  (Compatible with resume_pretrain_tensor.py)\n")
+                            if is_main_process:
+                                generated_text = hf_tokenizer.decode(generated[0].tolist())
+                                print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                            if is_main_process:
+                                # Save checkpoint with format compatible with resume script
+                                model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+                                checkpoint_state = {
+                                    "global_step": global_step,
+                                    "tokens_processed": tokens_processed,
+                                    "model_state_dict": model_state,
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "scheduler_state_dict": scheduler.state_dict(),
+                                    "loss": last_loss_value,
+                                    "data_position": data_position.get_state(),
+                                    "model_dtype": str(amp_dtype),
+                                    "tensor_parallel": True,
+                                    "world_size": world_size,
+                                    "rank": rank,
+                                    "batch_size": batch_size,
+                                }
+                                os.makedirs("pretrained", exist_ok=True)
+                                save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                safe_torch_save(checkpoint_state, save_path)
+                                print(f"✓ Checkpoint saved: {save_path}")
+                                print(f"  (Compatible with resume_pretrain_tensor.py)\n")
 
                     except StopIteration:
                         if is_main_process:
