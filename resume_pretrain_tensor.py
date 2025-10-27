@@ -43,6 +43,87 @@ from training import (
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
 
+def streaming_token_generator_with_special_tokens(
+    data_files: List[str],
+    tokenizer,
+    block_size: int,
+    start_file_idx: int = 0,
+    start_position: int = 0,
+    start_chunk_offset: int = 0,
+    rank: int = 0,
+):
+    """
+    Streaming token generator that adds BOS/EOS tokens PER DOCUMENT.
+    
+    Documents are wrapped with special tokens:
+        [<BOS>, ...document_tokens..., <EOS>]
+    
+    Multiple documents are concatenated and packed into chunks of block_size.
+    Long documents naturally span multiple chunks (BOS only at start, EOS only at end).
+    """
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+    
+    # Check if tokenizer has special tokens
+    has_special_tokens = (bos_id is not None and eos_id is not None)
+    
+    if not has_special_tokens and rank == 0:
+        print("⚠ Tokenizer missing BOS/EOS tokens - falling back to no special tokens")
+    
+    token_buffer = []
+    
+    for file_idx in range(start_file_idx, len(data_files)):
+        file_path = data_files[file_idx]
+        shard_name = os.path.basename(file_path)
+        
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(file_path)
+            texts = table.column('text').to_pylist()
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠ Error reading {shard_name}: {e}")
+            continue
+        
+        start_pos = start_position if file_idx == start_file_idx else 0
+        
+        for doc_idx in range(start_pos, len(texts)):
+            text = texts[doc_idx]
+            if not text or not isinstance(text, str):
+                continue
+            
+            # Tokenize the document
+            doc_tokens = tokenizer.encode(text, add_special_tokens=False)
+            
+            if not doc_tokens:
+                continue
+            
+            # Add BOS/EOS tokens if available
+            if has_special_tokens:
+                doc_tokens = [bos_id] + doc_tokens + [eos_id]
+            
+            # Add to buffer
+            token_buffer.extend(doc_tokens)
+            
+            # Yield chunks when buffer is large enough
+            while len(token_buffer) >= block_size:
+                chunk = token_buffer[:block_size]
+                token_buffer = token_buffer[block_size:]
+                yield chunk, file_idx, doc_idx, shard_name, 0
+        
+        # Reset position for next file
+        start_position = 0
+    
+    # Yield any remaining tokens
+    if token_buffer:
+        # Pad to block_size if needed
+        if len(token_buffer) < block_size:
+            # IMPROVED: Use EOS as padding, or pad_token, or fall back to 0
+            pad_id = eos_id if eos_id is not None else (tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+            token_buffer.extend([pad_id] * (block_size - len(token_buffer)))
+        yield token_buffer[:block_size], len(data_files) - 1, -1, "final_chunk", 0
+
+
 def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> None:
     """Keep only the most recent checkpoint files in a directory."""
     
@@ -269,7 +350,8 @@ def resume_training(
     num_proc: int = 8,
     trust_remote_code: bool = False,
     force_from_scratch: bool = False,
-    rewarmup_steps: int = 100,  # NEW: Re-warmup after resume
+    rewarmup_steps: int = 100,
+    add_special_tokens: bool = False,  # NEW parameter
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -509,13 +591,27 @@ def resume_training(
             print(f"Learning rate: {lr:.2e}")
             print(f"Batch size: {batch_size}")
             print(f"World size: {world_size}")
+            # NEW: Print special tokens mode
+            if add_special_tokens:
+                print(f"Special tokens: ENABLED (BOS/EOS per document)")
+            else:
+                print(f"Special tokens: DISABLED (backward compatible mode)")
             print(f"{'='*70}\n")
 
-        token_gen = streaming_token_generator(
-            data_files, hf_tokenizer, block_size,
-            data_position.current_file_idx, data_position.position_in_file, 
-            data_position.chunk_offset, rank
-        )
+        # NEW: Choose generator based on flag
+        if add_special_tokens:
+            token_gen = streaming_token_generator_with_special_tokens(
+                data_files, hf_tokenizer, block_size,
+                data_position.current_file_idx, data_position.position_in_file, 
+                data_position.chunk_offset, rank
+            )
+        else:
+            token_gen = streaming_token_generator(
+                data_files, hf_tokenizer, block_size,
+                data_position.current_file_idx, data_position.position_in_file, 
+                data_position.chunk_offset, rank
+            )
+        
         token_buffer: List[List[int]] = []
         active_shard: Optional[str] = None
         last_meta: Optional[Tuple[str, int, int, int]] = None
@@ -531,7 +627,15 @@ def resume_training(
                         if is_main_process:
                             print("End of dataset - restarting")
                         data_position.next_epoch()
-                        token_gen = streaming_token_generator(data_files, hf_tokenizer, block_size, rank=rank)
+                        # NEW: Use same generator type on restart
+                        if add_special_tokens:
+                            token_gen = streaming_token_generator_with_special_tokens(
+                                data_files, hf_tokenizer, block_size, rank=rank
+                            )
+                        else:
+                            token_gen = streaming_token_generator(
+                                data_files, hf_tokenizer, block_size, rank=rank
+                            )
                         continue
 
                     token_buffer.append(tokens)
@@ -648,7 +752,15 @@ def resume_training(
                     if is_main_process:
                         print("StopIteration - restarting dataset")
                     data_position.next_epoch()
-                    token_gen = streaming_token_generator(data_files, hf_tokenizer, block_size, rank=rank)
+                    # NEW: Use same generator type on restart
+                    if add_special_tokens:
+                        token_gen = streaming_token_generator_with_special_tokens(
+                            data_files, hf_tokenizer, block_size, rank=rank
+                        )
+                    else:
+                        token_gen = streaming_token_generator(
+                            data_files, hf_tokenizer, block_size, rank=rank
+                        )
                     continue
         finally:
             if pbar is not None:
@@ -797,6 +909,11 @@ def parse_args() -> argparse.Namespace:
         help="Force training from scratch, ignoring any checkpoints.",
     )
     parser.add_argument(
+        "--add-special-tokens",
+        action="store_true",
+        help="Add BOS/EOS tokens per document (recommended for new training runs)",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -823,6 +940,7 @@ def main():
         num_proc=args.num_proc,
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
+        add_special_tokens=args.add_special_tokens,  # NEW: Pass through the flag
     )
 
 
