@@ -61,14 +61,55 @@ def streaming_token_generator_with_special_tokens(
     Multiple documents are concatenated and packed into chunks of block_size.
     Long documents naturally span multiple chunks (BOS only at start, EOS only at end).
     """
+    # Try to get BOS/EOS tokens with multiple fallback strategies
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
     
-    # Check if tokenizer has special tokens
+    # Fallback 1: Check for <|im_start|> and <|im_end|> in additional_special_tokens
+    if bos_id is None or eos_id is None:
+        if hasattr(tokenizer, 'additional_special_tokens'):
+            for token in tokenizer.additional_special_tokens:
+                if token == "<|im_start|>" and bos_id is None:
+                    bos_id = tokenizer.convert_tokens_to_ids(token)
+                    if rank == 0:
+                        print(f"✓ Using <|im_start|> (id={bos_id}) as BOS token")
+                elif token == "<|im_end|>" and eos_id is None:
+                    eos_id = tokenizer.convert_tokens_to_ids(token)
+                    if rank == 0:
+                        print(f"✓ Using <|im_end|> (id={eos_id}) as EOS token")
+    
+    # Fallback 2: Try to get from vocabulary directly
+    if bos_id is None:
+        for candidate in ["<|im_start|>", "<s>", "<bos>"]:
+            try:
+                candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+                if candidate_id != tokenizer.unk_token_id:
+                    bos_id = candidate_id
+                    if rank == 0:
+                        print(f"✓ Using {candidate} (id={bos_id}) as BOS token")
+                    break
+            except:
+                continue
+    
+    if eos_id is None:
+        for candidate in ["<|im_end|>", "</s>", "<eos>"]:
+            try:
+                candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+                if candidate_id != tokenizer.unk_token_id:
+                    eos_id = candidate_id
+                    if rank == 0:
+                        print(f"✓ Using {candidate} (id={eos_id}) as EOS token")
+                    break
+            except:
+                continue
+    
+    # Check if we have valid special tokens
     has_special_tokens = (bos_id is not None and eos_id is not None)
     
     if not has_special_tokens and rank == 0:
         print("⚠ Tokenizer missing BOS/EOS tokens - falling back to no special tokens")
+    elif has_special_tokens and rank == 0:
+        print(f"✓ Using BOS token id={bos_id}, EOS token id={eos_id}")
     
     token_buffer = []
     
@@ -381,9 +422,40 @@ def resume_training(
     # Load tokenizer
     validate_tokenizer_path(tokenizer_path)
     hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
+    
+    # FIX: Explicitly set BOS/EOS tokens if they're in additional_special_tokens
+    if hf_tokenizer.bos_token is None and hasattr(hf_tokenizer, 'additional_special_tokens'):
+        if '<|im_start|>' in hf_tokenizer.additional_special_tokens:
+            # Get the token ID
+            bos_token_id = hf_tokenizer.convert_tokens_to_ids('<|im_start|>')
+            # Set it as the official BOS token
+            hf_tokenizer.bos_token = '<|im_start|>'
+            hf_tokenizer.bos_token_id = bos_token_id
+            if is_main_process:
+                print(f"✓ Set <|im_start|> as bos_token (id={bos_token_id})")
+    
+    # EOS token should already be set, but verify
+    if hf_tokenizer.eos_token is None and hasattr(hf_tokenizer, 'additional_special_tokens'):
+        if '<|im_end|>' in hf_tokenizer.additional_special_tokens:
+            eos_token_id = hf_tokenizer.convert_tokens_to_ids('<|im_end|>')
+            hf_tokenizer.eos_token = '<|im_end|>'
+            hf_tokenizer.eos_token_id = eos_token_id
+            if is_main_process:
+                print(f"✓ Set <|im_end|> as eos_token (id={eos_token_id})")
+    
     if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
         hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
     hf_tokenizer.model_max_length = max(block_size + 1, 1_000_000_000)
+    
+    # Log tokenizer special tokens info
+    if is_main_process and add_special_tokens:
+        print(f"\nTokenizer special tokens (after configuration):")
+        print(f"  bos_token: {hf_tokenizer.bos_token} (id={hf_tokenizer.bos_token_id})")
+        print(f"  eos_token: {hf_tokenizer.eos_token} (id={hf_tokenizer.eos_token_id})")
+        print(f"  pad_token: {hf_tokenizer.pad_token} (id={hf_tokenizer.pad_token_id})")
+        if hasattr(hf_tokenizer, 'additional_special_tokens') and hf_tokenizer.additional_special_tokens:
+            print(f"  additional_special_tokens: {hf_tokenizer.additional_special_tokens[:5]}...")  # Show first 5
+    
     vocab_size = len(hf_tokenizer)
 
     # Build config - MUST MATCH training.py exactly
