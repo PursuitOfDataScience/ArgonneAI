@@ -130,13 +130,46 @@ class DataPosition:
                 self.shuffled_indices = torch.randperm(total_samples).tolist()
 
 
-def streaming_token_generator(data_files: List[str], tokenizer, block_size: int, start_file_idx: int = 0, start_position: int = 0, start_chunk_offset: int = 0, rank: int = 0):
+def streaming_token_generator(
+    data_files: List[str],
+    tokenizer,
+    block_size: int,
+    start_file_idx: int = 0,
+    start_position: int = 0,
+    start_chunk_offset: int = 0,
+    rank: int = 0,
+    add_document_tokens: bool = False,
+):
     """Generator with chunk-level resume support."""
     import gc
-    
+
     file_idx = max(start_file_idx, 0)
     processed_count = 0
     is_main_process = (rank == 0)
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    document_tokens_enabled = bool(add_document_tokens)
+
+    if document_tokens_enabled:
+        missing_tokens = []
+        if bos_token_id is None:
+            missing_tokens.append("BOS")
+        if eos_token_id is None:
+            missing_tokens.append("EOS")
+
+        if missing_tokens:
+            if is_main_process:
+                print(
+                    "⚠ Unable to add document boundary tokens: missing "
+                    + ", ".join(missing_tokens)
+                    + " token id(s) in tokenizer"
+                )
+            document_tokens_enabled = False
+        elif is_main_process:
+            print(
+                f"✓ Adding BOS/EOS tokens to each document "
+                f"(bos_id={bos_token_id}, eos_id={eos_token_id})"
+            )
     initial_file_idx = file_idx
     initial_position = start_position
     initial_chunk_offset = start_chunk_offset
@@ -200,11 +233,28 @@ def streaming_token_generator(data_files: List[str], tokenizer, block_size: int,
                                 continue
                         
                         tokens = tokenizer.encode(text, add_special_tokens=False)
-                        
+                        resume_mid_document = (
+                            document_tokens_enabled
+                            and file_idx == initial_file_idx
+                            and position == initial_position
+                            and resume_chunk_offset > 0
+                        )
+
+                        if document_tokens_enabled:
+                            tokens = [bos_token_id, *tokens, eos_token_id]
+
+                            if resume_mid_document:
+                                # We are resuming from the middle of a document that was
+                                # previously trained without BOS/EOS tokens. Dropping the
+                                # prepended BOS ensures the chunk boundaries align with the
+                                # checkpoint's stored chunk_offset while still allowing the
+                                # trailing EOS to be learned for the remaining portion.
+                                tokens = tokens[1:]
+
                         if len(tokens) < 10:
                             position += 1
                             continue
-                        
+
                         for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
                             if file_idx == initial_file_idx and position == initial_position:
                                 if chunk_idx < resume_chunk_offset:
