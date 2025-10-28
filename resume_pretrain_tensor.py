@@ -3,7 +3,7 @@ import contextlib
 import json
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -72,6 +72,81 @@ def streaming_token_generator(
         bos_token_str,
         eos_token_str,
     ) = determine_document_boundary_tokens(tokenizer)
+
+    def _ensure_token_id(
+        token_id: Optional[int],
+        token_str: Optional[str],
+        default_candidates: Sequence[Optional[str]],
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Best-effort resolution of chat-style special tokens.
+
+        Some tokenizers (notably chat-oriented ones) expose boundary symbols via
+        ``additional_special_tokens`` but round-trip conversions through
+        ``convert_ids_to_tokens`` may normalise whitespace, causing the shared
+        resolver in ``training_utils`` to give up.  When that happens we fall
+        back to direct ``convert_tokens_to_ids`` / ``encode`` probes here so the
+        resume script can still honour ``--add-document-boundary-tokens``.
+        """
+
+        if token_id is not None:
+            return token_id, token_str
+
+        candidates: List[str] = []
+        if token_str:
+            candidates.append(token_str)
+        for candidate in default_candidates:
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            try:
+                candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+            except Exception:
+                candidate_id = None
+
+            if isinstance(candidate_id, int) and candidate_id >= 0:
+                return candidate_id, candidate
+
+            try:
+                encoded = tokenizer.encode(candidate, add_special_tokens=False)
+            except Exception:
+                encoded = None
+
+            if encoded and len(encoded) == 1:
+                return encoded[0], candidate
+
+        return None, token_str
+
+    fallback_bos_tokens: List[Optional[str]] = [
+        getattr(tokenizer, "bos_token", None),
+        "<|im_start|>",
+        "<s>",
+        "[CLS]",
+    ]
+    fallback_eos_tokens: List[Optional[str]] = [
+        getattr(tokenizer, "eos_token", None),
+        "<|im_end|>",
+        "</s>",
+        "[SEP]",
+    ]
+
+    additional_tokens = getattr(tokenizer, "additional_special_tokens", None) or []
+    for token in additional_tokens:
+        if token not in fallback_bos_tokens:
+            fallback_bos_tokens.append(token)
+        if token not in fallback_eos_tokens:
+            fallback_eos_tokens.append(token)
+
+    bos_token_id, bos_token_str = _ensure_token_id(
+        bos_token_id,
+        bos_token_str,
+        fallback_bos_tokens,
+    )
+    eos_token_id, eos_token_str = _ensure_token_id(
+        eos_token_id,
+        eos_token_str,
+        fallback_eos_tokens,
+    )
     document_tokens_enabled = bool(add_document_tokens)
 
     if document_tokens_enabled:
