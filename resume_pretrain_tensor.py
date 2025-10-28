@@ -393,6 +393,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     add_special_tokens: bool = False,  # NEW parameter
+    use_gradient_checkpointing: bool = True,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -469,7 +470,7 @@ def resume_training(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         use_flash_attention=True,
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=use_gradient_checkpointing,
         pad_token_id=hf_tokenizer.pad_token_id,
         bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
         eos_token_id=hf_tokenizer.eos_token_id,
@@ -580,9 +581,10 @@ def resume_training(
     
     # Create tensor parallel wrapper
     model = TensorParallelModel(base_model, world_size, rank)
-    
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
+
+    # Enable gradient checkpointing if requested
+    if use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -986,6 +988,11 @@ def parse_args() -> argparse.Namespace:
         help="Add BOS/EOS tokens per document (recommended for new training runs)",
     )
     parser.add_argument(
+        "--disable-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1013,6 +1020,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         add_special_tokens=args.add_special_tokens,  # NEW: Pass through the flag
+        use_gradient_checkpointing=not args.disable_gradient_checkpointing,
     )
 
 
