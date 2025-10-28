@@ -7,7 +7,7 @@ import math
 import os
 import re
 import tempfile
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from datasets import Dataset
@@ -15,6 +15,120 @@ from datasets import Dataset
 
 # Shared constant to keep the default training horizon consistent across scripts.
 DEFAULT_MAX_TRAINING_STEPS = 4_000_000
+
+
+def _resolve_token_id(
+    tokenizer,
+    id_attribute: str,
+    token_attribute: str,
+    fallback_tokens: Optional[Iterable[str]] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    """Return a token id/string pair from tokenizer attributes or fallbacks."""
+
+    token_id = getattr(tokenizer, id_attribute, None)
+    token_str = getattr(tokenizer, token_attribute, None)
+
+    if token_id is not None:
+        if token_str is None:
+            try:
+                token_str = tokenizer.convert_ids_to_tokens(token_id)
+            except Exception:
+                token_str = None
+        return token_id, token_str
+
+    candidates: Iterable[str] = fallback_tokens or ()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+        except Exception:
+            continue
+
+        if not isinstance(candidate_id, int) or candidate_id < 0:
+            continue
+
+        try:
+            round_trip = tokenizer.convert_ids_to_tokens(candidate_id)
+        except Exception:
+            round_trip = None
+
+        if round_trip == candidate:
+            return candidate_id, candidate
+
+    if token_str:
+        try:
+            candidate_id = tokenizer.convert_tokens_to_ids(token_str)
+            if isinstance(candidate_id, int) and candidate_id >= 0:
+                try:
+                    round_trip = tokenizer.convert_ids_to_tokens(candidate_id)
+                except Exception:
+                    round_trip = None
+                else:
+                    if round_trip == token_str:
+                        return candidate_id, token_str
+        except Exception:
+            pass
+
+    return None, token_str
+
+
+def determine_document_boundary_tokens(
+    tokenizer,
+    bos_fallback_tokens: Optional[Iterable[str]] = None,
+    eos_fallback_tokens: Optional[Iterable[str]] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[str], Optional[str]]:
+    """Determine BOS/EOS token ids (and strings) for document boundaries.
+
+    Chat-focused tokenizers occasionally omit ``bos_token_id`` even though a
+    suitable token (e.g. ``"<|im_start|>"``) exists in
+    ``additional_special_tokens``.  This helper searches common fallbacks so
+    document boundary injection can remain enabled without manual overrides.
+    """
+
+    default_bos_candidates = [
+        getattr(tokenizer, "bos_token", None),
+        "<|im_start|>",
+        "<s>",
+        "[CLS]",
+    ]
+    default_eos_candidates = [
+        getattr(tokenizer, "eos_token", None),
+        "<|im_end|>",
+        "</s>",
+        "[SEP]",
+    ]
+
+    additional_tokens = list(getattr(tokenizer, "additional_special_tokens", []) or [])
+    for token in additional_tokens:
+        if token not in default_bos_candidates:
+            default_bos_candidates.append(token)
+        if token not in default_eos_candidates:
+            default_eos_candidates.append(token)
+
+    if bos_fallback_tokens:
+        for token in bos_fallback_tokens:
+            if token not in default_bos_candidates:
+                default_bos_candidates.append(token)
+    if eos_fallback_tokens:
+        for token in eos_fallback_tokens:
+            if token not in default_eos_candidates:
+                default_eos_candidates.append(token)
+
+    bos_token_id, bos_token_str = _resolve_token_id(
+        tokenizer,
+        "bos_token_id",
+        "bos_token",
+        default_bos_candidates,
+    )
+    eos_token_id, eos_token_str = _resolve_token_id(
+        tokenizer,
+        "eos_token_id",
+        "eos_token",
+        default_eos_candidates,
+    )
+
+    return bos_token_id, eos_token_id, bos_token_str, eos_token_str
 
 
 def _natural_key(path: str) -> List[object]:
