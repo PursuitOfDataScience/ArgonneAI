@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from data_processing import (
     collate_batch,
+    chunk_tokens,
     load_tokenizer,
 )
 from model import ArgonneConfig, ArgonneModel
@@ -29,7 +30,6 @@ from training_utils import (
 # Import all tensor parallel components from training.py
 from training import (
     DataPosition,
-    streaming_token_generator,
     init_tensor_parallel_group,
     TensorParallelModel,
     _ensure_gradient_dtype_matches_params,
@@ -44,6 +44,176 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
+
+
+def streaming_token_generator(
+    data_files: List[str],
+    tokenizer,
+    block_size: int,
+    start_file_idx: int = 0,
+    start_position: int = 0,
+    start_chunk_offset: int = 0,
+    rank: int = 0,
+    add_document_tokens: bool = False,
+):
+    """Generator with chunk-level resume support and optional BOS/EOS injection."""
+
+    import gc
+
+    file_idx = max(start_file_idx, 0)
+    processed_count = 0
+    is_main_process = (rank == 0)
+
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    document_tokens_enabled = bool(add_document_tokens)
+
+    if document_tokens_enabled:
+        missing_tokens = []
+        if bos_token_id is None:
+            missing_tokens.append("BOS")
+        if eos_token_id is None:
+            missing_tokens.append("EOS")
+
+        if missing_tokens:
+            if is_main_process:
+                print(
+                    "⚠ Unable to add document boundary tokens: missing "
+                    + ", ".join(missing_tokens)
+                    + " token id(s) in tokenizer"
+                )
+            document_tokens_enabled = False
+        elif is_main_process:
+            print(
+                f"✓ Adding BOS/EOS tokens to each document "
+                f"(bos_id={bos_token_id}, eos_id={eos_token_id})"
+            )
+
+    initial_file_idx = file_idx
+    initial_position = start_position
+    initial_chunk_offset = start_chunk_offset
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
+
+    while file_idx < len(data_files):
+        dataset = None
+
+        try:
+            file_path = data_files[file_idx]
+            shard_name = os.path.basename(file_path)
+            if is_main_process:
+                print(f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}")
+
+            try:
+                dataset = load_streaming_shard(file_path)
+                if is_main_process:
+                    print(f"Successfully loaded dataset with {len(dataset)} rows")
+                consecutive_errors = 0
+
+            except Exception as file_error:
+                consecutive_errors += 1
+                if is_main_process:
+                    print(f"ERROR: Could not read file {file_path}: {file_error}")
+                    print(f"Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    if is_main_process:
+                        print(f"⚠ Too many consecutive errors. Forcing cleanup and restarting...")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    consecutive_errors = 0
+
+                file_idx += 1
+                continue
+
+            if file_idx == initial_file_idx:
+                position = initial_position
+                resume_chunk_offset = initial_chunk_offset
+                if is_main_process and (position > 0 or resume_chunk_offset > 0):
+                    print(f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}")
+            else:
+                position = 0
+                resume_chunk_offset = 0
+
+            while position < len(dataset):
+                try:
+                    item = dataset[position]
+                    if "text" in item and item["text"] and isinstance(item["text"], str):
+                        text = item["text"]
+
+                        if len(text) > 50:
+                            alpha_count = sum(c.isalpha() or c.isspace() for c in text)
+                            digit_count = sum(c.isdigit() for c in text)
+
+                            if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
+                                position += 1
+                                continue
+
+                        tokens = tokenizer.encode(text, add_special_tokens=False)
+                        resume_mid_document = (
+                            document_tokens_enabled
+                            and file_idx == initial_file_idx
+                            and position == initial_position
+                            and resume_chunk_offset > 0
+                        )
+
+                        if document_tokens_enabled:
+                            tokens = [bos_token_id, *tokens, eos_token_id]
+
+                            if resume_mid_document:
+                                tokens = tokens[1:]
+
+                        if len(tokens) < 10:
+                            position += 1
+                            continue
+
+                        for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
+                            if file_idx == initial_file_idx and position == initial_position:
+                                if chunk_idx < resume_chunk_offset:
+                                    continue
+
+                            processed_count += 1
+                            yield chunk, file_idx, position, shard_name, chunk_idx
+
+                except Exception as e:
+                    if is_main_process:
+                        print(f"Error processing item at position {position}: {e}")
+
+                position += 1
+
+            if is_main_process:
+                print(f"Finished processing {shard_name}, cleaning up resources...")
+
+            del dataset
+            dataset = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            import time
+
+            time.sleep(0.1)
+
+            file_idx += 1
+
+        except Exception as e:
+            if is_main_process:
+                print(f"Error processing file {data_files[file_idx]}: {e}")
+
+            if dataset is not None:
+                del dataset
+                dataset = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            file_idx += 1
+
+    if is_main_process:
+        print(f"Completed processing all available files. Processed {processed_count} samples.")
+
+    return None, -1, -1, "", -1
 
 
 def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> None:
@@ -274,6 +444,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
+    add_document_tokens: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -518,11 +689,16 @@ def resume_training(
             print(f"World size: {world_size}")
             print(f"{'='*70}\n")
 
-        # Use only the standard generator - no special token logic
+        # Initialize the streaming generator (optionally adding document boundary tokens)
         token_gen = streaming_token_generator(
-            data_files, hf_tokenizer, block_size,
-            data_position.current_file_idx, data_position.position_in_file,
-            data_position.chunk_offset, rank
+            data_files,
+            hf_tokenizer,
+            block_size,
+            data_position.current_file_idx,
+            data_position.position_in_file,
+            data_position.chunk_offset,
+            rank,
+            add_document_tokens=add_document_tokens,
         )
         
         token_buffer: List[List[int]] = []
@@ -542,7 +718,11 @@ def resume_training(
                         data_position.next_epoch()
                         # Restart with same generator type
                         token_gen = streaming_token_generator(
-                            data_files, hf_tokenizer, block_size, rank=rank
+                            data_files,
+                            hf_tokenizer,
+                            block_size,
+                            rank=rank,
+                            add_document_tokens=add_document_tokens,
                         )
                         continue
 
@@ -648,7 +828,11 @@ def resume_training(
                     data_position.next_epoch()
                     # Restart with same generator type
                     token_gen = streaming_token_generator(
-                        data_files, hf_tokenizer, block_size, rank=rank
+                        data_files,
+                        hf_tokenizer,
+                        block_size,
+                        rank=rank,
+                        add_document_tokens=add_document_tokens,
                     )
                     continue
         finally:
@@ -803,6 +987,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
     )
     parser.add_argument(
+        "--add-document-boundary-tokens",
+        action="store_true",
+        help=(
+            "Prepend the tokenizer BOS token and append the EOS token to each document "
+            "before chunking."
+        ),
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -830,6 +1022,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        add_document_tokens=args.add_document_boundary_tokens,
     )
 
 
