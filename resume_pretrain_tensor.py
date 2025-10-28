@@ -20,6 +20,7 @@ from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
     cast_state_dict_to_dtype,
+    determine_document_boundary_tokens,
     load_streaming_shard,
     log_dataset_plan,
     safe_torch_load,
@@ -65,8 +66,12 @@ def streaming_token_generator(
     processed_count = 0
     is_main_process = (rank == 0)
 
-    bos_token_id = getattr(tokenizer, "bos_token_id", None)
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    (
+        bos_token_id,
+        eos_token_id,
+        bos_token_str,
+        eos_token_str,
+    ) = determine_document_boundary_tokens(tokenizer)
     document_tokens_enabled = bool(add_document_tokens)
 
     if document_tokens_enabled:
@@ -85,9 +90,11 @@ def streaming_token_generator(
                 )
             document_tokens_enabled = False
         elif is_main_process:
+            bos_display = bos_token_str or bos_token_id
+            eos_display = eos_token_str or eos_token_id
             print(
-                f"✓ Adding BOS/EOS tokens to each document "
-                f"(bos_id={bos_token_id}, eos_id={eos_token_id})"
+                "✓ Adding BOS/EOS tokens to each document "
+                f"(bos={bos_display}, eos={eos_display})"
             )
 
     initial_file_idx = file_idx
