@@ -274,6 +274,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
+    add_document_tokens: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -518,11 +519,16 @@ def resume_training(
             print(f"World size: {world_size}")
             print(f"{'='*70}\n")
 
-        # Use only the standard generator - no special token logic
+        # Initialize the streaming generator (optionally adding document boundary tokens)
         token_gen = streaming_token_generator(
-            data_files, hf_tokenizer, block_size,
-            data_position.current_file_idx, data_position.position_in_file,
-            data_position.chunk_offset, rank
+            data_files,
+            hf_tokenizer,
+            block_size,
+            data_position.current_file_idx,
+            data_position.position_in_file,
+            data_position.chunk_offset,
+            rank,
+            add_document_tokens=add_document_tokens,
         )
         
         token_buffer: List[List[int]] = []
@@ -542,7 +548,11 @@ def resume_training(
                         data_position.next_epoch()
                         # Restart with same generator type
                         token_gen = streaming_token_generator(
-                            data_files, hf_tokenizer, block_size, rank=rank
+                            data_files,
+                            hf_tokenizer,
+                            block_size,
+                            rank=rank,
+                            add_document_tokens=add_document_tokens,
                         )
                         continue
 
@@ -648,7 +658,11 @@ def resume_training(
                     data_position.next_epoch()
                     # Restart with same generator type
                     token_gen = streaming_token_generator(
-                        data_files, hf_tokenizer, block_size, rank=rank
+                        data_files,
+                        hf_tokenizer,
+                        block_size,
+                        rank=rank,
+                        add_document_tokens=add_document_tokens,
                     )
                     continue
         finally:
@@ -803,6 +817,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
     )
     parser.add_argument(
+        "--add-document-boundary-tokens",
+        action="store_true",
+        help=(
+            "Prepend the tokenizer BOS token and append the EOS token to each document "
+            "before chunking."
+        ),
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -830,6 +852,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        add_document_tokens=args.add_document_boundary_tokens,
     )
 
 
