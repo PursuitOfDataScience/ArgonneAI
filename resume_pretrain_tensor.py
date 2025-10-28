@@ -20,6 +20,7 @@ from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
     cast_state_dict_to_dtype,
+    load_streaming_shard,
     log_dataset_plan,
     safe_torch_load,
     safe_torch_save,
