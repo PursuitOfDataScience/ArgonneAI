@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -528,6 +530,7 @@ def resume_training(
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = False,
+    compile_model: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -535,6 +538,7 @@ def resume_training(
     torch.cuda.set_device(local_rank)
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
+    compile_guard = contextlib.ExitStack()
     
     if is_main_process:
         cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
@@ -690,12 +694,53 @@ def resume_training(
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
-    
+
+    if compile_model:
+        def _disable_cudagraphs(module, attr_candidates, label):
+            for attr_name in attr_candidates:
+                if not hasattr(module, attr_name):
+                    continue
+                current = getattr(module, attr_name)
+                if not current:
+                    return False
+                if is_main_process:
+                    print(
+                        f"⚠ torch.compile: disabling {label} to preserve dropout randomness"
+                    )
+                compile_guard.callback(setattr, module, attr_name, current)
+                setattr(module, attr_name, False)
+                return True
+            return False
+
+        inductor_spec = importlib.util.find_spec("torch._inductor.config")
+        if inductor_spec is not None:
+            inductor_config = importlib.import_module("torch._inductor.config")
+            # Disable cudagraph capture so dropout masks remain random step-to-step.
+            _disable_cudagraphs(
+                inductor_config,
+                ("cudagraphs", "use_cuda_graphs"),
+                "Inductor cudagraph capture",
+            )
+            triton_cfg = getattr(inductor_config, "triton", None)
+            if triton_cfg is not None:
+                _disable_cudagraphs(
+                    triton_cfg,
+                    ("cudagraphs", "use_cuda_graphs"),
+                    "Triton cudagraph capture",
+                )
+        if is_main_process:
+            print(
+                "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
+                "to fuse kernels for higher throughput"
+            )
+        model = torch.compile(model, mode="max-autotune")
+        model.train()
+
     # Create optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
+        model.parameters(),
         lr=lr,
-        weight_decay=weight_decay, 
+        weight_decay=weight_decay,
         fused=True
     )
     
@@ -932,6 +977,8 @@ def resume_training(
     if dist.is_initialized():
         dist.barrier()
 
+    compile_guard.close()
+
 
 def update_training_stats(
     tokens,
@@ -1078,6 +1125,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help=(
+            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model "
+            "to fuse kernels and improve step-time throughput. This does not reduce activation "
+            "memory usage; leaving the flag unset keeps the exact existing eager workflow."
+        ),
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1106,6 +1162,7 @@ def main():
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         add_document_tokens=args.add_document_boundary_tokens,
+        compile_model=args.compile_model,
     )
 
 
