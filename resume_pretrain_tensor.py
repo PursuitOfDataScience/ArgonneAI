@@ -779,8 +779,32 @@ def resume_training(
             "steps_completed": min(steps_completed, rewarmup_steps),
             "total_steps": rewarmup_steps,
         }
+        def _preview_lr_value(step: int) -> float:
+            preview = getattr(scheduler, "preview_lr", None)
+            if callable(preview):
+                try:
+                    return float(preview(step))
+                except Exception:
+                    pass
+
+            lr_for_step = getattr(scheduler, "_lr_for_step", None)
+            if callable(lr_for_step):
+                try:
+                    return float(lr_for_step(step))
+                except Exception:
+                    pass
+
+            last_lr = getattr(scheduler, "last_lr", None)
+            if last_lr is not None:
+                try:
+                    return float(last_lr)
+                except Exception:
+                    pass
+
+            return float(lr)
+
         if is_main_process:
-            target_lr = scheduler.preview_lr(global_step)
+            target_lr = _preview_lr_value(global_step)
             print(
                 "⚠ Using %d-step LR ramp from %.6e to %.6e after optimizer reset"
                 % (rewarmup_steps, min_lr, target_lr)
