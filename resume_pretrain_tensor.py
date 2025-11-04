@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -536,6 +538,7 @@ def resume_training(
     torch.cuda.set_device(local_rank)
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
+    compile_guard = contextlib.ExitStack()
     
     if is_main_process:
         cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
@@ -693,9 +696,36 @@ def resume_training(
         model.gradient_checkpointing_enable()
 
     if compile_model:
+        inductor_spec = importlib.util.find_spec("torch._inductor.config")
+        if inductor_spec is not None:
+            inductor_config = importlib.import_module("torch._inductor.config")
+            # Disable cudagraph capture so dropout masks remain random step-to-step.
+            if getattr(inductor_config, "cudagraphs", True):
+                if is_main_process:
+                    print(
+                        "⚠ torch.compile: disabling Inductor cudagraph capture to preserve dropout randomness"
+                    )
+                previous = getattr(inductor_config, "cudagraphs", None)
+                if previous is not None:
+                    compile_guard.callback(setattr, inductor_config, "cudagraphs", previous)
+                inductor_config.cudagraphs = False
+            triton_cfg = getattr(inductor_config, "triton", None)
+            if triton_cfg is not None and getattr(triton_cfg, "cudagraphs", True):
+                if is_main_process:
+                    print(
+                        "⚠ torch.compile: disabling Triton cudagraph capture to preserve dropout randomness"
+                    )
+                previous_triton = getattr(triton_cfg, "cudagraphs", None)
+                if previous_triton is not None:
+                    compile_guard.callback(setattr, triton_cfg, "cudagraphs", previous_triton)
+                triton_cfg.cudagraphs = False
         if is_main_process:
-            print("✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune)")
+            print(
+                "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
+                "to fuse kernels for higher throughput"
+            )
         model = torch.compile(model, mode="max-autotune")
+        model.train()
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -938,6 +968,8 @@ def resume_training(
     if dist.is_initialized():
         dist.barrier()
 
+    compile_guard.close()
+
 
 def update_training_stats(
     tokens,
@@ -1087,8 +1119,9 @@ def parse_args() -> argparse.Namespace:
         "--compile-model",
         action="store_true",
         help=(
-            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model. "
-            "When unset the workflow matches the existing eager execution."
+            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model "
+            "to fuse kernels and improve step-time throughput. This does not reduce activation "
+            "memory usage; leaving the flag unset keeps the exact existing eager workflow."
         ),
     )
     parser.add_argument(
