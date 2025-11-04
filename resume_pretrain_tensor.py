@@ -695,6 +695,8 @@ def resume_training(
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    model.force_graph_breaks = compile_model
+
     if compile_model:
         def _disable_cudagraphs(module, attr_candidates, label):
             for attr_name in attr_candidates:
@@ -733,7 +735,11 @@ def resume_training(
                 "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
                 "to fuse kernels for higher throughput"
             )
-        model = torch.compile(model, mode="max-autotune")
+        compiled_model = torch.compile(model, mode="max-autotune")
+        setattr(compiled_model, "force_graph_breaks", True)
+        if hasattr(compiled_model, "_orig_mod"):
+            setattr(compiled_model._orig_mod, "force_graph_breaks", True)
+        model = compiled_model
         model.train()
 
     # Create optimizer

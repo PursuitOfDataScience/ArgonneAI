@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch import _dynamo as dynamo
 from tqdm import tqdm
 
 from data_processing import (
@@ -457,6 +458,7 @@ class TensorParallelModel(torch.nn.Module):
         self.rank = rank
         self.device = torch.device(f"cuda:{rank}")
         self.gradient_checkpointing = False
+        self.force_graph_breaks = False
         
         # Move model to device first
         self.base_model = self.base_model.to(self.device)
@@ -476,8 +478,10 @@ class TensorParallelModel(torch.nn.Module):
         
         # All-reduce for row-parallel output projection
         if self.world_size > 1:
+            if self.force_graph_breaks and dynamo.is_compiling():
+                dynamo.graph_break()
             dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
-        
+
         hidden_states = residual + attn_output
         
         # MLP with residual
@@ -487,6 +491,8 @@ class TensorParallelModel(torch.nn.Module):
         
         # All-reduce for row-parallel down_proj
         if self.world_size > 1:
+            if self.force_graph_breaks and dynamo.is_compiling():
+                dynamo.graph_break()
             dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
         
         hidden_states = residual + mlp_output
