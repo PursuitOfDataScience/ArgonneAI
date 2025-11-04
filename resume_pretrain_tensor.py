@@ -528,6 +528,7 @@ def resume_training(
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = False,
+    compile_model: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -690,12 +691,17 @@ def resume_training(
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
-    
+
+    if compile_model:
+        if is_main_process:
+            print("✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune)")
+        model = torch.compile(model, mode="max-autotune")
+
     # Create optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
+        model.parameters(),
         lr=lr,
-        weight_decay=weight_decay, 
+        weight_decay=weight_decay,
         fused=True
     )
     
@@ -1078,6 +1084,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help=(
+            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model. "
+            "When unset the workflow matches the existing eager execution."
+        ),
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1106,6 +1120,7 @@ def main():
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         add_document_tokens=args.add_document_boundary_tokens,
+        compile_model=args.compile_model,
     )
 
 
