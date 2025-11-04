@@ -374,6 +374,18 @@ class CosineWarmupScheduler:
         self._step = step
         return lr
 
+    def preview_lr(self, step: int) -> float:
+        """Return the learning rate the scheduler would use for ``step``."""
+
+        return self._lr_for_step(step)
+
+    def override_step(self, step: int, lr: float) -> float:
+        """Apply ``lr`` manually while keeping the internal step in sync."""
+
+        self._apply_lr(lr)
+        self._step = step
+        return lr
+
     def state_dict(self) -> dict:
         return {"step": self._step}
 
