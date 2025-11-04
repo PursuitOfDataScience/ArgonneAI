@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -528,6 +530,7 @@ def resume_training(
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = False,
+    compile_model: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -535,6 +538,7 @@ def resume_training(
     torch.cuda.set_device(local_rank)
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
+    compile_guard = contextlib.ExitStack()
     
     if is_main_process:
         cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
@@ -690,18 +694,63 @@ def resume_training(
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
-    
+
+    if compile_model:
+        def _disable_cudagraphs(module, attr_candidates, label):
+            for attr_name in attr_candidates:
+                if not hasattr(module, attr_name):
+                    continue
+                current = getattr(module, attr_name)
+                if not current:
+                    return False
+                if is_main_process:
+                    print(
+                        f"⚠ torch.compile: disabling {label} to preserve dropout randomness"
+                    )
+                compile_guard.callback(setattr, module, attr_name, current)
+                setattr(module, attr_name, False)
+                return True
+            return False
+
+        inductor_spec = importlib.util.find_spec("torch._inductor.config")
+        if inductor_spec is not None:
+            inductor_config = importlib.import_module("torch._inductor.config")
+            # Disable cudagraph capture so dropout masks remain random step-to-step.
+            _disable_cudagraphs(
+                inductor_config,
+                ("cudagraphs", "use_cuda_graphs"),
+                "Inductor cudagraph capture",
+            )
+            triton_cfg = getattr(inductor_config, "triton", None)
+            if triton_cfg is not None:
+                _disable_cudagraphs(
+                    triton_cfg,
+                    ("cudagraphs", "use_cuda_graphs"),
+                    "Triton cudagraph capture",
+                )
+        if is_main_process:
+            print(
+                "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
+                "to fuse kernels for higher throughput"
+            )
+        model = torch.compile(model, mode="max-autotune")
+        model.train()
+
     # Create optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
+        model.parameters(),
         lr=lr,
-        weight_decay=weight_decay, 
+        weight_decay=weight_decay,
         fused=True
     )
-    
+
+    saved_lr_ramp_state = None
+    if load_checkpoint and resolved_checkpoint:
+        saved_lr_ramp_state = ckpt.get("lr_ramp_state")
+
     # Setup scheduler
     min_lr = min(min_lr, lr)
-    
+
     # CRITICAL: If resuming, use shorter re-warmup to stabilize
     effective_warmup = warmup_steps
     if load_checkpoint and resolved_checkpoint and global_step > 0:
@@ -710,13 +759,65 @@ def resume_training(
             print(f"⚠ Using {rewarmup_steps}-step re-warmup for resume stability")
     
     scheduler = CosineWarmupScheduler(
-        optimizer, 
-        base_lr=lr, 
+        optimizer,
+        base_lr=lr,
         warmup_steps=effective_warmup,  # Use re-warmup if resuming
-        max_steps=total_training_steps, 
+        max_steps=total_training_steps,
         min_lr=min_lr,
     )
-    
+
+    lr_ramp_tracker = None
+    if load_checkpoint and resolved_checkpoint and global_step > 0 and rewarmup_steps > 0:
+        steps_completed = 0
+        if isinstance(saved_lr_ramp_state, dict):
+            stored_total = int(saved_lr_ramp_state.get("total_steps", rewarmup_steps))
+            stored_completed = int(saved_lr_ramp_state.get("steps_completed", 0))
+            if 0 <= stored_completed < stored_total:
+                steps_completed = max(0, stored_completed)
+
+        lr_ramp_tracker = {
+            "steps_completed": min(steps_completed, rewarmup_steps),
+            "total_steps": rewarmup_steps,
+        }
+        def _preview_lr_value(step: int) -> float:
+            preview = getattr(scheduler, "preview_lr", None)
+            if callable(preview):
+                try:
+                    return float(preview(step))
+                except Exception:
+                    pass
+
+            lr_for_step = getattr(scheduler, "_lr_for_step", None)
+            if callable(lr_for_step):
+                try:
+                    return float(lr_for_step(step))
+                except Exception:
+                    pass
+
+            last_lr = getattr(scheduler, "last_lr", None)
+            if last_lr is not None:
+                try:
+                    return float(last_lr)
+                except Exception:
+                    pass
+
+            return float(lr)
+
+        if is_main_process:
+            target_lr = _preview_lr_value(global_step)
+            print(
+                "⚠ Using %d-step LR ramp from %.6e to %.6e after optimizer reset"
+                % (rewarmup_steps, min_lr, target_lr)
+            )
+            if lr_ramp_tracker["steps_completed"] > 0:
+                print(
+                    "  Continuing ramp progress: %d/%d steps already applied"
+                    % (
+                        lr_ramp_tracker["steps_completed"],
+                        lr_ramp_tracker["total_steps"],
+                    )
+                )
+
     # Do NOT load optimizer state (incompatible across parallelism schemes)
     if load_checkpoint and resolved_checkpoint:
         if is_main_process:
@@ -830,6 +931,27 @@ def resume_training(
                     tokens_in_this_session += batch_tokens
                     current_lr = scheduler.step(global_step)
 
+                    if (
+                        lr_ramp_tracker
+                        and lr_ramp_tracker.get("steps_completed", 0)
+                        < lr_ramp_tracker.get("total_steps", 0)
+                    ):
+                        completed = lr_ramp_tracker["steps_completed"]
+                        total = max(1, lr_ramp_tracker["total_steps"])
+                        ramp_scale = min((completed + 1) / total, 1.0)
+                        ramp_lr = max(min_lr, current_lr * ramp_scale)
+                        current_lr = scheduler.override_step(global_step, ramp_lr)
+                        lr_ramp_tracker["steps_completed"] = completed + 1
+
+                        if (
+                            is_main_process
+                            and lr_ramp_tracker["steps_completed"]
+                            == lr_ramp_tracker["total_steps"]
+                        ):
+                            print(
+                                "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                            )
+
                     x_local = x_tens.to(first_device)
                     y_local = y_tens.to(first_device)
                     optimizer.zero_grad(set_to_none=True)
@@ -893,6 +1015,11 @@ def resume_training(
                                 "model_state_dict": model_state,
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
+                                "lr_ramp_state": (
+                                    dict(lr_ramp_tracker)
+                                    if lr_ramp_tracker is not None
+                                    else None
+                                ),
                                 "loss": last_loss_value,
                                 "data_position": data_position.get_state(),
                                 "model_dtype": str(amp_dtype),
@@ -931,6 +1058,8 @@ def resume_training(
 
     if dist.is_initialized():
         dist.barrier()
+
+    compile_guard.close()
 
 
 def update_training_stats(
@@ -1078,6 +1207,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help=(
+            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model "
+            "to fuse kernels and improve step-time throughput. This does not reduce activation "
+            "memory usage; leaving the flag unset keeps the exact existing eager workflow."
+        ),
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1106,6 +1244,7 @@ def main():
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         add_document_tokens=args.add_document_boundary_tokens,
+        compile_model=args.compile_model,
     )
 
 
