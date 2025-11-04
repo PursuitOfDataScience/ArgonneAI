@@ -696,29 +696,38 @@ def resume_training(
         model.gradient_checkpointing_enable()
 
     if compile_model:
+        def _disable_cudagraphs(module, attr_candidates, label):
+            for attr_name in attr_candidates:
+                if not hasattr(module, attr_name):
+                    continue
+                current = getattr(module, attr_name)
+                if not current:
+                    return False
+                if is_main_process:
+                    print(
+                        f"⚠ torch.compile: disabling {label} to preserve dropout randomness"
+                    )
+                compile_guard.callback(setattr, module, attr_name, current)
+                setattr(module, attr_name, False)
+                return True
+            return False
+
         inductor_spec = importlib.util.find_spec("torch._inductor.config")
         if inductor_spec is not None:
             inductor_config = importlib.import_module("torch._inductor.config")
             # Disable cudagraph capture so dropout masks remain random step-to-step.
-            if getattr(inductor_config, "cudagraphs", True):
-                if is_main_process:
-                    print(
-                        "⚠ torch.compile: disabling Inductor cudagraph capture to preserve dropout randomness"
-                    )
-                previous = getattr(inductor_config, "cudagraphs", None)
-                if previous is not None:
-                    compile_guard.callback(setattr, inductor_config, "cudagraphs", previous)
-                inductor_config.cudagraphs = False
+            _disable_cudagraphs(
+                inductor_config,
+                ("cudagraphs", "use_cuda_graphs"),
+                "Inductor cudagraph capture",
+            )
             triton_cfg = getattr(inductor_config, "triton", None)
-            if triton_cfg is not None and getattr(triton_cfg, "cudagraphs", True):
-                if is_main_process:
-                    print(
-                        "⚠ torch.compile: disabling Triton cudagraph capture to preserve dropout randomness"
-                    )
-                previous_triton = getattr(triton_cfg, "cudagraphs", None)
-                if previous_triton is not None:
-                    compile_guard.callback(setattr, triton_cfg, "cudagraphs", previous_triton)
-                triton_cfg.cudagraphs = False
+            if triton_cfg is not None:
+                _disable_cudagraphs(
+                    triton_cfg,
+                    ("cudagraphs", "use_cuda_graphs"),
+                    "Triton cudagraph capture",
+                )
         if is_main_process:
             print(
                 "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
