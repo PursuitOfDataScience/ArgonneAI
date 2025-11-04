@@ -743,10 +743,14 @@ def resume_training(
         weight_decay=weight_decay,
         fused=True
     )
-    
+
+    saved_lr_ramp_state = None
+    if load_checkpoint and resolved_checkpoint:
+        saved_lr_ramp_state = ckpt.get("lr_ramp_state")
+
     # Setup scheduler
     min_lr = min(min_lr, lr)
-    
+
     # CRITICAL: If resuming, use shorter re-warmup to stabilize
     effective_warmup = warmup_steps
     if load_checkpoint and resolved_checkpoint and global_step > 0:
@@ -755,13 +759,41 @@ def resume_training(
             print(f"⚠ Using {rewarmup_steps}-step re-warmup for resume stability")
     
     scheduler = CosineWarmupScheduler(
-        optimizer, 
-        base_lr=lr, 
+        optimizer,
+        base_lr=lr,
         warmup_steps=effective_warmup,  # Use re-warmup if resuming
-        max_steps=total_training_steps, 
+        max_steps=total_training_steps,
         min_lr=min_lr,
     )
-    
+
+    lr_ramp_tracker = None
+    if load_checkpoint and resolved_checkpoint and global_step > 0 and rewarmup_steps > 0:
+        steps_completed = 0
+        if isinstance(saved_lr_ramp_state, dict):
+            stored_total = int(saved_lr_ramp_state.get("total_steps", rewarmup_steps))
+            stored_completed = int(saved_lr_ramp_state.get("steps_completed", 0))
+            if 0 <= stored_completed < stored_total:
+                steps_completed = max(0, stored_completed)
+
+        lr_ramp_tracker = {
+            "steps_completed": min(steps_completed, rewarmup_steps),
+            "total_steps": rewarmup_steps,
+        }
+        if is_main_process:
+            target_lr = scheduler.preview_lr(global_step)
+            print(
+                "⚠ Using %d-step LR ramp from %.6e to %.6e after optimizer reset"
+                % (rewarmup_steps, min_lr, target_lr)
+            )
+            if lr_ramp_tracker["steps_completed"] > 0:
+                print(
+                    "  Continuing ramp progress: %d/%d steps already applied"
+                    % (
+                        lr_ramp_tracker["steps_completed"],
+                        lr_ramp_tracker["total_steps"],
+                    )
+                )
+
     # Do NOT load optimizer state (incompatible across parallelism schemes)
     if load_checkpoint and resolved_checkpoint:
         if is_main_process:
@@ -875,6 +907,27 @@ def resume_training(
                     tokens_in_this_session += batch_tokens
                     current_lr = scheduler.step(global_step)
 
+                    if (
+                        lr_ramp_tracker
+                        and lr_ramp_tracker.get("steps_completed", 0)
+                        < lr_ramp_tracker.get("total_steps", 0)
+                    ):
+                        completed = lr_ramp_tracker["steps_completed"]
+                        total = max(1, lr_ramp_tracker["total_steps"])
+                        ramp_scale = min((completed + 1) / total, 1.0)
+                        ramp_lr = max(min_lr, current_lr * ramp_scale)
+                        current_lr = scheduler.override_step(global_step, ramp_lr)
+                        lr_ramp_tracker["steps_completed"] = completed + 1
+
+                        if (
+                            is_main_process
+                            and lr_ramp_tracker["steps_completed"]
+                            == lr_ramp_tracker["total_steps"]
+                        ):
+                            print(
+                                "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                            )
+
                     x_local = x_tens.to(first_device)
                     y_local = y_tens.to(first_device)
                     optimizer.zero_grad(set_to_none=True)
@@ -938,6 +991,11 @@ def resume_training(
                                 "model_state_dict": model_state,
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
+                                "lr_ramp_state": (
+                                    dict(lr_ramp_tracker)
+                                    if lr_ramp_tracker is not None
+                                    else None
+                                ),
                                 "loss": last_loss_value,
                                 "data_position": data_position.get_state(),
                                 "model_dtype": str(amp_dtype),
