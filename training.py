@@ -473,7 +473,6 @@ class TensorParallelModel(torch.nn.Module):
         self.rank = rank
         self.device = torch.device(f"cuda:{rank}")
         self.gradient_checkpointing = False
-        self.force_graph_breaks = False
         
         # Move model to device first
         self.base_model = self.base_model.to(self.device)
@@ -491,13 +490,11 @@ class TensorParallelModel(torch.nn.Module):
         normed = block.input_norm(hidden_states)
         attn_output = block.attn(normed, position_embeddings, attention_mask)
         
-        # Always ensure contiguity for tensor parallel all-reduce (required for cudagraphs)
         attn_output = attn_output.contiguous()
         
         # All-reduce for row-parallel output projection
         if self.world_size > 1:
-            # Use non-compiled wrapper to prevent cudagraph capture
-            attn_output = _allreduce_non_compiled(attn_output)
+            dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
 
         hidden_states = residual + attn_output
         
@@ -506,13 +503,11 @@ class TensorParallelModel(torch.nn.Module):
         normed = block.post_norm(hidden_states)
         mlp_output = block.mlp(normed)
         
-        # Always ensure contiguity for tensor parallel all-reduce (required for cudagraphs)
         mlp_output = mlp_output.contiguous()
         
         # All-reduce for row-parallel down_proj
         if self.world_size > 1:
-            # Use non-compiled wrapper to prevent cudagraph capture
-            mlp_output = _allreduce_non_compiled(mlp_output)
+            dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
         
         hidden_states = residual + mlp_output
         
@@ -534,7 +529,7 @@ class TensorParallelModel(torch.nn.Module):
         cos, sin = self.base_model.rotary_emb(hidden_states, t)
         position_embeddings = (cos, sin)
         
-        # Process through blocks with gradient checkpointing (always per-block for stability)
+        # Process through blocks with simple per-block gradient checkpointing
         if self.gradient_checkpointing and self.training:
             for block in self.base_model.blocks:
                 hidden_states = torch.utils.checkpoint.checkpoint(
@@ -546,7 +541,7 @@ class TensorParallelModel(torch.nn.Module):
                     use_reentrant=False
                 )
         else:
-            # No checkpointing - process all blocks normally
+            # No checkpointing
             for block in self.base_model.blocks:
                 hidden_states = self._block_forward(block, hidden_states, position_embeddings, attention_mask)
         
@@ -578,14 +573,12 @@ class TensorParallelModel(torch.nn.Module):
 
             input_ids = input_ids.to(self.device)
 
-            # Make sure all ranks start with the same prompt when using tensor parallelism
+            # Make sure all ranks start with the same prompt
             if self.world_size > 1 and dist.is_initialized():
-                # Broadcast prompt length first to avoid shape mismatches
                 prompt_length = torch.tensor([input_ids.shape[1]], device=self.device, dtype=torch.long)
                 dist.broadcast(prompt_length, src=0)
 
                 if input_ids.shape[1] != int(prompt_length.item()):
-                    # Resize tensor for non-src ranks and broadcast prompt contents
                     new_prompt = torch.zeros(input_ids.shape[0], prompt_length.item(), dtype=input_ids.dtype, device=self.device)
                     if self.rank == 0:
                         new_prompt.copy_(input_ids[:, :prompt_length.item()])
@@ -649,10 +642,10 @@ class TensorParallelModel(torch.nn.Module):
         return self.base_model.parameters()
     
     def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing to reduce memory usage (always per-block for stability)."""
+        """Enable per-block gradient checkpointing."""
         self.gradient_checkpointing = True
         if self.rank == 0:
-            print(f"✓ Gradient checkpointing enabled (per-block for maximum stability)")
+            print(f"✓ Gradient checkpointing enabled (per-block)")
     
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing"""
@@ -1115,6 +1108,7 @@ def main():
         weight_decay=args.weight_decay,
         trust_remote_code=args.trust_remote_code,
     )
+
 
 
 if __name__ == "__main__":

@@ -519,9 +519,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
-    checkpoint_segments: int = 4,  # Changed from 1 to 4 for better speed/memory balance
     add_document_tokens: bool = False,
-    compile_model: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -753,58 +751,11 @@ def resume_training(
             if is_main_process:
                 print("✓ Loaded tensor-parallel shard weights with strict=False")
 
-    # Enable gradient checkpointing if requested (always per-block)
+    # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    model.force_graph_breaks = compile_model
-
-    if compile_model:
-        inductor_spec = importlib.util.find_spec("torch._inductor.config")
-        if inductor_spec is not None:
-            inductor_config = importlib.import_module("torch._inductor.config")
-            
-            # Disable cudagraphs comprehensively - CRITICAL for tensor parallelism
-            if is_main_process:
-                print("⚠ Disabling cudagraphs for tensor parallel + compile compatibility")
-            
-            # Method 1: Direct config attributes
-            for attr in ["cudagraphs", "triton_cudagraphs"]:
-                if hasattr(inductor_config, attr):
-                    old_val = getattr(inductor_config, attr)
-                    compile_guard.callback(setattr, inductor_config, attr, old_val)
-                    setattr(inductor_config, attr, False)
-                    if is_main_process:
-                        print(f"  Set inductor_config.{attr} = False")
-            
-            # Method 2: Triton-specific config
-            if hasattr(inductor_config, "triton"):
-                triton_cfg = inductor_config.triton
-                for attr in ["cudagraphs", "cudagraph_trees"]:
-                    if hasattr(triton_cfg, attr):
-                        old_val = getattr(triton_cfg, attr)
-                        compile_guard.callback(setattr, triton_cfg, attr, old_val)
-                        setattr(triton_cfg, attr, False)
-                        if is_main_process:
-                            print(f"  Set triton.{attr} = False")
-            
-            # Method 3: Disable cudagraph trees (new in recent PyTorch)
-            if hasattr(inductor_config, "triton_cudagraph_trees"):
-                compile_guard.callback(setattr, inductor_config, "triton_cudagraph_trees", inductor_config.triton_cudagraph_trees)
-                inductor_config.triton_cudagraph_trees = False
-                if is_main_process:
-                    print("  Set inductor_config.triton_cudagraph_trees = False")
-        
-        if is_main_process:
-            print("✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune, cudagraphs=DISABLED)")
-            print("  Note: Cudagraphs are incompatible with distributed collectives")
-        
-        compiled_model = torch.compile(model, mode="max-autotune", fullgraph=False, dynamic=False)
-        setattr(compiled_model, "force_graph_breaks", True)
-        if hasattr(compiled_model, "_orig_mod"):
-            setattr(compiled_model._orig_mod, "force_graph_breaks", True)
-        model = compiled_model
-        model.train()
+    # NO TORCH.COMPILE - removed entirely
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -1060,8 +1011,10 @@ def resume_training(
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
                         print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                    if global_step % 1200 == 0:  # Changed from 600 to 1200 to reduce checkpoint frequency
+                    if global_step % 1200 == 0:
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
+                        
+                        # Generate on all ranks to keep collectives in sync
                         prompt_str = "Long long time ago, "
                         token_ids = hf_tokenizer.encode(prompt_str)
                         prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
@@ -1077,32 +1030,14 @@ def resume_training(
                         if is_main_process:
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                        # Move shard gathering to CPU to avoid GPU OOM
-                        import gc
-                        torch.cuda.empty_cache()  # Free unused GPU memory before gathering
-                        
-                        local_state_cpu = _state_dict_to_cpu(model.base_model.state_dict())
-                        gathered_shards: Optional[List[Dict[str, torch.Tensor]]] = None
-                        if dist.is_initialized() and world_size > 1:
-                            shard_list: Optional[List[Dict[str, torch.Tensor]]] = [None] * world_size if is_main_process else None
-                            dist.gather_object(local_state_cpu, shard_list, dst=0)
-                            if is_main_process:
-                                gathered_shards = shard_list  # type: ignore[assignment]
-                        else:
-                            gathered_shards = [local_state_cpu]
-
-                        if is_main_process and gathered_shards is not None:
-                            shard_states_cpu = [cast_state_dict_to_dtype(shard, torch.float32) for shard in gathered_shards]
-                            full_state_cpu = merge_tensor_parallel_shards(shard_states_cpu)
-                            model_state = cast_state_dict_to_dtype(full_state_cpu, amp_dtype)
-                            shard_payload = [cast_state_dict_to_dtype(shard, amp_dtype) for shard in shard_states_cpu]
-
+                            
+                            # SIMPLE: Just save rank 0's model state (sharded weights)
+                            model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+                            
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model_state,
-                                "tensor_parallel_shards": shard_payload,
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": (
@@ -1121,10 +1056,6 @@ def resume_training(
                             save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                             safe_torch_save(checkpoint_state, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                            
-                            # Clean up gathered shards from memory
-                            del gathered_shards, shard_states_cpu, full_state_cpu, model_state, shard_payload, checkpoint_state
-                            gc.collect()
 
                 except StopIteration:
                     if is_main_process:
@@ -1152,64 +1083,6 @@ def resume_training(
 
     if dist.is_initialized():
         dist.barrier()
-
-    compile_guard.close()
-
-
-def update_training_stats(
-    tokens,
-    batch_size,
-    steps,
-    model,
-    n_layer,
-    n_head,
-    n_embd,
-    *,
-    base_lr: float | None = None,
-    min_lr: float | None = None,
-    warmup_steps: int | None = None,
-    max_steps: int | None = None,
-    final: bool = False,
-):
-    """Update the training statistics file with current information"""
-    model_params = sum(p.numel() for p in model.parameters())
-    
-    training_stats = {
-        "total_tokens": tokens,
-        "batch_size": batch_size,
-        "global_steps": steps,
-        "n_layer": n_layer,
-        "n_head": n_head,
-        "n_embd": n_embd,
-        "model_params": model_params,
-        "final_training": final,
-        "parallelism_type": "tensor_parallel"
-    }
-
-    if base_lr is not None:
-        training_stats["base_learning_rate"] = base_lr
-    if min_lr is not None:
-        training_stats["min_learning_rate"] = min_lr
-    if warmup_steps is not None:
-        training_stats["warmup_steps"] = warmup_steps
-    if max_steps is not None:
-        training_stats["max_steps"] = max_steps
-    
-    os.makedirs("stats", exist_ok=True)
-    
-    if final:
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"stats/final_training_stats_tensor_parallel_{timestamp}.json"
-    else:
-        filename = f"stats/current_training_stats_tensor_parallel_step_{steps}.json"
-        
-    with open(filename, "w") as f:
-        json.dump(training_stats, f, indent=2)
-    
-    if final:
-        print(f"Final training stats saved to: {filename}")
-    return filename
 
 
 def parse_args() -> argparse.Namespace:
@@ -1300,22 +1173,14 @@ def parse_args() -> argparse.Namespace:
             "before chunking."
         ),
     )
-    parser.add_argument(
-        "--compile-model",
-        action="store_true",
-        help=(
-            "Enable torch.compile with the 'max-autotune' mode for the tensor parallel model "
-            "to fuse kernels and improve step-time throughput. This does not reduce activation "
-            "memory usage; leaving the flag unset keeps the exact existing eager workflow."
-        ),
-    )
+    # REMOVED: --compile-model argument
+    # REMOVED: --checkpoint-segments argument
     parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
         help="Local rank for distributed training.",
     )
-    # Removed --checkpoint-segments argument (always use per-block checkpointing for stability)
     return parser.parse_args()
 
 
@@ -1339,7 +1204,6 @@ def main():
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         add_document_tokens=args.add_document_boundary_tokens,
-        compile_model=args.compile_model,
     )
 
 
