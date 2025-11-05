@@ -5,7 +5,7 @@ import importlib.util
 import json
 import os
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -53,6 +53,73 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
+
+
+COLUMN_PARALLEL_WEIGHT_SUFFIXES = (
+    ".attn.q_proj.weight",
+    ".attn.k_proj.weight",
+    ".attn.v_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+)
+
+ROW_PARALLEL_WEIGHT_SUFFIXES = (
+    ".attn.o_proj.weight",
+    ".mlp.down_proj.weight",
+)
+
+COLUMN_PARALLEL_BIAS_SUFFIXES = (
+    ".attn.q_proj.bias",
+    ".attn.k_proj.bias",
+    ".attn.v_proj.bias",
+    ".mlp.gate_proj.bias",
+    ".mlp.up_proj.bias",
+)
+
+
+def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    cpu_state: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cpu_state[key] = value.detach().cpu()
+        else:
+            cpu_state[key] = value
+    return cpu_state
+
+
+def merge_tensor_parallel_shards(
+    shard_states: Sequence[Mapping[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    """Reconstruct full weights from tensor-parallel shards."""
+
+    shard_list: List[Mapping[str, torch.Tensor]] = list(shard_states)
+    if not shard_list:
+        return {}
+
+    all_keys = set()
+    for shard in shard_list:
+        all_keys.update(shard.keys())
+
+    full_state: Dict[str, torch.Tensor] = {}
+    for key in sorted(all_keys):
+        values = [shard.get(key) for shard in shard_list]
+        tensors = [value for value in values if isinstance(value, torch.Tensor)]
+        if not tensors:
+            continue
+
+        if key.endswith(COLUMN_PARALLEL_WEIGHT_SUFFIXES):
+            full_state[key] = torch.cat(tensors, dim=0)
+        elif key.endswith(COLUMN_PARALLEL_BIAS_SUFFIXES):
+            full_state[key] = torch.cat(tensors, dim=0)
+        elif key.endswith(ROW_PARALLEL_WEIGHT_SUFFIXES):
+            # Skip ranks that do not hold this shard (bias-less linears)
+            ordered = [value for value in values if isinstance(value, torch.Tensor)]
+            full_state[key] = torch.cat(ordered, dim=1)
+        else:
+            # Parameters replicated on all ranks (embeddings, norms, lm_head, biases)
+            full_state[key] = tensors[0]
+
+    return full_state
 
 
 def streaming_token_generator(
@@ -389,88 +456,6 @@ def _resolve_checkpoint_path(checkpoint_path: Optional[str], rank: int = 0) -> O
     return latest_path
 
 
-def reconstruct_full_weights_from_sharded(state_dict: dict, world_size: int, rank: int = 0) -> dict:
-    """
-    Reconstruct full model weights from a tensor-parallel sharded checkpoint.
-    
-    This handles checkpoints saved by training.py which contain already-sharded weights.
-    """
-    if rank == 0:
-        print("Detected sharded checkpoint - reconstructing full weights...")
-    
-    # Check if this is actually a sharded checkpoint
-    sample_key = "blocks.0.attn.q_proj.weight"
-    if sample_key in state_dict:
-        expected_full_size = 4080  # Full q_proj should be [4080, 4080]
-        actual_size = state_dict[sample_key].shape[0]
-        
-        if actual_size == expected_full_size:
-            if rank == 0:
-                print("  Checkpoint contains full weights already - no reconstruction needed")
-            return state_dict
-    
-    # This is a sharded checkpoint - we need to reconstruct
-    # For tensor parallel checkpoints, we only have rank 0's shard
-    # We'll expand it back to full size by replicating (for resuming from scratch)
-    
-    reconstructed = {}
-    
-    for key, value in state_dict.items():
-        # Check if this is a sharded attention layer
-        if '.attn.q_proj.weight' in key or '.attn.k_proj.weight' in key or '.attn.v_proj.weight' in key:
-            # Column-parallel: out_features was sharded
-            # Original: [full_out, in] -> Sharded: [shard_out, in]
-            # Reconstruct by replicating world_size times
-            full_out = value.shape[0] * world_size
-            full_weight = value.repeat(world_size, 1)
-            reconstructed[key] = full_weight
-            if rank == 0 and 'blocks.0' in key:
-                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
-                
-        elif '.attn.o_proj.weight' in key:
-            # Row-parallel: in_features was sharded
-            # Original: [out, full_in] -> Sharded: [out, shard_in]
-            full_in = value.shape[1] * world_size
-            full_weight = value.repeat(1, world_size)
-            reconstructed[key] = full_weight
-            if rank == 0 and 'blocks.0' in key:
-                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
-                
-        elif '.mlp.gate_proj.weight' in key or '.mlp.up_proj.weight' in key:
-            # Column-parallel MLP
-            full_out = value.shape[0] * world_size
-            full_weight = value.repeat(world_size, 1)
-            reconstructed[key] = full_weight
-            if rank == 0 and 'blocks.0' in key:
-                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
-                
-        elif '.mlp.down_proj.weight' in key:
-            # Row-parallel MLP
-            full_in = value.shape[1] * world_size
-            full_weight = value.repeat(1, world_size)
-            reconstructed[key] = full_weight
-            if rank == 0 and 'blocks.0' in key:
-                print(f"  Reconstructed {key}: {value.shape} -> {full_weight.shape}")
-                
-        # Check for sharded biases
-        elif '.attn.q_proj.bias' in key or '.attn.k_proj.bias' in key or '.attn.v_proj.bias' in key:
-            full_bias = value.repeat(world_size)
-            reconstructed[key] = full_bias
-        elif '.mlp.gate_proj.bias' in key or '.mlp.up_proj.bias' in key:
-            full_bias = value.repeat(world_size)
-            reconstructed[key] = full_bias
-        elif '.attn.o_proj.bias' in key or '.mlp.down_proj.bias' in key:
-            # Row-parallel bias - only rank 0 has it, already full
-            reconstructed[key] = value
-        else:
-            # Not a sharded parameter
-            reconstructed[key] = value
-    
-    if rank == 0:
-        print(f"✓ Reconstructed full weights from sharded checkpoint")
-    
-    return reconstructed
-
 
 def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, rank: int = 0) -> bool:
     """
@@ -634,56 +619,93 @@ def resume_training(
     # Create base model (keep parameters in FP32 for stable optimizer state)
     base_model = ArgonneModel(config)
 
+    checkpoint_tensor_shards: Optional[List[Dict[str, torch.Tensor]]] = None
+    load_shards_after_wrap = False
+
     if load_checkpoint and resolved_checkpoint:
-        # Load checkpoint
         ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
-        
-        # Check if checkpoint is from tensor parallel training
+
         checkpoint_world_size = ckpt.get("world_size", 1)
         is_tensor_checkpoint = ckpt.get("tensor_parallel", False)
-        
-        # Handle compiled model checkpoints
-        if any(k.startswith("_orig_mod.") for k in ckpt["model_state_dict"].keys()):
+
+        raw_state_dict = ckpt.get("model_state_dict", {}) or {}
+        raw_shard_list = ckpt.get("tensor_parallel_shards")
+
+        def _normalize_keys(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            if not state_dict:
+                return {}
+            needs_conversion = any(k.startswith("_orig_mod.") for k in state_dict.keys())
+            if not needs_conversion:
+                return dict(state_dict)
             if is_main_process:
                 print("Detected compiled model checkpoint, converting parameter names...")
-            new_state_dict = {}
-            for k, v in ckpt["model_state_dict"].items():
-                if k.startswith("_orig_mod."):
-                    new_key = k.replace("_orig_mod.", "")
-                    new_state_dict[new_key] = v
-                else:
-                    new_state_dict[k] = v
-            ckpt["model_state_dict"] = new_state_dict
-        
-        # CRITICAL FIX: Reconstruct full weights if loading from sharded checkpoint
-        if is_tensor_checkpoint and checkpoint_world_size > 1:
-            if is_main_process:
-                print(f"Reconstructing full weights from {checkpoint_world_size}-way sharded checkpoint...")
-            ckpt["model_state_dict"] = reconstruct_full_weights_from_sharded(
-                ckpt["model_state_dict"], 
-                checkpoint_world_size, 
-                rank
+            converted: Dict[str, torch.Tensor] = {}
+            for key, value in state_dict.items():
+                new_key = key.replace("_orig_mod.", "") if key.startswith("_orig_mod.") else key
+                converted[new_key] = value
+            return converted
+
+        raw_state_dict = _normalize_keys(raw_state_dict)
+
+        shard_states: Optional[List[Dict[str, torch.Tensor]]] = None
+        if isinstance(raw_shard_list, (list, tuple)) and raw_shard_list:
+            shard_states = []
+            for shard in raw_shard_list:
+                normalized = _normalize_keys(shard)
+                shard_states.append(cast_state_dict_to_dtype(_state_dict_to_cpu(normalized), torch.float32))
+
+        model_state_cpu: Dict[str, torch.Tensor] = {}
+        if raw_state_dict:
+            model_state_cpu = cast_state_dict_to_dtype(_state_dict_to_cpu(raw_state_dict), torch.float32)
+
+        if shard_states and len(shard_states) != checkpoint_world_size:
+            raise RuntimeError(
+                "Checkpoint provides tensor_parallel_shards but the list length does not match the saved world size."
             )
-        
-        converted_state = cast_state_dict_to_dtype(ckpt["model_state_dict"], torch.float32)
-        
-        # Load weights
-        try:
-            base_model.load_state_dict(converted_state, strict=True)
-            if is_main_process:
-                print("✓ Loaded checkpoint with strict=True (exact match)")
-        except RuntimeError as e:
-            if is_main_process:
-                print(f"⚠ Strict loading failed: {e}")
-                print("  Attempting non-strict loading...")
-            base_model.load_state_dict(converted_state, strict=False)
-            if is_main_process:
-                print("✓ Loaded checkpoint with strict=False (some keys may be missing)")
-        
-        # Get checkpoint info
+
+        sample_key = "blocks.0.attn.q_proj.weight"
+        if model_state_cpu and sample_key in model_state_cpu:
+            expected = config.hidden_size
+            if model_state_cpu[sample_key].shape[0] != expected and not shard_states:
+                raise RuntimeError(
+                    "Checkpoint appears to contain sharded weights but does not include "
+                    "tensor_parallel_shards metadata. Please convert the checkpoint with the latest "
+                    "tensor parallel saver before resuming."
+                )
+
+        if shard_states and checkpoint_world_size == world_size:
+            load_shards_after_wrap = True
+            checkpoint_tensor_shards = shard_states
+        else:
+            if shard_states and checkpoint_world_size != world_size:
+                if is_main_process:
+                    print(
+                        "Merging tensor-parallel shards from checkpoint to rebuild full weights "
+                        "(checkpoint world size=%d, target world size=%d)..."
+                        % (checkpoint_world_size, world_size)
+                    )
+                model_state_cpu = merge_tensor_parallel_shards(shard_states)
+
+            if not model_state_cpu:
+                raise RuntimeError(
+                    "Checkpoint does not contain full weights to load after merging tensor parallel shards."
+                )
+
+            try:
+                base_model.load_state_dict(model_state_cpu, strict=True)
+                if is_main_process:
+                    print("✓ Loaded checkpoint with strict=True (exact match)")
+            except RuntimeError as e:
+                if is_main_process:
+                    print(f"⚠ Strict loading failed: {e}")
+                    print("  Attempting non-strict loading...")
+                base_model.load_state_dict(model_state_cpu, strict=False)
+                if is_main_process:
+                    print("✓ Loaded checkpoint with strict=False (some keys may be missing)")
+
         global_step = ckpt.get("global_step", 0)
         total_tokens_processed = ckpt.get("tokens_processed", 0)
-        
+
         if is_main_process:
             print(f"✓ Loaded checkpoint from step {global_step}, tokens: {total_tokens_processed:,}")
             checkpoint_type = "pipeline parallel" if ckpt.get("pipeline_parallel") else "tensor parallel"
@@ -696,6 +718,24 @@ def resume_training(
     
     # Create tensor parallel wrapper
     model = TensorParallelModel(base_model, world_size, rank)
+
+    if load_shards_after_wrap and checkpoint_tensor_shards:
+        if len(checkpoint_tensor_shards) != world_size:
+            raise RuntimeError(
+                "tensor_parallel_shards length does not match current world size; cannot load shard weights."
+            )
+        shard_state = checkpoint_tensor_shards[rank]
+        try:
+            model.base_model.load_state_dict(shard_state, strict=True)
+            if is_main_process:
+                print("✓ Loaded tensor-parallel shard weights with strict=True")
+        except RuntimeError as shard_err:
+            if is_main_process:
+                print(f"⚠ Strict shard loading failed: {shard_err}")
+                print("  Falling back to strict=False for shard weights")
+            model.base_model.load_state_dict(shard_state, strict=False)
+            if is_main_process:
+                print("✓ Loaded tensor-parallel shard weights with strict=False")
 
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
@@ -1022,11 +1062,27 @@ def resume_training(
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                            model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+                        local_state_cpu = _state_dict_to_cpu(model.base_model.state_dict())
+                        gathered_shards: Optional[List[Dict[str, torch.Tensor]]] = None
+                        if dist.is_initialized() and world_size > 1:
+                            shard_list: Optional[List[Dict[str, torch.Tensor]]] = [None] * world_size if is_main_process else None
+                            dist.gather_object(local_state_cpu, shard_list, dst=0)
+                            if is_main_process:
+                                gathered_shards = shard_list  # type: ignore[assignment]
+                        else:
+                            gathered_shards = [local_state_cpu]
+
+                        if is_main_process and gathered_shards is not None:
+                            shard_states_cpu = [cast_state_dict_to_dtype(shard, torch.float32) for shard in gathered_shards]
+                            full_state_cpu = merge_tensor_parallel_shards(shard_states_cpu)
+                            model_state = cast_state_dict_to_dtype(full_state_cpu, amp_dtype)
+                            shard_payload = [cast_state_dict_to_dtype(shard, amp_dtype) for shard in shard_states_cpu]
+
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model_state,
+                                "tensor_parallel_shards": shard_payload,
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": (
