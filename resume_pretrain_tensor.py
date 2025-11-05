@@ -7,6 +7,11 @@ import os
 import re
 from typing import List, Optional, Sequence, Tuple
 
+# CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
+# This is the most reliable way to prevent cudagraph capture in compiled models
+os.environ["TORCH_CUDAGRAPH_DISABLE"] = "1"
+os.environ["TORCH_INDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -529,6 +534,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
+    checkpoint_segments: int = 4,  # Changed from 1 to 4 for better speed/memory balance
     add_document_tokens: bool = False,
     compile_model: bool = False,
 ):
@@ -693,49 +699,51 @@ def resume_training(
 
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(checkpoint_segments=checkpoint_segments)
 
     model.force_graph_breaks = compile_model
 
     if compile_model:
-        def _disable_cudagraphs(module, attr_candidates, label):
-            for attr_name in attr_candidates:
-                if not hasattr(module, attr_name):
-                    continue
-                current = getattr(module, attr_name)
-                if not current:
-                    return False
-                if is_main_process:
-                    print(
-                        f"⚠ torch.compile: disabling {label} to preserve dropout randomness"
-                    )
-                compile_guard.callback(setattr, module, attr_name, current)
-                setattr(module, attr_name, False)
-                return True
-            return False
-
         inductor_spec = importlib.util.find_spec("torch._inductor.config")
         if inductor_spec is not None:
             inductor_config = importlib.import_module("torch._inductor.config")
-            # Disable cudagraph capture so dropout masks remain random step-to-step.
-            _disable_cudagraphs(
-                inductor_config,
-                ("cudagraphs", "use_cuda_graphs"),
-                "Inductor cudagraph capture",
-            )
-            triton_cfg = getattr(inductor_config, "triton", None)
-            if triton_cfg is not None:
-                _disable_cudagraphs(
-                    triton_cfg,
-                    ("cudagraphs", "use_cuda_graphs"),
-                    "Triton cudagraph capture",
-                )
+            
+            # Disable cudagraphs comprehensively - CRITICAL for tensor parallelism
+            if is_main_process:
+                print("⚠ Disabling cudagraphs for tensor parallel + compile compatibility")
+            
+            # Method 1: Direct config attributes
+            for attr in ["cudagraphs", "triton_cudagraphs"]:
+                if hasattr(inductor_config, attr):
+                    old_val = getattr(inductor_config, attr)
+                    compile_guard.callback(setattr, inductor_config, attr, old_val)
+                    setattr(inductor_config, attr, False)
+                    if is_main_process:
+                        print(f"  Set inductor_config.{attr} = False")
+            
+            # Method 2: Triton-specific config
+            if hasattr(inductor_config, "triton"):
+                triton_cfg = inductor_config.triton
+                for attr in ["cudagraphs", "cudagraph_trees"]:
+                    if hasattr(triton_cfg, attr):
+                        old_val = getattr(triton_cfg, attr)
+                        compile_guard.callback(setattr, triton_cfg, attr, old_val)
+                        setattr(triton_cfg, attr, False)
+                        if is_main_process:
+                            print(f"  Set triton.{attr} = False")
+            
+            # Method 3: Disable cudagraph trees (new in recent PyTorch)
+            if hasattr(inductor_config, "triton_cudagraph_trees"):
+                compile_guard.callback(setattr, inductor_config, "triton_cudagraph_trees", inductor_config.triton_cudagraph_trees)
+                inductor_config.triton_cudagraph_trees = False
+                if is_main_process:
+                    print("  Set inductor_config.triton_cudagraph_trees = False")
+        
         if is_main_process:
-            print(
-                "✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune) "
-                "to fuse kernels for higher throughput"
-            )
-        compiled_model = torch.compile(model, mode="max-autotune")
+            print("✓ Compiling tensor-parallel model with torch.compile (mode=max-autotune, cudagraphs=DISABLED)")
+            print("  Note: Cudagraphs are incompatible with distributed collectives")
+        
+        compiled_model = torch.compile(model, mode="max-autotune", fullgraph=False, dynamic=False)
         setattr(compiled_model, "force_graph_breaks", True)
         if hasattr(compiled_model, "_orig_mod"):
             setattr(compiled_model._orig_mod, "force_graph_breaks", True)
@@ -1227,6 +1235,12 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Local rank for distributed training.",
     )
+    parser.add_argument(
+        "--checkpoint-segments",
+        type=int,
+        default=4,  # Changed from 1 to 4 for better speed/memory balance
+        help="Number of transformer blocks to checkpoint together (1=max memory savings, 2-4=balanced, >4=faster)",
+    )
     return parser.parse_args()
 
 
@@ -1249,6 +1263,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        checkpoint_segments=args.checkpoint_segments,
         add_document_tokens=args.add_document_boundary_tokens,
         compile_model=args.compile_model,
     )
