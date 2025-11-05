@@ -534,45 +534,17 @@ class TensorParallelModel(torch.nn.Module):
         cos, sin = self.base_model.rotary_emb(hidden_states, t)
         position_embeddings = (cos, sin)
         
-        # Process through blocks with configurable checkpointing
+        # Process through blocks with gradient checkpointing (always per-block for stability)
         if self.gradient_checkpointing and self.training:
-            num_blocks = len(self.base_model.blocks)
-            checkpoint_segments = getattr(self, 'checkpoint_segments', 1)
-            
-            # Process blocks in segments
-            for seg_start in range(0, num_blocks, checkpoint_segments):
-                seg_end = min(seg_start + checkpoint_segments, num_blocks)
-                
-                if checkpoint_segments == 1:
-                    # Checkpoint each block individually (original behavior)
-                    block = self.base_model.blocks[seg_start]
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        self._block_forward, 
-                        block, 
-                        hidden_states,
-                        position_embeddings,
-                        attention_mask,
-                        use_reentrant=False
-                    )
-                else:
-                    # Checkpoint multiple blocks together
-                    def segment_forward(hidden, pos_emb, attn_mask):
-                        for block_idx in range(seg_start, seg_end):
-                            hidden = self._block_forward(
-                                self.base_model.blocks[block_idx],
-                                hidden,
-                                pos_emb,
-                                attn_mask
-                            )
-                        return hidden
-                    
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        segment_forward,
-                        hidden_states,
-                        position_embeddings,
-                        attention_mask,
-                        use_reentrant=False
-                    )
+            for block in self.base_model.blocks:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    self._block_forward, 
+                    block, 
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    use_reentrant=False
+                )
         else:
             # No checkpointing - process all blocks normally
             for block in self.base_model.blocks:
@@ -676,25 +648,15 @@ class TensorParallelModel(torch.nn.Module):
         """Get parameters from base model"""
         return self.base_model.parameters()
     
-    def gradient_checkpointing_enable(self, checkpoint_segments: int = 1):
-        """
-        Enable gradient checkpointing to reduce memory usage.
-        
-        Args:
-            checkpoint_segments: Number of transformer blocks to group together for checkpointing.
-                - 1 (default): Checkpoint every block individually (maximum memory savings)
-                - 2-4: Checkpoint every N blocks (moderate memory/speed tradeoff)
-                - >4: Checkpoint less frequently (less memory savings, faster training)
-        """
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing to reduce memory usage (always per-block for stability)."""
         self.gradient_checkpointing = True
-        self.checkpoint_segments = max(1, checkpoint_segments)
         if self.rank == 0:
-            print(f"✓ Gradient checkpointing enabled (segments={self.checkpoint_segments})")
+            print(f"✓ Gradient checkpointing enabled (per-block for maximum stability)")
     
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing"""
         self.gradient_checkpointing = False
-        self.checkpoint_segments = 1
 
 
 def train_from_scratch_tensor_parallel(
@@ -709,7 +671,6 @@ def train_from_scratch_tensor_parallel(
     warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
-    checkpoint_segments: int = 1,
 ):
     """
     Train model from scratch with tensor parallelism and automatic batch size tuning.
@@ -807,7 +768,7 @@ def train_from_scratch_tensor_parallel(
             
             # Create tensor parallel wrapper
             model = TensorParallelModel(base_model, world_size, rank)
-            model.gradient_checkpointing_enable(checkpoint_segments=checkpoint_segments)  # Tune this: 1-4
+            model.gradient_checkpointing_enable()
             
             # Create optimizer
             optimizer = torch.optim.AdamW(
@@ -1135,12 +1096,7 @@ def parse_args():
         default=-1,
         help="Local rank for distributed training.",
     )
-    parser.add_argument(
-        "--checkpoint-segments",
-        type=int,
-        default=4,  # Changed from 1 to 4 for better speed/memory balance
-        help="Number of transformer blocks to checkpoint together (1=max memory savings, 2-4=balanced, >4=faster)",
-    )
+    # Removed --checkpoint-segments argument (always use per-block checkpointing for stability)
     return parser.parse_args()
 
 
@@ -1158,9 +1114,9 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         trust_remote_code=args.trust_remote_code,
-        checkpoint_segments=args.checkpoint_segments,
     )
 
 
 if __name__ == "__main__":
     main()
+ 

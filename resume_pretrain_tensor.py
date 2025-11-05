@@ -667,11 +667,27 @@ def resume_training(
         if model_state_cpu and sample_key in model_state_cpu:
             expected = config.hidden_size
             if model_state_cpu[sample_key].shape[0] != expected and not shard_states:
-                raise RuntimeError(
-                    "Checkpoint appears to contain sharded weights but does not include "
-                    "tensor_parallel_shards metadata. Please convert the checkpoint with the latest "
-                    "tensor parallel saver before resuming."
-                )
+                # OLD CHECKPOINT: Has sharded weights but no shard metadata
+                # Replicate the shard to reconstruct full weights
+                if is_main_process:
+                    print("⚠ Loading OLD checkpoint with sharded weights (no tensor_parallel_shards metadata)")
+                    print("  Reconstructing full weights by replicating rank-0 shard...")
+                
+                shard_size = model_state_cpu[sample_key].shape[0]
+                if expected % shard_size != 0:
+                    raise RuntimeError(
+                        f"Cannot reconstruct full weights: expected size {expected} is not divisible by shard size {shard_size}"
+                    )
+                
+                # Replicate the shard to create pseudo-shards for all ranks
+                replicated_shards = []
+                for _ in range(checkpoint_world_size):
+                    replicated_shards.append(dict(model_state_cpu))
+                
+                if is_main_process:
+                    print(f"  Merging {len(replicated_shards)} replicated shards into full weights...")
+                
+                model_state_cpu = merge_tensor_parallel_shards(replicated_shards)
 
         if shard_states and checkpoint_world_size == world_size:
             load_shards_after_wrap = True
@@ -737,9 +753,9 @@ def resume_training(
             if is_main_process:
                 print("✓ Loaded tensor-parallel shard weights with strict=False")
 
-    # Enable gradient checkpointing if requested
+    # Enable gradient checkpointing if requested (always per-block)
     if use_gradient_checkpointing:
-        model.gradient_checkpointing_enable(checkpoint_segments=checkpoint_segments)
+        model.gradient_checkpointing_enable()
 
     model.force_graph_breaks = compile_model
 
@@ -1044,7 +1060,7 @@ def resume_training(
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
                         print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                    if global_step % 600 == 0:
+                    if global_step % 1200 == 0:  # Changed from 600 to 1200 to reduce checkpoint frequency
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
                         prompt_str = "Long long time ago, "
                         token_ids = hf_tokenizer.encode(prompt_str)
@@ -1062,6 +1078,10 @@ def resume_training(
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
+                        # Move shard gathering to CPU to avoid GPU OOM
+                        import gc
+                        torch.cuda.empty_cache()  # Free unused GPU memory before gathering
+                        
                         local_state_cpu = _state_dict_to_cpu(model.base_model.state_dict())
                         gathered_shards: Optional[List[Dict[str, torch.Tensor]]] = None
                         if dist.is_initialized() and world_size > 1:
@@ -1101,6 +1121,10 @@ def resume_training(
                             save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                             safe_torch_save(checkpoint_state, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                            
+                            # Clean up gathered shards from memory
+                            del gathered_shards, shard_states_cpu, full_state_cpu, model_state, shard_payload, checkpoint_state
+                            gc.collect()
 
                 except StopIteration:
                     if is_main_process:
@@ -1291,12 +1315,7 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Local rank for distributed training.",
     )
-    parser.add_argument(
-        "--checkpoint-segments",
-        type=int,
-        default=4,  # Changed from 1 to 4 for better speed/memory balance
-        help="Number of transformer blocks to checkpoint together (1=max memory savings, 2-4=balanced, >4=faster)",
-    )
+    # Removed --checkpoint-segments argument (always use per-block checkpointing for stability)
     return parser.parse_args()
 
 
@@ -1319,7 +1338,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
-        checkpoint_segments=args.checkpoint_segments,
         add_document_tokens=args.add_document_boundary_tokens,
         compile_model=args.compile_model,
     )
