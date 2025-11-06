@@ -196,8 +196,9 @@ def collate_batch(token_list_batch: Iterable[List[int]], block_size: int) -> Tup
     if not x_list:
         return None, None
 
-    x_tensor = torch.tensor(x_list, dtype=torch.long)
-    y_tensor = torch.tensor(y_list, dtype=torch.long)
+    pin = torch.cuda.is_available()
+    x_tensor = torch.tensor(x_list, dtype=torch.long, pin_memory=pin)
+    y_tensor = torch.tensor(y_list, dtype=torch.long, pin_memory=pin)
     return x_tensor, y_tensor
 
 def chunk_tokens(

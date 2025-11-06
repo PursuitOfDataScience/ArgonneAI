@@ -489,28 +489,34 @@ class TensorParallelModel(torch.nn.Module):
         residual = hidden_states
         normed = block.input_norm(hidden_states)
         attn_output = block.attn(normed, position_embeddings, attention_mask)
-        
+
         attn_output = attn_output.contiguous()
-        
-        # All-reduce for row-parallel output projection
+
+        attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            dist.all_reduce(attn_output, op=dist.ReduceOp.SUM)
+            attn_reduce = dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, async_op=True)
+
+        if attn_reduce is not None:
+            attn_reduce.wait()
 
         hidden_states = residual + attn_output
-        
+
         # MLP with residual
         residual = hidden_states
         normed = block.post_norm(hidden_states)
         mlp_output = block.mlp(normed)
-        
+
         mlp_output = mlp_output.contiguous()
-        
-        # All-reduce for row-parallel down_proj
+
+        mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM)
-        
+            mlp_reduce = dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM, async_op=True)
+
+        if mlp_reduce is not None:
+            mlp_reduce.wait()
+
         hidden_states = residual + mlp_output
-        
+
         return hidden_states
     
     def forward(self, input_ids, labels=None, attention_mask=None):
