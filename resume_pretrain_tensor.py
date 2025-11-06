@@ -1209,31 +1209,35 @@ def resume_training(
                                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
                                 # SIMPLE: Just save rank 0's model state (sharded weights)
-                                model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+                                model_state = cast_state_dict_to_dtype(
+                                    model.base_model.state_dict(), amp_dtype
+                                )
 
                                 checkpoint_state = {
-                                "global_step": global_step,
-                                "tokens_processed": current_total_tokens,
-                                "model_state_dict": model_state,
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "lr_ramp_state": (
-                                    dict(lr_ramp_tracker)
-                                    if lr_ramp_tracker is not None
-                                    else None
-                                ),
-                                "gradient_accumulation_steps": grad_accum_steps,
-                                "loss": last_loss_value,
-                                "data_position": data_position.get_state(),
-                                "model_dtype": str(amp_dtype),
-                                "tensor_parallel": True,
-                                "world_size": world_size,
-                                "rank": rank,
-                            }
-                            os.makedirs("pretrained", exist_ok=True)
-                            save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
-                            safe_torch_save(checkpoint_state, save_path)
-                            print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                                    "global_step": global_step,
+                                    "tokens_processed": current_total_tokens,
+                                    "model_state_dict": model_state,
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "scheduler_state_dict": scheduler.state_dict(),
+                                    "lr_ramp_state": (
+                                        dict(lr_ramp_tracker)
+                                        if lr_ramp_tracker is not None
+                                        else None
+                                    ),
+                                    "gradient_accumulation_steps": grad_accum_steps,
+                                    "loss": last_loss_value,
+                                    "data_position": data_position.get_state(),
+                                    "model_dtype": str(amp_dtype),
+                                    "tensor_parallel": True,
+                                    "world_size": world_size,
+                                    "rank": rank,
+                                }
+                                os.makedirs("pretrained", exist_ok=True)
+                                save_path = (
+                                    f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                )
+                                safe_torch_save(checkpoint_state, save_path)
+                                print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                 except StopIteration:
                     if is_main_process:
