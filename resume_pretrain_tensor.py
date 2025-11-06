@@ -5,8 +5,10 @@ import importlib.util
 import json
 import os
 import re
+from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import Dict, List, Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Deque, Dict, List, Optional, Tuple
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -52,6 +54,7 @@ from training import (
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
@@ -254,174 +257,229 @@ def streaming_token_generator(
     MAX_CONSECUTIVE_ERRORS = 5
 
     TOKENIZER_BATCH_ROWS = 64
+    tokenizer_workers = max(1, min(4, os.cpu_count() or 1))
+    max_pending_batches = max(2, tokenizer_workers * 2)
 
-    while file_idx < len(data_files):
-        dataset = None
-
+    def _tokenize_texts(batch_texts: List[str]) -> List[List[int]]:
         try:
-            file_path = data_files[file_idx]
-            shard_name = os.path.basename(file_path)
+            encoded_batch = tokenizer(
+                batch_texts,
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )
+            if isinstance(encoded_batch, Mapping):
+                token_batches = encoded_batch.get("input_ids", [])
+            else:
+                token_batches = encoded_batch
+        except Exception as batch_error:
             if is_main_process:
-                print(f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}")
+                print(
+                    f"Tokenizer batch failed: {batch_error}. Falling back to per-item encoding.",
+                    flush=True,
+                )
+            token_batches = []
+            for text in batch_texts:
+                try:
+                    token_batches.append(tokenizer.encode(text, add_special_tokens=False))
+                except Exception as single_error:
+                    token_batches.append([])
+                    if is_main_process:
+                        print(
+                            f"  Tokenizer error for text len={len(text)}: {single_error}",
+                            flush=True,
+                        )
+
+        normalized_batches: List[List[int]] = []
+        for tokens in token_batches:
+            if isinstance(tokens, Sequence):
+                normalized_batches.append(list(tokens))
+            else:
+                normalized_batches.append([])
+        return normalized_batches
+
+    pending_batches: Deque[Tuple[Future, List[Tuple[int, str]], List[bool]]] = deque()
+
+    def _clear_pending() -> None:
+        while pending_batches:
+            future, _, _ = pending_batches.popleft()
+            future.cancel()
+
+    with ThreadPoolExecutor(max_workers=tokenizer_workers, thread_name_prefix="tokenizer") as tokenizer_pool:
+        while file_idx < len(data_files):
+            dataset = None
 
             try:
-                dataset = load_streaming_shard(file_path)
+                file_path = data_files[file_idx]
+                shard_name = os.path.basename(file_path)
                 if is_main_process:
-                    print(f"Successfully loaded dataset with {len(dataset)} rows")
-                consecutive_errors = 0
-
-            except Exception as file_error:
-                consecutive_errors += 1
-                if is_main_process:
-                    print(f"ERROR: Could not read file {file_path}: {file_error}")
-                    print(f"Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
-
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    if is_main_process:
-                        print(f"⚠ Too many consecutive errors. Forcing cleanup and restarting...")
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    consecutive_errors = 0
-
-                file_idx += 1
-                continue
-
-            if file_idx == initial_file_idx:
-                position = initial_position
-                resume_chunk_offset = initial_chunk_offset
-                if is_main_process and (position > 0 or resume_chunk_offset > 0):
-                    print(f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}")
-            else:
-                position = 0
-                resume_chunk_offset = 0
-
-            while position < len(dataset):
-                batch_records: List[Tuple[int, str]] = []
-                batch_resume_flags: List[bool] = []
-
-                while len(batch_records) < TOKENIZER_BATCH_ROWS and position < len(dataset):
-                    try:
-                        item = dataset[position]
-                    except Exception as item_error:
-                        if is_main_process:
-                            print(f"Error reading item at position {position}: {item_error}")
-                        position += 1
-                        continue
-
-                    text = item.get("text") if isinstance(item, Mapping) else None
-                    if not text or not isinstance(text, str):
-                        position += 1
-                        continue
-
-                    if len(text) > 50:
-                        alpha_count = sum(c.isalpha() or c.isspace() for c in text)
-                        digit_count = sum(c.isdigit() for c in text)
-
-                        if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
-                            position += 1
-                            continue
-
-                    resume_mid_document = (
-                        document_tokens_enabled
-                        and file_idx == initial_file_idx
-                        and position == initial_position
-                        and resume_chunk_offset > 0
-                    )
-
-                    batch_records.append((position, text))
-                    batch_resume_flags.append(resume_mid_document)
-                    position += 1
-
-                if not batch_records:
-                    continue
-
-                batch_texts = [text for _, text in batch_records]
+                    print(f"Streaming from shard {file_idx + 1}/{len(data_files)}: {shard_name}")
 
                 try:
-                    encoded_batch = tokenizer(
-                        batch_texts,
-                        add_special_tokens=False,
-                        return_attention_mask=False,
-                    )
-
-                    if isinstance(encoded_batch, Mapping):
-                        token_batches = encoded_batch.get("input_ids", [])
-                    else:
-                        token_batches = encoded_batch
-                except Exception as batch_error:
+                    dataset = load_streaming_shard(file_path)
                     if is_main_process:
-                        print(f"Tokenizer batch failed: {batch_error}. Falling back to per-item encoding.")
-                    token_batches = []
-                    for _, text in batch_records:
-                        try:
-                            token_batches.append(tokenizer.encode(text, add_special_tokens=False))
-                        except Exception as single_error:
-                            token_batches.append([])
-                            if is_main_process:
-                                print(f"  Tokenizer error for text len={len(text)}: {single_error}")
+                        print(f"Successfully loaded dataset with {len(dataset)} rows")
+                    consecutive_errors = 0
 
-                for (item_position, _), tokens, resume_mid_document in zip(batch_records, token_batches, batch_resume_flags):
-                    if not isinstance(tokens, Sequence):
-                        continue
+                except Exception as file_error:
+                    consecutive_errors += 1
+                    if is_main_process:
+                        print(f"ERROR: Could not read file {file_path}: {file_error}")
+                        print(f"Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
 
-                    token_list = list(tokens)
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        if is_main_process:
+                            print(
+                                "⚠ Too many consecutive errors. Forcing cleanup and restarting..."
+                            )
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        consecutive_errors = 0
 
-                    if document_tokens_enabled:
-                        token_list = [bos_token_id, *token_list, eos_token_id]
+                    file_idx += 1
+                    continue
 
-                        if resume_mid_document and token_list:
-                            token_list = token_list[1:]
+                if file_idx == initial_file_idx:
+                    position = initial_position
+                    resume_chunk_offset = initial_chunk_offset
+                    if is_main_process and (position > 0 or resume_chunk_offset > 0):
+                        print(
+                            f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}"
+                        )
+                else:
+                    position = 0
+                    resume_chunk_offset = 0
 
-                    if len(token_list) < 10:
-                        continue
+                _clear_pending()
 
-                    for chunk_idx, chunk in enumerate(chunk_tokens(token_list, block_size)):
-                        if (
-                            file_idx == initial_file_idx
-                            and item_position == initial_position
-                            and chunk_idx < resume_chunk_offset
-                        ):
+                while position < len(dataset) or pending_batches:
+                    while position < len(dataset) and len(pending_batches) < max_pending_batches:
+                        batch_records: List[Tuple[int, str]] = []
+                        batch_resume_flags: List[bool] = []
+
+                        while len(batch_records) < TOKENIZER_BATCH_ROWS and position < len(dataset):
+                            try:
+                                item = dataset[position]
+                            except Exception as item_error:
+                                if is_main_process:
+                                    print(
+                                        f"Error reading item at position {position}: {item_error}"
+                                    )
+                                position += 1
+                                continue
+
+                            text = item.get("text") if isinstance(item, Mapping) else None
+                            if not text or not isinstance(text, str):
+                                position += 1
+                                continue
+
+                            if len(text) > 50:
+                                alpha_count = sum(c.isalpha() or c.isspace() for c in text)
+                                digit_count = sum(c.isdigit() for c in text)
+
+                                if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
+                                    position += 1
+                                    continue
+
+                            resume_mid_document = (
+                                document_tokens_enabled
+                                and file_idx == initial_file_idx
+                                and position == initial_position
+                                and resume_chunk_offset > 0
+                            )
+
+                            batch_records.append((position, text))
+                            batch_resume_flags.append(resume_mid_document)
+                            position += 1
+
+                        if not batch_records:
                             continue
 
-                        processed_count += 1
-                        yield chunk, file_idx, item_position, shard_name, chunk_idx
+                        batch_texts = [text for _, text in batch_records]
+                        future = tokenizer_pool.submit(_tokenize_texts, batch_texts)
+                        pending_batches.append((future, batch_records, batch_resume_flags))
 
-                    if (
-                        resume_mid_document
-                        and file_idx == initial_file_idx
-                        and item_position == initial_position
-                        and resume_chunk_offset > 0
+                    if not pending_batches:
+                        break
+
+                    future, batch_records, batch_resume_flags = pending_batches[0]
+                    try:
+                        token_batches = future.result()
+                    except Exception as future_error:
+                        if is_main_process:
+                            print(
+                                f"Tokenizer worker exception: {future_error}. Skipping batch.",
+                                flush=True,
+                            )
+                        token_batches = [[] for _ in batch_records]
+                    finally:
+                        pending_batches.popleft()
+
+                    for (item_position, _), tokens, resume_mid_document in zip(
+                        batch_records, token_batches, batch_resume_flags
                     ):
-                        resume_chunk_offset = 0
+                        if not tokens:
+                            continue
 
-            if is_main_process:
-                print(f"Finished processing {shard_name}, cleaning up resources...")
+                        token_list = tokens
 
-            del dataset
-            dataset = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                        if document_tokens_enabled:
+                            token_list = [bos_token_id, *token_list, eos_token_id]
 
-            import time
+                            if resume_mid_document and token_list:
+                                token_list = token_list[1:]
 
-            time.sleep(0.1)
+                        if len(token_list) < 10:
+                            continue
 
-            file_idx += 1
+                        for chunk_idx, chunk in enumerate(chunk_tokens(token_list, block_size)):
+                            if (
+                                file_idx == initial_file_idx
+                                and item_position == initial_position
+                                and chunk_idx < resume_chunk_offset
+                            ):
+                                continue
 
-        except Exception as e:
-            if is_main_process:
-                print(f"Error processing file {data_files[file_idx]}: {e}")
+                            processed_count += 1
+                            yield chunk, file_idx, item_position, shard_name, chunk_idx
 
-            if dataset is not None:
+                        if (
+                            resume_mid_document
+                            and file_idx == initial_file_idx
+                            and item_position == initial_position
+                            and resume_chunk_offset > 0
+                        ):
+                            resume_chunk_offset = 0
+
+                if is_main_process:
+                    print(f"Finished processing {shard_name}, cleaning up resources...")
+
+                _clear_pending()
                 del dataset
                 dataset = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            file_idx += 1
+                import time
+
+                time.sleep(0.1)
+
+                file_idx += 1
+
+            except Exception as e:
+                if is_main_process:
+                    print(f"Error processing file {data_files[file_idx]}: {e}")
+
+                if dataset is not None:
+                    del dataset
+                    dataset = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                _clear_pending()
+                file_idx += 1
 
     if is_main_process:
         print(f"Completed processing all available files. Processed {processed_count} samples.")
@@ -951,17 +1009,25 @@ def resume_training(
     first_device = model.device
     using_cuda = torch.cuda.is_available()
     prefetch_stream = torch.cuda.Stream(device=first_device) if using_cuda else None
-    prefetched_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    max_prefetch_batches = 2 if using_cuda else 1
+    prefetched_batches: Deque[Tuple[torch.Tensor, torch.Tensor]] = deque()
+    prefetch_warmup_done = not using_cuda
 
-    def stage_to_device(x_cpu: torch.Tensor, y_cpu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def enqueue_batch(x_cpu: torch.Tensor, y_cpu: torch.Tensor) -> None:
         if not using_cuda:
-            return x_cpu.to(first_device), y_cpu.to(first_device)
+            prefetched_batches.append((x_cpu.to(first_device), y_cpu.to(first_device)))
+            return
 
         assert prefetch_stream is not None
         with torch.cuda.stream(prefetch_stream):
             x_gpu = x_cpu.to(first_device, non_blocking=True)
             y_gpu = y_cpu.to(first_device, non_blocking=True)
-        return x_gpu, y_gpu
+        prefetched_batches.append((x_gpu, y_gpu))
+
+    def pop_prefetched() -> Tuple[torch.Tensor, torch.Tensor]:
+        if using_cuda and prefetch_stream is not None:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
+        return prefetched_batches.popleft()
 
     micro_step = 0
     tokens_in_this_session = 0
@@ -1040,15 +1106,15 @@ def resume_training(
                     y_local: torch.Tensor
 
                     if using_cuda:
-                        if prefetched_batch is None:
-                            prefetched_batch = stage_to_device(x_tens, y_tens)
-                            continue
-
-                        torch.cuda.current_stream().wait_stream(prefetch_stream)
-                        x_local, y_local = prefetched_batch
-                        prefetched_batch = stage_to_device(x_tens, y_tens)
+                        enqueue_batch(x_tens, y_tens)
+                        if not prefetch_warmup_done:
+                            if len(prefetched_batches) < max_prefetch_batches:
+                                continue
+                            prefetch_warmup_done = True
+                        x_local, y_local = pop_prefetched()
                     else:
-                        x_local, y_local = stage_to_device(x_tens, y_tens)
+                        enqueue_batch(x_tens, y_tens)
+                        x_local, y_local = pop_prefetched()
 
                     batch_tokens = x_local.numel()
                     tokens_in_this_session += batch_tokens
@@ -1185,7 +1251,8 @@ def resume_training(
         finally:
             if using_cuda and prefetch_stream is not None:
                 torch.cuda.current_stream().wait_stream(prefetch_stream)
-            prefetched_batch = None
+            prefetched_batches.clear()
+            prefetch_warmup_done = not using_cuda
             if pbar is not None:
                 pbar.close()
 
