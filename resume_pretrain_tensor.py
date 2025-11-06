@@ -565,6 +565,7 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
+    gradient_accumulation_steps: int = 4,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
     warmup_steps: int = 2000,
@@ -583,6 +584,7 @@ def resume_training(
     torch.cuda.set_device(local_rank)
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
+    grad_accum_steps = max(1, int(gradient_accumulation_steps))
     compile_guard = contextlib.ExitStack()
     
     if is_main_process:
@@ -678,6 +680,18 @@ def resume_training(
 
     if load_checkpoint and resolved_checkpoint:
         ckpt = safe_torch_load(resolved_checkpoint, map_location="cpu", weights_only=True)
+
+        saved_grad_accum = ckpt.get("gradient_accumulation_steps")
+        if (
+            isinstance(saved_grad_accum, int)
+            and saved_grad_accum > 0
+            and saved_grad_accum != grad_accum_steps
+            and is_main_process
+        ):
+            print(
+                "⚠ Checkpoint was created with gradient accumulation=%d (current setting=%d)"
+                % (saved_grad_accum, grad_accum_steps)
+            )
 
         checkpoint_world_size = ckpt.get("world_size", 1)
         is_tensor_checkpoint = ckpt.get("tensor_parallel", False)
@@ -949,8 +963,12 @@ def resume_training(
             y_gpu = y_cpu.to(first_device, non_blocking=True)
         return x_gpu, y_gpu
 
+    micro_step = 0
     tokens_in_this_session = 0
     last_loss_value: Optional[float] = None
+    current_lr = lr
+
+    optimizer.zero_grad(set_to_none=True)
 
     # Training loop
     if use_streaming:
@@ -1034,30 +1052,6 @@ def resume_training(
 
                     batch_tokens = x_local.numel()
                     tokens_in_this_session += batch_tokens
-                    current_lr = scheduler.step(global_step)
-
-                    if (
-                        lr_ramp_tracker
-                        and lr_ramp_tracker.get("steps_completed", 0)
-                        < lr_ramp_tracker.get("total_steps", 0)
-                    ):
-                        completed = lr_ramp_tracker["steps_completed"]
-                        total = max(1, lr_ramp_tracker["total_steps"])
-                        ramp_scale = min((completed + 1) / total, 1.0)
-                        ramp_lr = max(min_lr, current_lr * ramp_scale)
-                        current_lr = scheduler.override_step(global_step, ramp_lr)
-                        lr_ramp_tracker["steps_completed"] = completed + 1
-
-                        if (
-                            is_main_process
-                            and lr_ramp_tracker["steps_completed"]
-                            == lr_ramp_tracker["total_steps"]
-                        ):
-                            print(
-                                "✓ LR ramp complete: reached target LR %.6e" % current_lr
-                            )
-
-                    optimizer.zero_grad(set_to_none=True)
 
                     autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
 
@@ -1072,51 +1066,86 @@ def resume_training(
 
                     last_loss_value = float(loss_tensor.detach().cpu().item())
 
+                    loss_for_backward = loss_tensor / grad_accum_steps
+
                     if scaler is not None:
-                        scaler.scale(loss_tensor).backward()
-                        scaler.unscale_(optimizer)
-                        _ensure_gradient_dtype_matches_params(model)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        scaler.scale(loss_for_backward).backward()
                     else:
-                        loss_tensor.backward()
-                        _ensure_gradient_dtype_matches_params(model)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
+                        loss_for_backward.backward()
 
-                    global_step += 1
-                    if pbar is not None:
-                        pbar.update(1)
+                    micro_step += 1
 
-                    if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
-                        current_total_tokens = total_tokens_processed + tokens_in_this_session
-                        print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+                    if micro_step >= grad_accum_steps:
+                        current_lr = scheduler.step(global_step)
 
-                    if global_step % 1200 == 0:
-                        current_total_tokens = total_tokens_processed + tokens_in_this_session
-                        
-                        # Generate on all ranks to keep collectives in sync
-                        prompt_str = "Long long time ago, "
-                        token_ids = hf_tokenizer.encode(prompt_str)
-                        prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
-                        generated = model.generate(
-                            prompt_tensor,
-                            max_length=prompt_tensor.shape[1] + 100,
-                            do_sample=True,
-                            temperature=0.7,
-                            top_k=50,
-                            top_p=0.9,
-                        )
+                        if (
+                            lr_ramp_tracker
+                            and lr_ramp_tracker.get("steps_completed", 0)
+                            < lr_ramp_tracker.get("total_steps", 0)
+                        ):
+                            completed = lr_ramp_tracker["steps_completed"]
+                            total = max(1, lr_ramp_tracker["total_steps"])
+                            ramp_scale = min((completed + 1) / total, 1.0)
+                            ramp_lr = max(min_lr, current_lr * ramp_scale)
+                            current_lr = scheduler.override_step(global_step, ramp_lr)
+                            lr_ramp_tracker["steps_completed"] = completed + 1
 
-                        if is_main_process:
-                            generated_text = hf_tokenizer.decode(generated[0].tolist())
-                            print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-                            
-                            # SIMPLE: Just save rank 0's model state (sharded weights)
-                            model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
-                            
-                            checkpoint_state = {
+                            if (
+                                is_main_process
+                                and lr_ramp_tracker["steps_completed"]
+                                == lr_ramp_tracker["total_steps"]
+                            ):
+                                print(
+                                    "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                                )
+
+                        if scaler is not None:
+                            scaler.unscale_(optimizer)
+                            _ensure_gradient_dtype_matches_params(model)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            _ensure_gradient_dtype_matches_params(model)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                            optimizer.step()
+
+                        optimizer.zero_grad(set_to_none=True)
+
+                        global_step += 1
+                        micro_step = 0
+
+                        if pbar is not None:
+                            pbar.update(1)
+
+                        if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
+                            current_total_tokens = total_tokens_processed + tokens_in_this_session
+                            print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+
+                        if global_step % 1200 == 0:
+                            current_total_tokens = total_tokens_processed + tokens_in_this_session
+
+                            # Generate on all ranks to keep collectives in sync
+                            prompt_str = "Long long time ago, "
+                            token_ids = hf_tokenizer.encode(prompt_str)
+                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
+                            generated = model.generate(
+                                prompt_tensor,
+                                max_length=prompt_tensor.shape[1] + 100,
+                                do_sample=True,
+                                temperature=0.7,
+                                top_k=50,
+                                top_p=0.9,
+                            )
+
+                            if is_main_process:
+                                generated_text = hf_tokenizer.decode(generated[0].tolist())
+                                print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                                # SIMPLE: Just save rank 0's model state (sharded weights)
+                                model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+
+                                checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model_state,
@@ -1127,6 +1156,7 @@ def resume_training(
                                     if lr_ramp_tracker is not None
                                     else None
                                 ),
+                                "gradient_accumulation_steps": grad_accum_steps,
                                 "loss": last_loss_value,
                                 "data_position": data_position.get_state(),
                                 "model_dtype": str(amp_dtype),
@@ -1199,6 +1229,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=4,
+        help="Number of micro-batches to accumulate before each optimizer step.",
+    )
     parser.add_argument(
         "--learning-rate",
         type=float,
@@ -1278,6 +1314,7 @@ def main():
         total_training_steps=args.total_steps,
         block_size=args.block_size,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr=args.learning_rate,
         min_lr=args.min_learning_rate,
         warmup_steps=args.warmup_steps,
