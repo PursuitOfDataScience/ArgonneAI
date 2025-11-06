@@ -1188,7 +1188,7 @@ def resume_training(
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
                             print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                        if global_step % 1200 == 0:
+                        if global_step % 300 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                             # Generate on all ranks to keep collectives in sync
