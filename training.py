@@ -595,11 +595,27 @@ class TensorParallelModel(torch.nn.Module):
 
             generated = input_ids
 
+            use_autocast = self.device.type == "cuda"
+            amp_dtype = None
+            if use_autocast:
+                weight = self.base_model.embed_tokens.weight
+                if weight.is_floating_point():
+                    amp_dtype = weight.dtype
+
             with torch.no_grad():
                 while generated.shape[1] < max_length:
                     context_window = generated[:, -self.base_model.config.max_position_embeddings :]
-                    outputs = self.forward(context_window)
-                    logits = outputs.logits[:, -1, :] / temperature
+                    autocast_context = (
+                        torch.amp.autocast("cuda", dtype=amp_dtype)
+                        if use_autocast and amp_dtype is not None
+                        else contextlib.nullcontext()
+                    )
+
+                    with autocast_context:
+                        outputs = self.forward(context_window)
+                        logits = outputs.logits[:, -1, :]
+
+                    logits = logits / temperature
 
                     next_token: torch.Tensor
                     if do_sample:
