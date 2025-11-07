@@ -769,6 +769,10 @@ def resume_training(
     # Create base model (keep parameters in FP32 for stable optimizer state)
     base_model = ArgonneModel(config)
 
+    if is_main_process:
+        param_count = sum(p.numel() for p in base_model.parameters())
+        print(f"Model initialized with {param_count:,} parameters")
+
     checkpoint_tensor_shards: Optional[List[Dict[str, torch.Tensor]]] = None
     load_shards_after_wrap = False
 
@@ -1198,15 +1202,6 @@ def resume_training(
                             ramp_lr = max(min_lr, current_lr * ramp_scale)
                             current_lr = scheduler.override_step(global_step, ramp_lr)
                             lr_ramp_tracker["steps_completed"] = completed + 1
-
-                            if (
-                                is_main_process
-                                and lr_ramp_tracker["steps_completed"]
-                                == lr_ramp_tracker["total_steps"]
-                            ):
-                                print(
-                                    "✓ LR ramp complete: reached target LR %.6e" % current_lr
-                                )
 
                         if scaler is not None:
                             scaler.unscale_(optimizer)
