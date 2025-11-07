@@ -256,14 +256,50 @@ def streaming_token_generator(
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 5
 
-    TOKENIZER_BATCH_ROWS = 64
-    tokenizer_workers = max(1, min(4, os.cpu_count() or 1))
-    max_pending_batches = max(2, tokenizer_workers * 2)
+    logical_cores = os.cpu_count() or 1
+
+    env_rows = os.environ.get("RESUME_TOKENIZER_BATCH_ROWS")
+    if env_rows is not None:
+        try:
+            TOKENIZER_BATCH_ROWS = max(16, int(env_rows))
+        except ValueError:
+            TOKENIZER_BATCH_ROWS = 256
+    else:
+        TOKENIZER_BATCH_ROWS = max(128, min(512, logical_cores * 4))
+
+    env_workers = os.environ.get("RESUME_TOKENIZER_WORKERS")
+    if env_workers is not None:
+        try:
+            tokenizer_workers = max(1, int(env_workers))
+        except ValueError:
+            tokenizer_workers = max(1, logical_cores // 2 or 1)
+    else:
+        tokenizer_workers = max(4, min(32, logical_cores))
+
+    max_pending_batches = max(8, tokenizer_workers * 4)
 
     def _tokenize_texts(batch_texts: List[str]) -> List[List[int]]:
+        filtered_inputs: List[str] = []
+        skip_mask: List[bool] = []
+
+        for text in batch_texts:
+            keep_text = True
+            if len(text) > 50:
+                alpha_count = sum(c.isalpha() or c.isspace() for c in text)
+                digit_count = sum(c.isdigit() for c in text)
+                if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
+                    keep_text = False
+
+            if keep_text:
+                filtered_inputs.append(text)
+                skip_mask.append(False)
+            else:
+                filtered_inputs.append("")
+                skip_mask.append(True)
+
         try:
             encoded_batch = tokenizer(
-                batch_texts,
+                filtered_inputs,
                 add_special_tokens=False,
                 return_attention_mask=False,
             )
@@ -278,7 +314,10 @@ def streaming_token_generator(
                     flush=True,
                 )
             token_batches = []
-            for text in batch_texts:
+            for idx, text in enumerate(filtered_inputs):
+                if skip_mask[idx]:
+                    token_batches.append([])
+                    continue
                 try:
                     token_batches.append(tokenizer.encode(text, add_special_tokens=False))
                 except Exception as single_error:
@@ -289,9 +328,14 @@ def streaming_token_generator(
                             flush=True,
                         )
 
+        if len(token_batches) < len(skip_mask):
+            token_batches.extend([[] for _ in range(len(skip_mask) - len(token_batches))])
+
         normalized_batches: List[List[int]] = []
-        for tokens in token_batches:
-            if isinstance(tokens, Sequence):
+        for skip, tokens in zip(skip_mask, token_batches):
+            if skip:
+                normalized_batches.append([])
+            elif isinstance(tokens, Sequence):
                 normalized_batches.append(list(tokens))
             else:
                 normalized_batches.append([])
@@ -372,14 +416,6 @@ def streaming_token_generator(
                             if not text or not isinstance(text, str):
                                 position += 1
                                 continue
-
-                            if len(text) > 50:
-                                alpha_count = sum(c.isalpha() or c.isspace() for c in text)
-                                digit_count = sum(c.isdigit() for c in text)
-
-                                if digit_count / len(text) > 0.5 or alpha_count / len(text) < 0.3:
-                                    position += 1
-                                    continue
 
                             resume_mid_document = (
                                 document_tokens_enabled
@@ -1009,7 +1045,7 @@ def resume_training(
     first_device = model.device
     using_cuda = torch.cuda.is_available()
     prefetch_stream = torch.cuda.Stream(device=first_device) if using_cuda else None
-    max_prefetch_batches = 2 if using_cuda else 1
+    max_prefetch_batches = 6 if using_cuda else 2
     prefetched_batches: Deque[Tuple[torch.Tensor, torch.Tensor]] = deque()
     prefetch_warmup_done = not using_cuda
 
@@ -1064,8 +1100,15 @@ def resume_training(
         active_shard: Optional[str] = None
         last_meta: Optional[Tuple[str, int, int, int]] = None
 
+        prompt_seed_text = "Long long time ago, "
+        prompt_token_ids = hf_tokenizer.encode(prompt_seed_text)
+        prompt_tensor_device = first_device if using_cuda else model.device
+        cached_prompt_tensor = torch.tensor(
+            prompt_token_ids, dtype=torch.long, device=prompt_tensor_device
+        ).unsqueeze(0)
+
         pbar = tqdm(initial=global_step, total=total_training_steps, desc="Training") if is_main_process else None
-        
+
         try:
             while global_step < total_training_steps:
                 try:
@@ -1192,9 +1235,7 @@ def resume_training(
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                             # Generate on all ranks to keep collectives in sync
-                            prompt_str = "Long long time ago, "
-                            token_ids = hf_tokenizer.encode(prompt_str)
-                            prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(first_device)
+                            prompt_tensor = cached_prompt_tensor.to(first_device)
                             generated = model.generate(
                                 prompt_tensor,
                                 max_length=prompt_tensor.shape[1] + 100,
