@@ -1,17 +1,18 @@
 # ArgonneAI (Argonne 2.0)
 
 ## Overview
-Argonne 2.0 is a 24-layer decoder-only transformer trained with **tensor parallelism**.  The
-training entrypoints – `training.py` for fresh runs and `resume_pretrain_tensor.py` for continuing
-jobs – now share the same optimised data pipeline, fused optimiser configuration, and command-line
-behaviour.  Both scripts stream large Parquet datasets, shard the model across GPUs, and write
-resumable checkpoints that can be swapped between the two workflows.
+Argonne 2.0 is a ~2B parameter, 20-layer decoder-only transformer trained with **tensor parallelism**.
+The training entrypoints – `training.py` for fresh runs and `resume_pretrain_tensor.py` for
+continuing jobs – now share the same optimised data pipeline, fused optimiser configuration, and
+command-line behaviour.  Both scripts stream large Parquet datasets, shard the model across GPUs,
+and write resumable checkpoints that can be swapped between the two workflows.
 
 ## Model Architecture
-- **Layers:** 24 transformer blocks with rotary position embeddings (RoPE)
-- **Hidden Size:** 4,080 (170 dimensions per attention head)
-- **Attention:** Grouped-Query Attention (24 Q heads / 8 KV heads)
-- **Feed-Forward:** SwiGLU MLP (≈11k hidden dim)
+- **Parameters:** ~2.0B
+- **Layers:** 20 transformer blocks with rotary position embeddings (RoPE)
+- **Hidden Size:** 3,072 (128 dimensions per attention head)
+- **Attention:** Grouped-Query Attention (24 Q heads / 4 KV heads)
+- **Feed-Forward:** SwiGLU MLP (≈8.2k hidden dim)
 - **Context Length:** 4,096 tokens
 - **Normalization:** RMSNorm (ε = 1e-6)
 - **Activation:** SwiGLU
@@ -31,6 +32,8 @@ resumable checkpoints that can be swapped between the two workflows.
 - **Fused AdamW + gradient scaling** – both entrypoints create a fused AdamW optimiser
   (`fused=True`) and guard mixed precision with autocast/GradScaler.  Gradients are cast back to the
   parameter dtype prior to clipping to keep the fused kernels happy.
+- **Torch compile acceleration** – `torch.compile` is enabled by default and can be disabled with
+  `--disable-compile` if a run needs to fall back to eager mode.
 - **Asynchronous prefetch** – CPU-collected batches are staged onto GPU streams ahead of time so
   tensor-parallel workers stay saturated.
 - **Document boundary control** – `--add-document-boundary-tokens` can be specified in either script
@@ -79,6 +82,7 @@ an LR re-warmup for stability.
 | `--initial-batch-size` / `--batch-size` | Micro-batch size per step.  The training script auto-tunes on OOM. |
 | `--gradient-accumulation-steps` | Number of micro-batches to accumulate before each optimiser step. |
 | `--disable-gradient-checkpointing` | Disable per-block checkpointing (uses more memory, faster per step). |
+| `--disable-compile` | Run without `torch.compile` (falls back to eager execution). |
 | `--add-document-boundary-tokens` | Add BOS/EOS tokens to every document prior to chunking. |
 | `--warmup-steps` / `--rewarmup-steps` | Number of scheduler warmup steps (resume script shortens this after checkpoint loads). |
 | `--trust-remote-code` | Allow custom tokenizer implementations. |

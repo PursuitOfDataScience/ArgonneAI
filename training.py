@@ -4,6 +4,7 @@ import os
 import re
 import time
 import traceback
+import types
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -37,6 +38,13 @@ from training_utils import (
     validate_tokenizer_path,
 )
 
+DEFAULT_DATA_GLOB = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
+DEFAULT_FALLBACK_PATTERNS = [
+    os.path.join("data", "CC-MAIN-2025-26", "*.parquet"),
+    os.path.join("..", "data", "*.arrow"),
+    os.path.join("data", "*.arrow"),
+]
+
 # To silence the warning about tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -66,18 +74,96 @@ def _gcd(a: int, b: int) -> int:
 
 
 @torch._dynamo.disable
-def _allreduce_non_compiled(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Wrapper for all-reduce that prevents torch.compile from tracing through it.
-    
-    This is critical for tensor parallelism with torch.compile because:
-    1. Cudagraphs cannot capture collective operations
-    2. The all-reduce needs to happen outside the compiled graph
-    
-    The @torch._dynamo.disable decorator ensures this function is never compiled.
-    """
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+def _allreduce_non_compiled(tensor: torch.Tensor, *, async_op: bool = False):
+    """Run all-reduce outside any compiled graph, optionally asynchronously."""
+
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op)
+    if async_op:
+        return work
     return tensor
+
+
+@torch._dynamo.disable
+def _wait_for_work(work) -> None:
+    """Wait on a distributed work handle outside compiled regions."""
+
+    if work is not None:
+        work.wait()
+
+
+def _maybe_enable_compilation(
+    model: torch.nn.Module,
+    *,
+    enable_compile: bool,
+    is_main_process: bool,
+) -> bool:
+    """Optionally wrap ``model.forward`` with ``torch.compile`` for speedups."""
+
+    if not enable_compile:
+        if is_main_process:
+            print("✓ torch.compile disabled (flag provided)")
+        return False
+
+    if not hasattr(torch, "compile"):
+        if is_main_process:
+            print("⚠ torch.compile requested but not available; running in eager mode")
+        return False
+
+    try:
+        compiled_forward = torch.compile(model.forward.__func__)
+        model.forward = types.MethodType(compiled_forward, model)
+        if is_main_process:
+            print("✓ torch.compile enabled for model forward pass")
+        return True
+    except Exception as exc:
+        if is_main_process:
+            print(f"⚠ torch.compile failed ({exc}); falling back to eager mode")
+        return False
+
+
+def resolve_training_data(data_glob: str) -> Tuple[List[str], List[str]]:
+    """Resolve dataset files using the shared fallback patterns."""
+
+    fallback_patterns = list(DEFAULT_FALLBACK_PATTERNS)
+    if data_glob != DEFAULT_DATA_GLOB:
+        fallback_patterns.insert(0, DEFAULT_DATA_GLOB)
+    return resolve_data_files(data_glob, fallback_patterns=fallback_patterns)
+
+
+def load_tokenizer_and_build_config(
+    tokenizer_path: str,
+    *,
+    block_size: int,
+    trust_remote_code: bool,
+    use_gradient_checkpointing: bool,
+):
+    """Load tokenizer and construct the shared Argonne configuration."""
+
+    validate_tokenizer_path(tokenizer_path)
+    hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
+
+    if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
+        hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
+
+    hf_tokenizer.model_max_length = max(block_size + 1, 1_000_000_000)
+
+    config = ArgonneConfig(
+        vocab_size=len(hf_tokenizer),
+        hidden_size=3072,
+        max_position_embeddings=block_size,
+        num_hidden_layers=20,
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        use_flash_attention=True,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        pad_token_id=hf_tokenizer.pad_token_id,
+        bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
+        eos_token_id=hf_tokenizer.eos_token_id,
+    )
+
+    return hf_tokenizer, config
 
 
 class DataPosition:
@@ -725,10 +811,10 @@ class TensorParallelModel(torch.nn.Module):
 
         attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            attn_reduce = dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, async_op=True)
+            attn_reduce = _allreduce_non_compiled(attn_output, async_op=True)
 
         if attn_reduce is not None:
-            attn_reduce.wait()
+            _wait_for_work(attn_reduce)
 
         hidden_states = residual + attn_output
 
@@ -741,10 +827,10 @@ class TensorParallelModel(torch.nn.Module):
 
         mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            mlp_reduce = dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM, async_op=True)
+            mlp_reduce = _allreduce_non_compiled(mlp_output, async_op=True)
 
         if mlp_reduce is not None:
-            mlp_reduce.wait()
+            _wait_for_work(mlp_reduce)
 
         hidden_states = residual + mlp_output
 
@@ -925,6 +1011,7 @@ def _execute_training_attempt(
     add_document_tokens: bool,
     use_gradient_checkpointing: bool,
     is_main_process: bool,
+    enable_compile: bool,
 ) -> Tuple[int, int]:
     """Run a single end-to-end training attempt."""
 
@@ -935,6 +1022,10 @@ def _execute_training_attempt(
         model.gradient_checkpointing_enable()
     else:
         model.gradient_checkpointing_disable()
+
+    total_params = sum(p.numel() for p in model.parameters())
+
+    _maybe_enable_compilation(model, enable_compile=enable_compile, is_main_process=is_main_process)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -957,6 +1048,7 @@ def _execute_training_attempt(
 
     if is_main_process:
         print(f"✓ Model initialized with tensor parallelism")
+        print(f"  - Parameters: {total_params:,}")
         print(f"  - Learning rate: {lr:.2e}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Grad accumulation: {grad_accum_steps}")
@@ -1218,6 +1310,7 @@ def train_from_scratch_tensor_parallel(
     gradient_accumulation_steps: int = 4,
     disable_gradient_checkpointing: bool = False,
     add_document_tokens: bool = False,
+    enable_compile: bool = True,
 ):
     """Train model from scratch with tensor parallelism and automatic batch size tuning."""
 
@@ -1237,43 +1330,17 @@ def train_from_scratch_tensor_parallel(
 
     cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
 
-    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
-    fallback_patterns = [
-        os.path.join("data", "CC-MAIN-2025-26", "*.parquet"),
-        os.path.join("..", "data", "*.arrow"),
-        os.path.join("data", "*.arrow"),
-    ]
-    if data_glob != default_data_glob:
-        fallback_patterns.insert(0, default_data_glob)
-    data_files, _ = resolve_data_files(
-        data_glob, fallback_patterns=fallback_patterns
-    )
+    data_files, _ = resolve_training_data(data_glob)
 
     if is_main_process:
         print(f"Found {len(data_files)} data files")
         log_dataset_plan(data_files)
 
-    validate_tokenizer_path(tokenizer_path)
-    hf_tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
-    if hf_tokenizer.pad_token is None and hf_tokenizer.eos_token is not None:
-        hf_tokenizer.add_special_tokens({"pad_token": hf_tokenizer.eos_token})
-    hf_tokenizer.model_max_length = max(block_size + 1, 1_000_000_000)
-    vocab_size = len(hf_tokenizer)
-
-    config = ArgonneConfig(
-        vocab_size=vocab_size,
-        hidden_size=4080,
-        max_position_embeddings=block_size,
-        num_hidden_layers=24,
-        num_attention_heads=24,
-        num_key_value_heads=8,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        use_flash_attention=True,
+    hf_tokenizer, config = load_tokenizer_and_build_config(
+        tokenizer_path,
+        block_size=block_size,
+        trust_remote_code=trust_remote_code,
         use_gradient_checkpointing=not disable_gradient_checkpointing,
-        pad_token_id=hf_tokenizer.pad_token_id,
-        bos_token_id=getattr(hf_tokenizer, "bos_token_id", None),
-        eos_token_id=hf_tokenizer.eos_token_id,
     )
 
     supports_bf16 = False
@@ -1316,6 +1383,7 @@ def train_from_scratch_tensor_parallel(
                 add_document_tokens=add_document_tokens,
                 use_gradient_checkpointing=not disable_gradient_checkpointing,
                 is_main_process=is_main_process,
+                enable_compile=enable_compile,
             )
 
             if largest_successful_batch is None or batch_size > largest_successful_batch:
@@ -1393,11 +1461,10 @@ def train_from_scratch_tensor_parallel(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Argonne model from scratch with tensor parallelism")
-    default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
     parser.add_argument(
         "--data-glob",
         type=str,
-        default=default_data_glob,
+        default=DEFAULT_DATA_GLOB,
         help="Glob pattern for parquet shards",
     )
     parser.add_argument(
@@ -1473,6 +1540,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--disable-compile",
+        action="store_true",
+        help="Disable torch.compile acceleration.",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1499,6 +1571,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         disable_gradient_checkpointing=args.disable_gradient_checkpointing,
         add_document_tokens=args.add_document_boundary_tokens,
+        enable_compile=not args.disable_compile,
     )
 
 
