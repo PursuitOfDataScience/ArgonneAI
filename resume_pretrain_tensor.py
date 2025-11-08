@@ -39,6 +39,7 @@ from training import (
     _maybe_enable_compilation,
     average_gradients,
     broadcast_parameters,
+    resolve_data_parallel_source_rank,
     load_tokenizer_and_build_config,
     resolve_training_data,
     setup_distributed_environment,
@@ -78,6 +79,16 @@ COLUMN_PARALLEL_BIAS_SUFFIXES = (
     ".mlp.up_proj.bias",
 )
 
+KV_COLUMN_PARALLEL_WEIGHT_SUFFIXES = (
+    ".attn.k_proj.weight",
+    ".attn.v_proj.weight",
+)
+
+KV_COLUMN_PARALLEL_BIAS_SUFFIXES = (
+    ".attn.k_proj.bias",
+    ".attn.v_proj.bias",
+)
+
 
 def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     cpu_state: Dict[str, torch.Tensor] = {}
@@ -89,8 +100,49 @@ def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torc
     return cpu_state
 
 
+def _deduplicate_kv_tensor(
+    tensor: torch.Tensor,
+    *,
+    config: Optional[ArgonneConfig],
+    is_bias: bool,
+) -> torch.Tensor:
+    """Average replicated KV heads when tensor parallelism exceeds num_kv_heads."""
+
+    if config is None:
+        return tensor
+
+    expected_kv_out = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
+    if expected_kv_out <= 0:
+        return tensor
+
+    current = tensor.shape[0]
+    if current == expected_kv_out:
+        return tensor
+
+    if current % expected_kv_out != 0:
+        return tensor
+
+    replication = current // expected_kv_out
+    if replication <= 1:
+        return tensor
+
+    head_dim = config.hidden_size // config.num_attention_heads
+
+    if is_bias:
+        reshaped = tensor.reshape(replication, config.num_key_value_heads, head_dim)
+        averaged = reshaped.mean(dim=0)
+        return averaged.reshape(-1)
+
+    in_features = tensor.shape[1]
+    reshaped = tensor.reshape(replication, config.num_key_value_heads, head_dim, in_features)
+    averaged = reshaped.mean(dim=0)
+    return averaged.reshape(expected_kv_out, in_features)
+
+
 def merge_tensor_parallel_shards(
-    shard_states: Sequence[Mapping[str, torch.Tensor]]
+    shard_states: Sequence[Mapping[str, torch.Tensor]],
+    *,
+    config: Optional[ArgonneConfig] = None,
 ) -> Dict[str, torch.Tensor]:
     """Reconstruct full weights from tensor-parallel shards."""
 
@@ -110,9 +162,15 @@ def merge_tensor_parallel_shards(
             continue
 
         if key.endswith(COLUMN_PARALLEL_WEIGHT_SUFFIXES):
-            full_state[key] = torch.cat(tensors, dim=0)
+            merged = torch.cat(tensors, dim=0)
+            if key.endswith(KV_COLUMN_PARALLEL_WEIGHT_SUFFIXES):
+                merged = _deduplicate_kv_tensor(merged, config=config, is_bias=False)
+            full_state[key] = merged
         elif key.endswith(COLUMN_PARALLEL_BIAS_SUFFIXES):
-            full_state[key] = torch.cat(tensors, dim=0)
+            merged = torch.cat(tensors, dim=0)
+            if key.endswith(KV_COLUMN_PARALLEL_BIAS_SUFFIXES):
+                merged = _deduplicate_kv_tensor(merged, config=config, is_bias=True)
+            full_state[key] = merged
         elif key.endswith(ROW_PARALLEL_WEIGHT_SUFFIXES):
             # Skip ranks that do not hold this shard (bias-less linears)
             ordered = [value for value in values if isinstance(value, torch.Tensor)]
@@ -462,8 +520,10 @@ def resume_training(
                 
                 if is_main_process:
                     print(f"  Merging {len(replicated_shards)} replicated shards into full weights...")
-                
-                model_state_cpu = merge_tensor_parallel_shards(replicated_shards)
+
+                model_state_cpu = merge_tensor_parallel_shards(
+                    replicated_shards, config=config
+                )
 
         if shard_states and checkpoint_world_size == tensor_world_size:
             load_shards_after_wrap = True
@@ -476,7 +536,7 @@ def resume_training(
                         "(checkpoint world size=%d, target world size=%d)..."
                         % (checkpoint_world_size, tensor_world_size)
                     )
-                model_state_cpu = merge_tensor_parallel_shards(shard_states)
+                model_state_cpu = merge_tensor_parallel_shards(shard_states, config=config)
 
             if not model_state_cpu:
                 raise RuntimeError(
@@ -535,11 +595,19 @@ def resume_training(
             if is_main_process:
                 print("✓ Loaded tensor-parallel shard weights with strict=False")
 
-    broadcast_parameters(
-        model.parameters(), group=dist_ctx.data_parallel_group, src=0
+    dp_broadcast_src = resolve_data_parallel_source_rank(
+        group=dist_ctx.data_parallel_group,
+        default_rank=dist_ctx.rank,
     )
     broadcast_parameters(
-        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
+        model.parameters(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
+    )
+    broadcast_parameters(
+        model.base_model.buffers(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
     )
 
     # Enable gradient checkpointing if requested
