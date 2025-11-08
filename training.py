@@ -779,13 +779,30 @@ def setup_distributed_environment() -> DistributedContext:
     )
 
 
+def resolve_data_parallel_source_rank(
+    *, group: Optional[dist.ProcessGroup], default_rank: int
+) -> int:
+    """Return the global rank that should broadcast parameters within ``group``."""
+
+    if group is None:
+        return default_rank
+
+    try:
+        return dist.get_global_rank(group, 0)
+    except ValueError as exc:
+        raise ValueError(
+            "Data parallel group does not contain a rank 0 member; "
+            "cannot determine broadcast source"
+        ) from exc
+
+
 def broadcast_parameters(
     parameters: Iterable[torch.Tensor],
     *,
     group: Optional[dist.ProcessGroup],
     src: int = 0,
 ) -> None:
-    """Broadcast tensors from ``src`` rank to the provided group."""
+    """Broadcast tensors from a global ``src`` rank to the provided group."""
 
     if group is None:
         return
@@ -794,8 +811,19 @@ def broadcast_parameters(
     if group_world_size <= 1:
         return
 
+    src_rank = src
+    try:
+        # ``src`` may already be expressed as a global rank in the group.
+        dist.get_group_rank(group, src_rank)
+    except ValueError:
+        # Otherwise interpret ``src`` as a rank local to the group and map it to
+        # the corresponding global rank for the broadcast call.
+        src_rank = dist.get_global_rank(group, src_rank)
+        # Sanity check that the resolved rank is now part of the group.
+        dist.get_group_rank(group, src_rank)
+
     for tensor in parameters:
-        dist.broadcast(tensor, src=src, group=group)
+        dist.broadcast(tensor, src=src_rank, group=group)
 
 
 def average_gradients(
@@ -1206,11 +1234,19 @@ def _execute_training_attempt(
         dist_ctx.tensor_parallel_group,
     )
 
-    broadcast_parameters(
-        model.parameters(), group=dist_ctx.data_parallel_group, src=0
+    dp_broadcast_src = resolve_data_parallel_source_rank(
+        group=dist_ctx.data_parallel_group,
+        default_rank=dist_ctx.rank,
     )
     broadcast_parameters(
-        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
+        model.parameters(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
+    )
+    broadcast_parameters(
+        model.base_model.buffers(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
     )
 
     if use_gradient_checkpointing:
