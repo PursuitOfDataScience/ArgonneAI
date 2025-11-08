@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Deque, Iterable, List, Optional, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -18,8 +18,9 @@ os.environ["TORCH_CUDAGRAPH_DISABLE"] = "1"
 os.environ["TORCH_INDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from tqdm import tqdm
 
 from data_processing import (
@@ -779,13 +780,30 @@ def setup_distributed_environment() -> DistributedContext:
     )
 
 
+def resolve_data_parallel_source_rank(
+    *, group: Optional[dist.ProcessGroup], default_rank: int
+) -> int:
+    """Return the global rank that should broadcast parameters within ``group``."""
+
+    if group is None:
+        return default_rank
+
+    try:
+        return dist.get_global_rank(group, 0)
+    except ValueError as exc:
+        raise ValueError(
+            "Data parallel group does not contain a rank 0 member; "
+            "cannot determine broadcast source"
+        ) from exc
+
+
 def broadcast_parameters(
     parameters: Iterable[torch.Tensor],
     *,
     group: Optional[dist.ProcessGroup],
     src: int = 0,
 ) -> None:
-    """Broadcast tensors from ``src`` rank to the provided group."""
+    """Broadcast tensors from a global ``src`` rank to the provided group."""
 
     if group is None:
         return
@@ -794,8 +812,19 @@ def broadcast_parameters(
     if group_world_size <= 1:
         return
 
+    src_rank = src
+    try:
+        # ``src`` may already be expressed as a global rank in the group.
+        dist.get_group_rank(group, src_rank)
+    except ValueError:
+        # Otherwise interpret ``src`` as a rank local to the group and map it to
+        # the corresponding global rank for the broadcast call.
+        src_rank = dist.get_global_rank(group, src_rank)
+        # Sanity check that the resolved rank is now part of the group.
+        dist.get_group_rank(group, src_rank)
+
     for tensor in parameters:
-        dist.broadcast(tensor, src=src, group=group)
+        dist.broadcast(tensor, src=src_rank, group=group)
 
 
 def average_gradients(
@@ -803,18 +832,88 @@ def average_gradients(
     *,
     group: Optional[dist.ProcessGroup],
     world_size: int,
+    bucket_cap_mb: int = 25,
 ) -> None:
     """Average gradients across the provided data parallel ``group``."""
 
     if group is None or world_size <= 1:
         return
 
+    bucket_bytes_cap = max(1, bucket_cap_mb) * 1024 * 1024
+
+    dense_buckets: Dict[Tuple[torch.device, torch.dtype], List[torch.Tensor]] = {}
+    sparse_grads: List[torch.Tensor] = []
+
     for param in parameters:
         grad = param.grad
         if grad is None:
             continue
+
+        if grad.is_sparse:
+            sparse_grads.append(grad)
+            continue
+
+        bucket_key = (grad.device, grad.dtype)
+        dense_buckets.setdefault(bucket_key, []).append(grad)
+
+    for grads in dense_buckets.values():
+        if not grads:
+            continue
+
+        current_bucket: List[torch.Tensor] = []
+        current_size = 0
+
+        for grad in grads:
+            grad_bytes = grad.numel() * grad.element_size()
+            if current_bucket and current_size + grad_bytes > bucket_bytes_cap:
+                _allreduce_dense_bucket(
+                    current_bucket,
+                    group=group,
+                    world_size=world_size,
+                )
+                current_bucket = []
+                current_size = 0
+
+            current_bucket.append(grad)
+            current_size += grad_bytes
+
+        if current_bucket:
+            _allreduce_dense_bucket(
+                current_bucket,
+                group=group,
+                world_size=world_size,
+            )
+
+    for grad in sparse_grads:
         dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
-        grad.div_(world_size)
+        grad._values().div_(world_size)
+
+
+def _allreduce_dense_bucket(
+    bucket: List[torch.Tensor],
+    *,
+    group: dist.ProcessGroup,
+    world_size: int,
+) -> None:
+    """All-reduce a bucket of dense gradients and normalize in-place."""
+
+    if not bucket:
+        return
+
+    if len(bucket) == 1:
+        tensor = bucket[0]
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        tensor.div_(world_size)
+        return
+
+    flat_tensor = _flatten_dense_tensors(bucket)
+    dist.all_reduce(flat_tensor, op=dist.ReduceOp.SUM, group=group)
+    flat_tensor.div_(world_size)
+
+    for synced, original in zip(
+        _unflatten_dense_tensors(flat_tensor, bucket), bucket
+    ):
+        original.copy_(synced)
 
 
 def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) -> None:
@@ -874,9 +973,34 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
     actual_v_out = layer.v_proj.out_features
     
     # Update layer attributes for sharded dimensions
+    if original_num_heads % world_size != 0:
+        raise ValueError(
+            "Attention num_heads must be divisible by tensor parallel world size "
+            f"(got num_heads={original_num_heads}, world_size={world_size})"
+        )
+
     layer.num_heads = original_num_heads // world_size
     layer.head_dim = original_head_dim
-    layer.num_kv_heads = original_num_kv_heads // world_size
+
+    if original_num_kv_heads in (None, 0):
+        sharded_kv_heads = layer.num_heads
+    else:
+        if original_num_kv_heads % world_size != 0:
+            raise ValueError(
+                "Attention num_kv_heads must be divisible by tensor parallel "
+                f"world size (got num_kv_heads={original_num_kv_heads}, "
+                f"world_size={world_size})"
+            )
+        sharded_kv_heads = original_num_kv_heads // world_size
+
+    layer.num_kv_heads = sharded_kv_heads
+
+    if layer.num_kv_heads == 0:
+        raise ValueError(
+            "Sharded attention has zero key/value heads; check tensor parallel "
+            "configuration."
+        )
+
     layer.num_key_value_groups = layer.num_heads // layer.num_kv_heads
     
     if rank == 0:
@@ -1206,11 +1330,19 @@ def _execute_training_attempt(
         dist_ctx.tensor_parallel_group,
     )
 
-    broadcast_parameters(
-        model.parameters(), group=dist_ctx.data_parallel_group, src=0
+    dp_broadcast_src = resolve_data_parallel_source_rank(
+        group=dist_ctx.data_parallel_group,
+        default_rank=dist_ctx.rank,
     )
     broadcast_parameters(
-        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
+        model.parameters(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
+    )
+    broadcast_parameters(
+        model.base_model.buffers(),
+        group=dist_ctx.data_parallel_group,
+        src=dp_broadcast_src,
     )
 
     if use_gradient_checkpointing:
