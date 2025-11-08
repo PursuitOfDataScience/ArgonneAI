@@ -536,14 +536,10 @@ def resume_training(
                 print("✓ Loaded tensor-parallel shard weights with strict=False")
 
     broadcast_parameters(
-        model.parameters(),
-        group=dist_ctx.data_parallel_group,
-        src=dist_ctx.data_parallel_root_rank,
+        model.parameters(), group=dist_ctx.data_parallel_group, src=0
     )
     broadcast_parameters(
-        model.base_model.buffers(),
-        group=dist_ctx.data_parallel_group,
-        src=dist_ctx.data_parallel_root_rank,
+        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
     )
 
     # Enable gradient checkpointing if requested

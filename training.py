@@ -662,7 +662,6 @@ class DistributedContext:
     data_parallel_size: int
     data_parallel_rank: int
     data_parallel_group: Optional[dist.ProcessGroup]
-    data_parallel_root_rank: int
     num_nodes: int
     node_rank: int
     is_main_process: bool
@@ -722,7 +721,6 @@ def setup_distributed_environment() -> DistributedContext:
     data_parallel_size = num_nodes
     data_parallel_group: Optional[dist.ProcessGroup] = None
     data_parallel_rank = 0
-    data_parallel_root_rank = 0
     if data_parallel_size > 1:
         for local_idx in range(tensor_parallel_size):
             ranks = [local_idx + node_idx * tensor_parallel_size for node_idx in range(num_nodes)]
@@ -730,12 +728,9 @@ def setup_distributed_environment() -> DistributedContext:
             if rank in ranks:
                 data_parallel_group = group
                 data_parallel_rank = ranks.index(rank)
-                data_parallel_root_rank = ranks[0]
-                break
     else:
         data_parallel_group = None
         data_parallel_rank = 0
-        data_parallel_root_rank = rank
 
     hostname = socket.gethostname()
     is_main_process = rank == 0
@@ -777,7 +772,6 @@ def setup_distributed_environment() -> DistributedContext:
         data_parallel_size=max(1, data_parallel_size),
         data_parallel_rank=data_parallel_rank,
         data_parallel_group=data_parallel_group,
-        data_parallel_root_rank=data_parallel_root_rank,
         num_nodes=num_nodes,
         node_rank=rank // tensor_parallel_size,
         is_main_process=is_main_process,
@@ -1213,14 +1207,10 @@ def _execute_training_attempt(
     )
 
     broadcast_parameters(
-        model.parameters(),
-        group=dist_ctx.data_parallel_group,
-        src=dist_ctx.data_parallel_root_rank,
+        model.parameters(), group=dist_ctx.data_parallel_group, src=0
     )
     broadcast_parameters(
-        model.base_model.buffers(),
-        group=dist_ctx.data_parallel_group,
-        src=dist_ctx.data_parallel_root_rank,
+        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
     )
 
     if use_gradient_checkpointing:
