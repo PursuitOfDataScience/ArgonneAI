@@ -794,8 +794,18 @@ def broadcast_parameters(
     if group_world_size <= 1:
         return
 
+    try:
+        # ``src`` may be provided as a global rank. If this call succeeds, the
+        # caller already passed a valid global rank for the group.
+        dist.get_group_rank(group, src)
+        src_rank = src
+    except ValueError:
+        # Otherwise interpret ``src`` as a rank local to the group and map it to
+        # the corresponding global rank for the broadcast call.
+        src_rank = dist.get_global_rank(group, src)
+
     for tensor in parameters:
-        dist.broadcast(tensor, src=src, group=group)
+        dist.broadcast(tensor, src=src_rank, group=group)
 
 
 def average_gradients(
@@ -1207,10 +1217,14 @@ def _execute_training_attempt(
     )
 
     broadcast_parameters(
-        model.parameters(), group=dist_ctx.data_parallel_group, src=0
+        model.parameters(),
+        group=dist_ctx.data_parallel_group,
+        src=dist_ctx.tensor_parallel_rank,
     )
     broadcast_parameters(
-        model.base_model.buffers(), group=dist_ctx.data_parallel_group, src=0
+        model.base_model.buffers(),
+        group=dist_ctx.data_parallel_group,
+        src=dist_ctx.tensor_parallel_rank,
     )
 
     if use_gradient_checkpointing:
