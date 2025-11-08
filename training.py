@@ -973,9 +973,34 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
     actual_v_out = layer.v_proj.out_features
     
     # Update layer attributes for sharded dimensions
+    if original_num_heads % world_size != 0:
+        raise ValueError(
+            "Attention num_heads must be divisible by tensor parallel world size "
+            f"(got num_heads={original_num_heads}, world_size={world_size})"
+        )
+
     layer.num_heads = original_num_heads // world_size
     layer.head_dim = original_head_dim
-    layer.num_kv_heads = original_num_kv_heads // world_size
+
+    if original_num_kv_heads in (None, 0):
+        sharded_kv_heads = layer.num_heads
+    else:
+        if original_num_kv_heads % world_size != 0:
+            raise ValueError(
+                "Attention num_kv_heads must be divisible by tensor parallel "
+                f"world size (got num_kv_heads={original_num_kv_heads}, "
+                f"world_size={world_size})"
+            )
+        sharded_kv_heads = original_num_kv_heads // world_size
+
+    layer.num_kv_heads = sharded_kv_heads
+
+    if layer.num_kv_heads == 0:
+        raise ValueError(
+            "Sharded attention has zero key/value heads; check tensor parallel "
+            "configuration."
+        )
+
     layer.num_key_value_groups = layer.num_heads // layer.num_kv_heads
     
     if rank == 0:
