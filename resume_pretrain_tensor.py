@@ -39,6 +39,7 @@ from training import (
     _maybe_enable_compilation,
     average_gradients,
     broadcast_parameters,
+    resolve_data_parallel_source_rank,
     load_tokenizer_and_build_config,
     resolve_training_data,
     setup_distributed_environment,
@@ -535,15 +536,19 @@ def resume_training(
             if is_main_process:
                 print("✓ Loaded tensor-parallel shard weights with strict=False")
 
+    dp_broadcast_src = resolve_data_parallel_source_rank(
+        group=dist_ctx.data_parallel_group,
+        default_rank=dist_ctx.rank,
+    )
     broadcast_parameters(
         model.parameters(),
         group=dist_ctx.data_parallel_group,
-        src=dist_ctx.tensor_parallel_rank,
+        src=dp_broadcast_src,
     )
     broadcast_parameters(
         model.base_model.buffers(),
         group=dist_ctx.data_parallel_group,
-        src=dist_ctx.tensor_parallel_rank,
+        src=dp_broadcast_src,
     )
 
     # Enable gradient checkpointing if requested
