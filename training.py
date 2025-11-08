@@ -1127,7 +1127,7 @@ def _execute_training_attempt(
                             f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {tokens_processed:,} | LR: {current_lr:.6e}"
                         )
 
-                    if global_step % 350 == 0:
+                    if global_step % 430 == 0:
                         prompt_tensor = cached_prompt_tensor.to(first_device)
                         generated = model.generate(
                             prompt_tensor,
