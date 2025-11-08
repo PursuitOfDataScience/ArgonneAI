@@ -2,13 +2,15 @@ import argparse
 import contextlib
 import os
 import re
+import socket
 import time
 import traceback
 import types
+from dataclasses import dataclass
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Iterable, List, Optional, Tuple
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -74,10 +76,15 @@ def _gcd(a: int, b: int) -> int:
 
 
 @torch._dynamo.disable
-def _allreduce_non_compiled(tensor: torch.Tensor, *, async_op: bool = False):
+def _allreduce_non_compiled(
+    tensor: torch.Tensor,
+    *,
+    async_op: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+):
     """Run all-reduce outside any compiled graph, optionally asynchronously."""
 
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op)
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op, group=group)
     if async_op:
         return work
     return tensor
@@ -642,12 +649,178 @@ def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> Non
             print(f"WARNING: Failed to remove checkpoint '{path}': {exc}")
 
 
-def init_tensor_parallel_group(world_size: int, rank: int) -> None:
-    """Initialize distributed process group for tensor parallelism"""
+@dataclass
+class DistributedContext:
+    """Container describing the distributed topology for training."""
+
+    rank: int
+    local_rank: int
+    world_size: int
+    tensor_parallel_size: int
+    tensor_parallel_rank: int
+    tensor_parallel_group: dist.ProcessGroup
+    data_parallel_size: int
+    data_parallel_rank: int
+    data_parallel_group: Optional[dist.ProcessGroup]
+    data_parallel_root_rank: int
+    num_nodes: int
+    node_rank: int
+    is_main_process: bool
+    hostname: str
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(f"cuda:{self.local_rank}")
+
+
+def setup_distributed_environment() -> DistributedContext:
+    """Initialize global, tensor-parallel, and data-parallel process groups."""
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
-    if rank == 0:
-        print(f"Initialized tensor parallel group: rank {rank}/{world_size}")
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    inferred_local = os.environ.get("LOCAL_WORLD_SIZE")
+    if inferred_local is not None:
+        try:
+            tensor_parallel_size = max(1, int(inferred_local))
+        except ValueError:
+            tensor_parallel_size = torch.cuda.device_count()
+    else:
+        tensor_parallel_size = torch.cuda.device_count()
+
+    if tensor_parallel_size <= 0:
+        tensor_parallel_size = 1
+
+    if world_size % tensor_parallel_size != 0:
+        raise RuntimeError(
+            "Global world size %d is not divisible by tensor parallel size %d"
+            % (world_size, tensor_parallel_size)
+        )
+
+    num_nodes = world_size // tensor_parallel_size
+
+    tensor_parallel_group: Optional[dist.ProcessGroup] = None
+    tensor_parallel_rank = 0
+    for node_idx in range(num_nodes):
+        ranks = list(
+            range(node_idx * tensor_parallel_size, (node_idx + 1) * tensor_parallel_size)
+        )
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            tensor_parallel_group = group
+            tensor_parallel_rank = ranks.index(rank)
+
+    if tensor_parallel_group is None:
+        raise RuntimeError("Failed to initialize tensor parallel process group")
+
+    data_parallel_size = num_nodes
+    data_parallel_group: Optional[dist.ProcessGroup] = None
+    data_parallel_rank = 0
+    data_parallel_root_rank = 0
+    if data_parallel_size > 1:
+        for local_idx in range(tensor_parallel_size):
+            ranks = [local_idx + node_idx * tensor_parallel_size for node_idx in range(num_nodes)]
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                data_parallel_group = group
+                data_parallel_rank = ranks.index(rank)
+                data_parallel_root_rank = ranks[0]
+                break
+    else:
+        data_parallel_group = None
+        data_parallel_rank = 0
+        data_parallel_root_rank = rank
+
+    hostname = socket.gethostname()
+    is_main_process = rank == 0
+
+    gathered_hostnames: List[str] = [""] * world_size
+    dist.all_gather_object(gathered_hostnames, hostname)
+
+    if is_main_process:
+        unique_hosts = sorted(set(gathered_hostnames))
+        print("=" * 70)
+        print(
+            "Distributed initialization complete: %d GPUs across %d node(s)"
+            % (world_size, len(unique_hosts))
+        )
+        print(
+            "  - Tensor parallel size: %d GPUs per node" % tensor_parallel_size
+        )
+        print(
+            "  - Data parallel size: %d node(s)" % max(1, data_parallel_size)
+        )
+        print("Hosts participating:")
+        for idx, host in enumerate(unique_hosts):
+            host_gpu_count = sum(1 for name in gathered_hostnames if name == host)
+            print(f"    • Node {idx}: {host} ({host_gpu_count} rank(s))")
+        print("=" * 70)
+
+    if tensor_parallel_rank == 0:
+        print(
+            f"[Node {rank // tensor_parallel_size}] Host {hostname} active with {tensor_parallel_size} GPU(s)"
+        )
+
+    return DistributedContext(
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        tensor_parallel_size=tensor_parallel_size,
+        tensor_parallel_rank=tensor_parallel_rank,
+        tensor_parallel_group=tensor_parallel_group,
+        data_parallel_size=max(1, data_parallel_size),
+        data_parallel_rank=data_parallel_rank,
+        data_parallel_group=data_parallel_group,
+        data_parallel_root_rank=data_parallel_root_rank,
+        num_nodes=num_nodes,
+        node_rank=rank // tensor_parallel_size,
+        is_main_process=is_main_process,
+        hostname=hostname,
+    )
+
+
+def broadcast_parameters(
+    parameters: Iterable[torch.Tensor],
+    *,
+    group: Optional[dist.ProcessGroup],
+    src: int = 0,
+) -> None:
+    """Broadcast tensors from ``src`` rank to the provided group."""
+
+    if group is None:
+        return
+
+    group_world_size = dist.get_world_size(group=group)
+    if group_world_size <= 1:
+        return
+
+    for tensor in parameters:
+        dist.broadcast(tensor, src=src, group=group)
+
+
+def average_gradients(
+    parameters: Iterable[torch.nn.Parameter],
+    *,
+    group: Optional[dist.ProcessGroup],
+    world_size: int,
+) -> None:
+    """Average gradients across the provided data parallel ``group``."""
+
+    if group is None or world_size <= 1:
+        return
+
+    for param in parameters:
+        grad = param.grad
+        if grad is None:
+            continue
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+        grad.div_(world_size)
 
 
 def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) -> None:
@@ -783,22 +956,33 @@ def shard_tensor_parallel_correctly(model: ArgonneModel, world_size: int, rank: 
 
 class TensorParallelModel(torch.nn.Module):
     """Wrapper for ArgonneModel that implements tensor parallelism."""
-    def __init__(self, base_model: ArgonneModel, world_size: int, rank: int):
+
+    def __init__(
+        self,
+        base_model: ArgonneModel,
+        world_size: int,
+        rank: int,
+        local_rank: int,
+        tensor_parallel_group: dist.ProcessGroup,
+    ):
         super().__init__()
         self.base_model = base_model
         self.world_size = world_size
         self.rank = rank
-        self.device = torch.device(f"cuda:{rank}")
+        self.device = torch.device(f"cuda:{local_rank}")
+        self.tensor_parallel_group = tensor_parallel_group
         self.gradient_checkpointing = False
-        
+
         # Move model to device first
         self.base_model = self.base_model.to(self.device)
-        
+
         # Then shard it
         shard_tensor_parallel_correctly(self.base_model, world_size, rank)
-        
+
         if rank == 0:
-            print(f"✓ Model ready for tensor parallel training on {world_size} GPUs")
+            print(
+                f"✓ Model ready for tensor parallel training on {world_size} GPU(s) per node"
+            )
     
     def _block_forward(self, block, hidden_states, position_embeddings, attention_mask=None):
         """Forward pass for a single block with tensor parallelism."""
@@ -811,7 +995,9 @@ class TensorParallelModel(torch.nn.Module):
 
         attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            attn_reduce = _allreduce_non_compiled(attn_output, async_op=True)
+            attn_reduce = _allreduce_non_compiled(
+                attn_output, async_op=True, group=self.tensor_parallel_group
+            )
 
         if attn_reduce is not None:
             _wait_for_work(attn_reduce)
@@ -827,7 +1013,9 @@ class TensorParallelModel(torch.nn.Module):
 
         mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            mlp_reduce = _allreduce_non_compiled(mlp_output, async_op=True)
+            mlp_reduce = _allreduce_non_compiled(
+                mlp_output, async_op=True, group=self.tensor_parallel_group
+            )
 
         if mlp_reduce is not None:
             _wait_for_work(mlp_reduce)
@@ -898,17 +1086,19 @@ class TensorParallelModel(torch.nn.Module):
 
             # Make sure all ranks start with the same prompt
             if self.world_size > 1 and dist.is_initialized():
-                prompt_length = torch.tensor([input_ids.shape[1]], device=self.device, dtype=torch.long)
-                dist.broadcast(prompt_length, src=0)
+                prompt_length = torch.tensor(
+                    [input_ids.shape[1]], device=self.device, dtype=torch.long
+                )
+                dist.broadcast(prompt_length, src=0, group=self.tensor_parallel_group)
 
                 if input_ids.shape[1] != int(prompt_length.item()):
                     new_prompt = torch.zeros(input_ids.shape[0], prompt_length.item(), dtype=input_ids.dtype, device=self.device)
                     if self.rank == 0:
-                        new_prompt.copy_(input_ids[:, :prompt_length.item()])
-                    dist.broadcast(new_prompt, src=0)
+                        new_prompt.copy_(input_ids[:, : prompt_length.item()])
+                    dist.broadcast(new_prompt, src=0, group=self.tensor_parallel_group)
                     input_ids = new_prompt
                 else:
-                    dist.broadcast(input_ids, src=0)
+                    dist.broadcast(input_ids, src=0, group=self.tensor_parallel_group)
 
             generated = input_ids
 
@@ -960,7 +1150,7 @@ class TensorParallelModel(torch.nn.Module):
                             next_token = torch.empty((generated.size(0), 1), dtype=torch.long, device=self.device)
 
                     if self.world_size > 1 and dist.is_initialized():
-                        dist.broadcast(next_token, src=0)
+                        dist.broadcast(next_token, src=0, group=self.tensor_parallel_group)
 
                     generated = torch.cat([generated, next_token], dim=-1)
 
@@ -1000,8 +1190,7 @@ def _execute_training_attempt(
     batch_size: int,
     grad_accum_steps: int,
     total_training_steps: int,
-    world_size: int,
-    rank: int,
+    dist_ctx: DistributedContext,
     lr: float,
     min_lr: float,
     warmup_steps: int,
@@ -1010,13 +1199,29 @@ def _execute_training_attempt(
     supports_bf16: bool,
     add_document_tokens: bool,
     use_gradient_checkpointing: bool,
-    is_main_process: bool,
     enable_compile: bool,
 ) -> Tuple[int, int]:
     """Run a single end-to-end training attempt."""
 
     base_model = ArgonneModel(config)
-    model = TensorParallelModel(base_model, world_size, rank)
+    model = TensorParallelModel(
+        base_model,
+        dist_ctx.tensor_parallel_size,
+        dist_ctx.tensor_parallel_rank,
+        dist_ctx.local_rank,
+        dist_ctx.tensor_parallel_group,
+    )
+
+    broadcast_parameters(
+        model.parameters(),
+        group=dist_ctx.data_parallel_group,
+        src=dist_ctx.data_parallel_root_rank,
+    )
+    broadcast_parameters(
+        model.base_model.buffers(),
+        group=dist_ctx.data_parallel_group,
+        src=dist_ctx.data_parallel_root_rank,
+    )
 
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -1046,13 +1251,22 @@ def _execute_training_attempt(
     use_grad_scaler = amp_dtype == torch.float16 and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
 
+    is_main_process = dist_ctx.is_main_process
+
     if is_main_process:
         print(f"✓ Model initialized with tensor parallelism")
         print(f"  - Parameters: {total_params:,}")
         print(f"  - Learning rate: {lr:.2e}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Grad accumulation: {grad_accum_steps}")
-        print(f"  - World size: {world_size}")
+        print(
+            "  - Topology: %d tensor x %d data = %d total GPUs"
+            % (
+                dist_ctx.tensor_parallel_size,
+                dist_ctx.data_parallel_size,
+                dist_ctx.world_size,
+            )
+        )
         if supports_bf16:
             print("✓ Using torch.bfloat16 autocast")
         elif amp_dtype == torch.float16:
@@ -1086,7 +1300,7 @@ def _execute_training_attempt(
         data_files,
         tokenizer,
         block_size,
-        rank=rank,
+        rank=dist_ctx.rank,
         add_document_tokens=add_document_tokens,
     )
 
@@ -1129,7 +1343,7 @@ def _execute_training_attempt(
                         data_files,
                         tokenizer,
                         block_size,
-                        rank=rank,
+                        rank=dist_ctx.rank,
                         add_document_tokens=add_document_tokens,
                     )
                     continue
@@ -1198,11 +1412,21 @@ def _execute_training_attempt(
                     if scaler is not None:
                         scaler.unscale_(optimizer)
                         _ensure_gradient_dtype_matches_params(model)
+                        average_gradients(
+                            model.parameters(),
+                            group=dist_ctx.data_parallel_group,
+                            world_size=dist_ctx.data_parallel_size,
+                        )
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         _ensure_gradient_dtype_matches_params(model)
+                        average_gradients(
+                            model.parameters(),
+                            group=dist_ctx.data_parallel_group,
+                            world_size=dist_ctx.data_parallel_size,
+                        )
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
 
@@ -1252,8 +1476,12 @@ def _execute_training_attempt(
                                 "data_position": data_position.get_state(),
                                 "model_dtype": str(amp_dtype),
                                 "tensor_parallel": True,
-                                "world_size": world_size,
-                                "rank": rank,
+                                "tensor_parallel_world_size": dist_ctx.tensor_parallel_size,
+                                "data_parallel_world_size": dist_ctx.data_parallel_size,
+                                "global_world_size": dist_ctx.world_size,
+                                "rank": dist_ctx.rank,
+                                "tensor_parallel_rank": dist_ctx.tensor_parallel_rank,
+                                "data_parallel_rank": dist_ctx.data_parallel_rank,
                                 "batch_size": batch_size,
                             }
                             os.makedirs("pretrained", exist_ok=True)
@@ -1271,7 +1499,7 @@ def _execute_training_attempt(
                     data_files,
                     tokenizer,
                     block_size,
-                    rank=rank,
+                    rank=dist_ctx.rank,
                     add_document_tokens=add_document_tokens,
                 )
                 continue
@@ -1314,27 +1542,47 @@ def train_from_scratch_tensor_parallel(
 ):
     """Train model from scratch with tensor parallelism and automatic batch size tuning."""
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
-    rank = int(os.environ.get("RANK", local_rank))
-    torch.cuda.set_device(local_rank)
-    init_tensor_parallel_group(world_size, rank)
-    is_main_process = (rank == 0)
+    dist_ctx = setup_distributed_environment()
+    is_main_process = dist_ctx.is_main_process
 
     if is_main_process:
         print("=" * 70)
         print("STARTING FRESH TRAINING FROM SCRATCH (TENSOR PARALLEL)")
         print("=" * 70)
-        print(f"World size: {world_size} GPUs")
-        print(f"Rank: {rank}")
+        print(
+            "Total GPUs: %d (%d node(s) × %d GPU(s) each)"
+            % (
+                dist_ctx.world_size,
+                dist_ctx.num_nodes,
+                dist_ctx.tensor_parallel_size,
+            )
+        )
+        if dist_ctx.data_parallel_size > 1:
+            print(f"Data parallel replicas: {dist_ctx.data_parallel_size}")
 
-    cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
+    cleanup_old_checkpoints("pretrained", keep=50, rank=dist_ctx.rank)
 
     data_files, _ = resolve_training_data(data_glob)
 
     if is_main_process:
         print(f"Found {len(data_files)} data files")
         log_dataset_plan(data_files)
+
+    if dist_ctx.data_parallel_size > 1:
+        local_data_files = data_files[dist_ctx.data_parallel_rank :: dist_ctx.data_parallel_size]
+    else:
+        local_data_files = list(data_files)
+
+    if dist_ctx.tensor_parallel_rank == 0:
+        print(
+            f"Node {dist_ctx.node_rank}: assigned {len(local_data_files)} shard(s) for training"
+        )
+
+    if not local_data_files:
+        raise RuntimeError(
+            "No data shards assigned to rank %d (data_parallel_rank=%d)."
+            % (dist_ctx.rank, dist_ctx.data_parallel_rank)
+        )
 
     hf_tokenizer, config = load_tokenizer_and_build_config(
         tokenizer_path,
@@ -1366,14 +1614,13 @@ def train_from_scratch_tensor_parallel(
         try:
             global_step, tokens_processed = _execute_training_attempt(
                 config=config,
-                data_files=data_files,
+                data_files=local_data_files,
                 tokenizer=hf_tokenizer,
                 block_size=block_size,
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
                 total_training_steps=total_training_steps,
-                world_size=world_size,
-                rank=rank,
+                dist_ctx=dist_ctx,
                 lr=lr,
                 min_lr=min_lr,
                 warmup_steps=warmup_steps,
@@ -1382,7 +1629,6 @@ def train_from_scratch_tensor_parallel(
                 supports_bf16=supports_bf16,
                 add_document_tokens=add_document_tokens,
                 use_gradient_checkpointing=not disable_gradient_checkpointing,
-                is_main_process=is_main_process,
                 enable_compile=enable_compile,
             )
 
@@ -1393,8 +1639,12 @@ def train_from_scratch_tensor_parallel(
                 print(f"Optimal batch size: {batch_size}")
                 print("Checkpoints saved to: pretrained/")
                 print(
-                    "Resume with: torchrun --nproc_per_node=%d resume_pretrain_tensor.py --tokenizer-path %s"
-                    % (world_size, tokenizer_path)
+                    "Resume with the same topology (tensor=%d, data=%d, total GPUs=%d)"
+                    % (
+                        dist_ctx.tensor_parallel_size,
+                        dist_ctx.data_parallel_size,
+                        dist_ctx.world_size,
+                    )
                 )
 
             break
