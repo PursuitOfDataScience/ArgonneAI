@@ -1,7 +1,7 @@
 # ArgonneAI (Argonne 2.0)
 
 ## Overview
-This repository contains the training infrastructure for **Argonne 2.0**, a decoder-only transformer language model trained with **tensor parallelism** for efficient multi-GPU training. The codebase emphasizes large-scale pretraining with distributed data processing, automatic batch-size tuning, and robust checkpoint/resume capabilities.
+This repository contains the training infrastructure for **Argonne 2.0**, a decoder-only transformer language model trained with **tensor parallelism** for efficient multi-GPU training. The codebase emphasizes large-scale pretraining with distributed data processing, a unified scratch/resume workflow, and robust checkpointing.
 
 ## Model Architecture
 Argonne 2.0 is a 24-layer decoder-only transformer with the following specifications:
@@ -55,23 +55,13 @@ Both `training.py` and `resume_pretrain_tensor.py` use **tensor parallelism** to
 - ✅ **Synchronous Training:** No pipeline bubbles or complex staging
 - ✅ **Scalable:** Works well with NCCL on 8 GPUs (tested configuration)
 
-### Automatic Batch Size Tuning
-`training.py` includes intelligent batch-size discovery to find the optimal batch size for your hardware:
+### Unified Training Workflow
+`training.py` now wraps `resume_pretrain_tensor.py` directly. Launching a brand-new run and resuming after the wall-time limit execute the exact same code path, so every optimisation (multi-threaded streaming tokenisation, fused AdamW, asynchronous GPU prefetch, gradient accumulation, document-boundary handling, etc.) is available from the first step.
 
-**Algorithm:**
-1. Start with an initial batch size (default: 512)
-2. If CUDA OOM occurs, perform binary search:
-   - Track largest successful and smallest failed batch sizes
-   - Try midpoint between bounds
-   - Fallback to halving if bounds are tight
-3. Stop at minimum batch size (default: 4)
-4. Resume training with discovered optimal batch size
-
-**Benefits:**
-- 🚀 **Automatic:** No manual tuning required
-- 💾 **Memory Efficient:** Finds maximum utilization
-- 🔄 **Robust:** Handles varied GPU memory configurations
-- ⚡ **Fast Convergence:** Binary search quickly finds optimal size
+**Key behaviours:**
+- 🧭 **Single source of truth:** All CLI arguments accepted by `resume_pretrain_tensor.py` are forwarded by `training.py`, guaranteeing identical hyper-parameters and defaults.
+- 🚀 **Optimised from step zero:** The scratch run benefits from the same fused AdamW optimiser (`fused=True`), rewarm-up aware cosine scheduler, and cudagraph safeguards used while resuming.
+- 🔁 **Clear role split:** `training.py` always starts from scratch; use `resume_pretrain_tensor.py` to pick up from checkpoints once the initial wall-time expires.
 
 ### Learning Rate Schedule
 Both scripts use a cosine decay schedule with warmup:
@@ -121,10 +111,10 @@ Both training scripts save checkpoints every 300 steps with full resumability:
 - `model.py` - Defines the `ArgonneModel` transformer architecture and its `ArgonneConfig`, including rotary attention, RMSNorm layers, and backwards-compatible aliases for Argonne 1.x checkpoints.
 - `data_processing.py` - Handles tokenizer loading/fallback training, streaming parquet datasets, cached offline preprocessing, and assembling fixed-length token chunks for training.
 - `training_utils.py` - Provides shared helpers such as dataset shard discovery/logging and a cosine learning rate scheduler with warmup for use across entrypoints.
-- `training.py` - Pipeline-parallel training entrypoint with dataset streaming, resumable shard tracking, and automatic batch-size backoff when CUDA or compilation OOMs occur.
+- `training.py` - Tensor-parallel scratch launcher that calls into `resume_pretrain_tensor.py`, ensuring the initial run and later resumes share the same optimisations and CLI surface.
 - `train_with_fsdp.py` - Alternative Fully Sharded Data Parallel (FSDP) launcher for multi-GPU jobs that prefer sharded data parallelism over pipeline stages.
 - `resume_pretrain.py` - Legacy resume script maintained for compatibility with earlier experiments; kept while we migrate to the unified `training.py` flow.
-- `resume_pretrain_tensor.py` - **NEW**: Tensor parallelism training script that mirrors `resume_pretrain.py` but replaces pipeline parallelism with tensor parallelism, allowing all GPUs to work in parallel on the same layer.
+- `resume_pretrain_tensor.py` - Tensor-parallel training/resume entrypoint that hosts the full training loop used by both scratch launches and long-running resumes.
 - `TENSOR_PARALLEL_USAGE.md` - Detailed usage instructions, examples, and troubleshooting for tensor parallelism.
 
 ## Getting Started
@@ -167,21 +157,24 @@ To train a new Argonne 2.0 model from scratch:
    export DATA_PATH=/path/to/your/data
    ```
 3. Run the training script:
-   ```bash
-   torchrun --standalone --nproc_per_node=8 training.py \
-     --tokenizer-path ../Qwen2.5-3B-Instruct \
-     --data-glob $DATA_PATH/*.parquet \
-     --output-dir ./checkpoints \
-     --batch-size 512
-   ```
+ ```bash
+  torchrun --standalone --nproc_per_node=8 training.py \
+    --tokenizer-path ../Qwen2.5-3B-Instruct \
+    --data-glob $DATA_PATH/*.parquet \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --learning-rate 1e-4
+  ```
+
+`training.py` always starts from scratch and ignores `--checkpoint-path`; once the wall-time limit is reached, launch `resume_pretrain_tensor.py` with the same arguments to continue from the latest checkpoint.
 
 ## FAQ
 
 **Q: What is Argonne 2.0?**  
 A: Argonne 2.0 is a state-of-the-art language model developed by Argonne National Laboratory, designed for efficient training and inference using tensor parallelism.
 
-**Q: How is Argonne 2.0 different from other models?**  
-A: Argonne 2.0 features a unique combination of tensor parallelism, automatic batch size tuning, and a robust checkpoint system, enabling efficient training on large-scale data.
+**Q: How is Argonne 2.0 different from other models?**
+A: Argonne 2.0 features a unified tensor-parallel training stack with an optimised scratch/resume workflow, multi-threaded streaming data ingestion, and a robust checkpoint system, enabling efficient training on large-scale data.
 
 **Q: What are the hardware requirements for training Argonne 2.0?**  
 A: Training Argonne 2.0 requires NVIDIA GPUs with Tensor Cores, CUDA, and NCCL for distributed training. A minimum of 8 GPUs is recommended for optimal performance.
