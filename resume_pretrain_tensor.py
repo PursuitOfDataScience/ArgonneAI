@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import os
+import pickle
 import re
 from collections import deque
 from collections.abc import Mapping, Sequence
