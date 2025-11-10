@@ -726,6 +726,7 @@ def resume_training(
     )
 
     optimizer_state_loaded = False
+    optimizer_state_warning: Optional[str] = None
     saved_lr_ramp_state = None
     if load_checkpoint and resolved_checkpoint:
         saved_lr_ramp_state = ckpt.get("lr_ramp_state")
@@ -736,6 +737,9 @@ def resume_training(
                     "⚠ Cannot restore optimizer state: checkpoint tensor parallel world size=%d (current=%d)"
                     % (checkpoint_world_size, tensor_world_size)
                 )
+            optimizer_state_warning = (
+                "checkpoint tensor parallel world size does not match current topology"
+            )
         elif checkpoint_optimizer_shards and checkpoint_world_size == tensor_world_size:
             shard_idx = tensor_parallel_rank
             if 0 <= shard_idx < len(checkpoint_optimizer_shards):
@@ -751,6 +755,9 @@ def resume_training(
                                 "⚠ Failed to restore optimizer state shard for rank %d: %s"
                                 % (tensor_parallel_rank, opt_err)
                             )
+                        optimizer_state_warning = (
+                            "optimizer shard existed but failed to load; see error above"
+                        )
         elif legacy_optimizer_state and tensor_world_size == 1:
             try:
                 normalized_state = _normalize_optimizer_state_structure(legacy_optimizer_state)
@@ -759,6 +766,11 @@ def resume_training(
             except Exception as opt_err:
                 if is_main_process:
                     print(f"⚠ Failed to restore optimizer state: {opt_err}")
+                optimizer_state_warning = "legacy optimizer state was incompatible"
+        elif not checkpoint_optimizer_shards and not legacy_optimizer_state:
+            optimizer_state_warning = (
+                "checkpoint did not include tensor-parallel optimizer shards"
+            )
 
         if optimizer_state_loaded and is_main_process:
             print("✓ Restored optimizer state from checkpoint")
@@ -825,16 +837,30 @@ def resume_training(
 
             return float(lr)
 
-        target_lr = _preview_lr_value(global_step)
+        target_step = global_step + 1
+        target_lr = _preview_lr_value(target_step)
         start_lr = float(stored_start_lr)
         if isinstance(saved_lr_ramp_state, dict):
             start_lr = float(saved_lr_ramp_state.get("start_lr", start_lr))
 
+        completed_steps = min(steps_completed, rewarmup_steps)
+        ramp_total = max(rewarmup_steps, 1)
+
+        def _compute_progress(step_count: int) -> float:
+            if ramp_total <= 0:
+                return start_lr
+            fraction = min(max(step_count / ramp_total, 0.0), 1.0)
+            return start_lr + (target_lr - start_lr) * fraction
+
+        current_ramp_lr = _compute_progress(completed_steps)
+
         lr_ramp_tracker = {
-            "steps_completed": min(steps_completed, rewarmup_steps),
+            "steps_completed": completed_steps,
             "total_steps": rewarmup_steps,
             "start_lr": start_lr,
             "target_lr": target_lr,
+            "last_step": global_step,
+            "current_lr": current_ramp_lr,
         }
 
         if is_main_process:
@@ -849,6 +875,10 @@ def resume_training(
                         lr_ramp_tracker["steps_completed"],
                         lr_ramp_tracker["total_steps"],
                     )
+                )
+                print(
+                    "  Resuming ramp from LR %.6e"
+                    % lr_ramp_tracker["current_lr"]
                 )
 
     if load_checkpoint and resolved_checkpoint:
@@ -867,7 +897,13 @@ def resume_training(
         else:
             if is_main_process:
                 print("⚠ Note: Optimizer state not restored (incompatible with tensor parallelism)")
+                if optimizer_state_warning:
+                    print(f"  Reason: {optimizer_state_warning}")
                 print("  Using fresh AdamW optimizer - expect small loss spike initially")
+                if not checkpoint_optimizer_shards:
+                    print(
+                        "  Future checkpoints saved with this script will store tensor-parallel optimizer shards"
+                    )
                 if rewarmup_steps > 0:
                     print(f"  Re-warming up learning rate over {effective_warmup} steps")
             # When not restoring optimizer state we intentionally avoid loading scheduler state
@@ -1065,13 +1101,16 @@ def resume_training(
                     micro_step += 1
 
                     if micro_step >= grad_accum_steps:
-                        current_lr = scheduler.step(global_step)
+                        next_step = global_step + 1
+                        current_lr = scheduler.step(next_step)
 
-                        if (
-                            lr_ramp_tracker
+                        ramp_active = (
+                            lr_ramp_tracker is not None
                             and lr_ramp_tracker.get("steps_completed", 0)
                             < lr_ramp_tracker.get("total_steps", 0)
-                        ):
+                        )
+
+                        if ramp_active:
                             completed = lr_ramp_tracker["steps_completed"]
                             total = max(1, lr_ramp_tracker["total_steps"])
                             start_lr = float(lr_ramp_tracker.get("start_lr", min_lr))
@@ -1085,13 +1124,15 @@ def resume_training(
                             else:
                                 ramp_lr = max(target_lr, min(min_lr, ramp_lr))
 
-                            current_lr = scheduler.override_step(global_step, ramp_lr)
+                            current_lr = scheduler.override_step(next_step, ramp_lr)
                             lr_ramp_tracker["steps_completed"] = min(
                                 completed + 1,
                                 lr_ramp_tracker["total_steps"],
                             )
                             lr_ramp_tracker["start_lr"] = start_lr
                             lr_ramp_tracker["target_lr"] = target_lr
+                            lr_ramp_tracker["current_lr"] = current_lr
+                            lr_ramp_tracker["last_step"] = next_step
 
                             if (
                                 is_main_process
@@ -1102,6 +1143,9 @@ def resume_training(
                                     "✓ LR ramp complete: reached target LR %.6e"
                                     % target_lr
                                 )
+                        elif lr_ramp_tracker is not None:
+                            lr_ramp_tracker["current_lr"] = current_lr
+                            lr_ramp_tracker["last_step"] = next_step
 
                     if scaler is not None:
                         scaler.unscale_(optimizer)
