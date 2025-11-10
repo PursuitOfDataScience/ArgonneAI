@@ -219,38 +219,36 @@ def _gather_object_to_cpu(
         except ValueError:
             dst_rank = dst
 
-    serialized = pickle.dumps(obj)
-    storage = torch.ByteStorage.from_buffer(serialized)
-    tensor = torch.ByteTensor(storage).clone().to(cpu_device)
-    length_tensor = torch.tensor([tensor.numel()], dtype=torch.int64, device=cpu_device)
+    # ``gather`` with NCCL requires CUDA tensors, so emulate gather_object by
+    # serializing locally and broadcasting one rank at a time. This keeps all
+    # buffers on CPU while avoiding NCCL's GPU allocations for coalesced
+    # gathers.
+    if gather_list is not None and rank_in_group == dst_rank:
+        if len(gather_list) < world_size:
+            raise ValueError(
+                "gather_list must be sized to the tensor-parallel world size"
+            )
+        for idx in range(len(gather_list)):
+            gather_list[idx] = None
 
-    if rank_in_group == dst_rank:
-        length_list = [
-            torch.zeros(1, dtype=torch.int64, device=cpu_device) for _ in range(world_size)
-        ]
-    else:
-        length_list = None
+    for src_rank in range(world_size):
+        # Only the source rank seeds the object; others supply a placeholder.
+        payload: List[Optional[object]]
+        if rank_in_group == src_rank:
+            payload = [obj]
+        else:
+            payload = [None]
 
-    dist.gather(length_tensor, gather_list=length_list, dst=dst_rank, group=group)
+        dist.broadcast_object_list(payload, src=src_rank, group=group)
 
-    if rank_in_group == dst_rank:
-        recv_tensors = [
-            torch.empty(int(length_list[i].item()), dtype=torch.uint8, device=cpu_device)
-            for i in range(world_size)
-        ]
-    else:
-        recv_tensors = None
+        if rank_in_group != dst_rank:
+            payload[0] = None
+            continue
 
-    dist.gather(tensor, gather_list=recv_tensors, dst=dst_rank, group=group)
-
-    if rank_in_group == dst_rank and recv_tensors is not None:
-        gathered_objects: List[object] = []
-        for recv_tensor in recv_tensors:
-            gathered_objects.append(pickle.loads(memoryview(recv_tensor.numpy())))
-
+        received = payload[0]
         if gather_list is not None:
-            for idx, gathered in enumerate(gathered_objects):
-                gather_list[idx] = gathered
+            if src_rank < len(gather_list):
+                gather_list[src_rank] = received
 
 
 def _deduplicate_kv_tensor(
