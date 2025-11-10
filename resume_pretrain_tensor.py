@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -55,6 +56,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
+_GATHER_OBJECT_SUPPORTS_DEVICE = "device" in inspect.signature(dist.gather_object).parameters
+
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
 
@@ -98,6 +101,153 @@ def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torc
         else:
             cpu_state[key] = value
     return cpu_state
+
+
+def _optimizer_state_to_cpu(state_dict: Mapping[str, object]) -> Dict[str, object]:
+    """Recursively move optimizer state tensors to CPU for safe serialization."""
+
+    if not isinstance(state_dict, Mapping):
+        return {}
+
+    cpu_state: Dict[str, object] = {}
+    for key, value in state_dict.items():
+        if key == "state" and isinstance(value, Mapping):
+            state_map: Dict[int, Dict[str, object]] = {}
+            for param_id, inner in value.items():
+                if not isinstance(inner, Mapping):
+                    continue
+                param_state: Dict[str, object] = {}
+                for inner_key, inner_value in inner.items():
+                    if isinstance(inner_value, torch.Tensor):
+                        param_state[inner_key] = inner_value.detach().cpu()
+                    else:
+                        param_state[inner_key] = inner_value
+                try:
+                    state_map[int(param_id)] = param_state
+                except (TypeError, ValueError):
+                    continue
+            cpu_state["state"] = state_map
+        elif isinstance(value, Mapping):
+            cpu_state[key] = _optimizer_state_to_cpu(value)
+        else:
+            cpu_state[key] = value
+
+    if "param_groups" in state_dict:
+        cpu_state["param_groups"] = state_dict["param_groups"]
+
+    return cpu_state
+
+
+def _normalize_optimizer_state_structure(state: Mapping[str, object]) -> Dict[str, object]:
+    """Ensure optimizer state dict uses integer parameter ids and copies nested values."""
+
+    normalized: Dict[str, object] = {}
+
+    state_block = state.get("state") if isinstance(state, Mapping) else None
+    if isinstance(state_block, Mapping):
+        normalized_state: Dict[int, Dict[str, object]] = {}
+        for param_id, inner in state_block.items():
+            if not isinstance(inner, Mapping):
+                continue
+            try:
+                pid = int(param_id)
+            except (TypeError, ValueError):
+                continue
+            inner_copy: Dict[str, object] = {}
+            for inner_key, inner_value in inner.items():
+                inner_copy[inner_key] = inner_value
+            normalized_state[pid] = inner_copy
+        normalized["state"] = normalized_state
+    else:
+        normalized["state"] = {}
+
+    param_groups = state.get("param_groups") if isinstance(state, Mapping) else None
+    if isinstance(param_groups, list):
+        normalized["param_groups"] = [dict(group) for group in param_groups]
+    else:
+        normalized["param_groups"] = []
+
+    defaults = state.get("defaults") if isinstance(state, Mapping) else None
+    if isinstance(defaults, Mapping):
+        normalized["defaults"] = dict(defaults)
+
+    for key, value in state.items():
+        if key in {"state", "param_groups", "defaults"}:
+            continue
+        normalized[key] = value
+
+    return normalized
+
+
+def _gather_object_to_cpu(
+    obj: object,
+    gather_list: Optional[List[Optional[object]]],
+    *,
+    dst: int,
+    group: Optional[dist.ProcessGroup],
+) -> None:
+    """Gather ``obj`` across ``group`` while forcing CPU buffers to avoid CUDA OOM."""
+
+    if not dist.is_initialized():
+        if gather_list is not None:
+            for idx in range(len(gather_list)):
+                gather_list[idx] = obj if idx == 0 else None
+        return
+
+    cpu_device = torch.device("cpu")
+
+    if _GATHER_OBJECT_SUPPORTS_DEVICE:
+        dist.gather_object(
+            obj,
+            gather_list,
+            dst=dst,
+            group=group,
+            device=cpu_device,
+        )
+        return
+
+    if group is None:
+        rank_in_group = dist.get_rank()
+        world_size = dist.get_world_size()
+        dst_rank = dst
+    else:
+        rank_in_group = dist.get_rank(group=group)
+        world_size = dist.get_world_size(group=group)
+        try:
+            dst_rank = dist.get_group_rank(group, dst)
+        except ValueError:
+            dst_rank = dst
+
+    # ``gather`` with NCCL requires CUDA tensors, so emulate gather_object by
+    # serializing locally and broadcasting one rank at a time. This keeps all
+    # buffers on CPU while avoiding NCCL's GPU allocations for coalesced
+    # gathers.
+    if gather_list is not None and rank_in_group == dst_rank:
+        if len(gather_list) < world_size:
+            raise ValueError(
+                "gather_list must be sized to the tensor-parallel world size"
+            )
+        for idx in range(len(gather_list)):
+            gather_list[idx] = None
+
+    for src_rank in range(world_size):
+        # Only the source rank seeds the object; others supply a placeholder.
+        payload: List[Optional[object]]
+        if rank_in_group == src_rank:
+            payload = [obj]
+        else:
+            payload = [None]
+
+        dist.broadcast_object_list(payload, src=src_rank, group=group)
+
+        if rank_in_group != dst_rank:
+            payload[0] = None
+            continue
+
+        received = payload[0]
+        if gather_list is not None:
+            if src_rank < len(gather_list):
+                gather_list[src_rank] = received
 
 
 def _deduplicate_kv_tensor(
@@ -438,7 +588,11 @@ def resume_training(
     # Create base model (keep parameters in FP32 for stable optimizer state)
     base_model = ArgonneModel(config)
 
+    checkpoint_world_size = tensor_world_size
     checkpoint_tensor_shards: Optional[List[Dict[str, torch.Tensor]]] = None
+    checkpoint_optimizer_shards: Optional[List[Dict[str, object]]] = None
+    legacy_optimizer_state: Optional[Dict[str, object]] = None
+    saved_scheduler_state: Optional[Dict[str, object]] = None
     load_shards_after_wrap = False
 
     if load_checkpoint and resolved_checkpoint:
@@ -464,6 +618,9 @@ def resume_training(
 
         raw_state_dict = ckpt.get("model_state_dict", {}) or {}
         raw_shard_list = ckpt.get("tensor_parallel_shards")
+        raw_optimizer_shards = ckpt.get("tensor_parallel_optimizer_states")
+        legacy_optimizer_state = ckpt.get("optimizer_state_dict")
+        saved_scheduler_state = ckpt.get("scheduler_state_dict")
 
         def _normalize_keys(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
             if not state_dict:
@@ -487,6 +644,14 @@ def resume_training(
             for shard in raw_shard_list:
                 normalized = _normalize_keys(shard)
                 shard_states.append(cast_state_dict_to_dtype(_state_dict_to_cpu(normalized), torch.float32))
+
+        if isinstance(raw_optimizer_shards, (list, tuple)) and raw_optimizer_shards:
+            checkpoint_optimizer_shards = []
+            for shard in raw_optimizer_shards:
+                if isinstance(shard, Mapping):
+                    checkpoint_optimizer_shards.append(dict(shard))
+                else:
+                    checkpoint_optimizer_shards.append({})
 
         model_state_cpu: Dict[str, torch.Tensor] = {}
         if raw_state_dict:
@@ -634,9 +799,55 @@ def resume_training(
         fused=True
     )
 
+    optimizer_state_loaded = False
+    optimizer_state_warning: Optional[str] = None
     saved_lr_ramp_state = None
     if load_checkpoint and resolved_checkpoint:
         saved_lr_ramp_state = ckpt.get("lr_ramp_state")
+
+        if checkpoint_optimizer_shards and checkpoint_world_size != tensor_world_size:
+            if is_main_process:
+                print(
+                    "⚠ Cannot restore optimizer state: checkpoint tensor parallel world size=%d (current=%d)"
+                    % (checkpoint_world_size, tensor_world_size)
+                )
+            optimizer_state_warning = (
+                "checkpoint tensor parallel world size does not match current topology"
+            )
+        elif checkpoint_optimizer_shards and checkpoint_world_size == tensor_world_size:
+            shard_idx = tensor_parallel_rank
+            if 0 <= shard_idx < len(checkpoint_optimizer_shards):
+                shard_state = checkpoint_optimizer_shards[shard_idx]
+                if isinstance(shard_state, Mapping) and shard_state:
+                    try:
+                        normalized_state = _normalize_optimizer_state_structure(shard_state)
+                        optimizer.load_state_dict(normalized_state)
+                        optimizer_state_loaded = True
+                    except Exception as opt_err:
+                        if is_main_process:
+                            print(
+                                "⚠ Failed to restore optimizer state shard for rank %d: %s"
+                                % (tensor_parallel_rank, opt_err)
+                            )
+                        optimizer_state_warning = (
+                            "optimizer shard existed but failed to load; see error above"
+                        )
+        elif legacy_optimizer_state and tensor_world_size == 1:
+            try:
+                normalized_state = _normalize_optimizer_state_structure(legacy_optimizer_state)
+                optimizer.load_state_dict(normalized_state)
+                optimizer_state_loaded = True
+            except Exception as opt_err:
+                if is_main_process:
+                    print(f"⚠ Failed to restore optimizer state: {opt_err}")
+                optimizer_state_warning = "legacy optimizer state was incompatible"
+        elif not checkpoint_optimizer_shards and not legacy_optimizer_state:
+            optimizer_state_warning = (
+                "checkpoint did not include tensor-parallel optimizer shards"
+            )
+
+        if optimizer_state_loaded and is_main_process:
+            print("✓ Restored optimizer state from checkpoint")
 
     # Setup scheduler
     min_lr = min(min_lr, lr)
@@ -644,9 +855,12 @@ def resume_training(
     # CRITICAL: If resuming, use shorter re-warmup to stabilize
     effective_warmup = warmup_steps
     if load_checkpoint and resolved_checkpoint and global_step > 0:
-        effective_warmup = rewarmup_steps  # Much shorter re-warmup
-        if is_main_process:
-            print(f"⚠ Using {rewarmup_steps}-step re-warmup for resume stability")
+        if optimizer_state_loaded:
+            effective_warmup = warmup_steps
+        else:
+            effective_warmup = rewarmup_steps  # Much shorter re-warmup
+            if is_main_process and rewarmup_steps > 0:
+                print(f"⚠ Using {rewarmup_steps}-step re-warmup for resume stability")
     
     scheduler = CosineWarmupScheduler(
         optimizer,
@@ -657,18 +871,22 @@ def resume_training(
     )
 
     lr_ramp_tracker = None
-    if load_checkpoint and resolved_checkpoint and global_step > 0 and rewarmup_steps > 0:
+    if (
+        load_checkpoint
+        and resolved_checkpoint
+        and global_step > 0
+        and rewarmup_steps > 0
+        and not optimizer_state_loaded
+    ):
         steps_completed = 0
+        stored_start_lr = float(min_lr)
         if isinstance(saved_lr_ramp_state, dict):
             stored_total = int(saved_lr_ramp_state.get("total_steps", rewarmup_steps))
             stored_completed = int(saved_lr_ramp_state.get("steps_completed", 0))
             if 0 <= stored_completed < stored_total:
                 steps_completed = max(0, stored_completed)
+            stored_start_lr = float(saved_lr_ramp_state.get("start_lr", stored_start_lr))
 
-        lr_ramp_tracker = {
-            "steps_completed": min(steps_completed, rewarmup_steps),
-            "total_steps": rewarmup_steps,
-        }
         def _preview_lr_value(step: int) -> float:
             preview = getattr(scheduler, "preview_lr", None)
             if callable(preview):
@@ -693,11 +911,36 @@ def resume_training(
 
             return float(lr)
 
+        target_step = global_step + 1
+        target_lr = _preview_lr_value(target_step)
+        start_lr = float(stored_start_lr)
+        if isinstance(saved_lr_ramp_state, dict):
+            start_lr = float(saved_lr_ramp_state.get("start_lr", start_lr))
+
+        completed_steps = min(steps_completed, rewarmup_steps)
+        ramp_total = max(rewarmup_steps, 1)
+
+        def _compute_progress(step_count: int) -> float:
+            if ramp_total <= 0:
+                return start_lr
+            fraction = min(max(step_count / ramp_total, 0.0), 1.0)
+            return start_lr + (target_lr - start_lr) * fraction
+
+        current_ramp_lr = _compute_progress(completed_steps)
+
+        lr_ramp_tracker = {
+            "steps_completed": completed_steps,
+            "total_steps": rewarmup_steps,
+            "start_lr": start_lr,
+            "target_lr": target_lr,
+            "last_step": global_step,
+            "current_lr": current_ramp_lr,
+        }
+
         if is_main_process:
-            target_lr = _preview_lr_value(global_step)
             print(
                 "⚠ Using %d-step LR ramp from %.6e to %.6e after optimizer reset"
-                % (rewarmup_steps, min_lr, target_lr)
+                % (rewarmup_steps, start_lr, target_lr)
             )
             if lr_ramp_tracker["steps_completed"] > 0:
                 print(
@@ -707,16 +950,37 @@ def resume_training(
                         lr_ramp_tracker["total_steps"],
                     )
                 )
+                print(
+                    "  Resuming ramp from LR %.6e"
+                    % lr_ramp_tracker["current_lr"]
+                )
 
-    # Do NOT load optimizer state (incompatible across parallelism schemes)
     if load_checkpoint and resolved_checkpoint:
-        if is_main_process:
-            print("⚠ Note: Optimizer state not restored (incompatible with tensor parallelism)")
-            print("  Using fresh AdamW optimizer - expect small loss spike initially")
-            print(f"  Re-warming up learning rate over {effective_warmup} steps")
-
-        # Don't load scheduler state - we're intentionally re-warming
-        # The effective_warmup setting above handles the restart
+        if optimizer_state_loaded:
+            if isinstance(saved_scheduler_state, Mapping):
+                try:
+                    scheduler.load_state_dict(saved_scheduler_state)
+                    if is_main_process:
+                        print("✓ Restored scheduler state from checkpoint")
+                except Exception as sched_err:
+                    if is_main_process:
+                        print(f"⚠ Failed to restore scheduler state: {sched_err}")
+                    scheduler.step(global_step)
+            else:
+                scheduler.step(global_step)
+        else:
+            if is_main_process:
+                print("⚠ Note: Optimizer state not restored (incompatible with tensor parallelism)")
+                if optimizer_state_warning:
+                    print(f"  Reason: {optimizer_state_warning}")
+                print("  Using fresh AdamW optimizer - expect small loss spike initially")
+                if not checkpoint_optimizer_shards:
+                    print(
+                        "  Future checkpoints saved with this script will store tensor-parallel optimizer shards"
+                    )
+                if rewarmup_steps > 0:
+                    print(f"  Re-warming up learning rate over {effective_warmup} steps")
+            # When not restoring optimizer state we intentionally avoid loading scheduler state
     else:
         scheduler.step(global_step)
     
@@ -911,28 +1175,51 @@ def resume_training(
                     micro_step += 1
 
                     if micro_step >= grad_accum_steps:
-                        current_lr = scheduler.step(global_step)
+                        next_step = global_step + 1
+                        current_lr = scheduler.step(next_step)
 
-                        if (
-                            lr_ramp_tracker
+                        ramp_active = (
+                            lr_ramp_tracker is not None
                             and lr_ramp_tracker.get("steps_completed", 0)
                             < lr_ramp_tracker.get("total_steps", 0)
-                        ):
+                        )
+
+                        if ramp_active:
                             completed = lr_ramp_tracker["steps_completed"]
                             total = max(1, lr_ramp_tracker["total_steps"])
-                            ramp_scale = min((completed + 1) / total, 1.0)
-                            ramp_lr = max(min_lr, current_lr * ramp_scale)
-                            current_lr = scheduler.override_step(global_step, ramp_lr)
-                            lr_ramp_tracker["steps_completed"] = completed + 1
+                            start_lr = float(lr_ramp_tracker.get("start_lr", min_lr))
+                            target_lr = float(
+                                lr_ramp_tracker.get("target_lr", current_lr)
+                            )
+                            ramp_fraction = min((completed + 1) / total, 1.0)
+                            ramp_lr = start_lr + (target_lr - start_lr) * ramp_fraction
+                            if target_lr >= start_lr:
+                                ramp_lr = min(target_lr, max(min_lr, ramp_lr))
+                            else:
+                                ramp_lr = max(target_lr, min(min_lr, ramp_lr))
+
+                            current_lr = scheduler.override_step(next_step, ramp_lr)
+                            lr_ramp_tracker["steps_completed"] = min(
+                                completed + 1,
+                                lr_ramp_tracker["total_steps"],
+                            )
+                            lr_ramp_tracker["start_lr"] = start_lr
+                            lr_ramp_tracker["target_lr"] = target_lr
+                            lr_ramp_tracker["current_lr"] = current_lr
+                            lr_ramp_tracker["last_step"] = next_step
 
                             if (
                                 is_main_process
                                 and lr_ramp_tracker["steps_completed"]
-                                == lr_ramp_tracker["total_steps"]
+                                >= lr_ramp_tracker["total_steps"]
                             ):
                                 print(
-                                    "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                                    "✓ LR ramp complete: reached target LR %.6e"
+                                    % target_lr
                                 )
+                        elif lr_ramp_tracker is not None:
+                            lr_ramp_tracker["current_lr"] = current_lr
+                            lr_ramp_tracker["last_step"] = next_step
 
                     if scaler is not None:
                         scaler.unscale_(optimizer)
@@ -969,7 +1256,7 @@ def resume_training(
                             f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}"
                         )
 
-                    if global_step % 350 == 0:
+                    if global_step % 4611 == 0:
                         current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                         # Generate on all ranks to keep collectives in sync
@@ -983,20 +1270,91 @@ def resume_training(
                             top_p=0.9,
                         )
 
+                        local_model_state = cast_state_dict_to_dtype(
+                            model.base_model.state_dict(), amp_dtype
+                        )
+                        local_optimizer_state = _normalize_optimizer_state_structure(
+                            _optimizer_state_to_cpu(optimizer.state_dict())
+                        )
+
+                        tensor_parallel_shards_to_save: Optional[
+                            List[Dict[str, torch.Tensor]]
+                        ] = None
+                        tensor_parallel_optimizer_to_save: Optional[
+                            List[Dict[str, object]]
+                        ] = None
+
+                        if (
+                            dist.is_initialized()
+                            and dist_ctx.tensor_parallel_group is not None
+                            and dist_ctx.tensor_parallel_size > 1
+                        ):
+                            gather_root = dist.get_global_rank(
+                                dist_ctx.tensor_parallel_group, 0
+                            )
+
+                            shard_gather: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
+                            optimizer_gather: Optional[List[Optional[Dict[str, object]]]] = None
+
+                            if dist_ctx.rank == gather_root:
+                                shard_gather = [None] * dist_ctx.tensor_parallel_size
+                                optimizer_gather = [None] * dist_ctx.tensor_parallel_size
+
+                            _gather_object_to_cpu(
+                                local_model_state,
+                                shard_gather,
+                                dst=gather_root,
+                                group=dist_ctx.tensor_parallel_group,
+                            )
+                            _gather_object_to_cpu(
+                                local_optimizer_state,
+                                optimizer_gather,
+                                dst=gather_root,
+                                group=dist_ctx.tensor_parallel_group,
+                            )
+
+                            if dist_ctx.rank == gather_root:
+                                tensor_parallel_shards_to_save = [
+                                    dict(shard) if isinstance(shard, Mapping) else {}
+                                    for shard in (shard_gather or [])
+                                ]
+                                tensor_parallel_optimizer_to_save = [
+                                    _normalize_optimizer_state_structure(state)
+                                    if isinstance(state, Mapping)
+                                    else {}
+                                    for state in (optimizer_gather or [])
+                                ]
+                        else:
+                            tensor_parallel_shards_to_save = [local_model_state]
+                            tensor_parallel_optimizer_to_save = [local_optimizer_state]
+
                         if is_main_process:
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                            # SIMPLE: Just save rank 0's model state (sharded weights)
-                            model_state = cast_state_dict_to_dtype(
-                                model.base_model.state_dict(), amp_dtype
+                            shards_to_save = tensor_parallel_shards_to_save or [local_model_state]
+                            optimizer_states_to_save = (
+                                tensor_parallel_optimizer_to_save
+                                or [local_optimizer_state]
                             )
+
+                            model_state = shards_to_save[0]
+                            if len(shards_to_save) == tensor_world_size:
+                                try:
+                                    model_state = merge_tensor_parallel_shards(
+                                        shards_to_save, config=config
+                                    )
+                                except Exception as merge_err:
+                                    print(
+                                        "⚠ Failed to merge tensor-parallel shards for full checkpoint: %s"
+                                        % merge_err
+                                    )
 
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
                                 "model_state_dict": model_state,
-                                "optimizer_state_dict": optimizer.state_dict(),
+                                "optimizer_state_dict": optimizer_states_to_save[0],
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": (
                                     dict(lr_ramp_tracker)
@@ -1015,6 +1373,10 @@ def resume_training(
                                 "tensor_parallel_rank": tensor_parallel_rank,
                                 "data_parallel_rank": dist_ctx.data_parallel_rank,
                             }
+                            checkpoint_state["tensor_parallel_shards"] = shards_to_save
+                            checkpoint_state["tensor_parallel_optimizer_states"] = (
+                                optimizer_states_to_save
+                            )
                             os.makedirs("pretrained", exist_ok=True)
                             save_path = (
                                 f"pretrained/streaming_checkpoint_step_{global_step}.pth"
