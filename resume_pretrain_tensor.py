@@ -2,8 +2,10 @@ import argparse
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
+import pickle
 import re
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -54,6 +56,8 @@ from training import (
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
+
+_GATHER_OBJECT_SUPPORTS_DEVICE = "device" in inspect.signature(dist.gather_object).parameters
 
 CHECKPOINT_PATTERN = re.compile(r"_step_(\d+)(?:_rank\d+)?\.pth$")
 
@@ -174,6 +178,79 @@ def _normalize_optimizer_state_structure(state: Mapping[str, object]) -> Dict[st
         normalized[key] = value
 
     return normalized
+
+
+def _gather_object_to_cpu(
+    obj: object,
+    gather_list: Optional[List[Optional[object]]],
+    *,
+    dst: int,
+    group: Optional[dist.ProcessGroup],
+) -> None:
+    """Gather ``obj`` across ``group`` while forcing CPU buffers to avoid CUDA OOM."""
+
+    if not dist.is_initialized():
+        if gather_list is not None:
+            for idx in range(len(gather_list)):
+                gather_list[idx] = obj if idx == 0 else None
+        return
+
+    cpu_device = torch.device("cpu")
+
+    if _GATHER_OBJECT_SUPPORTS_DEVICE:
+        dist.gather_object(
+            obj,
+            gather_list,
+            dst=dst,
+            group=group,
+            device=cpu_device,
+        )
+        return
+
+    if group is None:
+        rank_in_group = dist.get_rank()
+        world_size = dist.get_world_size()
+        dst_rank = dst
+    else:
+        rank_in_group = dist.get_rank(group=group)
+        world_size = dist.get_world_size(group=group)
+        try:
+            dst_rank = dist.get_group_rank(group, dst)
+        except ValueError:
+            dst_rank = dst
+
+    serialized = pickle.dumps(obj)
+    storage = torch.ByteStorage.from_buffer(serialized)
+    tensor = torch.ByteTensor(storage).clone().to(cpu_device)
+    length_tensor = torch.tensor([tensor.numel()], dtype=torch.int64, device=cpu_device)
+
+    if rank_in_group == dst_rank:
+        length_list = [
+            torch.zeros(1, dtype=torch.int64, device=cpu_device) for _ in range(world_size)
+        ]
+    else:
+        length_list = None
+
+    dist.gather(length_tensor, gather_list=length_list, dst=dst_rank, group=group)
+
+    if rank_in_group == dst_rank:
+        recv_tensors = [
+            torch.empty(int(length_list[i].item()), dtype=torch.uint8, device=cpu_device)
+            for i in range(world_size)
+        ]
+    else:
+        recv_tensors = None
+
+    dist.gather(tensor, gather_list=recv_tensors, dst=dst_rank, group=group)
+
+    if rank_in_group == dst_rank and recv_tensors is not None:
+        gathered_objects: List[object] = []
+        for recv_tensor in recv_tensors:
+            gathered_objects.append(pickle.loads(memoryview(recv_tensor.numpy())))
+
+        if gather_list is not None:
+            for idx, gathered in enumerate(gathered_objects):
+                gather_list[idx] = gathered
 
 
 def _deduplicate_kv_tensor(
@@ -1226,13 +1303,13 @@ def resume_training(
                                 shard_gather = [None] * dist_ctx.tensor_parallel_size
                                 optimizer_gather = [None] * dist_ctx.tensor_parallel_size
 
-                            dist.gather_object(
+                            _gather_object_to_cpu(
                                 local_model_state,
                                 shard_gather,
                                 dst=gather_root,
                                 group=dist_ctx.tensor_parallel_group,
                             )
-                            dist.gather_object(
+                            _gather_object_to_cpu(
                                 local_optimizer_state,
                                 optimizer_gather,
                                 dst=gather_root,
