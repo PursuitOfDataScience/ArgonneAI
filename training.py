@@ -21,6 +21,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+try:
+    from torch.distributed.nn.functional import (
+        all_reduce as _dist_nn_all_reduce,
+    )
+except Exception:  # pragma: no cover - optional dependency across versions
+    _dist_nn_all_reduce = None
 from tqdm import tqdm
 
 from data_processing import (
@@ -76,27 +83,37 @@ def _gcd(a: int, b: int) -> int:
     return a
 
 
+class _FallbackAllReduce(torch.autograd.Function):
+    """Autograd-aware all-reduce used when dist.nn.functional is unavailable."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: Optional[dist.ProcessGroup]):
+        ctx.group = group
+        result = tensor.clone()
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad_output, None
+
+
 @torch._dynamo.disable
-def _allreduce_non_compiled(
+def _tensor_parallel_all_reduce(
     tensor: torch.Tensor,
     *,
-    async_op: bool = False,
-    group: Optional[dist.ProcessGroup] = None,
+    group: Optional[dist.ProcessGroup],
 ):
-    """Run all-reduce outside any compiled graph, optionally asynchronously."""
+    """All-reduce ``tensor`` with autograd support, avoiding cudagraph capture."""
 
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op, group=group)
-    if async_op:
-        return work
-    return tensor
+    if group is None or not dist.is_initialized():
+        return tensor
 
+    if _dist_nn_all_reduce is not None:
+        return _dist_nn_all_reduce(tensor, group=group)
 
-@torch._dynamo.disable
-def _wait_for_work(work) -> None:
-    """Wait on a distributed work handle outside compiled regions."""
-
-    if work is not None:
-        work.wait()
+    return _FallbackAllReduce.apply(tensor, group)
 
 
 def _maybe_enable_compilation(
@@ -1196,14 +1213,10 @@ class TensorParallelModel(torch.nn.Module):
 
         attn_output = attn_output.contiguous()
 
-        attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            attn_reduce = _allreduce_non_compiled(
-                attn_output, async_op=True, group=self.tensor_parallel_group
+            attn_output = _tensor_parallel_all_reduce(
+                attn_output, group=self.tensor_parallel_group
             )
-
-        if attn_reduce is not None:
-            _wait_for_work(attn_reduce)
 
         hidden_states = residual + attn_output
 
@@ -1214,14 +1227,10 @@ class TensorParallelModel(torch.nn.Module):
 
         mlp_output = mlp_output.contiguous()
 
-        mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            mlp_reduce = _allreduce_non_compiled(
-                mlp_output, async_op=True, group=self.tensor_parallel_group
+            mlp_output = _tensor_parallel_all_reduce(
+                mlp_output, group=self.tensor_parallel_group
             )
-
-        if mlp_reduce is not None:
-            _wait_for_work(mlp_reduce)
 
         hidden_states = residual + mlp_output
 
