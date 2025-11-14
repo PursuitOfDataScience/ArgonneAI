@@ -83,8 +83,8 @@ def _gcd(a: int, b: int) -> int:
     return a
 
 
-class _FallbackAllReduce(torch.autograd.Function):
-    """Autograd-aware all-reduce used when dist.nn.functional is unavailable."""
+class _TensorParallelAllReduceFn(torch.autograd.Function):
+    """All-reduce with identity backward for tensor-parallel activations."""
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, group: Optional[dist.ProcessGroup]):
@@ -95,7 +95,8 @@ class _FallbackAllReduce(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+        # Each rank receives the full summed activation in forward, so the
+        # gradient of that sum with respect to the local shard is identity.
         return grad_output, None
 
 
@@ -105,15 +106,16 @@ def _tensor_parallel_all_reduce(
     *,
     group: Optional[dist.ProcessGroup],
 ):
-    """All-reduce ``tensor`` with autograd support, avoiding cudagraph capture."""
+    """All-reduce ``tensor`` with identity backward outside compiled regions."""
 
     if group is None or not dist.is_initialized():
         return tensor
 
-    if _dist_nn_all_reduce is not None:
-        return _dist_nn_all_reduce(tensor, group=group)
+    world_size = dist.get_world_size(group)
+    if world_size <= 1:
+        return tensor
 
-    return _FallbackAllReduce.apply(tensor, group)
+    return _TensorParallelAllReduceFn.apply(tensor, group)
 
 
 def _maybe_enable_compilation(
