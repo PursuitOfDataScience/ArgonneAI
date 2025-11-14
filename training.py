@@ -21,6 +21,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+try:
+    from torch.distributed.nn.functional import (
+        all_reduce as _dist_nn_all_reduce,
+    )
+except Exception:  # pragma: no cover - optional dependency across versions
+    _dist_nn_all_reduce = None
 from tqdm import tqdm
 
 from data_processing import (
