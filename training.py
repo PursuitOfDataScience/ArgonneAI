@@ -23,6 +23,11 @@ import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from tqdm import tqdm
 
+try:
+    from torch.distributed.nn import functional as dist_nn_functional
+except Exception:  # pragma: no cover - older PyTorch versions
+    dist_nn_functional = None
+
 from data_processing import (
     collate_batch,
     load_tokenizer,
@@ -77,26 +82,31 @@ def _gcd(a: int, b: int) -> int:
 
 
 @torch._dynamo.disable
-def _allreduce_non_compiled(
+def _tensor_parallel_all_reduce(
     tensor: torch.Tensor,
     *,
-    async_op: bool = False,
-    group: Optional[dist.ProcessGroup] = None,
+    group: Optional[dist.ProcessGroup],
 ):
-    """Run all-reduce outside any compiled graph, optionally asynchronously."""
+    """All-reduce ``tensor`` with identity backward outside compiled regions."""
 
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op, group=group)
-    if async_op:
-        return work
-    return tensor
+    if group is None or not dist.is_initialized():
+        return tensor
 
+    world_size = dist.get_world_size(group)
+    if world_size <= 1:
+        return tensor
 
-@torch._dynamo.disable
-def _wait_for_work(work) -> None:
-    """Wait on a distributed work handle outside compiled regions."""
+    if dist_nn_functional is not None:
+        return dist_nn_functional.all_reduce(
+            tensor,
+            op=dist.ReduceOp.SUM,
+            group=group,
+        )
 
-    if work is not None:
-        work.wait()
+    # Fallback for environments without ``torch.distributed.nn``
+    result = tensor.clone()
+    dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+    return result
 
 
 def _maybe_enable_compilation(
@@ -1196,14 +1206,10 @@ class TensorParallelModel(torch.nn.Module):
 
         attn_output = attn_output.contiguous()
 
-        attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            attn_reduce = _allreduce_non_compiled(
-                attn_output, async_op=True, group=self.tensor_parallel_group
+            attn_output = _tensor_parallel_all_reduce(
+                attn_output, group=self.tensor_parallel_group
             )
-
-        if attn_reduce is not None:
-            _wait_for_work(attn_reduce)
 
         hidden_states = residual + attn_output
 
@@ -1214,14 +1220,10 @@ class TensorParallelModel(torch.nn.Module):
 
         mlp_output = mlp_output.contiguous()
 
-        mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            mlp_reduce = _allreduce_non_compiled(
-                mlp_output, async_op=True, group=self.tensor_parallel_group
+            mlp_output = _tensor_parallel_all_reduce(
+                mlp_output, group=self.tensor_parallel_group
             )
-
-        if mlp_reduce is not None:
-            _wait_for_work(mlp_reduce)
 
         hidden_states = residual + mlp_output
 
