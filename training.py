@@ -30,6 +30,11 @@ except Exception:  # pragma: no cover - optional dependency across versions
     _dist_nn_all_reduce = None
 from tqdm import tqdm
 
+try:
+    from torch.distributed.nn import functional as dist_nn_functional
+except Exception:  # pragma: no cover - older PyTorch versions
+    dist_nn_functional = None
+
 from data_processing import (
     collate_batch,
     load_tokenizer,
@@ -115,7 +120,17 @@ def _tensor_parallel_all_reduce(
     if world_size <= 1:
         return tensor
 
-    return _TensorParallelAllReduceFn.apply(tensor, group)
+    if dist_nn_functional is not None:
+        return dist_nn_functional.all_reduce(
+            tensor,
+            op=dist.ReduceOp.SUM,
+            group=group,
+        )
+
+    # Fallback for environments without ``torch.distributed.nn``
+    result = tensor.clone()
+    dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+    return result
 
 
 def _maybe_enable_compilation(
