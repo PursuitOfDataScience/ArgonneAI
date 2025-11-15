@@ -21,6 +21,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+try:
+    from torch.distributed.nn.functional import (
+        all_reduce as _dist_nn_all_reduce,
+    )
+except Exception:  # pragma: no cover - optional dependency across versions
+    _dist_nn_all_reduce = None
 from tqdm import tqdm
 
 try:
@@ -79,6 +86,23 @@ def _gcd(a: int, b: int) -> int:
     while b:
         a, b = b, a % b
     return a
+
+
+class _TensorParallelAllReduceFn(torch.autograd.Function):
+    """All-reduce with identity backward for tensor-parallel activations."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: Optional[dist.ProcessGroup]):
+        ctx.group = group
+        result = tensor.clone()
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        # Each rank receives the full summed activation in forward, so the
+        # gradient of that sum with respect to the local shard is identity.
+        return grad_output, None
 
 
 @torch._dynamo.disable
