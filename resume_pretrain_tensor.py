@@ -1373,6 +1373,12 @@ def resume_training(
                                     " to keep host memory usage bounded."
                                 )
 
+                            if optimizer_state_skipped:
+                                print(
+                                    "⚠ Skipping optimizer state capture for tensor-parallel checkpoint"
+                                    " to avoid host memory exhaustion."
+                                )
+
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
