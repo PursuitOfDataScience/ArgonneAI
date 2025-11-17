@@ -1358,17 +1358,20 @@ def resume_training(
                             elif local_optimizer_state is not None:
                                 optimizer_states_to_save = [local_optimizer_state]
 
-                            model_state = shards_to_save[0]
-                            if len(shards_to_save) == tensor_world_size:
-                                try:
-                                    model_state = merge_tensor_parallel_shards(
-                                        shards_to_save, config=config
-                                    )
-                                except Exception as merge_err:
-                                    print(
-                                        "⚠ Failed to merge tensor-parallel shards for full checkpoint: %s"
-                                        % merge_err
-                                    )
+                            full_model_state: Optional[Dict[str, torch.Tensor]] = None
+                            if tensor_world_size <= 1:
+                                full_model_state = shards_to_save[0]
+
+                            if optimizer_state_skipped:
+                                print(
+                                    "⚠ Skipping optimizer state capture for tensor-parallel checkpoint"
+                                    " to avoid host memory exhaustion."
+                                )
+                            if tensor_world_size > 1:
+                                print(
+                                    "⚠ Saving tensor-parallel shards without merging to a full state"
+                                    " to keep host memory usage bounded."
+                                )
 
                             if optimizer_state_skipped:
                                 print(
@@ -1379,7 +1382,7 @@ def resume_training(
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
-                                "model_state_dict": model_state,
+                                "model_state_dict": full_model_state,
                                 "optimizer_state_dict": (
                                     optimizer_states_to_save[0]
                                     if optimizer_states_to_save
