@@ -1274,9 +1274,13 @@ def resume_training(
                         local_model_state = cast_state_dict_to_dtype(
                             model.base_model.state_dict(), amp_dtype
                         )
-                        local_optimizer_state = _normalize_optimizer_state_structure(
-                            _optimizer_state_to_cpu(optimizer.state_dict())
-                        )
+
+                        capture_optimizer_state = dist_ctx.tensor_parallel_size <= 1
+                        local_optimizer_state: Optional[Dict[str, object]] = None
+                        if capture_optimizer_state:
+                            local_optimizer_state = _normalize_optimizer_state_structure(
+                                _optimizer_state_to_cpu(optimizer.state_dict())
+                            )
 
                         tensor_parallel_shards_to_save: Optional[
                             List[Dict[str, torch.Tensor]]
@@ -1285,6 +1289,7 @@ def resume_training(
                             List[Dict[str, object]]
                         ] = None
 
+                        optimizer_state_skipped = False
                         if (
                             dist.is_initialized()
                             and dist_ctx.tensor_parallel_group is not None
@@ -1299,7 +1304,8 @@ def resume_training(
 
                             if dist_ctx.rank == gather_root:
                                 shard_gather = [None] * dist_ctx.tensor_parallel_size
-                                optimizer_gather = [None] * dist_ctx.tensor_parallel_size
+                                if capture_optimizer_state:
+                                    optimizer_gather = [None] * dist_ctx.tensor_parallel_size
 
                             _gather_object_to_cpu(
                                 local_model_state,
@@ -1307,55 +1313,75 @@ def resume_training(
                                 dst=gather_root,
                                 group=dist_ctx.tensor_parallel_group,
                             )
-                            _gather_object_to_cpu(
-                                local_optimizer_state,
-                                optimizer_gather,
-                                dst=gather_root,
-                                group=dist_ctx.tensor_parallel_group,
-                            )
+                            if capture_optimizer_state and optimizer_gather is not None:
+                                _gather_object_to_cpu(
+                                    local_optimizer_state,
+                                    optimizer_gather,
+                                    dst=gather_root,
+                                    group=dist_ctx.tensor_parallel_group,
+                                )
+                            elif dist_ctx.rank == gather_root:
+                                optimizer_state_skipped = True
 
                             if dist_ctx.rank == gather_root:
                                 tensor_parallel_shards_to_save = [
                                     dict(shard) if isinstance(shard, Mapping) else {}
                                     for shard in (shard_gather or [])
                                 ]
-                                tensor_parallel_optimizer_to_save = [
-                                    _normalize_optimizer_state_structure(state)
-                                    if isinstance(state, Mapping)
-                                    else {}
-                                    for state in (optimizer_gather or [])
-                                ]
+                                if optimizer_gather is not None:
+                                    tensor_parallel_optimizer_to_save = [
+                                        _normalize_optimizer_state_structure(state)
+                                        if isinstance(state, Mapping)
+                                        else {}
+                                        for state in (optimizer_gather or [])
+                                    ]
                         else:
                             tensor_parallel_shards_to_save = [local_model_state]
-                            tensor_parallel_optimizer_to_save = [local_optimizer_state]
+                            tensor_parallel_optimizer_to_save = (
+                                [local_optimizer_state]
+                                if local_optimizer_state is not None
+                                else None
+                            )
 
                         if is_main_process:
                             generated_text = hf_tokenizer.decode(generated[0].tolist())
                             print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                            shards_to_save = tensor_parallel_shards_to_save or [local_model_state]
-                            optimizer_states_to_save = (
-                                tensor_parallel_optimizer_to_save
-                                or [local_optimizer_state]
+                            shards_to_save = (
+                                tensor_parallel_shards_to_save or [local_model_state]
                             )
+                            optimizer_states_to_save: Optional[
+                                List[Dict[str, object]]
+                            ] = None
+                            if tensor_parallel_optimizer_to_save is not None:
+                                optimizer_states_to_save = tensor_parallel_optimizer_to_save
+                            elif local_optimizer_state is not None:
+                                optimizer_states_to_save = [local_optimizer_state]
 
-                            model_state = shards_to_save[0]
-                            if len(shards_to_save) == tensor_world_size:
-                                try:
-                                    model_state = merge_tensor_parallel_shards(
-                                        shards_to_save, config=config
-                                    )
-                                except Exception as merge_err:
-                                    print(
-                                        "⚠ Failed to merge tensor-parallel shards for full checkpoint: %s"
-                                        % merge_err
-                                    )
+                            full_model_state: Optional[Dict[str, torch.Tensor]] = None
+                            if tensor_world_size <= 1:
+                                full_model_state = shards_to_save[0]
+
+                            if optimizer_state_skipped:
+                                print(
+                                    "⚠ Skipping optimizer state capture for tensor-parallel checkpoint"
+                                    " to avoid host memory exhaustion."
+                                )
+                            if tensor_world_size > 1:
+                                print(
+                                    "⚠ Saving tensor-parallel shards without merging to a full state"
+                                    " to keep host memory usage bounded."
+                                )
 
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": current_total_tokens,
-                                "model_state_dict": model_state,
-                                "optimizer_state_dict": optimizer_states_to_save[0],
+                                "model_state_dict": full_model_state,
+                                "optimizer_state_dict": (
+                                    optimizer_states_to_save[0]
+                                    if optimizer_states_to_save
+                                    else None
+                                ),
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": (
                                     dict(lr_ramp_tracker)
@@ -1375,9 +1401,10 @@ def resume_training(
                                 "data_parallel_rank": dist_ctx.data_parallel_rank,
                             }
                             checkpoint_state["tensor_parallel_shards"] = shards_to_save
-                            checkpoint_state["tensor_parallel_optimizer_states"] = (
-                                optimizer_states_to_save
-                            )
+                            if tensor_parallel_optimizer_to_save is not None:
+                                checkpoint_state["tensor_parallel_optimizer_states"] = (
+                                    tensor_parallel_optimizer_to_save
+                                )
                             os.makedirs("pretrained", exist_ok=True)
                             save_path = (
                                 f"pretrained/streaming_checkpoint_step_{global_step}.pth"
