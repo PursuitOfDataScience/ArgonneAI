@@ -769,6 +769,10 @@ def resume_training(
     # Create base model (keep parameters in FP32 for stable optimizer state)
     base_model = ArgonneModel(config)
 
+    total_params = sum(p.numel() for p in base_model.parameters())
+    if is_main_process:
+        print(f"✓ Model contains {total_params:,} parameters")
+
     checkpoint_tensor_shards: Optional[List[Dict[str, torch.Tensor]]] = None
     load_shards_after_wrap = False
 
