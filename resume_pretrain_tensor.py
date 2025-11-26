@@ -1306,11 +1306,34 @@ def resume_training(
                 pbar.close()
 
     final_token_count = total_tokens_processed + tokens_in_this_session
-    
+
     if is_main_process:
         print(f"\n===== TRAINING COMPLETE =====")
         print(f"Total tokens: {final_token_count:,}")
         print(f"Final step: {global_step}")
+
+        # Save a final checkpoint even if we didn't hit the periodic save interval
+        model_state = cast_state_dict_to_dtype(model.base_model.state_dict(), amp_dtype)
+        final_checkpoint_state = {
+            "global_step": global_step,
+            "tokens_processed": final_token_count,
+            "model_state_dict": model_state,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "lr_ramp_state": (dict(lr_ramp_tracker) if lr_ramp_tracker is not None else None),
+            "gradient_accumulation_steps": grad_accum_steps,
+            "loss": last_loss_value,
+            "data_position": data_position.get_state(),
+            "model_dtype": str(amp_dtype),
+            "tensor_parallel": True,
+            "world_size": world_size,
+            "rank": rank,
+        }
+
+        os.makedirs("pretrained", exist_ok=True)
+        final_checkpoint_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+        safe_torch_save(final_checkpoint_state, final_checkpoint_path)
+        print(f"Final checkpoint saved -> {final_checkpoint_path}")
 
     if dist.is_initialized():
         dist.barrier()
