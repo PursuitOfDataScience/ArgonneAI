@@ -1306,11 +1306,43 @@ def resume_training(
                 pbar.close()
 
     final_token_count = total_tokens_processed + tokens_in_this_session
-    
+
+    # Gather tensor-parallel shards and export a full model + tokenizer for final use
+    local_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model.base_model.state_dict()), torch.float32)
+
+    merged_state: Optional[Dict[str, torch.Tensor]] = None
+    if dist.is_initialized() and world_size > 1:
+        gathered_states: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
+        if rank == 0:
+            gathered_states = [None for _ in range(world_size)]
+
+        dist.gather_object(local_state, gather_list=gathered_states, dst=0)
+
+        if rank == 0:
+            shard_list: List[Mapping[str, torch.Tensor]] = [
+                shard for shard in gathered_states if shard is not None
+            ]
+            merged_state = merge_tensor_parallel_shards(shard_list)
+    else:
+        merged_state = local_state
+
     if is_main_process:
         print(f"\n===== TRAINING COMPLETE =====")
         print(f"Total tokens: {final_token_count:,}")
         print(f"Final step: {global_step}")
+
+        if not merged_state:
+            raise RuntimeError("Unable to merge tensor-parallel shards for final model export")
+
+        export_model = ArgonneModel(config)
+        export_model.load_state_dict(merged_state, strict=True)
+
+        output_dir = "Argonne2.0"
+        os.makedirs(output_dir, exist_ok=True)
+        export_model.save_pretrained(output_dir)
+        hf_tokenizer.save_pretrained(output_dir)
+
+        print(f"✓ Final model saved to {output_dir}")
 
     if dist.is_initialized():
         dist.barrier()
