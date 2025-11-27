@@ -1316,7 +1316,8 @@ def resume_training(
         if rank == 0:
             gathered_states = [None for _ in range(world_size)]
 
-        dist.gather_object(local_state, gather_list=gathered_states, dst=0)
+        # torch.distributed.gather_object uses `object_gather_list` (not `gather_list`)
+        dist.gather_object(local_state, object_gather_list=gathered_states, dst=0)
 
         if rank == 0:
             shard_list: List[Mapping[str, torch.Tensor]] = [
@@ -1339,7 +1340,7 @@ def resume_training(
 
         output_dir = "Argonne2.0"
         os.makedirs(output_dir, exist_ok=True)
-        export_model.save_pretrained(output_dir)
+        export_model.save_pretrained(output_dir, safe_serialization=False)
         hf_tokenizer.save_pretrained(output_dir)
 
         print(f"✓ Final model saved to {output_dir}")
