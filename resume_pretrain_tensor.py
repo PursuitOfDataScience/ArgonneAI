@@ -1340,7 +1340,7 @@ def resume_training(
 
         output_dir = "Argonne2.0"
         os.makedirs(output_dir, exist_ok=True)
-        export_model.save_pretrained(output_dir)
+        export_model.save_pretrained(output_dir, safe_serialization=False)
         hf_tokenizer.save_pretrained(output_dir)
 
         print(f"✓ Final model saved to {output_dir}")
