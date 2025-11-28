@@ -206,19 +206,18 @@ def load_teacher_model_tensor_parallel(
     """
     Load a HuggingFace teacher model with tensor parallelism.
     
-    This function:
-    1. Only loads the model checkpoint once (on rank 0)
-    2. Shards the weights appropriately for tensor parallelism
-    3. Distributes shards to all GPUs via efficient point-to-point communication
-    4. Returns a model ready for tensor-parallel inference
+    Each rank loads the full model independently to avoid NCCL timeout issues,
+    then keeps only its shard and discards the rest. While this means loading
+    from disk multiple times, it avoids the coordination bottleneck that causes
+    NCCL timeouts when rank 0 takes 10+ minutes to load.
     
-    For inference with sharded HF models, we need to handle the forward pass
-    carefully since the model expects full tensors. We create a wrapper that
-    does the necessary all-reduce operations.
-    
-    This is MUCH faster and more memory efficient than loading on each GPU.
+    This approach:
+    1. Each rank loads the model independently (parallel disk reads)
+    2. Each rank shards the weights and keeps only its portion
+    3. Returns a model ready for tensor-parallel inference
     """
     import gc
+    import time
     from transformers import AutoConfig
     
     is_main = (rank == 0)
@@ -231,11 +230,10 @@ def load_teacher_model_tensor_parallel(
         print(f"  Path: {teacher_path}")
         print(f"  World size: {world_size}")
         print(f"  Dtype: {dtype}")
+        print(f"  Strategy: Each rank loads and shards independently")
+        print(f"{'='*70}")
     
-    # Synchronize all ranks before loading
-    dist.barrier()
-    
-    # Load model config (all ranks need this)
+    # Load model config (all ranks need this - fast operation)
     config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
     
     # Validate that model can be sharded evenly
@@ -250,104 +248,63 @@ def load_teacher_model_tensor_parallel(
                 f"Number of KV heads ({config.num_key_value_heads}) must be divisible by world_size ({world_size})"
             )
     
-    # Step 1: Rank 0 loads the full model to CPU, then distributes shards
-    if rank == 0:
-        print("Loading full model on rank 0 (CPU)...")
-        teacher_full = AutoModelForCausalLM.from_pretrained(
-            teacher_path,
-            torch_dtype=dtype,
-            trust_remote_code=trust_remote_code,
-            low_cpu_mem_usage=True,
-            device_map="cpu",
-        )
-        full_state_dict = {k: v.cpu() for k, v in teacher_full.state_dict().items()}
-        param_keys = list(full_state_dict.keys())
-        total_params = sum(p.numel() for p in teacher_full.parameters())
-        print(f"✓ Loaded {total_params:,} parameters")
-        
-        # Delete the model to free CPU memory, keep state dict
-        del teacher_full
-        gc.collect()
-    else:
-        full_state_dict = None
-        param_keys = []
-    
-    # Broadcast parameter keys to all ranks
-    keys_list = [param_keys]
-    dist.broadcast_object_list(keys_list, src=0)
-    param_keys = keys_list[0]
-    
-    dist.barrier()
-    
+    # Each rank loads the full model to CPU independently
+    # This avoids NCCL timeout since there's no coordination during the slow load
     if is_main:
-        print(f"Distributing {len(param_keys)} parameters to {world_size} GPUs...")
+        print(f"All {world_size} ranks loading model in parallel...")
     
-    # Step 2: Create empty state dict for this rank's shard
+    start_time = time.time()
+    
+    # Load full model on CPU
+    teacher_full = AutoModelForCausalLM.from_pretrained(
+        teacher_path,
+        torch_dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        low_cpu_mem_usage=True,
+        device_map="cpu",
+    )
+    
+    elapsed = time.time() - start_time
+    if is_main:
+        total_params = sum(p.numel() for p in teacher_full.parameters())
+        print(f"✓ Rank 0 loaded {total_params:,} parameters in {elapsed:.1f}s")
+    
+    # Get the state dict and shard it for this rank
+    full_state_dict = teacher_full.state_dict()
+    
+    # Create sharded state dict for this rank
     my_shard: Dict[str, torch.Tensor] = {}
     
-    # Process parameters one by one
-    for key_idx, key in enumerate(param_keys):
-        if rank == 0:
-            tensor = full_state_dict[key]
-            
-            # Determine how to shard this parameter
-            if key.endswith(QWEN_COLUMN_PARALLEL_WEIGHT_SUFFIXES):
-                chunks = list(tensor.chunk(world_size, dim=0))
-            elif key.endswith(QWEN_COLUMN_PARALLEL_BIAS_SUFFIXES):
-                chunks = list(tensor.chunk(world_size, dim=0))
-            elif key.endswith(QWEN_ROW_PARALLEL_WEIGHT_SUFFIXES):
-                chunks = list(tensor.chunk(world_size, dim=1))
-            else:
-                # Replicate
-                chunks = [tensor.clone() for _ in range(world_size)]
-            
-            # Keep rank 0's chunk
-            my_shard[key] = chunks[0].contiguous().to(device=device, dtype=dtype)
-            
-            # Send to other ranks
-            for target_rank in range(1, world_size):
-                chunk = chunks[target_rank].contiguous()
-                # Send shape info first
-                shape_list = list(chunk.shape)
-                shape_info = [len(shape_list)] + shape_list
-                dist.send(torch.tensor(shape_info, dtype=torch.long, device=device), dst=target_rank)
-                # Send the actual data
-                dist.send(chunk.to(device=device, dtype=dtype), dst=target_rank)
-            
-            # Clear from full state dict to free memory
-            del full_state_dict[key]
-            del chunks
-            
-            if key_idx % 50 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
-        else:
-            # Receive shape info
-            shape_info = torch.zeros(11, dtype=torch.long, device=device)  # max 10 dims + length
-            dist.recv(shape_info, src=0)
-            num_dims = int(shape_info[0].item())
-            shape = [int(shape_info[i+1].item()) for i in range(num_dims)]
-            
-            # Receive tensor
-            chunk = torch.zeros(shape, dtype=dtype, device=device)
-            dist.recv(chunk, src=0)
-            my_shard[key] = chunk
+    for key, tensor in full_state_dict.items():
+        tensor_cpu = tensor.cpu()
         
-        if is_main and (key_idx + 1) % 100 == 0:
-            print(f"  Distributed {key_idx + 1}/{len(param_keys)} parameters...")
+        # Determine how to shard this parameter
+        if key.endswith(QWEN_COLUMN_PARALLEL_WEIGHT_SUFFIXES):
+            # Column-parallel: split along dim 0
+            chunks = list(tensor_cpu.chunk(world_size, dim=0))
+            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
+        elif key.endswith(QWEN_COLUMN_PARALLEL_BIAS_SUFFIXES):
+            # Column-parallel bias
+            chunks = list(tensor_cpu.chunk(world_size, dim=0))
+            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
+        elif key.endswith(QWEN_ROW_PARALLEL_WEIGHT_SUFFIXES):
+            # Row-parallel: split along dim 1
+            chunks = list(tensor_cpu.chunk(world_size, dim=1))
+            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
+        else:
+            # Replicate (embeddings, norms, lm_head, etc.)
+            my_shard[key] = tensor_cpu.to(device=device, dtype=dtype)
     
-    if rank == 0 and full_state_dict:
-        del full_state_dict
+    # Delete the full model to free memory
+    del teacher_full
+    del full_state_dict
     gc.collect()
     torch.cuda.empty_cache()
     
-    dist.barrier()
-    
     if is_main:
-        print("✓ All shards distributed. Building sharded model...")
+        print("✓ All ranks have sharded weights. Building models...")
     
-    # Step 3: Create the model with sharded dimensions
-    # Modify config for this rank's shard
+    # Create model with sharded config
     sharded_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
     sharded_config.num_attention_heads = config.num_attention_heads // world_size
     sharded_config.num_key_value_heads = config.num_key_value_heads // world_size
@@ -365,7 +322,6 @@ def load_teacher_model_tensor_parallel(
     teacher_model = teacher_model.to(device)
     
     # Load sharded state dict
-    # This should now match dimensions
     try:
         teacher_model.load_state_dict(my_shard, strict=True)
         if is_main:
@@ -384,6 +340,7 @@ def load_teacher_model_tensor_parallel(
     gc.collect()
     torch.cuda.empty_cache()
     
+    # Now we can safely use NCCL barrier since all ranks are done
     dist.barrier()
     
     if is_main:
