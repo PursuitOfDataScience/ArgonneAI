@@ -678,6 +678,7 @@ def resume_training(
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = True,
     teacher_low_cpu_mem_usage: bool = False,
+    teacher_device_map: str = "auto",
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -781,14 +782,30 @@ def resume_training(
         supports_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
+    teacher_device_map_option = teacher_device_map
     teacher_device_map = None
-    if torch.cuda.is_available() and teacher_low_cpu_mem_usage:
-        teacher_device_map = {"": f"cuda:{torch.cuda.current_device()}"}
+    teacher_low_cpu_mem_usage = bool(teacher_low_cpu_mem_usage)
+    if torch.cuda.is_available():
+        if teacher_device_map_option == "auto":
+            teacher_device_map = "auto"
+            teacher_low_cpu_mem_usage = True
+        elif teacher_device_map_option and teacher_device_map_option != "none":
+            teacher_device_map = teacher_device_map_option
+            teacher_low_cpu_mem_usage = True
+        else:
+            teacher_device_map = None
+    else:
+        teacher_device_map = None
 
     if is_main_process:
-        target_device = teacher_device_map[""] if teacher_device_map else (
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-        )
+        if teacher_device_map == "auto":
+            target_device = "CUDA (device_map=auto across all GPUs)"
+        elif teacher_device_map:
+            target_device = str(teacher_device_map)
+        else:
+            target_device = (
+                f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            )
         cpu_mode = "low CPU memory" if teacher_low_cpu_mem_usage else "full CPU prefetch"
         print(
             f"✓ Loading teacher model from {teacher_path} on {target_device} "
@@ -1562,6 +1579,13 @@ def parse_args() -> argparse.Namespace:
         help="Use low-CPU-memory loading for the teacher model (slower but lighter).",
     )
     parser.add_argument(
+        "--teacher-device-map",
+        type=str,
+        default="auto",
+        choices=["auto", "none"],
+        help="Device map strategy for the teacher model (requires low CPU memory mode)",
+    )
+    parser.add_argument(
         "--force-from-scratch",
         action="store_true",
         help="Force training from scratch, ignoring any checkpoints.",
@@ -1604,6 +1628,7 @@ def main():
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         teacher_low_cpu_mem_usage=args.teacher_low_cpu_mem_usage,
+        teacher_device_map=args.teacher_device_map,
     )
 
 
