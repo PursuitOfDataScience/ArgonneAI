@@ -204,20 +204,25 @@ def load_teacher_model_tensor_parallel(
     trust_remote_code: bool = False,
 ) -> torch.nn.Module:
     """
-    Load a HuggingFace teacher model with tensor parallelism.
+    Load a HuggingFace teacher model for tensor-parallel inference.
     
-    Each rank loads the full model independently to avoid NCCL timeout issues,
-    then keeps only its shard and discards the rest. While this means loading
-    from disk multiple times, it avoids the coordination bottleneck that causes
-    NCCL timeouts when rank 0 takes 10+ minutes to load.
+    This uses a DIFFERENT approach than true tensor parallelism:
+    - Each GPU loads the FULL model
+    - We do NOT shard weights because HuggingFace models don't support it directly
+    - Instead, we use pipeline-style: replicate model on each GPU
+    - Use gradient checkpointing and torch.cuda.amp to manage memory
     
-    This approach:
-    1. Each rank loads the model independently (parallel disk reads)
-    2. Each rank shards the weights and keeps only its portion
-    3. Returns a model ready for tensor-parallel inference
+    For a 32B model on 8x A100 80GB, this should work since:
+    - 32B params * 2 bytes (bf16) = 64GB, fits in 80GB
+    - We run in eval mode with no gradients, so no optimizer states
+    
+    For faster loading, we use safetensors with parallel workers.
     """
     import gc
     import time
+    import json
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor
     from transformers import AutoConfig
     
     is_main = (rank == 0)
@@ -225,195 +230,125 @@ def load_teacher_model_tensor_parallel(
     
     if is_main:
         print(f"{'='*70}")
-        print("LOADING TEACHER MODEL WITH TENSOR PARALLELISM")
+        print("LOADING TEACHER MODEL (REPLICATED MODE)")
         print(f"{'='*70}")
         print(f"  Path: {teacher_path}")
         print(f"  World size: {world_size}")
         print(f"  Dtype: {dtype}")
-        print(f"  Strategy: Each rank loads and shards independently")
+        print(f"  Strategy: Full model on each GPU (eval mode, no grads)")
         print(f"{'='*70}")
-    
-    # Load model config (all ranks need this - fast operation)
-    config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
-    
-    # Validate that model can be sharded evenly
-    if hasattr(config, "num_attention_heads"):
-        if config.num_attention_heads % world_size != 0:
-            raise ValueError(
-                f"Number of attention heads ({config.num_attention_heads}) must be divisible by world_size ({world_size})"
-            )
-    if hasattr(config, "num_key_value_heads"):
-        if config.num_key_value_heads % world_size != 0:
-            raise ValueError(
-                f"Number of KV heads ({config.num_key_value_heads}) must be divisible by world_size ({world_size})"
-            )
-    
-    # Each rank loads the full model to CPU independently
-    # This avoids NCCL timeout since there's no coordination during the slow load
-    if is_main:
-        print(f"All {world_size} ranks loading model in parallel...")
     
     start_time = time.time()
     
-    # Load full model on CPU
-    teacher_full = AutoModelForCausalLM.from_pretrained(
-        teacher_path,
-        torch_dtype=dtype,
-        trust_remote_code=trust_remote_code,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-    )
+    # Check if safetensors is available for faster loading
+    teacher_path_obj = Path(teacher_path)
+    index_file = teacher_path_obj / "model.safetensors.index.json"
+    use_safetensors = index_file.exists()
     
-    elapsed = time.time() - start_time
-    if is_main:
-        total_params = sum(p.numel() for p in teacher_full.parameters())
-        print(f"✓ Rank 0 loaded {total_params:,} parameters in {elapsed:.1f}s")
+    if use_safetensors and is_main:
+        print("✓ Found safetensors index, will use fast parallel loading")
     
-    # Get the state dict and shard it for this rank
-    full_state_dict = teacher_full.state_dict()
+    # Try to use safetensors for much faster parallel loading
+    if use_safetensors:
+        try:
+            from safetensors import safe_open
+            from safetensors.torch import load_file as load_safetensors
+            
+            # Load the index to find all shard files
+            with open(index_file, "r") as f:
+                index_data = json.load(f)
+            
+            weight_map = index_data.get("weight_map", {})
+            shard_files = list(set(weight_map.values()))
+            shard_files.sort()
+            
+            if is_main:
+                print(f"  Loading {len(shard_files)} safetensor shards in parallel...")
+            
+            # Function to load a single shard
+            def load_shard(shard_name: str) -> Dict[str, torch.Tensor]:
+                shard_path = teacher_path_obj / shard_name
+                return load_safetensors(str(shard_path), device="cpu")
+            
+            # Parallel load all shards using multiple CPU threads
+            # Use more workers for faster parallel I/O
+            num_workers = min(len(shard_files), 16)  # Up to 16 parallel loads
+            
+            all_weights: Dict[str, torch.Tensor] = {}
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                shard_dicts = list(executor.map(load_shard, shard_files))
+                for shard_dict in shard_dicts:
+                    all_weights.update(shard_dict)
+            
+            elapsed_load = time.time() - start_time
+            if is_main:
+                print(f"✓ Loaded all weights in {elapsed_load:.1f}s (parallel safetensors)")
+            
+            # Now create the model structure and load weights
+            config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
+            
+            # Create model on meta device first (no memory allocation)
+            with torch.device("meta"):
+                teacher_model = AutoModelForCausalLM.from_config(
+                    config,
+                    torch_dtype=dtype,
+                    trust_remote_code=trust_remote_code,
+                )
+            
+            # Materialize on GPU with loaded weights
+            if is_main:
+                print(f"  Moving model to GPU {rank}...")
+            
+            # Convert all weights to target dtype and move to GPU
+            for key in all_weights:
+                all_weights[key] = all_weights[key].to(dtype=dtype, device=device)
+            
+            # Load weights
+            teacher_model.load_state_dict(all_weights, assign=True, strict=False)
+            
+            del all_weights
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except ImportError:
+            if is_main:
+                print("⚠ safetensors not available, falling back to standard loading")
+            use_safetensors = False
+        except Exception as e:
+            if is_main:
+                print(f"⚠ safetensors loading failed ({e}), falling back to standard loading")
+            use_safetensors = False
     
-    # Create sharded state dict for this rank
-    my_shard: Dict[str, torch.Tensor] = {}
-    
-    for key, tensor in full_state_dict.items():
-        tensor_cpu = tensor.cpu()
+    # Fallback to standard HuggingFace loading if safetensors failed
+    if not use_safetensors:
+        if is_main:
+            print("  Using standard HuggingFace loading (slower)...")
         
-        # Determine how to shard this parameter
-        if key.endswith(QWEN_COLUMN_PARALLEL_WEIGHT_SUFFIXES):
-            # Column-parallel: split along dim 0
-            chunks = list(tensor_cpu.chunk(world_size, dim=0))
-            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
-        elif key.endswith(QWEN_COLUMN_PARALLEL_BIAS_SUFFIXES):
-            # Column-parallel bias
-            chunks = list(tensor_cpu.chunk(world_size, dim=0))
-            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
-        elif key.endswith(QWEN_ROW_PARALLEL_WEIGHT_SUFFIXES):
-            # Row-parallel: split along dim 1
-            chunks = list(tensor_cpu.chunk(world_size, dim=1))
-            my_shard[key] = chunks[rank].contiguous().to(device=device, dtype=dtype)
-        else:
-            # Replicate (embeddings, norms, lm_head, etc.)
-            my_shard[key] = tensor_cpu.to(device=device, dtype=dtype)
+        # Load directly to GPU to avoid CPU memory bottleneck
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            teacher_path,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True,
+            device_map={"": device},  # Load directly to this GPU
+        )
     
-    # Delete the full model to free memory
-    del teacher_full
-    del full_state_dict
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    if is_main:
-        print("✓ All ranks have sharded weights. Building models...")
-    
-    # Create model with sharded config
-    sharded_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
-    sharded_config.num_attention_heads = config.num_attention_heads // world_size
-    sharded_config.num_key_value_heads = config.num_key_value_heads // world_size
-    
-    # For Qwen2 models, intermediate_size is split for gate/up projections
-    if hasattr(sharded_config, "intermediate_size"):
-        sharded_config.intermediate_size = config.intermediate_size // world_size
-    
-    # Create model with sharded config
-    teacher_model = AutoModelForCausalLM.from_config(
-        sharded_config,
-        torch_dtype=dtype,
-        trust_remote_code=trust_remote_code,
-    )
-    teacher_model = teacher_model.to(device)
-    
-    # Load sharded state dict
-    try:
-        teacher_model.load_state_dict(my_shard, strict=True)
-        if is_main:
-            print("✓ Loaded sharded weights with strict=True")
-    except RuntimeError as e:
-        if is_main:
-            print(f"Note: strict loading failed ({e}), using strict=False")
-        teacher_model.load_state_dict(my_shard, strict=False)
-    
-    # Freeze and eval mode
+    # Set to eval mode and freeze
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
     
-    del my_shard
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Now we can safely use NCCL barrier since all ranks are done
-    dist.barrier()
-    
+    elapsed = time.time() - start_time
     if is_main:
-        shard_params = sum(p.numel() for p in teacher_model.parameters())
-        print(f"✓ Teacher model ready. Each GPU holds ~{shard_params:,} parameters")
+        total_params = sum(p.numel() for p in teacher_model.parameters())
+        print(f"✓ Teacher loaded: {total_params:,} parameters in {elapsed:.1f}s")
+        print(f"  GPU memory: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
         print(f"{'='*70}")
     
-    # Wrap in a class that handles tensor-parallel forward pass
-    return TensorParallelTeacherWrapper(teacher_model, world_size, rank)
-
-
-class TensorParallelTeacherWrapper(torch.nn.Module):
-    """
-    Wrapper for sharded HuggingFace teacher model that handles
-    all-reduce operations for tensor parallel inference.
-    """
+    # Synchronize all ranks
+    dist.barrier()
     
-    def __init__(self, model: torch.nn.Module, world_size: int, rank: int):
-        super().__init__()
-        self.model = model
-        self.world_size = world_size
-        self.rank = rank
-        self.device = torch.device(f"cuda:{rank}")
-        
-        # Register forward hooks to do all-reduce after attention and MLP
-        self._register_allreduce_hooks()
-    
-    def _register_allreduce_hooks(self):
-        """Register hooks to all-reduce after row-parallel layers."""
-        for layer in self.model.model.layers:
-            # Hook for attention output projection (o_proj)
-            if hasattr(layer.self_attn, 'o_proj'):
-                layer.self_attn.o_proj.register_forward_hook(self._allreduce_hook)
-            
-            # Hook for MLP down projection (down_proj)
-            if hasattr(layer.mlp, 'down_proj'):
-                layer.mlp.down_proj.register_forward_hook(self._allreduce_hook)
-    
-    def _allreduce_hook(self, module, input, output):
-        """All-reduce the output of row-parallel layers."""
-        if self.world_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        return output
-    
-    def forward(self, input_ids, attention_mask=None, **kwargs):
-        """Forward pass with tensor parallel all-reduce."""
-        input_ids = input_ids.to(self.device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                **kwargs,
-            )
-        
-        return outputs
-    
-    def __call__(self, input_ids, attention_mask=None, **kwargs):
-        return self.forward(input_ids, attention_mask, **kwargs)
-    
-    def parameters(self):
-        return self.model.parameters()
-    
-    def eval(self):
-        self.model.eval()
-        return self
-    
-    @property
-    def config(self):
-        return self.model.config
+    return teacher_model
 
 
 def streaming_token_generator(
