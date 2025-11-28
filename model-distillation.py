@@ -678,7 +678,7 @@ def resume_training(
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = True,
     teacher_low_cpu_mem_usage: bool = False,
-    teacher_device_map: str = "auto",
+    teacher_device_map: str = "local",
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -789,6 +789,8 @@ def resume_training(
         if teacher_device_map_option == "auto":
             teacher_device_map = "auto"
             teacher_low_cpu_mem_usage = True
+        elif teacher_device_map_option == "local":
+            teacher_device_map = {"": torch.cuda.current_device()}
         elif teacher_device_map_option and teacher_device_map_option != "none":
             teacher_device_map = teacher_device_map_option
             teacher_low_cpu_mem_usage = True
@@ -800,6 +802,8 @@ def resume_training(
     if is_main_process:
         if teacher_device_map == "auto":
             target_device = "CUDA (device_map=auto across all GPUs)"
+        elif isinstance(teacher_device_map, dict):
+            target_device = f"cuda:{torch.cuda.current_device()} (per-rank device_map)"
         elif teacher_device_map:
             target_device = str(teacher_device_map)
         else:
@@ -1581,9 +1585,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teacher-device-map",
         type=str,
-        default="auto",
-        choices=["auto", "none"],
-        help="Device map strategy for the teacher model (requires low CPU memory mode)",
+        default="local",
+        choices=["auto", "local", "none"],
+        help=(
+            "Device map strategy for the teacher model. "
+            "Use 'local' to pin each rank to its LOCAL_RANK GPU and avoid multi-rank auto-sharding."
+        ),
     )
     parser.add_argument(
         "--force-from-scratch",
