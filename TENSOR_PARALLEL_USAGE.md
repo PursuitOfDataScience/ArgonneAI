@@ -145,6 +145,8 @@ CUDA_VISIBLE_DEVICES=3 RANK=3 LOCAL_RANK=3 WORLD_SIZE=4 python resume_pretrain_t
 ### Other Options
 - `--trust-remote-code`: Allow loading tokenizers with custom code
 - `--local_rank`: Local rank for distributed training (set by torchrun)
+- `--teacher-device-map`: For distillation runs, prefer `local` (default) to pin the teacher to each rank's GPU
+  instead of letting every process attempt an `auto` device map across all GPUs.
 
 ## Monitoring Training
 
