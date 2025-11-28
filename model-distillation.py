@@ -788,16 +788,18 @@ def resume_training(
     if torch.cuda.is_available():
         if teacher_device_map_option == "auto":
             teacher_device_map = "auto"
-            teacher_low_cpu_mem_usage = True
         elif teacher_device_map_option == "local":
             teacher_device_map = {"": torch.cuda.current_device()}
         elif teacher_device_map_option and teacher_device_map_option != "none":
             teacher_device_map = teacher_device_map_option
-            teacher_low_cpu_mem_usage = True
         else:
             teacher_device_map = None
     else:
         teacher_device_map = None
+
+    # Hugging Face requires low_cpu_mem_usage=True whenever a device_map is provided
+    if teacher_device_map is not None:
+        teacher_low_cpu_mem_usage = True
 
     if is_main_process:
         if teacher_device_map == "auto":
@@ -1580,7 +1582,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teacher-low-cpu-mem-usage",
         action="store_true",
-        help="Use low-CPU-memory loading for the teacher model (slower but lighter).",
+        help=(
+            "Use low-CPU-memory loading for the teacher model (slower but lighter). "
+            "Automatically enabled when a device_map is provided."
+        ),
     )
     parser.add_argument(
         "--teacher-device-map",
@@ -1589,7 +1594,8 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "local", "none"],
         help=(
             "Device map strategy for the teacher model. "
-            "Use 'local' to pin each rank to its LOCAL_RANK GPU and avoid multi-rank auto-sharding."
+            "Use 'local' to pin each rank to its LOCAL_RANK GPU and avoid multi-rank auto-sharding. "
+            "When set, low_cpu_mem_usage is forced on to satisfy transformers requirements."
         ),
     )
     parser.add_argument(
