@@ -782,11 +782,13 @@ def resume_training(
         amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
 
     teacher_device_map = None
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and teacher_low_cpu_mem_usage:
         teacher_device_map = {"": f"cuda:{torch.cuda.current_device()}"}
 
     if is_main_process:
-        target_device = teacher_device_map[""] if teacher_device_map else "cpu"
+        target_device = teacher_device_map[""] if teacher_device_map else (
+            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+        )
         cpu_mode = "low CPU memory" if teacher_low_cpu_mem_usage else "full CPU prefetch"
         print(
             f"✓ Loading teacher model from {teacher_path} on {target_device} "
@@ -800,6 +802,8 @@ def resume_training(
         low_cpu_mem_usage=teacher_low_cpu_mem_usage,
         device_map=teacher_device_map,
     )
+    if teacher_device_map is None and torch.cuda.is_available():
+        teacher_model = teacher_model.to(torch.cuda.current_device())
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
