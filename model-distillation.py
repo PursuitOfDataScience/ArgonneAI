@@ -202,151 +202,99 @@ def load_teacher_model_tensor_parallel(
     rank: int,
     dtype: torch.dtype = torch.bfloat16,
     trust_remote_code: bool = False,
-) -> torch.nn.Module:
+) -> Optional[torch.nn.Module]:
     """
-    Load a HuggingFace teacher model for tensor-parallel inference.
+    Load a HuggingFace teacher model for inference using pipeline parallelism.
     
-    This uses a DIFFERENT approach than true tensor parallelism:
-    - Each GPU loads the FULL model
-    - We do NOT shard weights because HuggingFace models don't support it directly
-    - Instead, we use pipeline-style: replicate model on each GPU
-    - Use gradient checkpointing and torch.cuda.amp to manage memory
+    Strategy: Spread teacher across GPUs 1-7, leaving GPU 0 mostly free for
+    rank 0's student model. Only rank 0 loads the teacher.
     
-    For a 32B model on 8x A100 80GB, this should work since:
-    - 32B params * 2 bytes (bf16) = 64GB, fits in 80GB
-    - We run in eval mode with no gradients, so no optimizer states
+    Memory budget (80GB A100s):
+    - GPU 0: ~10GB teacher + student shard (~1.2GB) + activations = ~20GB
+    - GPUs 1-7: ~9GB teacher each + student shard (~1.2GB) + activations = ~15GB each
     
-    For faster loading, we use safetensors with parallel workers.
+    This works because:
+    1. Teacher spread = 64GB / 7 GPUs (1-7) ≈ 9GB each, plus overflow to GPU 0
+    2. Each student shard = 5B/8 = 0.6B params = 1.2GB in bf16
+    3. Plenty of room for activations
     """
     import gc
     import time
-    import json
-    from pathlib import Path
-    from concurrent.futures import ThreadPoolExecutor
-    from transformers import AutoConfig
+    from datetime import timedelta
     
     is_main = (rank == 0)
-    device = torch.device(f"cuda:{rank}")
     
     if is_main:
         print(f"{'='*70}")
-        print("LOADING TEACHER MODEL (REPLICATED MODE)")
+        print("LOADING TEACHER MODEL (PIPELINE PARALLEL)")
         print(f"{'='*70}")
         print(f"  Path: {teacher_path}")
         print(f"  World size: {world_size}")
         print(f"  Dtype: {dtype}")
-        print(f"  Strategy: Full model on each GPU (eval mode, no grads)")
+        print(f"  Strategy: Spread across GPUs, minimize GPU 0 usage")
         print(f"{'='*70}")
     
-    start_time = time.time()
-    
-    # Check if safetensors is available for faster loading
-    teacher_path_obj = Path(teacher_path)
-    index_file = teacher_path_obj / "model.safetensors.index.json"
-    use_safetensors = index_file.exists()
-    
-    if use_safetensors and is_main:
-        print("✓ Found safetensors index, will use fast parallel loading")
-    
-    # Try to use safetensors for much faster parallel loading
-    if use_safetensors:
+    # Extend NCCL timeout for the loading phase
+    if dist.is_initialized():
         try:
-            from safetensors import safe_open
-            from safetensors.torch import load_file as load_safetensors
-            
-            # Load the index to find all shard files
-            with open(index_file, "r") as f:
-                index_data = json.load(f)
-            
-            weight_map = index_data.get("weight_map", {})
-            shard_files = list(set(weight_map.values()))
-            shard_files.sort()
-            
+            pg = dist.distributed_c10d._get_default_group()
+            extended_timeout = timedelta(minutes=60)
+            if hasattr(pg.options, '_timeout'):
+                pg.options._timeout = extended_timeout
             if is_main:
-                print(f"  Loading {len(shard_files)} safetensor shards in parallel...")
-            
-            # Function to load a single shard
-            def load_shard(shard_name: str) -> Dict[str, torch.Tensor]:
-                shard_path = teacher_path_obj / shard_name
-                return load_safetensors(str(shard_path), device="cpu")
-            
-            # Parallel load all shards using multiple CPU threads
-            # Use more workers for faster parallel I/O
-            num_workers = min(len(shard_files), 16)  # Up to 16 parallel loads
-            
-            all_weights: Dict[str, torch.Tensor] = {}
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                shard_dicts = list(executor.map(load_shard, shard_files))
-                for shard_dict in shard_dicts:
-                    all_weights.update(shard_dict)
-            
-            elapsed_load = time.time() - start_time
-            if is_main:
-                print(f"✓ Loaded all weights in {elapsed_load:.1f}s (parallel safetensors)")
-            
-            # Now create the model structure and load weights
-            config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=trust_remote_code)
-            
-            # Create model on meta device first (no memory allocation)
-            with torch.device("meta"):
-                teacher_model = AutoModelForCausalLM.from_config(
-                    config,
-                    torch_dtype=dtype,
-                    trust_remote_code=trust_remote_code,
-                )
-            
-            # Materialize on GPU with loaded weights
-            if is_main:
-                print(f"  Moving model to GPU {rank}...")
-            
-            # Convert all weights to target dtype and move to GPU
-            for key in all_weights:
-                all_weights[key] = all_weights[key].to(dtype=dtype, device=device)
-            
-            # Load weights
-            teacher_model.load_state_dict(all_weights, assign=True, strict=False)
-            
-            del all_weights
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-        except ImportError:
-            if is_main:
-                print("⚠ safetensors not available, falling back to standard loading")
-            use_safetensors = False
+                print(f"  Extended NCCL timeout to {extended_timeout}")
         except Exception as e:
             if is_main:
-                print(f"⚠ safetensors loading failed ({e}), falling back to standard loading")
-            use_safetensors = False
+                print(f"  Note: Could not extend NCCL timeout ({e})")
     
-    # Fallback to standard HuggingFace loading if safetensors failed
-    if not use_safetensors:
-        if is_main:
-            print("  Using standard HuggingFace loading (slower)...")
+    teacher_model = None
+    
+    if is_main:
+        start_time = time.time()
+        print(f"[Rank 0] Loading teacher model with pipeline parallelism...")
         
-        # Load directly to GPU to avoid CPU memory bottleneck
+        # Allocate MORE memory to GPUs 1-7, LESS to GPU 0
+        # This leaves room on GPU 0 for the student model
+        max_memory = {
+            0: "12GiB",   # Minimal on GPU 0 - student needs space here
+        }
+        for i in range(1, world_size):
+            max_memory[i] = "11GiB"  # More on other GPUs
+        max_memory["cpu"] = "0GiB"  # No CPU offload
+        
         teacher_model = AutoModelForCausalLM.from_pretrained(
             teacher_path,
             torch_dtype=dtype,
             trust_remote_code=trust_remote_code,
             low_cpu_mem_usage=True,
-            device_map={"": device},  # Load directly to this GPU
+            device_map="auto",
+            max_memory=max_memory,
         )
-    
-    # Set to eval mode and freeze
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-    
-    elapsed = time.time() - start_time
-    if is_main:
+        
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        
+        elapsed = time.time() - start_time
         total_params = sum(p.numel() for p in teacher_model.parameters())
-        print(f"✓ Teacher loaded: {total_params:,} parameters in {elapsed:.1f}s")
-        print(f"  GPU memory: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
-        print(f"{'='*70}")
+        
+        # Show memory usage per GPU
+        print(f"[Rank 0] ✓ Loaded {total_params:,} params in {elapsed:.1f}s")
+        for i in range(world_size):
+            mem_gb = torch.cuda.memory_allocated(i) / 1e9
+            print(f"  GPU {i}: {mem_gb:.2f} GB used by teacher")
+        
+        # Force garbage collection
+        gc.collect()
+        torch.cuda.empty_cache()
     
     # Synchronize all ranks
     dist.barrier()
+    
+    if is_main:
+        print(f"{'='*70}")
+        print("✓ Teacher model loaded (pipeline parallel)")
+        print(f"{'='*70}")
     
     return teacher_model
 
@@ -1178,17 +1126,10 @@ def resume_training(
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    # Attempt to compile for additional throughput; fall back gracefully on failure
-    compiled_model = None
-    if torch.cuda.is_available():
-        try:
-            compiled_model = torch.compile(model, mode="max-autotune")
-            model = compiled_model
-            if is_main_process:
-                print("✓ Enabled torch.compile for training")
-        except Exception as compile_err:
-            if is_main_process:
-                print(f"⚠ torch.compile failed ({compile_err}); continuing without compilation")
+    # NOTE: torch.compile with max-autotune causes CUDA graph assertion failures
+    # in distributed tensor parallel training. Disabled for stability.
+    if is_main_process:
+        print("ℹ torch.compile disabled for tensor parallel training (causes cudagraph issues)")
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -1334,8 +1275,8 @@ def resume_training(
 
     first_device = model.device
     using_cuda = torch.cuda.is_available()
-    if using_cuda:
-        teacher_model.to(first_device)
+    # Note: teacher_model is only loaded on rank 0 (pipeline parallel across all GPUs)
+    # Other ranks have teacher_model = None
     prefetch_stream = torch.cuda.Stream(device=first_device) if using_cuda else None
     max_prefetch_batches = 6 if using_cuda else 2
     prefetched_batches: Deque[Tuple[torch.Tensor, torch.Tensor]] = deque()
@@ -1463,12 +1404,55 @@ def resume_training(
 
                         loss_tensor = None
                         try:
+                            # Student forward pass (on local GPU shard)
                             with autocast_context:
                                 outputs = model(input_ids=x_local)
                                 logits = outputs.logits
+                            
+                            # Teacher forward pass (pipeline parallel, rank 0 only)
+                            # Teacher is spread across GPUs, input goes to first device
+                            # Then broadcast teacher logits to all ranks
                             with torch.no_grad():
-                                teacher_out = teacher_model(input_ids=x_local)
-                                teacher_logits = teacher_out.logits.to(logits.dtype)
+                                if is_main_process and teacher_model is not None:
+                                    # Rank 0 runs teacher inference
+                                    # Input needs to go to the first device of the teacher model
+                                    # With device_map="auto", we need to find where input should go
+                                    if hasattr(teacher_model, 'hf_device_map'):
+                                        # Find the device for the embedding layer
+                                        first_teacher_device = next(teacher_model.parameters()).device
+                                    else:
+                                        first_teacher_device = torch.device("cuda:0")
+                                    
+                                    x_for_teacher = x_local.to(first_teacher_device)
+                                    batch_size_teacher = x_for_teacher.shape[0]
+                                    
+                                    # Process in micro-batches to reduce activation memory
+                                    teacher_micro_batch = 4
+                                    teacher_logits_list = []
+                                    
+                                    for i in range(0, batch_size_teacher, teacher_micro_batch):
+                                        end_idx = min(i + teacher_micro_batch, batch_size_teacher)
+                                        micro_input = x_for_teacher[i:end_idx]
+                                        micro_out = teacher_model(input_ids=micro_input)
+                                        # Move logits to rank 0's device for broadcast
+                                        teacher_logits_list.append(micro_out.logits.to(first_device))
+                                        del micro_out
+                                    
+                                    # Concatenate 
+                                    teacher_logits = torch.cat(teacher_logits_list, dim=0)
+                                    teacher_logits = teacher_logits.to(dtype=logits.dtype)
+                                    del teacher_logits_list
+                                    
+                                    # Clear cache after teacher forward
+                                    torch.cuda.empty_cache()
+                                else:
+                                    # Other ranks allocate empty tensor to receive broadcast
+                                    teacher_logits = torch.empty(
+                                        logits.shape, dtype=logits.dtype, device=first_device
+                                    )
+                                
+                                # Broadcast teacher logits from rank 0 to all ranks
+                                dist.broadcast(teacher_logits, src=0)
 
                             student_ce = F.cross_entropy(
                                 logits.view(-1, logits.size(-1)),
@@ -1504,6 +1488,12 @@ def resume_training(
                                     print(
                                         f"⚠ CUDA OOM encountered at batch size {prev_batch}; reducing to {current_batch_size}"
                                     )
+                                # If we OOM at batch size 1, kill the job
+                                if prev_batch == 1:
+                                    if is_main_process:
+                                        print("💀 OOM at minimum batch size (1), killing job")
+                                    import sys
+                                    sys.exit(1)
                                 if current_batch_size < 1:
                                     raise
                                 break
@@ -1512,110 +1502,110 @@ def resume_training(
                         if loss_tensor is None:
                             continue
 
-                    loss_for_backward = loss_tensor / grad_accum_steps
-
-                    if scaler is not None:
-                        scaler.scale(loss_for_backward).backward()
-                    else:
-                        loss_for_backward.backward()
-
-                    micro_step += 1
-
-                    if micro_step >= grad_accum_steps:
-                        current_lr = scheduler.step(global_step)
-
-                        if (
-                            lr_ramp_tracker
-                            and lr_ramp_tracker.get("steps_completed", 0)
-                            < lr_ramp_tracker.get("total_steps", 0)
-                        ):
-                            completed = lr_ramp_tracker["steps_completed"]
-                            total = max(1, lr_ramp_tracker["total_steps"])
-                            ramp_scale = min((completed + 1) / total, 1.0)
-                            ramp_lr = max(min_lr, current_lr * ramp_scale)
-                            current_lr = scheduler.override_step(global_step, ramp_lr)
-                            lr_ramp_tracker["steps_completed"] = completed + 1
-
-                            if (
-                                is_main_process
-                                and lr_ramp_tracker["steps_completed"]
-                                == lr_ramp_tracker["total_steps"]
-                            ):
-                                print(
-                                    "✓ LR ramp complete: reached target LR %.6e" % current_lr
-                                )
+                        loss_for_backward = loss_tensor / grad_accum_steps
 
                         if scaler is not None:
-                            scaler.unscale_(optimizer)
-                            _ensure_gradient_dtype_matches_params(model)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                            scaler.step(optimizer)
-                            scaler.update()
+                            scaler.scale(loss_for_backward).backward()
                         else:
-                            _ensure_gradient_dtype_matches_params(model)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                            optimizer.step()
+                            loss_for_backward.backward()
 
-                        optimizer.zero_grad(set_to_none=True)
+                        micro_step += 1
 
-                        global_step += 1
-                        micro_step = 0
+                        if micro_step >= grad_accum_steps:
+                            current_lr = scheduler.step(global_step)
 
-                        if pbar is not None:
-                            pbar.update(1)
+                            if (
+                                lr_ramp_tracker
+                                and lr_ramp_tracker.get("steps_completed", 0)
+                                < lr_ramp_tracker.get("total_steps", 0)
+                            ):
+                                completed = lr_ramp_tracker["steps_completed"]
+                                total = max(1, lr_ramp_tracker["total_steps"])
+                                ramp_scale = min((completed + 1) / total, 1.0)
+                                ramp_lr = max(min_lr, current_lr * ramp_scale)
+                                current_lr = scheduler.override_step(global_step, ramp_lr)
+                                lr_ramp_tracker["steps_completed"] = completed + 1
 
-                        if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
-                            current_total_tokens = total_tokens_processed + tokens_in_this_session
-                            print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+                                if (
+                                    is_main_process
+                                    and lr_ramp_tracker["steps_completed"]
+                                    == lr_ramp_tracker["total_steps"]
+                                ):
+                                    print(
+                                        "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                                    )
 
-                        if global_step % 430 == 0:
-                            current_total_tokens = total_tokens_processed + tokens_in_this_session
+                            if scaler is not None:
+                                scaler.unscale_(optimizer)
+                                _ensure_gradient_dtype_matches_params(model)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                _ensure_gradient_dtype_matches_params(model)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                optimizer.step()
 
-                            # Generate on all ranks to keep collectives in sync
-                            prompt_tensor = cached_prompt_tensor.to(first_device)
-                            generated = model.generate(
-                                prompt_tensor,
-                                max_length=prompt_tensor.shape[1] + 100,
-                                do_sample=True,
-                                temperature=0.7,
-                                top_k=50,
-                                top_p=0.9,
-                            )
+                            optimizer.zero_grad(set_to_none=True)
 
-                            if is_main_process:
-                                generated_text = hf_tokenizer.decode(generated[0].tolist())
-                                print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+                            global_step += 1
+                            micro_step = 0
 
-                                # SIMPLE: Just save rank 0's model state (sharded weights)
-                                model_state = cast_state_dict_to_dtype(
-                                    model.base_model.state_dict(), amp_dtype
+                            if pbar is not None:
+                                pbar.update(1)
+
+                            if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
+                                current_total_tokens = total_tokens_processed + tokens_in_this_session
+                                print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+
+                            if global_step % 430 == 0:
+                                current_total_tokens = total_tokens_processed + tokens_in_this_session
+
+                                # Generate on all ranks to keep collectives in sync
+                                prompt_tensor = cached_prompt_tensor.to(first_device)
+                                generated = model.generate(
+                                    prompt_tensor,
+                                    max_length=prompt_tensor.shape[1] + 100,
+                                    do_sample=True,
+                                    temperature=0.7,
+                                    top_k=50,
+                                    top_p=0.9,
                                 )
 
-                                checkpoint_state = {
-                                    "global_step": global_step,
-                                    "tokens_processed": current_total_tokens,
-                                    "model_state_dict": model_state,
-                                    "optimizer_state_dict": optimizer.state_dict(),
-                                    "scheduler_state_dict": scheduler.state_dict(),
-                                    "lr_ramp_state": (
-                                        dict(lr_ramp_tracker)
-                                        if lr_ramp_tracker is not None
-                                        else None
-                                    ),
-                                    "gradient_accumulation_steps": grad_accum_steps,
-                                    "loss": last_loss_value,
-                                    "data_position": data_position.get_state(),
-                                    "model_dtype": str(amp_dtype),
-                                    "tensor_parallel": True,
-                                    "world_size": world_size,
-                                    "rank": rank,
-                                }
-                                os.makedirs("distill-pretrained", exist_ok=True)
-                                save_path = (
-                                    f"distill-pretrained/streaming_checkpoint_step_{global_step}.pth"
-                                )
-                                safe_torch_save(checkpoint_state, save_path)
-                                print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                                if is_main_process:
+                                    generated_text = hf_tokenizer.decode(generated[0].tolist())
+                                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                                    # SIMPLE: Just save rank 0's model state (sharded weights)
+                                    model_state = cast_state_dict_to_dtype(
+                                        model.base_model.state_dict(), amp_dtype
+                                    )
+
+                                    checkpoint_state = {
+                                        "global_step": global_step,
+                                        "tokens_processed": current_total_tokens,
+                                        "model_state_dict": model_state,
+                                        "optimizer_state_dict": optimizer.state_dict(),
+                                        "scheduler_state_dict": scheduler.state_dict(),
+                                        "lr_ramp_state": (
+                                            dict(lr_ramp_tracker)
+                                            if lr_ramp_tracker is not None
+                                            else None
+                                        ),
+                                        "gradient_accumulation_steps": grad_accum_steps,
+                                        "loss": last_loss_value,
+                                        "data_position": data_position.get_state(),
+                                        "model_dtype": str(amp_dtype),
+                                        "tensor_parallel": True,
+                                        "world_size": world_size,
+                                        "rank": rank,
+                                    }
+                                    os.makedirs("distill-pretrained", exist_ok=True)
+                                    save_path = (
+                                        f"distill-pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                    )
+                                    safe_torch_save(checkpoint_state, save_path)
+                                    print(f"Checkpoint saved @ step {global_step} -> {save_path}")
 
                 except StopIteration:
                     if is_main_process:
@@ -1699,7 +1689,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teacher-path",
         type=str,
-        default=os.path.join("..", "Qwen2.5-32B-Instruct"),
+        default=os.path.join("..", "Qwen2.5-3B-Instruct"),
         help="Filesystem directory containing the teacher model checkpoint.",
     )
     parser.add_argument(
@@ -1714,12 +1704,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_TRAINING_STEPS,
         help="Total number of training steps to run.",
     )
-    parser.add_argument("--context-window", type=int, default=2048)
-    parser.add_argument("--initial-batch-size", type=int, default=64)
+    parser.add_argument("--context-window", type=int, default=1024)  # Reduced from 2048 to save memory
+    parser.add_argument("--initial-batch-size", type=int, default=64)  # Reduced for distillation (teacher uses memory)
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=4,
+        default=4,  # Reduced from 8 to save memory
         help="Number of micro-batches to accumulate before each optimizer step.",
     )
     parser.add_argument(
