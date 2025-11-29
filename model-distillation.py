@@ -1524,7 +1524,7 @@ def resume_training(
                         except RuntimeError as oom_err:
                             if "out of memory" in str(oom_err).lower():
                                 prev_batch = current_batch_size
-                                current_batch_size = max(1, current_batch_size - 12)
+                                current_batch_size = max(1, current_batch_size - 4)
                                 token_buffer = batch_tokens_list + token_buffer
                                 if using_cuda:
                                     torch.cuda.empty_cache()
@@ -1599,11 +1599,11 @@ def resume_training(
                             if pbar is not None:
                                 pbar.update(1)
 
-                            if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
+                            if global_step % 10 == 0 and last_loss_value is not None and is_main_process:
                                 current_total_tokens = total_tokens_processed + tokens_in_this_session
                                 print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                            if global_step % 430 == 0:
+                            if global_step % 100 == 0:
                                 current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                                 # Generate on all ranks to keep collectives in sync
@@ -1750,7 +1750,7 @@ def parse_args() -> argparse.Namespace:
         help="Total number of training steps to run.",
     )
     parser.add_argument("--context-window", type=int, default=1024)  # Reduced from 2048 to save memory
-    parser.add_argument("--initial-batch-size", type=int, default=16)  # Reduced for distillation (teacher uses memory)
+    parser.add_argument("--initial-batch-size", type=int, default=12)  # Reduced for distillation (teacher uses memory)
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
