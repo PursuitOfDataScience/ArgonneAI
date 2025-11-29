@@ -202,7 +202,7 @@ def load_teacher_model_tensor_parallel(
     rank: int,
     dtype: torch.dtype = torch.bfloat16,
     trust_remote_code: bool = False,
-) -> Optional[torch.nn.Module]:
+) -> Tuple[Optional[torch.nn.Module], int]:
     """
     Load a HuggingFace teacher model for inference using pipeline parallelism.
     
@@ -217,6 +217,10 @@ def load_teacher_model_tensor_parallel(
     1. Teacher spread = 64GB / 7 GPUs (1-7) ≈ 9GB each, plus overflow to GPU 0
     2. Each student shard = 5B/8 = 0.6B params = 1.2GB in bf16
     3. Plenty of room for activations
+    
+    Returns:
+        Tuple of (teacher_model, teacher_vocab_size) where teacher_model is None
+        on non-main ranks and teacher_vocab_size is broadcast to all ranks.
     """
     import gc
     import time
@@ -288,15 +292,28 @@ def load_teacher_model_tensor_parallel(
         gc.collect()
         torch.cuda.empty_cache()
     
+    # Get teacher vocab size and broadcast to all ranks
+    # This is needed because only rank 0 has the teacher model loaded
+    if is_main and teacher_model is not None:
+        teacher_vocab_size = teacher_model.config.vocab_size
+    else:
+        teacher_vocab_size = 0
+    
+    # Broadcast teacher vocab size from rank 0 to all ranks
+    teacher_vocab_tensor = torch.tensor([teacher_vocab_size], dtype=torch.long, device=f"cuda:{rank}")
+    dist.broadcast(teacher_vocab_tensor, src=0)
+    teacher_vocab_size = int(teacher_vocab_tensor.item())
+    
     # Synchronize all ranks
     dist.barrier()
     
     if is_main:
         print(f"{'='*70}")
         print("✓ Teacher model loaded (pipeline parallel)")
+        print(f"  Teacher vocab size: {teacher_vocab_size}")
         print(f"{'='*70}")
     
-    return teacher_model
+    return teacher_model, teacher_vocab_size
 
 
 def streaming_token_generator(
@@ -951,13 +968,29 @@ def resume_training(
     # Load teacher model with TENSOR PARALLELISM
     # This loads the model ONCE on rank 0, shards it, and distributes to all GPUs
     # Much faster and more memory efficient than the previous approach
-    teacher_model = load_teacher_model_tensor_parallel(
+    teacher_model, teacher_vocab_size = load_teacher_model_tensor_parallel(
         teacher_path=teacher_path,
         world_size=world_size,
         rank=rank,
         dtype=amp_dtype,
         trust_remote_code=trust_remote_code,
     )
+    
+    # Check for vocab size mismatch between teacher and student
+    # This is common when using a teacher model with a larger vocabulary
+    student_vocab_size = vocab_size  # Already computed from tokenizer
+    if teacher_vocab_size != student_vocab_size:
+        if is_main_process:
+            print(f"{'='*70}")
+            print("⚠ VOCABULARY SIZE MISMATCH DETECTED")
+            print(f"{'='*70}")
+            print(f"  Teacher vocab size: {teacher_vocab_size}")
+            print(f"  Student vocab size: {student_vocab_size}")
+            print(f"  Difference: {teacher_vocab_size - student_vocab_size} tokens")
+            print(f"")
+            print(f"  Strategy: Teacher logits will be sliced to match student vocab")
+            print(f"  This is safe because the student tokenizer is a subset of the teacher's")
+            print(f"{'='*70}")
 
     # Create base model on CPU first (keep parameters in FP32 for stable optimizer state)
     # We load on CPU to avoid OOM, then shard and move to GPU
@@ -1443,15 +1476,27 @@ def resume_training(
                                     teacher_logits = teacher_logits.to(dtype=logits.dtype)
                                     del teacher_logits_list
                                     
+                                    # CRITICAL: Slice teacher logits to student vocab size BEFORE broadcast
+                                    # Teacher vocab (151936) > Student vocab (151665)
+                                    # The extra tokens in teacher's vocabulary are not used by student
+                                    if teacher_vocab_size > student_vocab_size:
+                                        teacher_logits = teacher_logits[:, :, :student_vocab_size].contiguous()
+                                    
                                     # Clear cache after teacher forward
                                     torch.cuda.empty_cache()
                                 else:
                                     # Other ranks allocate empty tensor to receive broadcast
+                                    # Use student_vocab_size since rank 0 slices before broadcasting
+                                    batch_size_for_alloc = logits.shape[0]
+                                    seq_len_for_alloc = logits.shape[1]
                                     teacher_logits = torch.empty(
-                                        logits.shape, dtype=logits.dtype, device=first_device
+                                        (batch_size_for_alloc, seq_len_for_alloc, student_vocab_size),
+                                        dtype=logits.dtype,
+                                        device=first_device
                                     )
                                 
                                 # Broadcast teacher logits from rank 0 to all ranks
+                                # At this point, teacher_logits has shape [batch, seq, student_vocab_size]
                                 dist.broadcast(teacher_logits, src=0)
 
                             student_ce = F.cross_entropy(
@@ -1705,7 +1750,7 @@ def parse_args() -> argparse.Namespace:
         help="Total number of training steps to run.",
     )
     parser.add_argument("--context-window", type=int, default=1024)  # Reduced from 2048 to save memory
-    parser.add_argument("--initial-batch-size", type=int, default=64)  # Reduced for distillation (teacher uses memory)
+    parser.add_argument("--initial-batch-size", type=int, default=16)  # Reduced for distillation (teacher uses memory)
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
