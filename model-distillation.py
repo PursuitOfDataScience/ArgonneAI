@@ -257,13 +257,14 @@ def load_teacher_model_tensor_parallel(
         start_time = time.time()
         print(f"[Rank 0] Loading teacher model with pipeline parallelism...")
         
-        # Allocate MORE memory to GPUs 1-7, LESS to GPU 0
+        # Allocate memory to all GPUs (0-7), with less on GPU 0 for student model
         # This leaves room on GPU 0 for the student model
-        max_memory = {
-            0: "12GiB",   # Minimal on GPU 0 - student needs space here
-        }
-        for i in range(1, world_size):
-            max_memory[i] = "11GiB"  # More on other GPUs
+        max_memory = {}
+        for i in range(world_size):
+            if i == 0:
+                max_memory[i] = "12GiB"   # Less on GPU 0 - student needs space here
+            else:
+                max_memory[i] = "11GiB"   # More on other GPUs
         max_memory["cpu"] = "0GiB"  # No CPU offload
         
         teacher_model = AutoModelForCausalLM.from_pretrained(
@@ -1476,28 +1477,38 @@ def resume_training(
                                     teacher_logits = teacher_logits.to(dtype=logits.dtype)
                                     del teacher_logits_list
                                     
-                                    # CRITICAL: Slice teacher logits to student vocab size BEFORE broadcast
-                                    # Teacher vocab (151936) > Student vocab (151665)
-                                    # The extra tokens in teacher's vocabulary are not used by student
+                                    # CRITICAL: Compute softmax on FULL teacher logits FIRST, then slice
+                                    # This preserves the teacher's original probability distribution
+                                    # If we slice logits before softmax, we'd redistribute probability mass incorrectly
+                                    teacher_probs_full = F.softmax(
+                                        teacher_logits / distill_temperature, dim=-1
+                                    )
+                                    
+                                    # Now slice to student vocab size - this keeps the original probabilities
+                                    # for the shared vocabulary (the extra 271 tokens just get dropped)
                                     if teacher_vocab_size > student_vocab_size:
-                                        teacher_logits = teacher_logits[:, :, :student_vocab_size].contiguous()
+                                        teacher_probs = teacher_probs_full[:, :, :student_vocab_size].contiguous()
+                                    else:
+                                        teacher_probs = teacher_probs_full
+                                    
+                                    del teacher_logits, teacher_probs_full
                                     
                                     # Clear cache after teacher forward
                                     torch.cuda.empty_cache()
                                 else:
                                     # Other ranks allocate empty tensor to receive broadcast
-                                    # Use student_vocab_size since rank 0 slices before broadcasting
+                                    # We broadcast teacher_probs (already softmaxed and sliced)
                                     batch_size_for_alloc = logits.shape[0]
                                     seq_len_for_alloc = logits.shape[1]
-                                    teacher_logits = torch.empty(
+                                    teacher_probs = torch.empty(
                                         (batch_size_for_alloc, seq_len_for_alloc, student_vocab_size),
                                         dtype=logits.dtype,
                                         device=first_device
                                     )
                                 
-                                # Broadcast teacher logits from rank 0 to all ranks
-                                # At this point, teacher_logits has shape [batch, seq, student_vocab_size]
-                                dist.broadcast(teacher_logits, src=0)
+                                # Broadcast teacher probs from rank 0 to all ranks
+                                # At this point, teacher_probs has shape [batch, seq, student_vocab_size]
+                                dist.broadcast(teacher_probs, src=0)
 
                             student_ce = F.cross_entropy(
                                 logits.view(-1, logits.size(-1)),
@@ -1508,9 +1519,7 @@ def resume_training(
                             student_log_probs = F.log_softmax(
                                 logits / distill_temperature, dim=-1
                             )
-                            teacher_probs = F.softmax(
-                                teacher_logits / distill_temperature, dim=-1
-                            )
+                            # teacher_probs is already computed (softmax done before slicing on rank 0)
 
                             distill_loss = F.kl_div(
                                 student_log_probs,
