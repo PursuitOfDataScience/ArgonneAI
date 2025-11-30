@@ -873,7 +873,7 @@ def resume_training(
     grad_accum_steps = max(1, int(gradient_accumulation_steps))
     
     if is_main_process:
-        cleanup_old_checkpoints("distill-pretrained", keep=50, rank=rank)
+        cleanup_old_checkpoints("distill-pretrained", keep=3, rank=rank)
     
     # Resolve data files
     default_data_glob = os.path.join("..", "data", "CC-MAIN-2025-26", "*.parquet")
@@ -1750,7 +1750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--teacher-path",
         type=str,
-        default=os.path.join("..", "Qwen2.5-3B-Instruct"),
+        default=os.path.join("..", "Qwen2.5-14B-Instruct-1M"),
         help="Filesystem directory containing the teacher model checkpoint.",
     )
     parser.add_argument(
