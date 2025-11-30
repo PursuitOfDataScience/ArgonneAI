@@ -244,7 +244,14 @@ class GroupedQueryAttention(nn.Module):
         key = self._repeat_kv(key)
         value = self._repeat_kv(value)
 
-        if hasattr(F, "scaled_dot_product_attention") and self.use_flash_attention:
+        use_scaled_dot = (
+            hasattr(F, "scaled_dot_product_attention")
+            and self.use_flash_attention
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and self.head_dim % 4 == 0
+        )
+
+        if use_scaled_dot:
             attn_output = F.scaled_dot_product_attention(
                 query,
                 key,
