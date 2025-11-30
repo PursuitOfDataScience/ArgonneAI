@@ -251,16 +251,22 @@ class GroupedQueryAttention(nn.Module):
             and self.head_dim % 4 == 0
         )
 
+        attn_output = None
         if use_scaled_dot:
-            attn_output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=attention_mask is None,
-            )
-        else:
+            try:
+                attn_output = F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=attention_mask is None,
+                )
+            except RuntimeError:
+                # Fallback to math attention when kernels are unavailable
+                attn_output = None
+
+        if attn_output is None:
             scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
             if attention_mask is None:
                 causal_mask = torch.triu(
