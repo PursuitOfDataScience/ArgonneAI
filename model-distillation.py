@@ -1521,9 +1521,16 @@ def resume_training(
                             )
                             # teacher_probs is already computed (softmax done before slicing on rank 0)
 
+                            # Flatten batch and sequence dims so batchmean reduction divides
+                            # by the true number of tokens instead of just batch size.
+                            # Without this, KL loss summed over the sequence dimension,
+                            # leading to extremely large loss values (hundreds+) at start.
+                            flattened_student = student_log_probs.view(-1, student_log_probs.size(-1))
+                            flattened_teacher = teacher_probs.view(-1, teacher_probs.size(-1))
+
                             distill_loss = F.kl_div(
-                                student_log_probs,
-                                teacher_probs,
+                                flattened_student,
+                                flattened_teacher,
                                 reduction="batchmean",
                             ) * (distill_temperature ** 2)
 
