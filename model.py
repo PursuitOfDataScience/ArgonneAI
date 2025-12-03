@@ -606,6 +606,7 @@ class ArgonneModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
         batch_size, seq_length = input_ids.shape
 
