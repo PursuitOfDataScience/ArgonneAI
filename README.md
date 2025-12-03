@@ -1,125 +1,117 @@
-# ArgonneAI (Argonne 2.0)
+# Argonne 2.0
 
-## Overview
-Argonne 2.0 is a 24-layer decoder-only transformer trained with **tensor parallelism**.  The
-training entrypoints – `training.py` for fresh runs and `resume_pretrain_tensor.py` for continuing
-jobs – now share the same optimised data pipeline, fused optimiser configuration, and command-line
-behaviour.  Both scripts stream large Parquet datasets, shard the model across GPUs, and write
-resumable checkpoints that can be swapped between the two workflows.
+A **4.9 billion parameter** decoder-only transformer language model trained from scratch using tensor parallelism on a single DGX A100 node.
+
+## Training Loss Curve
+
+![Training Loss vs Tokens](training_loss_vs_tokens.png)
+
+The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), achieving a final loss of approximately **2.5–3.5** after 1.35 million training steps.
 
 ## Model Architecture
-- **Layers:** 24 transformer blocks with rotary position embeddings (RoPE)
-- **Hidden Size:** 4,080 (170 dimensions per attention head)
-- **Attention:** Grouped-Query Attention (24 Q heads / 8 KV heads)
-- **Feed-Forward:** SwiGLU MLP (≈11k hidden dim)
-- **Context Length:** 4,096 tokens
-- **Normalization:** RMSNorm (ε = 1e-6)
-- **Activation:** SwiGLU
-- **Flash Attention:** Enabled when available
-- **Tokenizer:** Qwen2.5-3B-Instruct with pad token fallbacks
 
-## Training Pipeline Highlights
-- **Tensor parallel execution** – `TensorParallelModel` shards attention and MLP projections across
-  all GPUs while keeping embeddings and norms replicated.  Collectives are issued outside compiled
-  graphs to avoid cudagraph capture issues.
-- **Streaming dataset ingestion** – the shared `streaming_token_generator` performs threaded
-  batch tokenisation, optional BOS/EOS injection, and aggressively filters malformed rows.  Data can
-  be resumed at chunk-level precision using the persisted `DataPosition` state.
-- **Automatic batch-size tuning** – `training.py` performs an OOM-aware search over the micro-batch
-  size while keeping `--gradient-accumulation-steps` constant.  Successful runs reuse the exact
-  configuration inside `resume_pretrain_tensor.py`.
-- **Fused AdamW + gradient scaling** – both entrypoints create a fused AdamW optimiser
-  (`fused=True`) and guard mixed precision with autocast/GradScaler.  Gradients are cast back to the
-  parameter dtype prior to clipping to keep the fused kernels happy.
-- **Asynchronous prefetch** – CPU-collected batches are staged onto GPU streams ahead of time so
-  tensor-parallel workers stay saturated.
-- **Document boundary control** – `--add-document-boundary-tokens` can be specified in either script
-  to add BOS/EOS markers even for chat-style tokenisers that need manual resolution.
+| Component | Specification |
+|-----------|--------------|
+| **Parameters** | 4,918,072,800 (~4.9B) |
+| **Layers** | 24 transformer blocks |
+| **Hidden Size** | 4,080 |
+| **Attention Heads** | 24 query heads / 8 key-value heads (Grouped-Query Attention) |
+| **Head Dimension** | 170 |
+| **Feed-Forward** | SwiGLU MLP (~10,880 intermediate dim) |
+| **Context Length** | 4,096 tokens |
+| **Vocabulary Size** | 151,665 (Qwen2.5-3B-Instruct tokenizer) |
+| **Normalization** | RMSNorm (ε = 1e-6) |
+| **Position Encoding** | Rotary Position Embeddings (RoPE) |
+| **Precision** | bfloat16 mixed precision |
 
-## Usage
-### Prerequisites
-- Python 3.9+
-- PyTorch with CUDA + NCCL (tested on Ampere/Hopper GPUs)
-- Parquet or Arrow shards accessible to every worker
+### Key Architectural Features
 
-### Starting a new run
-```bash
-torchrun --nproc_per_node=8 training.py \
-  --tokenizer-path ../Qwen2.5-3B-Instruct \
-  --data-glob /datasets/cc-main/*.parquet \
-  --initial-batch-size 512 \
-  --gradient-accumulation-steps 4 \
-  --learning-rate 1e-4 \
-  --add-document-boundary-tokens
+- **Grouped-Query Attention (GQA)**: Uses 24 query heads with 8 key-value heads (3:1 ratio), reducing memory bandwidth requirements while maintaining model quality.
+- **SwiGLU Activation**: Employs the SwiGLU activation function in the MLP layers for improved training dynamics.
+- **Flash Attention**: Leverages PyTorch's `scaled_dot_product_attention` for efficient attention computation on Ampere/Hopper GPUs.
+- **RoPE**: Rotary position embeddings enable better length generalization compared to absolute positional encodings.
+
+## Training Details
+
+### Hardware Configuration
+
+- **Node**: 1× DGX A100 (8× NVIDIA A100 80GB GPUs)
+- **Parallelism**: Tensor parallelism across 8 GPUs
+- **Interconnect**: NVLink for high-bandwidth GPU-to-GPU communication
+
+### Training Hyperparameters
+
+| Parameter | Value |
+|-----------|-------|
+| **Total Training Steps** | 1,347,890 |
+| **Tokens Processed** | ~21.9 billion |
+| **Micro-batch Size** | 2–4 per GPU |
+| **Gradient Accumulation** | 4 steps |
+| **Effective Batch Size** | ~64–128 sequences |
+| **Learning Rate** | 1e-4 (peak) → 1e-5 (cosine decay) |
+| **Warmup Steps** | 2,000 |
+| **Weight Decay** | 0.1 |
+| **Gradient Clipping** | 1.0 |
+| **Optimizer** | AdamW (fused) |
+
+### Training Data
+
+The model was trained on **Common Crawl CC-MAIN-2025-26** data:
+- 250 Parquet shards streamed sequentially
+- Documents tokenized with BOS/EOS boundary markers
+- Aggressive filtering of low-quality content (high digit ratio, low alpha ratio)
+- Chunked into 4,096-token sequences
+
+### Tensor Parallelism Implementation
+
+The training uses a custom tensor parallel implementation (`TensorParallelModel`) that:
+- **Shards attention projections**: Q/K/V/O projections are split across GPUs
+- **Shards MLP layers**: Gate, up, and down projections distributed across GPUs
+- **Replicates embeddings and norms**: Token embeddings and layer norms remain replicated for simplicity
+- **Async all-reduce**: Uses asynchronous collective operations for overlapping communication with computation
+
+Each GPU holds 1/8th of the attention heads (3 Q heads, 1 KV head per GPU) and 1/8th of the MLP hidden dimension.
+
+### Checkpointing
+
+- Checkpoints saved every ~430 steps
+- Per-block gradient checkpointing enabled to reduce memory footprint
+- Automatic pruning of old checkpoints (keeps last 50)
+- Resumable training with exact data position tracking
+
+## Training Progress
+
+### Loss Progression
+
+| Milestone | Steps | Tokens | Loss |
+|-----------|-------|--------|------|
+| Start | 0 | 0 | ~9.3 |
+| 1K steps | 1,000 | 16M | ~6.5 |
+| 10K steps | 10,000 | 164M | ~5.5 |
+| 100K steps | 100,000 | 1.6B | ~4.0 |
+| 500K steps | 500,000 | 8.2B | ~3.5 |
+| 1M steps | 1,000,000 | 16.4B | ~3.0 |
+| Final | 1,347,890 | 21.9B | ~2.5–3.5 |
+
+### Sample Generations
+
+**At step 1,347,190:**
+> "Long long time ago, 5,000 years ago, I have been told it is more than 10,000 times. It is not the same as the 10,000 years ago. You just have to have a very good reason for believing that you are a good person and that you are good..."
+
+The model demonstrates emergent capabilities in generating coherent English text, though quality varies with the inherent noise of web-scale pretraining data.
+
+## Repository Structure
+
 ```
-`training.py` will back off the batch size automatically if an out-of-memory error is detected and
-persist checkpoints every 350 steps.  Restarting the same command will reuse the discovered batch
-size.
-
-### Resuming from a checkpoint
-```bash
-torchrun --nproc_per_node=8 resume_pretrain_tensor.py \
-  --tokenizer-path ../Qwen2.5-3B-Instruct \
-  --checkpoint-path pretrained \
-  --total-steps 200000 \
-  --batch-size 384 \
-  --gradient-accumulation-steps 4 \
-  --rewarmup-steps 100 \
-  --add-document-boundary-tokens
+ArgonneAI/
+├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
+├── training.py                 # Fresh training with tensor parallelism
+├── resume_pretrain_tensor.py   # Resume training from checkpoints
+├── data_processing.py          # Tokenization and data loading utilities
+├── training_utils.py           # Schedulers, checkpoint utilities
+├── inference.py                # Inference utilities
+├── model-distillation.py       # Knowledge distillation experiments
+├── IMPLEMENTATION_NOTES.md     # Architectural decisions
+├── TENSOR_PARALLEL_FIX.md      # Debugging notes for TP issues
+└── TENSOR_PARALLEL_USAGE.md    # TP launch instructions
 ```
-`resume_pretrain_tensor.py` automatically discovers the latest `streaming_checkpoint_step_*.pth`
-file when a directory is provided.  Optimiser state is intentionally reset and the scheduler applies
-an LR re-warmup for stability.
-
-### Key command-line flags
-| Flag | Description |
-| --- | --- |
-| `--data-glob` | Glob for Parquet/Arrow shards.  Both scripts fall back to common defaults if empty. |
-| `--tokenizer-path` | Directory containing the Hugging Face tokenizer files. |
-| `--initial-batch-size` / `--batch-size` | Micro-batch size per step.  The training script auto-tunes on OOM. |
-| `--gradient-accumulation-steps` | Number of micro-batches to accumulate before each optimiser step. |
-| `--disable-gradient-checkpointing` | Disable per-block checkpointing (uses more memory, faster per step). |
-| `--add-document-boundary-tokens` | Add BOS/EOS tokens to every document prior to chunking. |
-| `--warmup-steps` / `--rewarmup-steps` | Number of scheduler warmup steps (resume script shortens this after checkpoint loads). |
-| `--trust-remote-code` | Allow custom tokenizer implementations. |
-
-Environment overrides:
-- `RESUME_TOKENIZER_BATCH_ROWS` and `RESUME_TOKENIZER_WORKERS` tune the threaded tokenizer batcher
-  used by both scripts.
-
-## Checkpoints
-Checkpoints are stored under `pretrained/` by default and contain:
-- `model_state_dict` (tensor-parallel shard friendly)
-- Optimiser + scheduler state
-- Learning-rate ramp metadata
-- `data_position` for exact resume locations
-- Training metadata (step, loss, tokens processed, world size, batch size)
-
-Old checkpoints are automatically pruned (keep-last-50) when new ones are written.  Files can be
-restored interchangeably between the initial training run and the resume script.
-
-## Repository Layout
-```
-.
-├── README.md
-├── data_processing.py
-├── model.py
-├── resume_pretrain_tensor.py
-├── training.py
-├── training_utils.py
-├── IMPLEMENTATION_NOTES.md
-├── TENSOR_PARALLEL_FIX.md
-└── TENSOR_PARALLEL_USAGE.md
-```
-
-## Further Reading
-- `TENSOR_PARALLEL_USAGE.md` – step-by-step launch instructions and troubleshooting tips.
-- `IMPLEMENTATION_NOTES.md` – architectural decisions and historical context.
-
-## License
-MIT License.  See `LICENSE` for details.
-
-## Acknowledgements
-- Argonne National Laboratory
-- PyTorch & TorchInductor teams
-- NVIDIA NCCL team
