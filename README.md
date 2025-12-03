@@ -60,7 +60,7 @@ The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), 
 
 ### Training Data
 
-The model was trained on **Common Crawl CC-MAIN-2025-26** data:
+The model was trained on **FineWeb (CC-MAIN-2025-26)** data:
 - 250 Parquet shards streamed sequentially
 - Documents tokenized with BOS/EOS boundary markers
 - Aggressive filtering of low-quality content (high digit ratio, low alpha ratio)
