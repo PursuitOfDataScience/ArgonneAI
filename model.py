@@ -346,6 +346,7 @@ class Block(nn.Module):
 class ArgonneModel(PreTrainedModel):
     config_class = ArgonneConfig
     _no_split_modules = ["Block"]
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: ArgonneConfig) -> None:
         super().__init__(config)
