@@ -600,6 +600,43 @@ class ArgonneModel(PreTrainedModel):
         )
         print(f"           Estimated post-head load: ≈{output_gb:.2f} GB")
 
+    def _prepare_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        batch_size: int,
+        seq_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Convert 2D attention mask to 4D causal mask."""
+        if attention_mask is None:
+            return None
+        
+        # attention_mask is [batch, seq_len] with 1 for valid tokens, 0 for padding
+        # We need to convert to 4D [batch, 1, seq_len, seq_len] causal mask
+        # where -inf indicates positions to mask
+        
+        if attention_mask.dim() == 2:
+            # Create causal mask [1, 1, seq_len, seq_len]
+            causal_mask = torch.triu(
+                torch.ones(seq_length, seq_length, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+            # Expand attention_mask [batch, seq_len] -> [batch, 1, 1, seq_len]
+            expanded_mask = attention_mask[:, None, None, :].to(dtype)
+            # Invert: 1 -> 0, 0 -> -inf
+            expanded_mask = (1.0 - expanded_mask) * torch.finfo(dtype).min
+            # Add causal mask
+            causal_mask_expanded = causal_mask[None, None, :, :].expand(batch_size, 1, seq_length, seq_length)
+            combined_mask = expanded_mask.expand(-1, -1, seq_length, -1).clone()
+            combined_mask = combined_mask.masked_fill(causal_mask_expanded, torch.finfo(dtype).min)
+            return combined_mask
+        elif attention_mask.dim() == 4:
+            # Already 4D, return as-is
+            return attention_mask.to(dtype)
+        else:
+            raise ValueError(f"Unexpected attention_mask dimension: {attention_mask.dim()}")
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -612,10 +649,18 @@ class ArgonneModel(PreTrainedModel):
 
         if self.pipeline_partitions:
             first_device = self.pipeline_partitions[0][2]
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(first_device)
-
             hidden_states = self.embed_tokens(input_ids.to(first_device))
+            
+            # Prepare 4D attention mask
+            if attention_mask is not None:
+                attention_mask = self._prepare_attention_mask(
+                    attention_mask.to(first_device),
+                    batch_size,
+                    seq_length,
+                    first_device,
+                    hidden_states.dtype,
+                )
+            
             cos, sin = self.rotary_emb(hidden_states, seq_length)
 
             for start, end, device in self.pipeline_partitions:
@@ -639,9 +684,18 @@ class ArgonneModel(PreTrainedModel):
             hidden_states = hidden_states.to(self.output_device)
         else:
             device = self.embed_tokens.weight.device
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
             hidden_states = self.embed_tokens(input_ids.to(device))
+            
+            # Prepare 4D attention mask
+            if attention_mask is not None:
+                attention_mask = self._prepare_attention_mask(
+                    attention_mask.to(device),
+                    batch_size,
+                    seq_length,
+                    device,
+                    hidden_states.dtype,
+                )
+            
             cos, sin = self.rotary_emb(hidden_states, seq_length)
             rotary = (cos, sin)
 
