@@ -609,15 +609,21 @@ class ArgonneModel(PreTrainedModel):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        """Convert 2D attention mask to 4D causal mask."""
+        """Convert 2D attention mask to 4D causal mask, or return None for Flash Attention.
+        
+        For maximum speed, if all tokens are valid (no padding), return None so that
+        scaled_dot_product_attention can use is_causal=True (Flash Attention kernel).
+        """
         if attention_mask is None:
             return None
         
-        # attention_mask is [batch, seq_len] with 1 for valid tokens, 0 for padding
-        # We need to convert to 4D [batch, 1, seq_len, seq_len] causal mask
-        # where -inf indicates positions to mask
-        
+        # Check if all tokens are valid (no padding) - if so, return None for Flash Attention
         if attention_mask.dim() == 2:
+            # Fast path: if all values are 1, no masking needed - use is_causal=True in SDPA
+            if attention_mask.all():
+                return None
+            
+            # Slow path: need explicit mask for padding
             # Create causal mask [1, 1, seq_len, seq_len]
             causal_mask = torch.triu(
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=device),
