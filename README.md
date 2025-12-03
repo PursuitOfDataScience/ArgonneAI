@@ -8,7 +8,7 @@ A **4.9 billion parameter** decoder-only transformer language model trained from
 
 ## Training Loss Curve
 
-![Training Loss vs Tokens](training_loss_vs_tokens.png)
+![Training Loss vs Tokens](plots/training_loss_vs_tokens.png)
 
 The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), achieving a final loss of approximately **2.5–3.5** after 1.35 million training steps.
 
