@@ -254,32 +254,43 @@ class GroupedQueryAttention(nn.Module):
         attn_output = None
         if use_scaled_dot:
             try:
-                # Always use is_causal=True for speed (Flash Attention kernel)
-                # Padding is handled by labels=-100 in loss computation
-                # This is safe because:
-                # 1. Causal mask prevents attending to future tokens
-                # 2. Padded positions don't contribute to loss (labels=-100)
-                # 3. Output at padded positions doesn't matter
-                attn_output = F.scaled_dot_product_attention(
-                    query,
-                    key,
-                    value,
-                    attn_mask=None,  # Don't pass mask - use is_causal instead
-                    dropout_p=self.attention_dropout if self.training else 0.0,
-                    is_causal=True,  # Always use causal for decoder
-                )
+                # Use is_causal=True when no attention_mask (faster Flash Attention path)
+                # When attention_mask is provided, we need to combine it with causal masking
+                if attention_mask is None:
+                    attn_output = F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=None,
+                        dropout_p=self.attention_dropout if self.training else 0.0,
+                        is_causal=True,
+                    )
+                else:
+                    # With attention_mask: need to pass it explicitly (slower but correct)
+                    # attention_mask should be 4D: (bsz, 1, seq, seq) or broadcastable
+                    attn_output = F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attention_mask,
+                        dropout_p=self.attention_dropout if self.training else 0.0,
+                        is_causal=False,  # Mask already includes causal component
+                    )
             except RuntimeError:
                 # Fallback to math attention when kernels are unavailable
                 attn_output = None
 
         if attn_output is None:
             scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # Always apply causal mask for decoder
+            # Apply causal mask
             causal_mask = torch.triu(
                 torch.ones(seqlen, seqlen, dtype=torch.bool, device=hidden_states.device),
                 diagonal=1,
             )
             scores = scores.masked_fill(causal_mask, float("-inf"))
+            # Apply attention_mask if provided
+            if attention_mask is not None:
+                scores = scores + attention_mask
             attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
@@ -613,11 +624,34 @@ class ArgonneModel(PreTrainedModel):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        """Prepare attention mask. For training with Flash Attention, we ignore the mask
-        and rely on is_causal=True + labels=-100 for padding handling."""
-        # For Flash Attention path, we use is_causal=True and ignore padding mask
-        # Padding is handled by labels=-100 in loss computation
-        return None
+        """Prepare 4D attention mask from 2D mask (batch_size, seq_length).
+        
+        Returns a 4D mask suitable for scaled_dot_product_attention.
+        The mask should be additive (0 for attend, -inf for mask out).
+        """
+        if attention_mask is None:
+            return None
+        
+        # Convert 2D mask to 4D: (batch_size, seq_length) -> (batch_size, 1, seq_length, seq_length)
+        # Create causal mask
+        causal_mask = torch.triu(
+            torch.ones(seq_length, seq_length, dtype=torch.bool, device=device),
+            diagonal=1,
+        )
+        
+        # Expand attention_mask from (batch, seq) to (batch, 1, 1, seq)
+        expanded_mask = attention_mask[:, None, None, :].expand(batch_size, 1, seq_length, seq_length)
+        
+        # Combine: positions that are either causally masked OR padding should be masked
+        # attention_mask is 1 for attend, 0 for mask -> invert for additive mask
+        # Final mask: 0 where we attend, -inf where we don't
+        combined_mask = torch.where(
+            causal_mask | (expanded_mask == 0),
+            torch.tensor(float("-inf"), dtype=dtype, device=device),
+            torch.tensor(0.0, dtype=dtype, device=device),
+        )
+        
+        return combined_mask
 
     def forward(
         self,
