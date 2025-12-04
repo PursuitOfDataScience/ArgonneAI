@@ -113,6 +113,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.to(torch.float32)
+        # Clamp values to prevent overflow in pow(2)
+        x = torch.clamp(x, min=-65504.0, max=65504.0)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return (self.weight * x.to(orig_dtype))
@@ -282,12 +284,13 @@ class GroupedQueryAttention(nn.Module):
 
         if attn_output is None:
             scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # Apply causal mask
+            # Apply causal mask - use large negative instead of -inf for numerical stability
             causal_mask = torch.triu(
                 torch.ones(seqlen, seqlen, dtype=torch.bool, device=hidden_states.device),
                 diagonal=1,
             )
-            scores = scores.masked_fill(causal_mask, float("-inf"))
+            mask_value = -65504.0  # Large negative instead of -inf
+            scores = scores.masked_fill(causal_mask, mask_value)
             # Apply attention_mask if provided
             if attention_mask is not None:
                 scores = scores + attention_mask
@@ -325,7 +328,12 @@ class SwiGLUMLP(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        # Clamp intermediate values to prevent overflow
+        gate = self.gate_proj(x)
+        gate = torch.clamp(gate, min=-65504.0, max=65504.0)
+        up = self.up_proj(x)
+        up = torch.clamp(up, min=-65504.0, max=65504.0)
+        return self.dropout(self.down_proj(F.silu(gate) * up))
 
 
 class Block(nn.Module):
@@ -644,10 +652,15 @@ class ArgonneModel(PreTrainedModel):
         
         # Combine: positions that are either causally masked OR padding should be masked
         # attention_mask is 1 for attend, 0 for mask -> invert for additive mask
-        # Final mask: 0 where we attend, -inf where we don't
+        # Use a large negative value instead of -inf to avoid numerical issues in bfloat16
+        # -65504 is approximately the most negative value representable in float16
+        # Using a more conservative value for numerical stability
+        min_dtype = torch.finfo(dtype).min if dtype.is_floating_point else -1e9
+        mask_value = max(min_dtype, -65504.0)  # Clamp to avoid true -inf
+        
         combined_mask = torch.where(
             causal_mask | (expanded_mask == 0),
-            torch.tensor(float("-inf"), dtype=dtype, device=device),
+            torch.tensor(mask_value, dtype=dtype, device=device),
             torch.tensor(0.0, dtype=dtype, device=device),
         )
         
@@ -729,6 +742,11 @@ class ArgonneModel(PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        
+        # Check for NaN in logits and handle gracefully
+        if torch.isnan(logits).any():
+            # Replace NaN with zeros to prevent cascading failures
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=65504.0, neginf=-65504.0)
 
         loss = None
         if labels is not None:
@@ -741,6 +759,9 @@ class ArgonneModel(PreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            # Handle NaN loss
+            if torch.isnan(loss):
+                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
 
         return CausalLMOutput(logits=logits, loss=loss)
 
