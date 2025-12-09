@@ -1,4 +1,5 @@
 import math
+import importlib.util
 from bisect import bisect_left, bisect_right
 from typing import List, Optional, Tuple
 
@@ -13,6 +14,11 @@ from transformers import (
     PretrainedConfig,
 )
 from transformers.modeling_outputs import CausalLMOutput
+
+
+_flash_attn_available = importlib.util.find_spec("flash_attn") is not None
+if _flash_attn_available:
+    from flash_attn.flash_attn_interface import flash_attn_func
 
 
 class ArgonneConfig(PretrainedConfig):
@@ -191,6 +197,7 @@ class GroupedQueryAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.sliding_window = config.sliding_window
 
         self.q_proj = nn.Linear(
             self.hidden_size,
@@ -246,6 +253,13 @@ class GroupedQueryAttention(nn.Module):
         key = self._repeat_kv(key)
         value = self._repeat_kv(value)
 
+        use_flash_attn_2 = (
+            _flash_attn_available
+            and self.use_flash_attention
+            and attention_mask is None
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and self.head_dim % 4 == 0
+        )
         use_scaled_dot = (
             hasattr(F, "scaled_dot_product_attention")
             and self.use_flash_attention
@@ -254,7 +268,30 @@ class GroupedQueryAttention(nn.Module):
         )
 
         attn_output = None
-        if use_scaled_dot:
+        if use_flash_attn_2:
+            try:
+                flash_dropout = self.attention_dropout if self.training else 0.0
+                window = (
+                    (self.sliding_window, self.sliding_window)
+                    if self.sliding_window is not None
+                    else (-1, -1)
+                )
+                q = query.transpose(1, 2).contiguous()
+                k = key.transpose(1, 2).contiguous()
+                v = value.transpose(1, 2).contiguous()
+                attn_output = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=flash_dropout,
+                    softmax_scale=None,
+                    causal=True,
+                    window_size=window,
+                ).transpose(1, 2)
+            except RuntimeError:
+                attn_output = None
+
+        if attn_output is None and use_scaled_dot:
             try:
                 # Use is_causal=True when no attention_mask (faster Flash Attention path)
                 # When attention_mask is provided, we need to combine it with causal masking
