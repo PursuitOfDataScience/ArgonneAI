@@ -32,8 +32,14 @@ The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), 
 
 - **Grouped-Query Attention (GQA)**: Uses 24 query heads with 8 key-value heads (3:1 ratio), reducing memory bandwidth requirements while maintaining model quality.
 - **SwiGLU Activation**: Employs the SwiGLU activation function in the MLP layers for improved training dynamics.
-- **Flash Attention**: Leverages PyTorch's `scaled_dot_product_attention` for efficient attention computation on Ampere/Hopper GPUs.
+- **Flash Attention 2**: Uses FlashAttention 2 kernels when available (with rotary + GQA support) for higher throughput and lower memory use; falls back to PyTorch's `scaled_dot_product_attention` otherwise.
 - **RoPE**: Rotary position embeddings enable better length generalization compared to absolute positional encodings.
+
+#### FlashAttention 2 notes
+
+- Install the optional dependency with `pip install flash-attn>=2.5.6` (compile-time CUDA toolkit required).
+- FlashAttention 2 is enabled when `config.use_flash_attention=True`, tensors are in bf16/fp16, and no explicit attention mask is provided; otherwise the model automatically falls back to PyTorch's fused attention or the math implementation.
+- Sliding-window attention (if configured) is forwarded to the FlashAttention kernel via `window_size` for better cache locality.
 
 ## Training Details
 
