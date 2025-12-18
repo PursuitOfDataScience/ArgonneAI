@@ -963,11 +963,11 @@ def resume_training(
         # Fallback to static config
         config = ArgonneConfig(
             vocab_size=vocab_size,
-            hidden_size=4080,
+            hidden_size=8192,
             max_position_embeddings=block_size,
             num_hidden_layers=24,
-            num_attention_heads=24,
-            num_key_value_heads=8,
+            num_attention_heads=64,
+            num_key_value_heads=16,
             attention_dropout=0.0,
             hidden_dropout=0.0,
             use_flash_attention=True,

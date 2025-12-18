@@ -115,16 +115,20 @@ The model demonstrates emergent capabilities in generating coherent English text
 ```
 ArgonneAI/
 ├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
-├── training.py                 # Fresh training with tensor parallelism
-├── resume_pretrain_tensor.py   # Resume training from checkpoints
+├── training.py                 # Fresh FSDP pretraining (bf16 by default)
+├── resume_training_fsdp.py     # Resume FSDP training from checkpoints
 ├── data_processing.py          # Tokenization and data loading utilities
 ├── training_utils.py           # Schedulers, checkpoint utilities
 ├── inference.py                # Inference utilities
 ├── model-distillation.py       # Knowledge distillation experiments
-├── IMPLEMENTATION_NOTES.md     # Architectural decisions
-├── TENSOR_PARALLEL_FIX.md      # Debugging notes for TP issues
-└── TENSOR_PARALLEL_USAGE.md    # TP launch instructions
+└── plots                       # Evaluation plots and visualizations
 ```
+
+### FSDP training workflow
+- Use `training.py` for fresh FSDP pretraining; it configures bf16 by default and targets a single DGX A100 (8 GPUs) unless you pass additional `torchrun` rendezvous flags for multi-node jobs.
+- Use `resume_training_fsdp.py --resume-from <checkpoint>` strictly for resuming jobs; it enforces checkpoint existence before launching.
+- Default precision is bf16 on Ampere/Hopper GPUs; falls back to fp16 elsewhere.
+- The FSDP configuration defaults to an 8192-dimensional model with 24 layers and a 16K-token context window (2× the model dimension).
 
 ## Argonne 1.5
 

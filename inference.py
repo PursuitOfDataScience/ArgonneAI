@@ -322,7 +322,7 @@ def compute_perplexity(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     eval_lines: Iterable[str],
-    block_size: int = 4096,
+    block_size: int = 16384,
     batch_size: int = 8,
     device: Optional[torch.device] = None,
     max_lines: Optional[int] = None,
