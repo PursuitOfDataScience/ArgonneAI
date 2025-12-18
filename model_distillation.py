@@ -1,14 +1,23 @@
 import argparse
 import contextlib
+import gc
 import importlib
 import importlib.util
 import json
 import os
 import re
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Deque, Dict, List, Optional, Tuple
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -863,6 +872,10 @@ def resume_training(
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
     add_document_tokens: bool = True,
+    use_wandb: bool = False,
+    wandb_project: str = "argonne-distillation",
+    wandb_run_name: Optional[str] = None,
+    enable_profiling: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -871,6 +884,35 @@ def resume_training(
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
     grad_accum_steps = max(1, int(gradient_accumulation_steps))
+    
+    # Initialize wandb (only on main process)
+    wandb_enabled = use_wandb and WANDB_AVAILABLE and is_main_process
+    if wandb_enabled:
+        wandb_config = {
+            "teacher_path": teacher_path,
+            "student_path": student_path,
+            "total_training_steps": total_training_steps,
+            "block_size": block_size,
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "learning_rate": lr,
+            "min_learning_rate": min_lr,
+            "warmup_steps": warmup_steps,
+            "rewarmup_steps": rewarmup_steps,
+            "weight_decay": weight_decay,
+            "world_size": world_size,
+            "use_gradient_checkpointing": use_gradient_checkpointing,
+        }
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config=wandb_config,
+            resume="allow",
+        )
+        print("✓ Wandb initialized for logging")
+    elif use_wandb and not WANDB_AVAILABLE:
+        if is_main_process:
+            print("⚠ wandb requested but not installed. Install with: pip install wandb")
     
     if is_main_process:
         cleanup_old_checkpoints("distill-pretrained", keep=3, rank=rank)
@@ -1335,6 +1377,8 @@ def resume_training(
     micro_step = 0
     tokens_in_this_session = 0
     last_loss_value: Optional[float] = None
+    last_student_ce: Optional[float] = None
+    last_distill_loss: Optional[float] = None
     current_lr = lr
     current_batch_size = max(1, int(batch_size))
 
@@ -1380,14 +1424,349 @@ def resume_training(
         distill_temperature = 1.0
         distill_alpha = 0.5
 
-        try:
-            while global_step < total_training_steps:
-                try:
-                    tokens, file_idx, position, shard_name, chunk_idx = next(token_gen)
+        # Setup profiler if enabled
+        profiler_context = contextlib.nullcontext()
+        if enable_profiling and is_main_process:
+            profiler_schedule = torch.profiler.schedule(
+                wait=10,      # Skip first 10 steps
+                warmup=5,     # Warmup for 5 steps
+                active=5,     # Profile for 5 steps
+                repeat=2,     # Repeat this cycle twice
+            )
+            profiler_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=profiler_schedule,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_logs"),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            print("✓ Profiler enabled - traces will be saved to ./profiler_logs")
+            print("  View with: tensorboard --logdir=./profiler_logs")
 
-                    if file_idx == -1:
+        with profiler_context as profiler:
+            try:
+                while global_step < total_training_steps:
+                    try:
+                        tokens, file_idx, position, shard_name, chunk_idx = next(token_gen)
+
+                        if file_idx == -1:
+                            if is_main_process:
+                                print("End of dataset - restarting")
+                            data_position.next_epoch()
+                            # Restart with same generator type
+                            token_gen = streaming_token_generator(
+                                data_files,
+                                hf_tokenizer,
+                                block_size,
+                                rank=rank,
+                                add_document_tokens=add_document_tokens,
+                            )
+                            continue
+
+                        token_buffer.append(tokens)
+                        last_meta = (shard_name, file_idx, position, chunk_idx)
+                        data_position.update_streaming_position(file_idx, position, chunk_idx, data_files[file_idx])
+
+                        if shard_name != active_shard:
+                            active_shard = shard_name
+                            if is_main_process:
+                                print(f"Processing shard {file_idx + 1}/{len(data_files)}: {shard_name}")
+
+                        while len(token_buffer) >= current_batch_size:
+                            batch_tokens_list = token_buffer[:current_batch_size]
+                            token_buffer = token_buffer[current_batch_size:]
+
+                            x_tens, y_tens = collate_batch(batch_tokens_list, block_size)
+                            if x_tens is None or last_meta is None:
+                                continue
+
+                            x_local: torch.Tensor
+                            y_local: torch.Tensor
+
+                            if using_cuda:
+                                enqueue_batch(x_tens, y_tens)
+                                if not prefetch_warmup_done:
+                                    if len(prefetched_batches) < max_prefetch_batches:
+                                        token_buffer = batch_tokens_list + token_buffer
+                                        break
+                                    prefetch_warmup_done = True
+                                x_local, y_local = pop_prefetched()
+                            else:
+                                enqueue_batch(x_tens, y_tens)
+                                x_local, y_local = pop_prefetched()
+
+                            batch_tokens = x_local.numel()
+                            tokens_in_this_session += batch_tokens
+
+                            autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
+
+                            loss_tensor = None
+                            try:
+                                # Student forward pass (on local GPU shard)
+                                with autocast_context:
+                                    outputs = model(input_ids=x_local)
+                                    logits = outputs.logits
+                                
+                                # Teacher forward pass (pipeline parallel, rank 0 only)
+                                # Teacher is spread across GPUs, input goes to first device
+                                # Then broadcast teacher logits to all ranks
+                                with torch.no_grad():
+                                    if is_main_process and teacher_model is not None:
+                                        # Rank 0 runs teacher inference
+                                        # Input needs to go to the first device of the teacher model
+                                        # With device_map="auto", we need to find where input should go
+                                        if hasattr(teacher_model, 'hf_device_map'):
+                                            # Find the device for the embedding layer
+                                            first_teacher_device = next(teacher_model.parameters()).device
+                                        else:
+                                            first_teacher_device = torch.device("cuda:0")
+                                        
+                                        x_for_teacher = x_local.to(first_teacher_device)
+                                        batch_size_teacher = x_for_teacher.shape[0]
+                                        
+                                        # Process in micro-batches to reduce activation memory
+                                        teacher_micro_batch = 4
+                                        teacher_logits_list = []
+                                        
+                                        for i in range(0, batch_size_teacher, teacher_micro_batch):
+                                            end_idx = min(i + teacher_micro_batch, batch_size_teacher)
+                                            micro_input = x_for_teacher[i:end_idx]
+                                            micro_out = teacher_model(input_ids=micro_input)
+                                            # Move logits to rank 0's device for broadcast
+                                            teacher_logits_list.append(micro_out.logits.to(first_device))
+                                            del micro_out
+                                        
+                                        # Concatenate 
+                                        teacher_logits = torch.cat(teacher_logits_list, dim=0)
+                                        teacher_logits = teacher_logits.to(dtype=logits.dtype)
+                                        del teacher_logits_list
+                                        
+                                        # CRITICAL: Compute softmax on FULL teacher logits FIRST, then slice
+                                        # This preserves the teacher's original probability distribution
+                                        # If we slice logits before softmax, we'd redistribute probability mass incorrectly
+                                        teacher_probs_full = F.softmax(
+                                            teacher_logits / distill_temperature, dim=-1
+                                        )
+                                        
+                                        # Now slice to student vocab size - this keeps the original probabilities
+                                        # for the shared vocabulary (the extra 271 tokens just get dropped)
+                                        if teacher_vocab_size > student_vocab_size:
+                                            teacher_probs = teacher_probs_full[:, :, :student_vocab_size].contiguous()
+                                        else:
+                                            teacher_probs = teacher_probs_full
+                                        
+                                        del teacher_logits, teacher_probs_full
+                                        
+                                        # Clear cache after teacher forward
+                                        torch.cuda.empty_cache()
+                                    else:
+                                        # Other ranks allocate empty tensor to receive broadcast
+                                        # We broadcast teacher_probs (already softmaxed and sliced)
+                                        batch_size_for_alloc = logits.shape[0]
+                                        seq_len_for_alloc = logits.shape[1]
+                                        teacher_probs = torch.empty(
+                                            (batch_size_for_alloc, seq_len_for_alloc, student_vocab_size),
+                                            dtype=logits.dtype,
+                                            device=first_device
+                                        )
+                                    
+                                    # Broadcast teacher probs from rank 0 to all ranks
+                                    # At this point, teacher_probs has shape [batch, seq, student_vocab_size]
+                                    dist.broadcast(teacher_probs, src=0)
+
+                                student_ce = F.cross_entropy(
+                                    logits.view(-1, logits.size(-1)),
+                                    y_local.view(-1),
+                                    ignore_index=-100,
+                                )
+
+                                student_log_probs = F.log_softmax(
+                                    logits / distill_temperature, dim=-1
+                                )
+                                # teacher_probs is already computed (softmax done before slicing on rank 0)
+
+                                # Flatten batch and sequence dims so batchmean reduction divides
+                                # by the true number of tokens instead of just batch size.
+                                # Without this, KL loss summed over the sequence dimension,
+                                # leading to extremely large loss values (hundreds+) at start.
+                                flattened_student = student_log_probs.view(-1, student_log_probs.size(-1))
+                                flattened_teacher = teacher_probs.view(-1, teacher_probs.size(-1))
+
+                                distill_loss = F.kl_div(
+                                    flattened_student,
+                                    flattened_teacher,
+                                    reduction="batchmean",
+                                ) * (distill_temperature ** 2)
+
+                                loss_tensor = distill_alpha * student_ce + (1.0 - distill_alpha) * distill_loss
+
+                                # Store loss components for async logging (avoid .item() sync during forward/backward)
+                                loss_for_log = loss_tensor.detach()
+                                student_ce_for_log = student_ce.detach()
+                                distill_loss_for_log = distill_loss.detach()
+                            except RuntimeError as oom_err:
+                                if "out of memory" in str(oom_err).lower():
+                                    prev_batch = current_batch_size
+                                    current_batch_size = max(1, current_batch_size - 4)
+                                    token_buffer = batch_tokens_list + token_buffer
+                                    if using_cuda:
+                                        torch.cuda.empty_cache()
+                                    optimizer.zero_grad(set_to_none=True)
+                                    if is_main_process:
+                                        print(
+                                            f"⚠ CUDA OOM encountered at batch size {prev_batch}; reducing to {current_batch_size}"
+                                        )
+                                    # If we OOM at batch size 1, kill the job
+                                    if prev_batch == 1:
+                                        if is_main_process:
+                                            print("💀 OOM at minimum batch size (1), killing job")
+                                        import sys
+                                        sys.exit(1)
+                                    if current_batch_size < 1:
+                                        raise
+                                    break
+                                raise
+
+                            if loss_tensor is None:
+                                continue
+
+                            # Convert to float for logging only after backward pass setup
+                            # This still calls .item() but groups the sync at a logical boundary
+                            last_loss_value = float(loss_for_log.cpu().item())
+                            last_student_ce = float(student_ce_for_log.cpu().item())
+                            last_distill_loss = float(distill_loss_for_log.cpu().item())
+
+                            loss_for_backward = loss_tensor / grad_accum_steps
+
+                            if scaler is not None:
+                                scaler.scale(loss_for_backward).backward()
+                            else:
+                                loss_for_backward.backward()
+
+                            micro_step += 1
+
+                            if micro_step >= grad_accum_steps:
+                                current_lr = scheduler.step(global_step)
+
+                                if (
+                                    lr_ramp_tracker
+                                    and lr_ramp_tracker.get("steps_completed", 0)
+                                    < lr_ramp_tracker.get("total_steps", 0)
+                                ):
+                                    completed = lr_ramp_tracker["steps_completed"]
+                                    total = max(1, lr_ramp_tracker["total_steps"])
+                                    ramp_scale = min((completed + 1) / total, 1.0)
+                                    ramp_lr = max(min_lr, current_lr * ramp_scale)
+                                    current_lr = scheduler.override_step(global_step, ramp_lr)
+                                    lr_ramp_tracker["steps_completed"] = completed + 1
+
+                                    if (
+                                        is_main_process
+                                        and lr_ramp_tracker["steps_completed"]
+                                        == lr_ramp_tracker["total_steps"]
+                                    ):
+                                        print(
+                                            "✓ LR ramp complete: reached target LR %.6e" % current_lr
+                                        )
+
+                                if scaler is not None:
+                                    scaler.unscale_(optimizer)
+                                    _ensure_gradient_dtype_matches_params(model)
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                    scaler.step(optimizer)
+                                    scaler.update()
+                                else:
+                                    _ensure_gradient_dtype_matches_params(model)
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                    optimizer.step()
+
+                                optimizer.zero_grad(set_to_none=True)
+
+                                global_step += 1
+                                micro_step = 0
+
+                                if pbar is not None:
+                                    pbar.update(1)
+
+                                # Step profiler if enabled
+                                if profiler is not None:
+                                    profiler.step()
+
+                                # Log metrics every 10 steps
+                                if global_step % 10 == 0 and last_loss_value is not None and is_main_process:
+                                    current_total_tokens = total_tokens_processed + tokens_in_this_session
+                                    
+                                    # Use wandb for logging if available
+                                    if wandb_enabled:
+                                        wandb.log({
+                                            "loss/total": last_loss_value,
+                                            "loss/student_ce": last_student_ce,
+                                            "loss/distill_kl": last_distill_loss,
+                                            "training/learning_rate": current_lr,
+                                            "training/tokens_processed": current_total_tokens,
+                                            "training/batch_size": current_batch_size,
+                                            "training/global_step": global_step,
+                                        }, step=global_step)
+                                    else:
+                                        # Fallback to print logging
+                                        print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+
+                                if global_step % 100 == 0:
+                                    current_total_tokens = total_tokens_processed + tokens_in_this_session
+
+                                    # Generate on all ranks to keep collectives in sync
+                                    prompt_tensor = cached_prompt_tensor.to(first_device)
+                                    generated = model.generate(
+                                        prompt_tensor,
+                                        max_length=prompt_tensor.shape[1] + 100,
+                                        do_sample=True,
+                                        temperature=0.7,
+                                        top_k=50,
+                                        top_p=0.9,
+                                    )
+
+                                    if is_main_process:
+                                        generated_text = hf_tokenizer.decode(generated[0].tolist())
+                                        print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+                                        # SIMPLE: Just save rank 0's model state (sharded weights)
+                                        model_state = cast_state_dict_to_dtype(
+                                            model.base_model.state_dict(), amp_dtype
+                                        )
+
+                                        checkpoint_state = {
+                                            "global_step": global_step,
+                                            "tokens_processed": current_total_tokens,
+                                            "model_state_dict": model_state,
+                                            "optimizer_state_dict": optimizer.state_dict(),
+                                            "scheduler_state_dict": scheduler.state_dict(),
+                                            "lr_ramp_state": (
+                                                dict(lr_ramp_tracker)
+                                                if lr_ramp_tracker is not None
+                                                else None
+                                            ),
+                                            "gradient_accumulation_steps": grad_accum_steps,
+                                            "loss": last_loss_value,
+                                            "data_position": data_position.get_state(),
+                                            "model_dtype": str(amp_dtype),
+                                            "tensor_parallel": True,
+                                            "world_size": world_size,
+                                            "rank": rank,
+                                        }
+                                        os.makedirs("distill-pretrained", exist_ok=True)
+                                        save_path = (
+                                            f"distill-pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                        )
+                                        safe_torch_save(checkpoint_state, save_path)
+                                        print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+
+                    except StopIteration:
                         if is_main_process:
-                            print("End of dataset - restarting")
+                            print("StopIteration - restarting dataset")
                         data_position.next_epoch()
                         # Restart with same generator type
                         token_gen = streaming_token_generator(
@@ -1398,296 +1777,17 @@ def resume_training(
                             add_document_tokens=add_document_tokens,
                         )
                         continue
-
-                    token_buffer.append(tokens)
-                    last_meta = (shard_name, file_idx, position, chunk_idx)
-                    data_position.update_streaming_position(file_idx, position, chunk_idx, data_files[file_idx])
-
-                    if shard_name != active_shard:
-                        active_shard = shard_name
-                        if is_main_process:
-                            print(f"Processing shard {file_idx + 1}/{len(data_files)}: {shard_name}")
-
-                    while len(token_buffer) >= current_batch_size:
-                        batch_tokens_list = token_buffer[:current_batch_size]
-                        token_buffer = token_buffer[current_batch_size:]
-
-                        x_tens, y_tens = collate_batch(batch_tokens_list, block_size)
-                        if x_tens is None or last_meta is None:
-                            continue
-
-                        x_local: torch.Tensor
-                        y_local: torch.Tensor
-
-                        if using_cuda:
-                            enqueue_batch(x_tens, y_tens)
-                            if not prefetch_warmup_done:
-                                if len(prefetched_batches) < max_prefetch_batches:
-                                    token_buffer = batch_tokens_list + token_buffer
-                                    break
-                                prefetch_warmup_done = True
-                            x_local, y_local = pop_prefetched()
-                        else:
-                            enqueue_batch(x_tens, y_tens)
-                            x_local, y_local = pop_prefetched()
-
-                        batch_tokens = x_local.numel()
-                        tokens_in_this_session += batch_tokens
-
-                        autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
-
-                        loss_tensor = None
-                        try:
-                            # Student forward pass (on local GPU shard)
-                            with autocast_context:
-                                outputs = model(input_ids=x_local)
-                                logits = outputs.logits
-                            
-                            # Teacher forward pass (pipeline parallel, rank 0 only)
-                            # Teacher is spread across GPUs, input goes to first device
-                            # Then broadcast teacher logits to all ranks
-                            with torch.no_grad():
-                                if is_main_process and teacher_model is not None:
-                                    # Rank 0 runs teacher inference
-                                    # Input needs to go to the first device of the teacher model
-                                    # With device_map="auto", we need to find where input should go
-                                    if hasattr(teacher_model, 'hf_device_map'):
-                                        # Find the device for the embedding layer
-                                        first_teacher_device = next(teacher_model.parameters()).device
-                                    else:
-                                        first_teacher_device = torch.device("cuda:0")
-                                    
-                                    x_for_teacher = x_local.to(first_teacher_device)
-                                    batch_size_teacher = x_for_teacher.shape[0]
-                                    
-                                    # Process in micro-batches to reduce activation memory
-                                    teacher_micro_batch = 4
-                                    teacher_logits_list = []
-                                    
-                                    for i in range(0, batch_size_teacher, teacher_micro_batch):
-                                        end_idx = min(i + teacher_micro_batch, batch_size_teacher)
-                                        micro_input = x_for_teacher[i:end_idx]
-                                        micro_out = teacher_model(input_ids=micro_input)
-                                        # Move logits to rank 0's device for broadcast
-                                        teacher_logits_list.append(micro_out.logits.to(first_device))
-                                        del micro_out
-                                    
-                                    # Concatenate 
-                                    teacher_logits = torch.cat(teacher_logits_list, dim=0)
-                                    teacher_logits = teacher_logits.to(dtype=logits.dtype)
-                                    del teacher_logits_list
-                                    
-                                    # CRITICAL: Compute softmax on FULL teacher logits FIRST, then slice
-                                    # This preserves the teacher's original probability distribution
-                                    # If we slice logits before softmax, we'd redistribute probability mass incorrectly
-                                    teacher_probs_full = F.softmax(
-                                        teacher_logits / distill_temperature, dim=-1
-                                    )
-                                    
-                                    # Now slice to student vocab size - this keeps the original probabilities
-                                    # for the shared vocabulary (the extra 271 tokens just get dropped)
-                                    if teacher_vocab_size > student_vocab_size:
-                                        teacher_probs = teacher_probs_full[:, :, :student_vocab_size].contiguous()
-                                    else:
-                                        teacher_probs = teacher_probs_full
-                                    
-                                    del teacher_logits, teacher_probs_full
-                                    
-                                    # Clear cache after teacher forward
-                                    torch.cuda.empty_cache()
-                                else:
-                                    # Other ranks allocate empty tensor to receive broadcast
-                                    # We broadcast teacher_probs (already softmaxed and sliced)
-                                    batch_size_for_alloc = logits.shape[0]
-                                    seq_len_for_alloc = logits.shape[1]
-                                    teacher_probs = torch.empty(
-                                        (batch_size_for_alloc, seq_len_for_alloc, student_vocab_size),
-                                        dtype=logits.dtype,
-                                        device=first_device
-                                    )
-                                
-                                # Broadcast teacher probs from rank 0 to all ranks
-                                # At this point, teacher_probs has shape [batch, seq, student_vocab_size]
-                                dist.broadcast(teacher_probs, src=0)
-
-                            student_ce = F.cross_entropy(
-                                logits.view(-1, logits.size(-1)),
-                                y_local.view(-1),
-                                ignore_index=-100,
-                            )
-
-                            student_log_probs = F.log_softmax(
-                                logits / distill_temperature, dim=-1
-                            )
-                            # teacher_probs is already computed (softmax done before slicing on rank 0)
-
-                            # Flatten batch and sequence dims so batchmean reduction divides
-                            # by the true number of tokens instead of just batch size.
-                            # Without this, KL loss summed over the sequence dimension,
-                            # leading to extremely large loss values (hundreds+) at start.
-                            flattened_student = student_log_probs.view(-1, student_log_probs.size(-1))
-                            flattened_teacher = teacher_probs.view(-1, teacher_probs.size(-1))
-
-                            distill_loss = F.kl_div(
-                                flattened_student,
-                                flattened_teacher,
-                                reduction="batchmean",
-                            ) * (distill_temperature ** 2)
-
-                            loss_tensor = distill_alpha * student_ce + (1.0 - distill_alpha) * distill_loss
-
-                            last_loss_value = float(loss_tensor.detach().cpu().item())
-                        except RuntimeError as oom_err:
-                            if "out of memory" in str(oom_err).lower():
-                                prev_batch = current_batch_size
-                                current_batch_size = max(1, current_batch_size - 4)
-                                token_buffer = batch_tokens_list + token_buffer
-                                if using_cuda:
-                                    torch.cuda.empty_cache()
-                                optimizer.zero_grad(set_to_none=True)
-                                if is_main_process:
-                                    print(
-                                        f"⚠ CUDA OOM encountered at batch size {prev_batch}; reducing to {current_batch_size}"
-                                    )
-                                # If we OOM at batch size 1, kill the job
-                                if prev_batch == 1:
-                                    if is_main_process:
-                                        print("💀 OOM at minimum batch size (1), killing job")
-                                    import sys
-                                    sys.exit(1)
-                                if current_batch_size < 1:
-                                    raise
-                                break
-                            raise
-
-                        if loss_tensor is None:
-                            continue
-
-                        loss_for_backward = loss_tensor / grad_accum_steps
-
-                        if scaler is not None:
-                            scaler.scale(loss_for_backward).backward()
-                        else:
-                            loss_for_backward.backward()
-
-                        micro_step += 1
-
-                        if micro_step >= grad_accum_steps:
-                            current_lr = scheduler.step(global_step)
-
-                            if (
-                                lr_ramp_tracker
-                                and lr_ramp_tracker.get("steps_completed", 0)
-                                < lr_ramp_tracker.get("total_steps", 0)
-                            ):
-                                completed = lr_ramp_tracker["steps_completed"]
-                                total = max(1, lr_ramp_tracker["total_steps"])
-                                ramp_scale = min((completed + 1) / total, 1.0)
-                                ramp_lr = max(min_lr, current_lr * ramp_scale)
-                                current_lr = scheduler.override_step(global_step, ramp_lr)
-                                lr_ramp_tracker["steps_completed"] = completed + 1
-
-                                if (
-                                    is_main_process
-                                    and lr_ramp_tracker["steps_completed"]
-                                    == lr_ramp_tracker["total_steps"]
-                                ):
-                                    print(
-                                        "✓ LR ramp complete: reached target LR %.6e" % current_lr
-                                    )
-
-                            if scaler is not None:
-                                scaler.unscale_(optimizer)
-                                _ensure_gradient_dtype_matches_params(model)
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                                scaler.step(optimizer)
-                                scaler.update()
-                            else:
-                                _ensure_gradient_dtype_matches_params(model)
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                                optimizer.step()
-
-                            optimizer.zero_grad(set_to_none=True)
-
-                            global_step += 1
-                            micro_step = 0
-
-                            if pbar is not None:
-                                pbar.update(1)
-
-                            if global_step % 10 == 0 and last_loss_value is not None and is_main_process:
-                                current_total_tokens = total_tokens_processed + tokens_in_this_session
-                                print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
-
-                            if global_step % 100 == 0:
-                                current_total_tokens = total_tokens_processed + tokens_in_this_session
-
-                                # Generate on all ranks to keep collectives in sync
-                                prompt_tensor = cached_prompt_tensor.to(first_device)
-                                generated = model.generate(
-                                    prompt_tensor,
-                                    max_length=prompt_tensor.shape[1] + 100,
-                                    do_sample=True,
-                                    temperature=0.7,
-                                    top_k=50,
-                                    top_p=0.9,
-                                )
-
-                                if is_main_process:
-                                    generated_text = hf_tokenizer.decode(generated[0].tolist())
-                                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-                                    # SIMPLE: Just save rank 0's model state (sharded weights)
-                                    model_state = cast_state_dict_to_dtype(
-                                        model.base_model.state_dict(), amp_dtype
-                                    )
-
-                                    checkpoint_state = {
-                                        "global_step": global_step,
-                                        "tokens_processed": current_total_tokens,
-                                        "model_state_dict": model_state,
-                                        "optimizer_state_dict": optimizer.state_dict(),
-                                        "scheduler_state_dict": scheduler.state_dict(),
-                                        "lr_ramp_state": (
-                                            dict(lr_ramp_tracker)
-                                            if lr_ramp_tracker is not None
-                                            else None
-                                        ),
-                                        "gradient_accumulation_steps": grad_accum_steps,
-                                        "loss": last_loss_value,
-                                        "data_position": data_position.get_state(),
-                                        "model_dtype": str(amp_dtype),
-                                        "tensor_parallel": True,
-                                        "world_size": world_size,
-                                        "rank": rank,
-                                    }
-                                    os.makedirs("distill-pretrained", exist_ok=True)
-                                    save_path = (
-                                        f"distill-pretrained/streaming_checkpoint_step_{global_step}.pth"
-                                    )
-                                    safe_torch_save(checkpoint_state, save_path)
-                                    print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-
-                except StopIteration:
-                    if is_main_process:
-                        print("StopIteration - restarting dataset")
-                    data_position.next_epoch()
-                    # Restart with same generator type
-                    token_gen = streaming_token_generator(
-                        data_files,
-                        hf_tokenizer,
-                        block_size,
-                        rank=rank,
-                        add_document_tokens=add_document_tokens,
-                    )
-                    continue
-        finally:
-            if using_cuda and prefetch_stream is not None:
-                torch.cuda.current_stream().wait_stream(prefetch_stream)
-            prefetched_batches.clear()
-            prefetch_warmup_done = not using_cuda
-            if pbar is not None:
-                pbar.close()
+            finally:
+                if using_cuda and prefetch_stream is not None:
+                    torch.cuda.current_stream().wait_stream(prefetch_stream)
+                prefetched_batches.clear()
+                prefetch_warmup_done = not using_cuda
+                if pbar is not None:
+                    pbar.close()
+    
+    # Finish wandb run if enabled
+    if wandb_enabled:
+        wandb.finish()
 
     final_token_count = total_tokens_processed + tokens_in_this_session
 
@@ -1834,6 +1934,30 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Local rank for distributed training.",
     )
+    # Wandb logging arguments
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for metrics tracking.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="argonne-distillation",
+        help="Wandb project name.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Wandb run name (optional, auto-generated if not provided).",
+    )
+    # Profiling argument
+    parser.add_argument(
+        "--profiling",
+        action="store_true",
+        help="Enable PyTorch profiler for performance analysis. Traces saved to ./profiler_logs/",
+    )
     return parser.parse_args()
 
 
@@ -1858,6 +1982,10 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        enable_profiling=args.profiling,
     )
 
 
