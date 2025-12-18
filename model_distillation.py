@@ -886,30 +886,38 @@ def resume_training(
     grad_accum_steps = max(1, int(gradient_accumulation_steps))
     
     # Initialize wandb (only on main process)
-    wandb_enabled = use_wandb and WANDB_AVAILABLE and is_main_process
-    if wandb_enabled:
-        wandb_config = {
-            "teacher_path": teacher_path,
-            "student_path": student_path,
-            "total_training_steps": total_training_steps,
-            "block_size": block_size,
-            "batch_size": batch_size,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
-            "learning_rate": lr,
-            "min_learning_rate": min_lr,
-            "warmup_steps": warmup_steps,
-            "rewarmup_steps": rewarmup_steps,
-            "weight_decay": weight_decay,
-            "world_size": world_size,
-            "use_gradient_checkpointing": use_gradient_checkpointing,
-        }
-        wandb.init(
-            project=wandb_project,
-            name=wandb_run_name,
-            config=wandb_config,
-            resume="allow",
-        )
-        print("✓ Wandb initialized for logging")
+    # Wrapped in try-except to handle missing API key gracefully
+    wandb_enabled = False
+    if use_wandb and WANDB_AVAILABLE and is_main_process:
+        try:
+            wandb_config = {
+                "teacher_path": teacher_path,
+                "student_path": student_path,
+                "total_training_steps": total_training_steps,
+                "block_size": block_size,
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "learning_rate": lr,
+                "min_learning_rate": min_lr,
+                "warmup_steps": warmup_steps,
+                "rewarmup_steps": rewarmup_steps,
+                "weight_decay": weight_decay,
+                "world_size": world_size,
+                "use_gradient_checkpointing": use_gradient_checkpointing,
+            }
+            wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                config=wandb_config,
+                resume="allow",
+            )
+            wandb_enabled = True
+            print("✓ Wandb initialized for logging")
+        except Exception as wandb_err:
+            print(f"⚠ Wandb initialization failed: {wandb_err}")
+            print("  Continuing without wandb logging.")
+            print("  To fix: run 'wandb login' or set WANDB_API_KEY environment variable")
+            wandb_enabled = False
     elif use_wandb and not WANDB_AVAILABLE:
         if is_main_process:
             print("⚠ wandb requested but not installed. Install with: pip install wandb")
