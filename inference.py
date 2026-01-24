@@ -446,8 +446,7 @@ def generate_from_prompt(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Argonne model inference utility (CUDA + bf16)")
-    parser.add_argument("--model-dir", type=str, required=False,
-                        default="/project/rcc/youzhi/Argonne2.0",
+    parser.add_argument("--model-dir", type=str, required=True,
                         help="Path to the exported model directory (save_pretrained output)")
     parser.add_argument("--eval-file", type=str, default=None, help="Plaintext file (one document per line) to compute perplexity")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt string to generate from")
