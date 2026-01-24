@@ -32,11 +32,26 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from datasets import disable_caching, load_from_disk
-from transformers import (
-    AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer,
-    PreTrainedTokenizerFast, PreTrainedTokenizerBase, TrainingArguments, Trainer,
-)
-from transformers.trainer_callback import TrainerCallback
+
+try:
+    from transformers import (
+        AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer,
+        PreTrainedTokenizerFast, PreTrainedTokenizerBase, TrainingArguments, Trainer,
+    )
+    from transformers.trainer_callback import TrainerCallback
+except RuntimeError as e:
+    if "scipy" in str(e).lower() or "numpy" in str(e).lower():
+        print("=" * 70)
+        print("ERROR: Environment compatibility issue detected!")
+        print("=" * 70)
+        print("There is a version mismatch between numpy and scipy.")
+        print("Please activate a conda environment with compatible packages:")
+        print("  conda activate <your_env>")
+        print("Or install compatible versions:")
+        print("  pip install --upgrade numpy scipy transformers")
+        print("=" * 70)
+        sys.exit(1)
+    raise
 
 
 # =============================================================================
@@ -167,7 +182,7 @@ def apply_chat_template(
 # Dataset Classes
 # =============================================================================
 class ReasoningDataset(torch.utils.data.Dataset):
-    """Dataset for reasoning/CoT finetuning."""
+    """Dataset for reasoning/CoT finetuning with on-the-fly tokenization."""
     
     def __init__(self, ds, tokenizer: PreTrainedTokenizerBase, max_len: int):
         self.ds = ds
@@ -180,18 +195,20 @@ class ReasoningDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         ex = self.ds[idx]
-        ids = ex["input_ids"][:self.max_len]
+        messages = ex["messages"]
         
-        # Remove trailing padding
-        end = len(ids)
-        while end > 0 and ids[end - 1] == self.pad_id:
-            end -= 1
+        # Tokenize on-the-fly
+        result = build_reasoning_example(self.tokenizer, messages, self.max_len)
         
-        return {
-            "input_ids": ids[:end],
-            "attention_mask": ex["attention_mask"][:end],
-            "labels": ex["labels"][:end],
-        }
+        if result is None:
+            # Return a dummy example if tokenization fails (will be filtered by collator)
+            return {
+                "input_ids": [self.pad_id],
+                "attention_mask": [0],
+                "labels": [-100],
+            }
+        
+        return result
 
 
 @dataclass
@@ -298,36 +315,6 @@ def build_reasoning_example(
         "attention_mask": attention_mask,
         "labels": labels,
     }
-
-
-def tokenize_reasoning_dataset(
-    ds,
-    tokenizer: PreTrainedTokenizerBase,
-    max_len: int,
-    num_proc: int = 8,
-):
-    """Tokenize the reasoning dataset."""
-    
-    def process_batch(batch):
-        results = {"input_ids": [], "attention_mask": [], "labels": []}
-        
-        for messages in batch["messages"]:
-            ex = build_reasoning_example(tokenizer, messages, max_len)
-            if ex is not None:
-                for k in results:
-                    results[k].append(ex[k])
-        
-        return results
-    
-    return ds.map(
-        process_batch,
-        batched=True,
-        batch_size=512,
-        num_proc=num_proc,
-        remove_columns=ds.column_names,
-        load_from_cache_file=False,
-        desc="Tokenizing",
-    )
 
 
 # =============================================================================
@@ -470,6 +457,7 @@ def run_training(
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
+        save_total_limit=1,  # Keep only the most recent checkpoint
         eval_strategy="steps" if eval_ds else "no",
         eval_steps=args.eval_steps if eval_ds else None,
         bf16=True,
@@ -611,8 +599,8 @@ Examples:
     parser.add_argument(
         "--save-steps",
         type=int,
-        default=500,
-        help="Save checkpoint every N steps (default: 500)",
+        default=5000,
+        help="Save checkpoint every N steps (default: 5000)",
     )
     parser.add_argument(
         "--eval-steps",
@@ -713,22 +701,17 @@ def main():
         train_raw = train_raw.select(range(args.max_samples))
         print(f"  Limited to: {len(train_raw)} samples")
     
-    # Tokenize dataset
-    num_proc = min(16, os.cpu_count() or 4)
-    print(f"\nTokenizing with {num_proc} workers...")
-    train_tok = tokenize_reasoning_dataset(train_raw, tokenizer, args.max_ctx, num_proc)
-    print(f"  Tokenized samples: {len(train_tok)}")
+    # Create eval dataset (subset of raw data)
+    eval_raw = None
+    if args.eval_samples and len(train_raw) > args.eval_samples:
+        eval_indices = list(range(0, len(train_raw), len(train_raw) // args.eval_samples))[:args.eval_samples]
+        eval_raw = train_raw.select(eval_indices)
+        print(f"  Eval samples: {len(eval_raw)}")
     
-    # Create eval dataset (subset)
-    eval_tok = None
-    if args.eval_samples and len(train_tok) > args.eval_samples:
-        eval_indices = list(range(0, len(train_tok), len(train_tok) // args.eval_samples))[:args.eval_samples]
-        eval_tok = train_tok.select(eval_indices)
-        print(f"  Eval samples: {len(eval_tok)}")
-    
-    # Wrap in Dataset class
-    train_ds = ReasoningDataset(train_tok, tokenizer, args.max_ctx)
-    eval_ds = ReasoningDataset(eval_tok, tokenizer, args.max_ctx) if eval_tok else None
+    # Wrap in Dataset class (tokenization happens on-the-fly)
+    print("\nUsing on-the-fly tokenization...")
+    train_ds = ReasoningDataset(train_raw, tokenizer, args.max_ctx)
+    eval_ds = ReasoningDataset(eval_raw, tokenizer, args.max_ctx) if eval_raw else None
     
     # Training with auto batch size reduction
     batch_size = args.batch_size
