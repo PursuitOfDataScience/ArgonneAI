@@ -393,7 +393,7 @@ def parse_args():
     parser.add_argument("--logging-steps", type=int, default=10, help="Log every N steps")
     parser.add_argument("--save-steps", type=int, default=5000, help="Save every N steps")
     parser.add_argument("--eval-steps", type=int, default=5000, help="Eval every N steps")
-    parser.add_argument("--generation-steps", type=int, default=500, help="Generate every N steps")
+    parser.add_argument("--generation-steps", type=int, default=100, help="Generate every N steps")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples")
     parser.add_argument("--eval-samples", type=int, default=500, help="Eval samples")
     return parser.parse_args()
