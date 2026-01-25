@@ -316,7 +316,16 @@ class ReasoningGenerationCallback(TrainerCallback):
             ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"].to(device)
             with torch.no_grad():
                 try:
-                    out = model.generate(input_ids=ids, max_new_tokens=1000, temperature=0.7, top_p=0.9, top_k=50, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
+                    # Use max_length instead of max_new_tokens for custom Argonne model
+                    max_len = ids.shape[1] + 1000
+                    out = model.generate(
+                        input_ids=ids, 
+                        max_length=max_len, 
+                        temperature=0.7, 
+                        top_p=0.9, 
+                        top_k=50, 
+                        do_sample=True
+                    )
                     response = self.tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=False)
                 except Exception as e:
                     response = f"[Error: {e}]"
