@@ -329,7 +329,7 @@ class ReasoningGenerationCallback(TrainerCallback):
                     response = self.tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=False)
                 except Exception as e:
                     response = f"[Error: {e}]"
-            print(f"\n[Q{i}] {prompt[:80]}...\n[A{i}] <think>{response[:400]}...\n" + "-" * 50)
+            print(f"\n[Q{i}] {prompt}...\n[A{i}] <think>{response}...\n" + "-" * 50)
         model.train()
     
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -446,7 +446,7 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
     parser.add_argument("--logging-steps", type=int, default=10, help="Log every N steps")
     parser.add_argument("--save-steps", type=int, default=100, help="Save checkpoint every N steps")
-    parser.add_argument("--eval-steps", type=int, default=5000, help="Eval every N steps")
+    parser.add_argument("--eval-steps", type=int, default=500, help="Eval every N steps")
     parser.add_argument("--generation-steps", type=int, default=50, help="Generate every N steps")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples")
     parser.add_argument("--eval-samples", type=int, default=500, help="Eval samples")
