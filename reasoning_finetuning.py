@@ -10,8 +10,15 @@ Features:
 - Streaming tokenization: tokenizes on-the-fly during training (no pre-tokenization)
 - Auto batch size reduction on OOM
 - Periodic generation to monitor reasoning quality
+- Baseline generation before training for comparison
+- Checkpoint resume: automatically resumes from latest checkpoint if job is interrupted
+  (saves optimizer state, scheduler state, and data position)
 
 Usage:
+    python reasoning_finetuning.py --model-dir /path/to/base/model --data-dir /path/to/cot/data
+
+Resume from checkpoint (automatic):
+    # Just run the same command again - it will auto-detect and resume from latest checkpoint
     python reasoning_finetuning.py --model-dir /path/to/base/model --data-dir /path/to/cot/data
 
 The data should be a HuggingFace dataset with a "messages" column containing
@@ -293,7 +300,7 @@ class ReasoningGenerationCallback(TrainerCallback):
         "If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly? Reason through this.",
     ]
     
-    def __init__(self, tokenizer, steps=200):
+    def __init__(self, tokenizer, steps=50):
         self.tokenizer = tokenizer
         self.steps = steps
         self._initial_done = False
@@ -316,8 +323,14 @@ class ReasoningGenerationCallback(TrainerCallback):
             print(f"\n[Q{i}] {prompt[:80]}...\n[A{i}] <think>{response[:400]}...\n" + "-" * 50)
         model.train()
     
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Generate baseline samples before training starts for comparison."""
+        if model and not self._initial_done:
+            self._initial_done = True
+            self._generate_samples(model, "BASELINE (Before Training)")
+    
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        # Skip initial generation, only generate after real training progress
+        # Generate after every N steps
         if model and state.global_step > 0 and state.global_step % self.steps == 0 and state.global_step != self._last_generated_step:
             self._last_generated_step = state.global_step
             self._generate_samples(model, f"Step {state.global_step}")
@@ -326,8 +339,37 @@ class ReasoningGenerationCallback(TrainerCallback):
 # =============================================================================
 # Training Loop
 # =============================================================================
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Find the latest checkpoint in the output directory."""
+    if not os.path.isdir(output_dir):
+        return None
+    
+    checkpoints = []
+    for name in os.listdir(output_dir):
+        if name.startswith("checkpoint-"):
+            try:
+                step = int(name.split("-")[1])
+                checkpoints.append((step, os.path.join(output_dir, name)))
+            except (IndexError, ValueError):
+                continue
+    
+    if not checkpoints:
+        return None
+    
+    # Return the checkpoint with the highest step number
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    return checkpoints[0][1]
+
+
 def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
     grad_accum = 8  # Fixed gradient accumulation
+    
+    # Check for existing checkpoint to resume from
+    resume_from_checkpoint = find_latest_checkpoint(args.output_dir)
+    if resume_from_checkpoint:
+        print(f"\n{'=' * 70}")
+        print(f"RESUMING FROM CHECKPOINT: {resume_from_checkpoint}")
+        print(f"{'=' * 70}\n")
     
     training_args = TrainingArguments(
         output_dir=args.output_dir, num_train_epochs=args.epochs,
@@ -337,7 +379,7 @@ def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         learning_rate=args.lr, lr_scheduler_type="cosine", warmup_steps=args.warmup_steps,
         logging_steps=args.logging_steps, save_strategy="steps", save_steps=args.save_steps,
-        save_total_limit=1,  # Keep only 1 checkpoint
+        save_total_limit=3,  # Keep 3 checkpoints for resume capability
         eval_strategy="steps" if eval_ds else "no", eval_steps=args.eval_steps if eval_ds else None,
         bf16=True, max_grad_norm=1.0, weight_decay=0.01, report_to="none",
         remove_unused_columns=False, 
@@ -348,6 +390,9 @@ def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
         # Hopper (H100) optimizations
         bf16_full_eval=True,
         torch_compile=False,  # Can enable if model supports it
+        # Resume capability - save optimizer and scheduler state
+        save_on_each_node=True,
+        ignore_data_skip=False,  # Important: ensures data loader resumes at correct position
     )
     
     if hasattr(model, "config"):
@@ -365,7 +410,7 @@ def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
     print(f"\nTraining: batch={batch_size}, grad_accum={grad_accum}, effective={batch_size * grad_accum}, lr={args.lr}, max_ctx={args.max_ctx}\n")
     
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         return True, trainer
     except RuntimeError as e:
         if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
@@ -391,9 +436,9 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
     parser.add_argument("--logging-steps", type=int, default=10, help="Log every N steps")
-    parser.add_argument("--save-steps", type=int, default=5000, help="Save every N steps")
+    parser.add_argument("--save-steps", type=int, default=100, help="Save checkpoint every N steps")
     parser.add_argument("--eval-steps", type=int, default=5000, help="Eval every N steps")
-    parser.add_argument("--generation-steps", type=int, default=100, help="Generate every N steps")
+    parser.add_argument("--generation-steps", type=int, default=50, help="Generate every N steps")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples")
     parser.add_argument("--eval-samples", type=int, default=500, help="Eval samples")
     return parser.parse_args()
