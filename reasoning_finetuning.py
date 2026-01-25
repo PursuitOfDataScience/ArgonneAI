@@ -36,6 +36,13 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# Hopper (H100) specific optimizations
+if torch.cuda.is_available():
+    # Enable flash attention scaling for Hopper
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)  # Prefer flash/mem-efficient over math
+
 from datasets import load_from_disk
 from transformers import (
     AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer,
@@ -149,22 +156,26 @@ def apply_chat_template(tokenizer, messages, add_generation_prompt=False):
 
 
 # =============================================================================
-# Streaming Dataset - Tokenizes on-the-fly
+# Streaming Dataset - Tokenizes on-the-fly with caching
 # =============================================================================
 class IndexedReasoningDataset(torch.utils.data.Dataset):
-    """Map-style dataset that tokenizes examples on-the-fly."""
+    """Map-style dataset that tokenizes examples on-the-fly with LRU cache."""
     
-    def __init__(self, hf_dataset, tokenizer, max_len):
+    def __init__(self, hf_dataset, tokenizer, max_len, cache_size=10000):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.pad_id = tokenizer.pad_token_id
+        # Simple LRU-ish cache to avoid re-tokenizing recently seen examples
+        self._cache = {}
+        self._cache_order = []
+        self._cache_size = cache_size
     
     def __len__(self):
         return len(self.hf_dataset)
     
-    def __getitem__(self, idx):
-        example = self.hf_dataset[idx]
+    def _tokenize_example(self, example):
+        """Tokenize a single example."""
         messages = example.get("messages", [])
         
         user_msg, assistant_msg = None, None
@@ -196,6 +207,25 @@ class IndexedReasoningDataset(torch.utils.data.Dataset):
         
         labels = [-100] * prompt_len + input_ids[prompt_len:]
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+    
+    def __getitem__(self, idx):
+        # Check cache first
+        if idx in self._cache:
+            return self._cache[idx]
+        
+        example = self.hf_dataset[idx]
+        result = self._tokenize_example(example)
+        
+        # Add to cache with simple eviction
+        if len(self._cache) >= self._cache_size:
+            # Remove oldest entries
+            for old_idx in self._cache_order[:1000]:
+                self._cache.pop(old_idx, None)
+            self._cache_order = self._cache_order[1000:]
+        
+        self._cache[idx] = result
+        self._cache_order.append(idx)
+        return result
 
 
 @dataclass
@@ -215,14 +245,21 @@ class DataCollatorForCausalLM:
         max_len = ((max_len + self.pad_multiple - 1) // self.pad_multiple) * self.pad_multiple
         
         pad_id = self.tokenizer.pad_token_id
-        batch = {"input_ids": [], "attention_mask": [], "labels": []}
-        for f in features:
+        batch_size = len(features)
+        
+        # Pre-allocate tensors
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+        labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        
+        for i, f in enumerate(features):
             n = min(len(f["input_ids"]), max_len)
-            pad = max_len - n
-            batch["input_ids"].append([pad_id] * pad + list(f["input_ids"][-n:]))
-            batch["attention_mask"].append([0] * pad + list(f["attention_mask"][-n:]))
-            batch["labels"].append([-100] * pad + list(f["labels"][-n:]))
-        return {k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()}
+            # Left padding: place content at the right
+            input_ids[i, -n:] = torch.tensor(f["input_ids"][-n:], dtype=torch.long)
+            attention_mask[i, -n:] = torch.tensor(f["attention_mask"][-n:], dtype=torch.long)
+            labels[i, -n:] = torch.tensor(f["labels"][-n:], dtype=torch.long)
+        
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 # =============================================================================
@@ -260,6 +297,7 @@ class ReasoningGenerationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.steps = steps
         self._initial_done = False
+        self._last_generated_step = -1
     
     def _generate_samples(self, model, label):
         model.eval()
@@ -271,20 +309,17 @@ class ReasoningGenerationCallback(TrainerCallback):
             ids = self.tokenizer(formatted, return_tensors="pt")["input_ids"].to(device)
             with torch.no_grad():
                 try:
-                    out = model.generate(input_ids=ids, max_length=min(ids.shape[1] + 300, 4096), temperature=0.7, top_p=0.9, top_k=50, do_sample=True)
+                    out = model.generate(input_ids=ids, max_new_tokens=1000, temperature=0.7, top_p=0.9, top_k=50, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
                     response = self.tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=False)
                 except Exception as e:
                     response = f"[Error: {e}]"
             print(f"\n[Q{i}] {prompt[:80]}...\n[A{i}] <think>{response[:400]}...\n" + "-" * 50)
         model.train()
     
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if model and not self._initial_done:
-            self._generate_samples(model, "Before Training")
-            self._initial_done = True
-    
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if model and state.global_step > 0 and state.global_step % self.steps == 0:
+        # Skip initial generation, only generate after real training progress
+        if model and state.global_step > 0 and state.global_step % self.steps == 0 and state.global_step != self._last_generated_step:
+            self._last_generated_step = state.global_step
             self._generate_samples(model, f"Step {state.global_step}")
 
 
@@ -292,8 +327,7 @@ class ReasoningGenerationCallback(TrainerCallback):
 # Training Loop
 # =============================================================================
 def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
-    effective_batch = 64
-    grad_accum = max(1, effective_batch // batch_size)
+    grad_accum = 8  # Fixed gradient accumulation
     
     training_args = TrainingArguments(
         output_dir=args.output_dir, num_train_epochs=args.epochs,
@@ -303,10 +337,17 @@ def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         learning_rate=args.lr, lr_scheduler_type="cosine", warmup_steps=args.warmup_steps,
         logging_steps=args.logging_steps, save_strategy="steps", save_steps=args.save_steps,
+        save_total_limit=1,  # Keep only 1 checkpoint
         eval_strategy="steps" if eval_ds else "no", eval_steps=args.eval_steps if eval_ds else None,
         bf16=True, max_grad_norm=1.0, weight_decay=0.01, report_to="none",
-        remove_unused_columns=False, dataloader_num_workers=4, dataloader_pin_memory=True,
+        remove_unused_columns=False, 
+        dataloader_num_workers=0,  # Use 0 workers for on-the-fly tokenization (faster with cache)
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=None,  # Disable prefetch with 0 workers
         save_safetensors=False, load_best_model_at_end=False,
+        # Hopper (H100) optimizations
+        bf16_full_eval=True,
+        torch_compile=False,  # Can enable if model supports it
     )
     
     if hasattr(model, "config"):
@@ -342,9 +383,9 @@ def parse_args():
     parser.add_argument("--model-dir", type=str, required=True, help="Path to base model")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to CoT dataset")
     parser.add_argument("--output-dir", type=str, default="./argonne-reasoning", help="Output directory")
-    parser.add_argument("--batch-size", type=int, default=64, help="Initial batch size")
+    parser.add_argument("--batch-size", type=int, default=4, help="Initial batch size")
     parser.add_argument("--min-batch-size", type=int, default=1, help="Min batch size")
-    parser.add_argument("--batch-reduce", type=int, default=12, help="Batch reduction on OOM")
+    parser.add_argument("--batch-reduce", type=int, default=1, help="Batch reduction on OOM")
     parser.add_argument("--max-ctx", type=int, default=4096, help="Max context window")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
@@ -352,7 +393,7 @@ def parse_args():
     parser.add_argument("--logging-steps", type=int, default=10, help="Log every N steps")
     parser.add_argument("--save-steps", type=int, default=5000, help="Save every N steps")
     parser.add_argument("--eval-steps", type=int, default=5000, help="Eval every N steps")
-    parser.add_argument("--generation-steps", type=int, default=200, help="Generate every N steps")
+    parser.add_argument("--generation-steps", type=int, default=500, help="Generate every N steps")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit samples")
     parser.add_argument("--eval-samples", type=int, default=500, help="Eval samples")
     return parser.parse_args()
@@ -400,17 +441,14 @@ def main():
         eval_ds = IndexedReasoningDataset(train_raw.select(eval_indices), tokenizer, args.max_ctx)
         print(f"  Eval: {len(eval_ds)}")
     
-    batch_size, trainer = args.batch_size, None
-    print("\nStarting training...")
-    while batch_size >= args.min_batch_size:
-        success, trainer = run_training(model, tokenizer, train_ds, eval_ds, args, batch_size)
-        if success:
-            break
-        batch_size -= args.batch_reduce
-        if batch_size < args.min_batch_size:
-            print(f"\n*** Cannot train with min batch {args.min_batch_size}. Reduce --max-ctx. ***")
-            sys.exit(1)
-        print(f"\n*** Reducing batch to {batch_size} ***\n")
+    batch_size = args.batch_size  # Fixed at 4
+    print(f"\nStarting training with batch_size={batch_size}, grad_accum=8, effective_batch=32...")
+    
+    success, trainer = run_training(model, tokenizer, train_ds, eval_ds, args, batch_size)
+    
+    if not success:
+        print(f"\n*** Training failed. Try reducing --max-ctx or --batch-size. ***")
+        sys.exit(1)
     
     if trainer:
         print(f"\nSaving to {args.output_dir}...")
