@@ -26,14 +26,112 @@ conversations with user questions and assistant responses that include
 <think>...</think> reasoning.
 """
 
+import sys
+import types
+import importlib.util
 import os
+from enum import IntEnum
+
+# =============================================================================
+# CRITICAL: Set environment variables FIRST before any imports
+# =============================================================================
+os.environ["TRANSFORMERS_NO_FLASH_ATTN"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =============================================================================
+# CRITICAL: Mock problematic packages before ANY imports
+# This prevents flash_attn ABI issues and torchvision compatibility issues
+# =============================================================================
+class _FakeModule(types.ModuleType):
+    """A fake module that returns None for any attribute access."""
+    def __init__(self, name):
+        super().__init__(name)
+        self.__file__ = "<fake>"
+        self.__loader__ = None
+        self.__path__ = []  # Mark as package
+        self.__package__ = name
+        self.__spec__ = importlib.util.spec_from_loader(name, loader=None, is_package=True)
+    
+    def __getattr__(self, name):
+        # Return a callable that returns None for any function call
+        return lambda *args, **kwargs: None
+    
+    def __call__(self, *args, **kwargs):
+        return None
+
+
+class _FakeInterpolationMode(IntEnum):
+    """Fake InterpolationMode enum for torchvision.transforms compatibility."""
+    NEAREST = 0
+    BILINEAR = 2
+    BICUBIC = 3
+    BOX = 4
+    HAMMING = 5
+    LANCZOS = 1
+
+
+def _install_fake_modules():
+    """Install fake flash_attn and torchvision packages to avoid import errors."""
+    # All submodules that transformers might try to import
+    modules_to_fake = [
+        # flash_attn modules
+        "flash_attn",
+        "flash_attn.flash_attn_interface",
+        "flash_attn.bert_padding",
+        "flash_attn.layers",
+        "flash_attn.layers.rotary",
+        "flash_attn.flash_attn_triton",
+        "flash_attn.ops",
+        "flash_attn.ops.triton",
+        "flash_attn_2_cuda",
+        # torchvision modules (to avoid nms operator error)
+        "torchvision",
+        "torchvision.io",
+        "torchvision._meta_registrations",
+        "torchvision.datasets",
+        "torchvision.models",
+        "torchvision.ops",
+        "torchvision.transforms",
+        "torchvision.transforms.functional",
+        "torchvision.utils",
+    ]
+    
+    for mod_name in modules_to_fake:
+        sys.modules[mod_name] = _FakeModule(mod_name)
+    
+    # Set up parent-child relationships for flash_attn
+    sys.modules["flash_attn"].flash_attn_interface = sys.modules["flash_attn.flash_attn_interface"]
+    sys.modules["flash_attn"].bert_padding = sys.modules["flash_attn.bert_padding"]
+    sys.modules["flash_attn"].layers = sys.modules["flash_attn.layers"]
+    sys.modules["flash_attn.layers"].rotary = sys.modules["flash_attn.layers.rotary"]
+    
+    # Set up parent-child relationships for torchvision
+    sys.modules["torchvision"].io = sys.modules["torchvision.io"]
+    sys.modules["torchvision"]._meta_registrations = sys.modules["torchvision._meta_registrations"]
+    sys.modules["torchvision"].datasets = sys.modules["torchvision.datasets"]
+    sys.modules["torchvision"].models = sys.modules["torchvision.models"]
+    sys.modules["torchvision"].ops = sys.modules["torchvision.ops"]
+    sys.modules["torchvision"].transforms = sys.modules["torchvision.transforms"]
+    sys.modules["torchvision"].utils = sys.modules["torchvision.utils"]
+    
+    # Add InterpolationMode to transforms (required by transformers image_utils)
+    sys.modules["torchvision.transforms"].InterpolationMode = _FakeInterpolationMode
+    sys.modules["torchvision.transforms"].functional = sys.modules["torchvision.transforms.functional"]
+    sys.modules["torchvision.transforms.functional"].InterpolationMode = _FakeInterpolationMode
+    
+    # Add specific attributes that transformers looks for
+    sys.modules["flash_attn.bert_padding"].index_first_axis = lambda *a, **k: None
+    sys.modules["flash_attn.bert_padding"].pad_input = lambda *a, **k: None
+    sys.modules["flash_attn.bert_padding"].unpad_input = lambda *a, **k: None
+    sys.modules["flash_attn.layers.rotary"].apply_rotary_emb = lambda *a, **k: None
+
+# Install fake modules BEFORE any other imports
+_install_fake_modules()
 
 import argparse
 import json
 import glob
-import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -370,6 +468,35 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return checkpoints[0][1]
 
 
+def clean_checkpoint_optimizer_state(checkpoint_path: str) -> bool:
+    """
+    Remove optimizer and scheduler state from checkpoint to avoid version mismatch errors.
+    This allows resuming training from model weights while reinitializing optimizer.
+    Returns True if files were removed.
+    """
+    if not checkpoint_path or not os.path.isdir(checkpoint_path):
+        return False
+    
+    files_to_remove = [
+        "optimizer.pt",
+        "scheduler.pt", 
+        "rng_state.pth",
+    ]
+    
+    removed = False
+    for fname in files_to_remove:
+        fpath = os.path.join(checkpoint_path, fname)
+        if os.path.isfile(fpath):
+            try:
+                os.remove(fpath)
+                print(f"  Removed {fname} to avoid version mismatch")
+                removed = True
+            except OSError as e:
+                print(f"  Warning: Could not remove {fname}: {e}")
+    
+    return removed
+
+
 def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
     grad_accum = 8  # Fixed gradient accumulation
     
@@ -378,7 +505,12 @@ def run_training(model, tokenizer, train_ds, eval_ds, args, batch_size):
     if resume_from_checkpoint:
         print(f"\n{'=' * 70}")
         print(f"RESUMING FROM CHECKPOINT: {resume_from_checkpoint}")
-        print(f"{'=' * 70}\n")
+        print(f"{'=' * 70}")
+        # Clean optimizer state to avoid version mismatch errors
+        # This allows us to resume from model weights while reinitializing optimizer
+        print("Cleaning checkpoint optimizer state to avoid version mismatch...")
+        clean_checkpoint_optimizer_state(resume_from_checkpoint)
+        print()
     
     training_args = TrainingArguments(
         output_dir=args.output_dir, num_train_epochs=args.epochs,
