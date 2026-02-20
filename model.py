@@ -22,16 +22,16 @@ if _flash_attn_available:
 
 
 class ArgonneConfig(PretrainedConfig):
-    """Configuration for the Argonne v2 family of models."""
+    """Configuration for the Argonne v2.5 family of models."""
 
     model_type = "argonne2"
 
     def __init__(
         self,
-        vocab_size: int = 32000,
-        hidden_size: int = 4096,
-        num_hidden_layers: int = 48,
-        num_attention_heads: int = 32,
+        vocab_size: int = 151936,
+        hidden_size: int = 2048,
+        num_hidden_layers: int = 16,
+        num_attention_heads: int = 16,
         num_key_value_heads: Optional[int] = None,
         intermediate_size: Optional[int] = None,
         max_position_embeddings: int = 4096,

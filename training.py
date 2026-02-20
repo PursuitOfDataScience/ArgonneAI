@@ -22,14 +22,12 @@ from tqdm import tqdm
 from data_processing import (
     collate_batch,
     load_tokenizer,
-    chunk_tokens,
 )
 from model import ArgonneConfig, ArgonneModel
 from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
     cast_state_dict_to_dtype,
-    determine_document_boundary_tokens,
     load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
@@ -162,9 +160,17 @@ def streaming_token_generator(
     start_position: int = 0,
     start_chunk_offset: int = 0,
     rank: int = 0,
-    add_document_tokens: bool = False,
 ):
-    """Generator with chunk-level resume support and optional BOS/EOS injection."""
+    """Sequence-packing generator that concatenates documents separated by the
+    tokenizer's EOS token into sequences of exactly ``block_size`` tokens.
+
+    Documents are tokenized on the fly using a thread pool for CPU prefetching.
+    When a document is truncated at the end of a packed sequence the remaining
+    tokens carry over to the beginning of the next sequence.  This means every
+    produced sequence is exactly ``block_size`` tokens and no padding is needed.
+
+    Yields: (packed_tokens, file_idx, position, shard_name, seq_counter)
+    """
 
     import gc
 
@@ -172,103 +178,28 @@ def streaming_token_generator(
     processed_count = 0
     is_main_process = (rank == 0)
 
-    (
-        bos_token_id,
-        eos_token_id,
-        bos_token_str,
-        eos_token_str,
-    ) = determine_document_boundary_tokens(tokenizer)
-
-    def _ensure_token_id(
-        token_id: Optional[int],
-        token_str: Optional[str],
-        default_candidates: Sequence[Optional[str]],
-    ) -> Tuple[Optional[int], Optional[str]]:
-        """Best-effort resolution of chat-style special tokens."""
-
-        if token_id is not None:
-            return token_id, token_str
-
-        candidates: List[str] = []
-        if token_str:
-            candidates.append(token_str)
-        for candidate in default_candidates:
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-
-        for candidate in candidates:
+    # Resolve EOS token id from the tokenizer (never hardcode)
+    eos_token_id: Optional[int] = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        # Fallback: try to resolve from eos_token string
+        eos_token_str = getattr(tokenizer, "eos_token", None)
+        if eos_token_str:
             try:
-                candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+                eos_token_id = tokenizer.convert_tokens_to_ids(eos_token_str)
+                if not isinstance(eos_token_id, int) or eos_token_id < 0:
+                    eos_token_id = None
             except Exception:
-                candidate_id = None
+                eos_token_id = None
 
-            if isinstance(candidate_id, int) and candidate_id >= 0:
-                return candidate_id, candidate
+    if eos_token_id is None:
+        raise RuntimeError(
+            "Sequence packing requires an EOS token but the tokenizer does not "
+            "provide one.  Please use a tokenizer with eos_token defined."
+        )
 
-            try:
-                encoded = tokenizer.encode(candidate, add_special_tokens=False)
-            except Exception:
-                encoded = None
-
-            if encoded and len(encoded) == 1:
-                return encoded[0], candidate
-
-        return None, token_str
-
-    fallback_bos_tokens: List[Optional[str]] = [
-        getattr(tokenizer, "bos_token", None),
-        "<|im_start|>",
-        "<s>",
-        "[CLS]",
-    ]
-    fallback_eos_tokens: List[Optional[str]] = [
-        getattr(tokenizer, "eos_token", None),
-        "<|im_end|>",
-        "</s>",
-        "[SEP]",
-    ]
-
-    additional_tokens = getattr(tokenizer, "additional_special_tokens", None) or []
-    for token in additional_tokens:
-        if token not in fallback_bos_tokens:
-            fallback_bos_tokens.append(token)
-        if token not in fallback_eos_tokens:
-            fallback_eos_tokens.append(token)
-
-    bos_token_id, bos_token_str = _ensure_token_id(
-        bos_token_id,
-        bos_token_str,
-        fallback_bos_tokens,
-    )
-    eos_token_id, eos_token_str = _ensure_token_id(
-        eos_token_id,
-        eos_token_str,
-        fallback_eos_tokens,
-    )
-    document_tokens_enabled = bool(add_document_tokens)
-
-    if document_tokens_enabled:
-        missing_tokens = []
-        if bos_token_id is None:
-            missing_tokens.append("BOS")
-        if eos_token_id is None:
-            missing_tokens.append("EOS")
-
-        if missing_tokens:
-            if is_main_process:
-                print(
-                    "⚠ Unable to add document boundary tokens: missing "
-                    + ", ".join(missing_tokens)
-                    + " token id(s) in tokenizer"
-                )
-            document_tokens_enabled = False
-        elif is_main_process:
-            bos_display = bos_token_str or bos_token_id
-            eos_display = eos_token_str or eos_token_id
-            print(
-                "✓ Adding BOS/EOS tokens to each document "
-                f"(bos={bos_display}, eos={eos_display})"
-            )
+    if is_main_process:
+        eos_display = getattr(tokenizer, "eos_token", None) or eos_token_id
+        print(f"✓ Sequence packing enabled (block_size={block_size}, eos={eos_display})")
 
     initial_file_idx = file_idx
     initial_position = start_position
@@ -363,12 +294,20 @@ def streaming_token_generator(
                 normalized_batches.append([])
         return normalized_batches
 
-    pending_batches: Deque[Tuple[Future, List[Tuple[int, str]], List[bool]]] = deque()
+    pending_batches: Deque[Tuple[Future, List[Tuple[int, str]]]] = deque()
 
     def _clear_pending() -> None:
         while pending_batches:
-            future, _, _ = pending_batches.popleft()
+            future, _ = pending_batches.popleft()
             future.cancel()
+
+    # ---- Sequence packing state ----
+    # Token buffer that accumulates tokens across documents until we have
+    # exactly ``block_size`` tokens to yield.
+    packing_buffer: List[int] = []
+    seq_counter = 0  # monotonically increasing counter for yielded sequences
+    # Track how many packed sequences we need to skip for resume
+    sequences_to_skip = start_chunk_offset
 
     with ThreadPoolExecutor(max_workers=tokenizer_workers, thread_name_prefix="tokenizer") as tokenizer_pool:
         while file_idx < len(data_files):
@@ -405,23 +344,22 @@ def streaming_token_generator(
                     file_idx += 1
                     continue
 
+                # Determine starting position within this shard
                 if file_idx == initial_file_idx:
                     position = initial_position
-                    resume_chunk_offset = initial_chunk_offset
-                    if is_main_process and (position > 0 or resume_chunk_offset > 0):
+                    if is_main_process and position > 0:
                         print(
-                            f"  >>> RESUMING from position {position}, chunk offset {resume_chunk_offset}"
+                            f"  >>> RESUMING from position {position}, seq_offset {sequences_to_skip}"
                         )
                 else:
                     position = 0
-                    resume_chunk_offset = 0
 
                 _clear_pending()
 
                 while position < len(dataset) or pending_batches:
+                    # Fill the pending queue with tokenization futures
                     while position < len(dataset) and len(pending_batches) < max_pending_batches:
                         batch_records: List[Tuple[int, str]] = []
-                        batch_resume_flags: List[bool] = []
 
                         while len(batch_records) < TOKENIZER_BATCH_ROWS and position < len(dataset):
                             try:
@@ -439,15 +377,7 @@ def streaming_token_generator(
                                 position += 1
                                 continue
 
-                            resume_mid_document = (
-                                document_tokens_enabled
-                                and file_idx == initial_file_idx
-                                and position == initial_position
-                                and resume_chunk_offset > 0
-                            )
-
                             batch_records.append((position, text))
-                            batch_resume_flags.append(resume_mid_document)
                             position += 1
 
                         if not batch_records:
@@ -455,12 +385,12 @@ def streaming_token_generator(
 
                         batch_texts = [text for _, text in batch_records]
                         future = tokenizer_pool.submit(_tokenize_texts, batch_texts)
-                        pending_batches.append((future, batch_records, batch_resume_flags))
+                        pending_batches.append((future, batch_records))
 
                     if not pending_batches:
                         break
 
-                    future, batch_records, batch_resume_flags = pending_batches[0]
+                    future, batch_records = pending_batches[0]
                     try:
                         token_batches = future.result()
                     except Exception as future_error:
@@ -474,30 +404,27 @@ def streaming_token_generator(
 
                     pending_batches.popleft()
 
-                    for (record_position, text), resume_mid_document, tokens in zip(
-                        batch_records,
-                        batch_resume_flags,
-                        token_batches,
-                    ):
+                    for (record_position, _text), tokens in zip(batch_records, token_batches):
                         if not tokens:
                             continue
 
-                        if document_tokens_enabled:
-                            tokens = [bos_token_id, *tokens, eos_token_id]
+                        # Append document tokens + EOS to the packing buffer
+                        packing_buffer.extend(tokens)
+                        packing_buffer.append(eos_token_id)
 
-                            if resume_mid_document:
-                                tokens = tokens[1:]
+                        # Yield as many full packed sequences as possible
+                        while len(packing_buffer) >= block_size:
+                            packed_seq = packing_buffer[:block_size]
+                            packing_buffer = packing_buffer[block_size:]
 
-                        if len(tokens) < 10:
-                            continue
-
-                        for chunk_idx, chunk in enumerate(chunk_tokens(tokens, block_size)):
-                            if file_idx == initial_file_idx and record_position == initial_position:
-                                if chunk_idx < resume_chunk_offset:
-                                    continue
+                            # Handle resume: skip sequences we've already processed
+                            if sequences_to_skip > 0:
+                                sequences_to_skip -= 1
+                                continue
 
                             processed_count += 1
-                            yield chunk, file_idx, record_position, shard_name, chunk_idx
+                            seq_counter += 1
+                            yield packed_seq, file_idx, record_position, shard_name, seq_counter
 
                 _clear_pending()
                 file_idx += 1
@@ -510,8 +437,19 @@ def streaming_token_generator(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+    # Flush any remaining tokens in the packing buffer (last partial sequence)
+    # Only yield if we have enough tokens to be useful (at least half block_size)
+    if len(packing_buffer) >= block_size // 2 and sequences_to_skip <= 0:
+        # Pad the last sequence with EOS tokens to reach block_size
+        while len(packing_buffer) < block_size:
+            packing_buffer.append(eos_token_id)
+        packed_seq = packing_buffer[:block_size]
+        processed_count += 1
+        seq_counter += 1
+        yield packed_seq, file_idx - 1, -1, "", seq_counter
+
     if is_main_process:
-        print(f"Completed processing all available files. Processed {processed_count} samples.")
+        print(f"Completed processing all available files. Produced {processed_count} packed sequences.")
 
     return None, -1, -1, "", -1
 
@@ -922,7 +860,6 @@ def _execute_training_attempt(
     weight_decay: float,
     amp_dtype: torch.dtype,
     supports_bf16: bool,
-    add_document_tokens: bool,
     use_gradient_checkpointing: bool,
     is_main_process: bool,
 ) -> Tuple[int, int]:
@@ -995,7 +932,6 @@ def _execute_training_attempt(
         tokenizer,
         block_size,
         rank=rank,
-        add_document_tokens=add_document_tokens,
     )
 
     token_buffer: List[List[int]] = []
@@ -1038,7 +974,6 @@ def _execute_training_attempt(
                         tokenizer,
                         block_size,
                         rank=rank,
-                        add_document_tokens=add_document_tokens,
                     )
                     continue
 
@@ -1180,7 +1115,6 @@ def _execute_training_attempt(
                     tokenizer,
                     block_size,
                     rank=rank,
-                    add_document_tokens=add_document_tokens,
                 )
                 continue
     finally:
@@ -1208,7 +1142,7 @@ def train_from_scratch_tensor_parallel(
     tokenizer_path: str,
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
-    initial_batch_size: int = 512,
+    initial_batch_size: int = 128,
     min_batch_size: int = 4,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
@@ -1217,7 +1151,6 @@ def train_from_scratch_tensor_parallel(
     trust_remote_code: bool = False,
     gradient_accumulation_steps: int = 4,
     disable_gradient_checkpointing: bool = False,
-    add_document_tokens: bool = False,
 ):
     """Train model from scratch with tensor parallelism and automatic batch size tuning."""
 
@@ -1262,10 +1195,10 @@ def train_from_scratch_tensor_parallel(
 
     config = ArgonneConfig(
         vocab_size=vocab_size,
-        hidden_size=4080,
+        hidden_size=2048,
         max_position_embeddings=block_size,
-        num_hidden_layers=24,
-        num_attention_heads=24,
+        num_hidden_layers=16,
+        num_attention_heads=16,
         num_key_value_heads=8,
         attention_dropout=0.0,
         hidden_dropout=0.0,
@@ -1313,7 +1246,6 @@ def train_from_scratch_tensor_parallel(
                 weight_decay=weight_decay,
                 amp_dtype=amp_dtype,
                 supports_bf16=supports_bf16,
-                add_document_tokens=add_document_tokens,
                 use_gradient_checkpointing=not disable_gradient_checkpointing,
                 is_main_process=is_main_process,
             )
@@ -1416,7 +1348,7 @@ def parse_args():
     parser.add_argument(
         "--initial-batch-size",
         type=int,
-        default=512,
+        default=128,
         help="Initial batch size to try (will be reduced on OOM).",
     )
     parser.add_argument(
@@ -1466,19 +1398,11 @@ def parse_args():
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
     )
     parser.add_argument(
-        "--add-document-boundary-tokens",
-        action="store_true",
-        help=(
-            "Prepend the tokenizer BOS token and append the EOS token to each document before chunking."
-        ),
-    )
-    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
         help="Local rank for distributed training.",
     )
-    # Removed --checkpoint-segments argument (always use per-block checkpointing for stability)
     return parser.parse_args()
 
 
@@ -1498,7 +1422,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         disable_gradient_checkpointing=args.disable_gradient_checkpointing,
-        add_document_tokens=args.add_document_boundary_tokens,
     )
 
 

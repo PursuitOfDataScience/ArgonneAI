@@ -183,15 +183,24 @@ def load_nonstream_data(
     return token_dataset["token_ids"]
 
 
-def collate_batch(token_list_batch: Iterable[List[int]], block_size: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+def collate_batch(
+    token_list_batch: Iterable[List[int]], block_size: int
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Collate a batch of packed sequences into x/y tensors for next-token prediction.
+
+    Each sequence should be exactly ``block_size`` tokens long (from sequence packing).
+    x = tokens[:-1] (first block_size-1 tokens), y = tokens[1:] (last block_size-1 tokens).
+    """
     x_list: List[List[int]] = []
     y_list: List[List[int]] = []
     for tokens in token_list_batch:
-        if len(tokens) < block_size + 1:
+        if len(tokens) < 2:
             continue
-        tokens = tokens[: block_size + 1]
-        x_list.append(tokens[:-1])
-        y_list.append(tokens[1:])
+        seq = tokens[:block_size]
+        if len(seq) < 2:
+            continue
+        x_list.append(seq[:-1])
+        y_list.append(seq[1:])
 
     if not x_list:
         return None, None

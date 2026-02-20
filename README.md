@@ -2,133 +2,128 @@
 
 Author: Youzhi Yu
 
-# Argonne 2.0
+---
 
-A **4.9 billion parameter** decoder-only transformer language model trained from scratch using tensor parallelism on a single DGX A100 node.
+# Argonne 2.5
 
-## Training Loss Curve
-
-![Training Loss vs Tokens](plots/training_loss_vs_tokens.png)
-
-The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), achieving a final loss of approximately **2.5–3.5** after 1.35 million training steps.
+A **~1 billion parameter** decoder-only transformer language model trained from scratch using tensor parallelism on a single DGX A100 node, featuring **sequence packing** for zero-waste training and the **Qwen3-0.6B-Base tokenizer** (vocab size 151,936).
 
 ## Model Architecture
 
 | Component | Specification |
 |-----------|--------------|
-| **Parameters** | 4,918,072,800 (~4.9B) |
-| **Layers** | 24 transformer blocks |
-| **Hidden Size** | 4,080 |
-| **Attention Heads** | 24 query heads / 8 key-value heads (Grouped-Query Attention) |
-| **Head Dimension** | 170 |
-| **Feed-Forward** | SwiGLU MLP (~10,880 intermediate dim) |
+| **Parameters** | ~1,066,207,232 (~1.07B unique) |
+| **Layers** | 16 transformer blocks |
+| **Hidden Size** | 2,048 |
+| **Attention Heads** | 16 query heads / 8 key-value heads (Grouped-Query Attention) |
+| **Head Dimension** | 128 |
+| **Feed-Forward** | SwiGLU MLP (5,632 intermediate dim, auto-calculated) |
 | **Context Length** | 4,096 tokens |
-| **Vocabulary Size** | 151,665 (Qwen2.5-3B-Instruct tokenizer) |
+| **Vocabulary Size** | 151,936 (Qwen3-0.6B-Base tokenizer) |
 | **Normalization** | RMSNorm (ε = 1e-6) |
 | **Position Encoding** | Rotary Position Embeddings (RoPE) |
-| **Precision** | bfloat16 mixed precision |
+| **Precision** | bfloat16 mixed precision, TF32 for matmuls |
+| **Weight Tying** | Embedding and LM head weights are tied |
 
 ### Key Architectural Features
 
-- **Grouped-Query Attention (GQA)**: Uses 24 query heads with 8 key-value heads (3:1 ratio), reducing memory bandwidth requirements while maintaining model quality.
-- **SwiGLU Activation**: Employs the SwiGLU activation function in the MLP layers for improved training dynamics.
-- **Flash Attention 2**: Uses FlashAttention 2 kernels when available (with rotary + GQA support) for higher throughput and lower memory use; falls back to PyTorch's `scaled_dot_product_attention` otherwise.
-- **RoPE**: Rotary position embeddings enable better length generalization compared to absolute positional encodings.
+- **Grouped-Query Attention (GQA)**: Uses 16 query heads with 8 key-value heads (2:1 ratio), reducing KV-cache memory while maintaining quality.
+- **SwiGLU Activation**: Employs the SwiGLU activation function in the MLP layers for improved training dynamics. Intermediate size is auto-calculated as `round_up(8H/3, 256)`.
+- **Flash Attention 2**: Uses FlashAttention 2 kernels for high throughput and low memory; falls back to PyTorch's `scaled_dot_product_attention` when unavailable.
+- **RoPE**: Rotary position embeddings for length generalization.
+- **Tied Embeddings**: Token embedding and LM head share the same weight matrix, reducing parameter count.
 
-#### FlashAttention 2 notes
+#### FlashAttention 2 Notes
 
-- Install the optional dependency with `pip install flash-attn>=2.5.6` (compile-time CUDA toolkit required).
-- FlashAttention 2 is enabled when `config.use_flash_attention=True`, tensors are in bf16/fp16, and no explicit attention mask is provided; otherwise the model automatically falls back to PyTorch's fused attention or the math implementation.
-- Sliding-window attention (if configured) is forwarded to the FlashAttention kernel via `window_size` for better cache locality.
+- Install with `pip install flash-attn>=2.5.6` (CUDA toolkit required at compile time).
+- Enabled when `config.use_flash_attention=True` and tensors are in bf16/fp16 with no explicit attention mask.
+- Falls back to PyTorch fused or math attention otherwise.
+
+## Sequence Packing
+
+Argonne 2.5 uses **sequence packing** — a zero-padding approach to training data:
+
+- Documents are tokenized on the fly and concatenated end-to-end, separated by the tokenizer's **EOS token** (resolved at runtime, never hardcoded).
+- The concatenated stream is sliced into sequences of **exactly `block_size` (4,096) tokens**.
+- When a document is truncated at a sequence boundary, its remaining tokens **carry over** to the start of the next packed sequence.
+- The final partial sequence is emitted (padded with EOS) only if it is at least half the block size.
+
+This eliminates all padding waste and ensures every training sequence is fully utilized. The `collate_batch` function creates input/target pairs by shifting: `x = seq[:-1]`, `y = seq[1:]`.
+
+### CPU Prefetching
+
+Tokenization runs asynchronously on CPU threads using `ThreadPoolExecutor`, with a configurable batch size (default: 500 rows per batch, tunable via `TOKENIZER_BATCH_ROWS` / `RESUME_TOKENIZER_BATCH_ROWS` env vars). This keeps the GPU pipeline fed without blocking on tokenization.
 
 ## Training Details
 
 ### Hardware Configuration
 
 - **Node**: 1× DGX A100 (8× NVIDIA A100 80GB GPUs)
-- **Parallelism**: Tensor parallelism across 8 GPUs
+- **Parallelism**: Custom tensor parallelism across 8 GPUs
 - **Interconnect**: NVLink for high-bandwidth GPU-to-GPU communication
+- **Ampere Optimizations**: TF32 enabled for matmuls, bfloat16 mixed precision
 
 ### Training Hyperparameters
 
 | Parameter | Value |
 |-----------|-------|
-| **Total Training Steps** | 1,347,890 |
-| **Tokens Processed** | ~21.9 billion |
-| **Micro-batch Size** | 2–4 per GPU |
+| **Initial Micro-batch Size** | 128 per GPU (auto-halved on OOM) |
 | **Gradient Accumulation** | 4 steps |
-| **Effective Batch Size** | ~64–128 sequences |
 | **Learning Rate** | 1e-4 (peak) → 1e-5 (cosine decay) |
 | **Warmup Steps** | 2,000 |
 | **Weight Decay** | 0.1 |
 | **Gradient Clipping** | 1.0 |
-| **Optimizer** | AdamW (fused) |
+| **Optimizer** | Fused AdamW |
+| **Scheduler** | Cosine warmup with min LR |
+
+### Auto Batch Size Tuning
+
+`training.py` starts with an initial batch size of 128 and automatically halves it whenever an OOM error is detected, until a workable size is found. `resume_pretrain_tensor.py` picks up from the last successful batch size stored in the checkpoint.
 
 ### Training Data
 
-The model was trained on **FineWeb (CC-MAIN-2025-26)** data:
-- 250 Parquet shards streamed sequentially
-- Documents tokenized with BOS/EOS boundary markers
-- Aggressive filtering of low-quality content (high digit ratio, low alpha ratio)
-- Chunked into 4,096-token sequences
+- **Source**: FineWeb Parquet shards, streamed sequentially.
+- **Tokenization**: On-the-fly with Qwen3-0.6B-Base tokenizer.
+- **Packing**: Documents concatenated with EOS separator into 4,096-token packed sequences (no padding).
 
 ### Tensor Parallelism Implementation
 
-The training uses a custom tensor parallel implementation (`TensorParallelModel`) that:
-- **Shards attention projections**: Q/K/V/O projections are split across GPUs
-- **Shards MLP layers**: Gate, up, and down projections distributed across GPUs
-- **Replicates embeddings and norms**: Token embeddings and layer norms remain replicated for simplicity
-- **Async all-reduce**: Uses asynchronous collective operations for overlapping communication with computation
+The training uses a custom tensor parallel implementation (`TensorParallelModel`):
 
-Each GPU holds 1/8th of the attention heads (3 Q heads, 1 KV head per GPU) and 1/8th of the MLP hidden dimension.
+- **Column-parallel**: Q, K, V, gate, and up projections are split across GPUs.
+- **Row-parallel**: O and down projections are split across GPUs.
+- **Replicated**: Token embeddings, RMSNorm, and LM head remain replicated on all GPUs.
+- **Async all-reduce**: Overlaps communication with computation for minimal overhead.
+
+Each GPU holds **2 query heads and 1 KV head** (16/8 = 2 Q heads per GPU, 8/8 = 1 KV head per GPU) and 1/8th of the MLP intermediate dimension (5,632 / 8 = 704 per GPU).
 
 ### Checkpointing
 
-- Checkpoints saved every ~430 steps
-- Per-block gradient checkpointing enabled to reduce memory footprint
-- Automatic pruning of old checkpoints (keeps last 50)
-- Resumable training with exact data position tracking
-
-## Training Progress
-
-### Loss Progression
-
-| Milestone | Steps | Tokens | Loss |
-|-----------|-------|--------|------|
-| Start | 0 | 0 | ~9.3 |
-| 1K steps | 1,000 | 16M | ~6.5 |
-| 10K steps | 10,000 | 164M | ~5.5 |
-| 100K steps | 100,000 | 1.6B | ~4.0 |
-| 500K steps | 500,000 | 8.2B | ~3.5 |
-| 1M steps | 1,000,000 | 16.4B | ~3.0 |
-| Final | 1,347,890 | 21.9B | ~2.5–3.5 |
-
-### Sample Generations
-
-**At step 1,347,190:**
-> "Long long time ago, 5,000 years ago, I have been told it is more than 10,000 times. It is not the same as the 10,000 years ago. You just have to have a very good reason for believing that you are a good person and that you are good..."
-
-The model demonstrates emergent capabilities in generating coherent English text, though quality varies with the inherent noise of web-scale pretraining data.
+- Checkpoints saved periodically, including **model state, optimizer state, scheduler state, and exact data position** (file index, byte offset, chunk offset).
+- Automatic pruning of old checkpoints (configurable, default keeps last 50).
+- **Per-block gradient checkpointing** enabled for memory efficiency.
+- Training is fully resumable — `resume_pretrain_tensor.py` automatically locates the latest checkpoint and restores the data stream to the exact position.
 
 ## Repository Structure
 
 ```
 ArgonneAI/
 ├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
-├── training.py                 # Fresh training with tensor parallelism
+├── training.py                 # Initial training with auto batch size tuning + tensor parallelism
 ├── resume_pretrain_tensor.py   # Resume training from checkpoints
-├── data_processing.py          # Tokenization and data loading utilities
-├── training_utils.py           # Schedulers, checkpoint utilities
-├── inference.py                # Inference utilities
-├── model-distillation.py       # Knowledge distillation experiments
-├── IMPLEMENTATION_NOTES.md     # Architectural decisions
-├── TENSOR_PARALLEL_FIX.md      # Debugging notes for TP issues
-└── TENSOR_PARALLEL_USAGE.md    # TP launch instructions
+├── data_processing.py          # Tokenization, collation, and data loading utilities
+├── training_utils.py           # CosineWarmupScheduler, checkpoint I/O, token/data resolution
+├── test_param_count.py         # Parameter count verification script
+└── README.md                   # This file
 ```
 
-## Argonne 1.5
+---
 
-### 🤗 Hugging Face Model
+## Previous Versions
+
+### Argonne 1.5
+
+#### 🤗 Hugging Face Model
 
 The pretrained model weights and detailed model card are available on Hugging Face:
 
