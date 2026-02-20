@@ -106,14 +106,32 @@ def load_bpe_tokenizer() -> PreTrainedTokenizerFast:
 
 
 def load_tokenizer(tokenizer_name_or_path: str, trust_remote_code: bool = False):
-    """Load an existing tokenizer from disk. Assumes offline availability."""
+    """Load an existing tokenizer from disk. Assumes offline availability.
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name_or_path,
-        use_fast=True,
-        trust_remote_code=trust_remote_code,
-        local_files_only=True,
-    )
+    Tries the fast (Rust) tokenizer first.  If it fails — e.g. because the
+    installed ``tokenizers`` library is too old for the ``tokenizer.json``
+    format — falls back to the slow (Python) tokenizer automatically.
+    """
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+    except Exception as fast_err:
+        # Common with newer Qwen3 tokenizer.json on older tokenizers lib
+        print(
+            f"⚠ Fast tokenizer failed ({fast_err!r}), "
+            f"falling back to slow tokenizer..."
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=False,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
 
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
