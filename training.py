@@ -863,7 +863,16 @@ def _execute_training_attempt(
     use_gradient_checkpointing: bool,
     is_main_process: bool,
 ) -> Tuple[int, int]:
-    """Run a single end-to-end training attempt."""
+    """Run a single end-to-end training attempt.
+
+    If any rank hits CUDA OOM during the **first forward/backward pass**
+    (i.e. before the first successful optimizer step), we broadcast the
+    error to all ranks via ``dist.all_reduce`` so that every rank exits
+    cleanly and the outer loop can retry with a smaller batch size.
+
+    After at least one successful step, OOM is re-raised as a hard error
+    because the optimizer / NCCL state may already be inconsistent.
+    """
 
     base_model = ArgonneModel(config)
     model = TensorParallelModel(base_model, world_size, rank)
@@ -960,6 +969,78 @@ def _execute_training_attempt(
 
     pbar = tqdm(initial=global_step, total=total_training_steps, desc="Training") if is_main_process else None
 
+    # Flag tensor used to broadcast OOM status across ranks.
+    # 0 = OK, 1 = at least one rank hit OOM.
+    oom_flag = torch.zeros(1, dtype=torch.int32, device=first_device)
+    completed_one_step = False  # tracks if at least one optimizer step succeeded
+
+    # ---- Probing step: run one dummy forward+backward to detect OOM early ----
+    # This ensures all ranks fail together before entering the main loop.
+    # First, do a cheap memory headroom check to avoid a mid-NCCL-op OOM
+    # (which would deadlock the other ranks).
+    if is_main_process:
+        print("Running memory probe (1 forward + backward on dummy batch)...")
+
+    probe_oom = False
+
+    # Conservative memory check: estimate if batch can fit before touching NCCL
+    if using_cuda:
+        torch.cuda.synchronize(first_device)
+        free_mem = torch.cuda.mem_get_info(first_device)[0]
+        # Rough estimate: each sample needs ~(block_size * hidden_size * num_layers * 10) bytes
+        # for activations + gradients with gradient checkpointing and bf16
+        bytes_per_sample = block_size * config.hidden_size * config.num_hidden_layers * 10
+        estimated_need = batch_size * bytes_per_sample
+        headroom_ratio = free_mem / max(estimated_need, 1)
+        if is_main_process:
+            print(f"  Free GPU memory: {free_mem / 1e9:.2f} GB, estimated need: {estimated_need / 1e9:.2f} GB (ratio: {headroom_ratio:.2f})")
+        if headroom_ratio < 0.5:
+            # Almost certainly won't fit — skip the probe to avoid NCCL deadlock
+            probe_oom = True
+            if is_main_process:
+                print(f"  ✗ Insufficient headroom (ratio {headroom_ratio:.2f} < 0.5) — skipping probe")
+
+    if not probe_oom:
+        try:
+            dummy_x = torch.randint(0, config.vocab_size, (batch_size, block_size - 1), device=first_device)
+            dummy_y = torch.randint(0, config.vocab_size, (batch_size, block_size - 1), device=first_device)
+            autocast_ctx = (
+                torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available()
+                else contextlib.nullcontext()
+            )
+            with autocast_ctx:
+                probe_out = model(input_ids=dummy_x)
+                probe_loss = F.cross_entropy(
+                    probe_out.logits.view(-1, probe_out.logits.size(-1)),
+                    dummy_y.view(-1),
+                    ignore_index=-100,
+                )
+            (probe_loss / grad_accum_steps).backward()
+            optimizer.zero_grad(set_to_none=True)
+            del dummy_x, dummy_y, probe_out, probe_loss
+            torch.cuda.empty_cache()
+            if is_main_process:
+                print(f"✓ Memory probe passed for batch_size={batch_size}")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as probe_err:
+            err_msg = str(probe_err)
+            if isinstance(probe_err, torch.cuda.OutOfMemoryError) or "out of memory" in err_msg.lower():
+                probe_oom = True
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+            else:
+                raise
+
+    # All ranks agree on probe result
+    oom_flag.fill_(1 if probe_oom else 0)
+    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+    if oom_flag.item() > 0:
+        if is_main_process:
+            print(f"✗ Memory probe FAILED for batch_size={batch_size} — triggering OOM retry")
+        raise torch.cuda.OutOfMemoryError(
+            f"Memory probe failed for batch_size={batch_size}"
+        )
+    # ---- end probing step ----------------------------------------------------
+
     try:
         while global_step < total_training_steps:
             try:
@@ -1007,7 +1088,6 @@ def _execute_training_attempt(
                     x_local, y_local = pop_prefetched()
 
                 batch_tokens = x_local.numel()
-                tokens_processed += batch_tokens
 
                 autocast_context = (
                     torch.amp.autocast("cuda", dtype=amp_dtype)
@@ -1015,23 +1095,63 @@ def _execute_training_attempt(
                     else contextlib.nullcontext()
                 )
 
-                with autocast_context:
-                    outputs = model(input_ids=x_local)
-                    logits = outputs.logits
-                    loss_tensor = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        y_local.view(-1),
-                        ignore_index=-100,
-                    )
+                # ---- OOM-safe forward / backward --------------------------------
+                # Each rank tries the forward+backward locally.  If it OOMs, it
+                # sets a local flag.  Then ALL ranks do an all_reduce(MAX) on the
+                # flag so that every rank learns whether *any* rank OOMed.
+                local_oom = False
+                try:
+                    with autocast_context:
+                        outputs = model(input_ids=x_local)
+                        logits = outputs.logits
+                        loss_tensor = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            y_local.view(-1),
+                            ignore_index=-100,
+                        )
 
-                last_loss_value = float(loss_tensor.detach().cpu().item())
+                    last_loss_value = float(loss_tensor.detach().cpu().item())
 
-                loss_for_backward = loss_tensor / grad_accum_steps
+                    loss_for_backward = loss_tensor / grad_accum_steps
 
-                if scaler is not None:
-                    scaler.scale(loss_for_backward).backward()
-                else:
-                    loss_for_backward.backward()
+                    if scaler is not None:
+                        scaler.scale(loss_for_backward).backward()
+                    else:
+                        loss_for_backward.backward()
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as fwd_err:
+                    err_msg = str(fwd_err)
+                    if isinstance(fwd_err, torch.cuda.OutOfMemoryError) or "out of memory" in err_msg.lower():
+                        local_oom = True
+                        if is_main_process:
+                            print(f"⚠ Rank {rank} hit CUDA OOM during forward/backward")
+                        # Free as much as possible so the all_reduce below succeeds
+                        del x_local, y_local
+                        torch.cuda.empty_cache()
+                    else:
+                        raise
+
+                # Collective OOM check — every rank participates
+                oom_flag.fill_(1 if local_oom else 0)
+                dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+
+                if oom_flag.item() > 0:
+                    # At least one rank OOMed
+                    if not completed_one_step:
+                        # No step succeeded yet → safe to exit for batch-size retry
+                        if is_main_process:
+                            print("OOM detected (collective) before first successful step — aborting for retry")
+                        raise torch.cuda.OutOfMemoryError(
+                            "Collective OOM detected during batch-size search"
+                        )
+                    else:
+                        # Already made progress — can't safely retry
+                        raise RuntimeError(
+                            "CUDA OOM after training already started. "
+                            "Reduce batch size or gradient accumulation and restart."
+                        )
+                # ---- end OOM-safe block ------------------------------------------
+
+                tokens_processed += batch_tokens
 
                 micro_step += 1
 
@@ -1053,6 +1173,7 @@ def _execute_training_attempt(
 
                     global_step += 1
                     micro_step = 0
+                    completed_one_step = True
 
                     if pbar is not None:
                         pbar.update(1)
@@ -1142,8 +1263,8 @@ def train_from_scratch_tensor_parallel(
     tokenizer_path: str,
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
-    initial_batch_size: int = 128,
-    min_batch_size: int = 4,
+    initial_batch_size: int = 16,
+    min_batch_size: int = 1,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
     warmup_steps: int = 2000,
@@ -1272,15 +1393,18 @@ def train_from_scratch_tensor_parallel(
 
             if is_main_process:
                 print(f"\n{'='*70}")
-                print("CUDA OUT OF MEMORY DETECTED")
+                print("CUDA OUT OF MEMORY DETECTED (collective)")
                 print(f"{'='*70}")
                 print(f"Error: {error_message}")
-                if hasattr(e, "__traceback__"):
-                    tb_lines = traceback.format_exception(type(e), e, e.__traceback__)
-                    print("".join(tb_lines))
 
+            # Aggressive cleanup — the model / optimizer from the failed
+            # attempt are already out of scope, but fragments may linger.
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
 
+            # Barrier is safe here because _execute_training_attempt uses
+            # all_reduce to ensure ALL ranks exit together on OOM.
             if dist.is_initialized():
                 dist.barrier()
 
@@ -1348,13 +1472,13 @@ def parse_args():
     parser.add_argument(
         "--initial-batch-size",
         type=int,
-        default=128,
+        default=32,
         help="Initial batch size to try (will be reduced on OOM).",
     )
     parser.add_argument(
         "--min-batch-size",
         type=int,
-        default=4,
+        default=2,
         help="Minimum batch size before giving up.",
     )
     parser.add_argument(
