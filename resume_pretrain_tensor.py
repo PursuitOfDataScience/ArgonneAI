@@ -174,7 +174,14 @@ def streaming_token_generator(
 
     initial_file_idx = file_idx
     initial_position = start_position
-    initial_chunk_offset = start_chunk_offset
+    # NOTE: we intentionally ignore start_chunk_offset.  The old approach
+    # re-tokenized everything from the resume row onward and skipped N
+    # packed sequences to reconstruct the exact packing state — but that
+    # could take tens of minutes for large offsets.  Instead we just start
+    # packing from the saved row position with an empty buffer.  The only
+    # cost is re-seeing at most one document's worth of tokens that were
+    # already at the tail of the last packing buffer, which is completely
+    # negligible for pretraining.
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 5
 
@@ -273,7 +280,6 @@ def streaming_token_generator(
     # ---- Sequence packing state ----
     packing_buffer: List[int] = []
     seq_counter = 0
-    sequences_to_skip = start_chunk_offset
 
     with ThreadPoolExecutor(max_workers=tokenizer_workers, thread_name_prefix="tokenizer") as tokenizer_pool:
         while file_idx < len(data_files):
@@ -314,7 +320,7 @@ def streaming_token_generator(
                     position = initial_position
                     if is_main_process and position > 0:
                         print(
-                            f"  >>> RESUMING from position {position}, seq_offset {sequences_to_skip}"
+                            f"  >>> RESUMING from row position {position}"
                         )
                 else:
                     position = 0
@@ -380,10 +386,6 @@ def streaming_token_generator(
                             packed_seq = packing_buffer[:block_size]
                             packing_buffer = packing_buffer[block_size:]
 
-                            if sequences_to_skip > 0:
-                                sequences_to_skip -= 1
-                                continue
-
                             processed_count += 1
                             seq_counter += 1
                             yield packed_seq, file_idx, record_position, shard_name, seq_counter
@@ -418,7 +420,7 @@ def streaming_token_generator(
                 file_idx += 1
 
     # Flush remaining tokens (last partial sequence)
-    if len(packing_buffer) >= block_size // 2 and sequences_to_skip <= 0:
+    if len(packing_buffer) >= block_size // 2:
         while len(packing_buffer) < block_size:
             packing_buffer.append(eos_token_id)
         packed_seq = packing_buffer[:block_size]
