@@ -527,6 +527,11 @@ def check_checkpoint_compatibility(checkpoint_path: str, config: ArgonneConfig, 
         ckpt = safe_torch_load(checkpoint_path, map_location="cpu", weights_only=True)
         state_dict = ckpt.get("model_state_dict", {})
         
+        # If model_state_dict is empty, look at the first tensor_parallel_shards entry
+        shard_list = ckpt.get("tensor_parallel_shards")
+        if (not state_dict) and isinstance(shard_list, (list, tuple)) and shard_list:
+            state_dict = shard_list[0]
+        
         # Check if checkpoint is from pipeline parallel training
         is_pipeline_checkpoint = ckpt.get("pipeline_parallel", False)
         is_tensor_checkpoint = ckpt.get("tensor_parallel", False)
@@ -917,15 +922,35 @@ def resume_training(
                     )
                 )
 
-    # Do NOT load optimizer state (incompatible across parallelism schemes)
+    # Restore optimizer state if the checkpoint was produced with the same TP layout
+    optimizer_restored = False
     if load_checkpoint and resolved_checkpoint:
-        if is_main_process:
-            print("⚠ Note: Optimizer state not restored (incompatible with tensor parallelism)")
+        if load_shards_after_wrap:
+            # Same world_size → parameter shapes match → optimizer state is compatible
+            saved_optim = ckpt.get("optimizer_state_dict")
+            if saved_optim:
+                try:
+                    optimizer.load_state_dict(saved_optim)
+                    optimizer_restored = True
+                    if is_main_process:
+                        print("✓ Optimizer state restored (same TP layout)")
+                except Exception as opt_err:
+                    if is_main_process:
+                        print(f"⚠ Could not restore optimizer state: {opt_err}")
+                        print("  Using fresh AdamW optimizer")
+        if not optimizer_restored and is_main_process:
+            print("⚠ Optimizer state not restored (different TP layout or missing)")
             print("  Using fresh AdamW optimizer - expect small loss spike initially")
             print(f"  Re-warming up learning rate over {effective_warmup} steps")
 
         # Don't load scheduler state - we're intentionally re-warming
         # The effective_warmup setting above handles the restart
+
+        # If optimizer was restored, disable the LR ramp — momentum is already warm
+        if optimizer_restored and lr_ramp_tracker is not None:
+            lr_ramp_tracker = None
+            if is_main_process:
+                print("  Skipping LR ramp (optimizer momentum already restored)")
     else:
         scheduler.step(global_step)
     
@@ -1160,15 +1185,30 @@ def resume_training(
                                 generated_text = hf_tokenizer.decode(generated[0].tolist())
                                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
-                                # SIMPLE: Just save rank 0's model state (sharded weights)
-                                model_state = cast_state_dict_to_dtype(
-                                    model.base_model.state_dict(), amp_dtype
-                                )
+                            # Save all TP shards via filesystem (avoids GPU memory from gather_object)
+                            import gc as _gc
+                            os.makedirs("pretrained", exist_ok=True)
+                            shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
+                            local_state = cast_state_dict_to_dtype(
+                                _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
+                            )
+                            safe_torch_save(local_state, shard_path)
+                            del local_state
+                            _gc.collect()
+
+                            dist.barrier()  # wait for all ranks to finish writing
+
+                            if is_main_process:
+                                shard_list = []
+                                for r in range(world_size):
+                                    rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
 
                                 checkpoint_state = {
                                     "global_step": global_step,
                                     "tokens_processed": current_total_tokens,
-                                    "model_state_dict": model_state,
+                                    "model_state_dict": {},
+                                    "tensor_parallel_shards": shard_list,
                                     "optimizer_state_dict": optimizer.state_dict(),
                                     "scheduler_state_dict": scheduler.state_dict(),
                                     "lr_ramp_state": (
@@ -1183,13 +1223,26 @@ def resume_training(
                                     "tensor_parallel": True,
                                     "world_size": world_size,
                                     "rank": rank,
+                                    "batch_size": batch_size,
                                 }
-                                os.makedirs("pretrained", exist_ok=True)
                                 save_path = (
                                     f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                                 )
                                 safe_torch_save(checkpoint_state, save_path)
                                 print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                                del checkpoint_state, shard_list
+
+                                # Clean up temp shard files
+                                for r in range(world_size):
+                                    rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    try:
+                                        os.remove(rpath)
+                                    except OSError:
+                                        pass
+
+                            dist.barrier()  # wait for rank 0 to finish before others proceed
+                            _gc.collect()
+                            torch.cuda.empty_cache()
 
                 except StopIteration:
                     if is_main_process:
@@ -1213,22 +1266,33 @@ def resume_training(
     final_token_count = total_tokens_processed + tokens_in_this_session
 
     # Gather tensor-parallel shards and export a full model + tokenizer for final use
+    import gc as _gc
     local_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model.base_model.state_dict()), torch.float32)
 
     merged_state: Optional[Dict[str, torch.Tensor]] = None
     if dist.is_initialized() and world_size > 1:
-        gathered_states: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
-        if rank == 0:
-            gathered_states = [None for _ in range(world_size)]
+        os.makedirs("pretrained", exist_ok=True)
+        shard_path = f"pretrained/.final_shard_rank{rank}.pt"
+        safe_torch_save(local_state, shard_path)
+        del local_state
+        _gc.collect()
+        torch.cuda.empty_cache()
 
-        # torch.distributed.gather_object uses `object_gather_list` (not `gather_list`)
-        dist.gather_object(local_state, object_gather_list=gathered_states, dst=0)
+        dist.barrier()
 
         if rank == 0:
-            shard_list: List[Mapping[str, torch.Tensor]] = [
-                shard for shard in gathered_states if shard is not None
-            ]
-            merged_state = merge_tensor_parallel_shards(shard_list)
+            all_shards: List[Mapping[str, torch.Tensor]] = []
+            for r in range(world_size):
+                rpath = f"pretrained/.final_shard_rank{r}.pt"
+                all_shards.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+            merged_state = merge_tensor_parallel_shards(all_shards)
+            del all_shards
+            # Clean up temp files
+            for r in range(world_size):
+                try:
+                    os.remove(f"pretrained/.final_shard_rank{r}.pt")
+                except OSError:
+                    pass
     else:
         merged_state = local_state
 

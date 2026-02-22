@@ -7,7 +7,7 @@ import traceback
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 # CRITICAL: Disable cudagraphs via environment variable BEFORE importing torch
 # This is the most reliable way to prevent cudagraph capture in compiled models
@@ -31,6 +31,7 @@ from training_utils import (
     load_streaming_shard,
     log_dataset_plan,
     resolve_data_files,
+    safe_torch_load,
     safe_torch_save,
     validate_tokenizer_path,
 )
@@ -44,6 +45,17 @@ torch.backends.cudnn.allow_tf32 = True
 
 if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
+
+
+def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Move all tensors in a state dict to CPU."""
+    cpu_state: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cpu_state[key] = value.detach().cpu()
+        else:
+            cpu_state[key] = value
+    return cpu_state
 
 
 def _ensure_gradient_dtype_matches_params(model: torch.nn.Module) -> None:
@@ -511,9 +523,6 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
     original_num_kv_heads = layer.num_kv_heads
     original_head_dim = layer.head_dim
     
-    if rank == 0:
-        print(f"  Original: num_heads={original_num_heads}, num_kv_heads={original_num_kv_heads}, head_dim={original_head_dim}")
-    
     # Shard Q, K, V projections (column-parallel)
     for proj_name in ['q_proj', 'k_proj', 'v_proj']:
         if hasattr(layer, proj_name):
@@ -563,11 +572,6 @@ def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) ->
     layer.head_dim = original_head_dim
     layer.num_kv_heads = original_num_kv_heads // world_size
     layer.num_key_value_groups = layer.num_heads // layer.num_kv_heads
-    
-    if rank == 0:
-        print(f"  Sharded: num_heads={layer.num_heads}, num_kv_heads={layer.num_kv_heads}, head_dim={layer.head_dim}")
-        print(f"  Dims: Q={actual_q_out}, K={actual_k_out}, V={actual_v_out}")
-        print(f"  Groups: {layer.num_key_value_groups}")
 
 
 def shard_mlp_layer(mlp: torch.nn.Module, world_size: int, rank: int) -> None:
@@ -630,6 +634,16 @@ def shard_tensor_parallel_correctly(model: ArgonneModel, world_size: int, rank: 
             shard_mlp_layer(block.mlp, world_size, rank)
     
     if rank == 0:
+        # Print summary once (values are identical across all blocks)
+        sample_attn = model.blocks[0].attn
+        print(
+            f"  Per-rank: num_heads={sample_attn.num_heads}, "
+            f"num_kv_heads={sample_attn.num_kv_heads}, "
+            f"head_dim={sample_attn.head_dim}, "
+            f"Q={sample_attn.q_proj.out_features}, "
+            f"K={sample_attn.k_proj.out_features}, "
+            f"V={sample_attn.v_proj.out_features}"
+        )
         print(f"✓ Successfully sharded {len(model.blocks)} transformer blocks")
 
 
@@ -1200,14 +1214,30 @@ def _execute_training_attempt(
                                 f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
                             )
 
-                            model_state = cast_state_dict_to_dtype(
-                                model.base_model.state_dict(), amp_dtype
-                            )
+                        # Save all TP shards via filesystem (avoids GPU memory from gather_object)
+                        import gc as _gc
+                        os.makedirs("pretrained", exist_ok=True)
+                        shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
+                        local_state = cast_state_dict_to_dtype(
+                            _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
+                        )
+                        safe_torch_save(local_state, shard_path)
+                        del local_state
+                        _gc.collect()
+
+                        dist.barrier()  # wait for all ranks to finish writing
+
+                        if is_main_process:
+                            shard_list = []
+                            for r in range(world_size):
+                                rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
 
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": tokens_processed,
-                                "model_state_dict": model_state,
+                                "model_state_dict": {},
+                                "tensor_parallel_shards": shard_list,
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": None,
@@ -1220,12 +1250,24 @@ def _execute_training_attempt(
                                 "rank": rank,
                                 "batch_size": batch_size,
                             }
-                            os.makedirs("pretrained", exist_ok=True)
                             save_path = (
                                 f"pretrained/streaming_checkpoint_step_{global_step}.pth"
                             )
                             safe_torch_save(checkpoint_state, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                            del checkpoint_state, shard_list
+
+                            # Clean up temp shard files
+                            for r in range(world_size):
+                                rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                try:
+                                    os.remove(rpath)
+                                except OSError:
+                                    pass
+
+                        dist.barrier()  # wait for rank 0 to finish before others proceed
+                        _gc.collect()
+                        torch.cuda.empty_cache()
 
             except StopIteration:
                 if is_main_process:
