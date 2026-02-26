@@ -6,7 +6,16 @@ Author: Youzhi Yu
 
 # Argonne 2.5
 
-A **~1 billion parameter** decoder-only transformer language model trained from scratch using tensor parallelism on a single DGX A100 node, featuring **sequence packing** for zero-waste training and the **Qwen3-0.6B-Base tokenizer** (vocab size 151,936).
+A **~1 billion parameter** decoder-only transformer language model trained from scratch using **hybrid tensor parallelism + data parallelism** across multiple DGX A100 nodes, featuring **sequence packing** for zero-waste training and the **Qwen3-0.6B-Base tokenizer** (vocab size 151,936).
+
+## Parallelism Strategy
+
+Argonne 2.5 uses a **two-level hybrid parallelism** approach:
+
+- **Tensor Parallelism (TP)** within each node: 8 GPUs on a single node shard the model's attention and MLP layers. All-reduce operations within the TP group synchronize partial results.
+- **Data Parallelism (DP)** across nodes: Each node processes a different subset of the training data. Gradients are averaged across DP ranks after gradient accumulation via all-reduce on the DP process group.
+
+This design scales to any number of nodes without code changes — adding more nodes increases throughput linearly while keeping the per-node memory footprint unchanged.
 
 ## Model Architecture
 
@@ -58,17 +67,18 @@ Tokenization runs asynchronously on CPU threads using `ThreadPoolExecutor`, with
 
 ### Hardware Configuration
 
-- **Node**: 1× DGX A100 (8× NVIDIA A100 80GB GPUs)
-- **Parallelism**: Custom tensor parallelism across 8 GPUs
-- **Interconnect**: NVLink for high-bandwidth GPU-to-GPU communication
+- **Nodes**: N× DGX A100 (8× NVIDIA A100 80GB GPUs per node, configurable)
+- **Intra-node Parallelism**: Custom tensor parallelism across 8 GPUs (TP)
+- **Inter-node Parallelism**: Data parallelism across nodes (DP)
+- **Interconnect**: NVLink (intra-node), InfiniBand / high-speed Ethernet (inter-node)
 - **Ampere Optimizations**: TF32 enabled for matmuls, bfloat16 mixed precision
 
 ### Training Hyperparameters
 
 | Parameter | Value |
 |-----------|-------|
-| **Initial Micro-batch Size** | 128 per GPU (auto-halved on OOM) |
-| **Gradient Accumulation** | 4 steps |
+| **Micro-batch Size** | 4 per node |
+| **Gradient Accumulation** | 8 steps |
 | **Learning Rate** | 1e-4 (peak) → 1e-5 (cosine decay) |
 | **Warmup Steps** | 2,000 |
 | **Weight Decay** | 0.1 |
@@ -78,7 +88,7 @@ Tokenization runs asynchronously on CPU threads using `ThreadPoolExecutor`, with
 
 ### Auto Batch Size Tuning
 
-`training.py` starts with an initial batch size of 128 and automatically halves it whenever an OOM error is detected, until a workable size is found. `resume_pretrain_tensor.py` picks up from the last successful batch size stored in the checkpoint.
+`training.py` starts with an initial batch size of 4 and automatically halves it whenever an OOM error is detected, until a workable size is found. `resume_pretrain_tensor.py` picks up from the last successful batch size stored in the checkpoint.
 
 ### Training Data
 
@@ -94,27 +104,58 @@ The training uses a custom tensor parallel implementation (`TensorParallelModel`
 - **Row-parallel**: O and down projections are split across GPUs.
 - **Replicated**: Token embeddings, RMSNorm, and LM head remain replicated on all GPUs.
 - **Async all-reduce**: Overlaps communication with computation for minimal overhead.
+- **Process groups**: TP all-reduce uses a dedicated intra-node NCCL sub-group, while DP gradient all-reduce uses a separate inter-node sub-group.
 
 Each GPU holds **2 query heads and 1 KV head** (16/8 = 2 Q heads per GPU, 8/8 = 1 KV head per GPU) and 1/8th of the MLP intermediate dimension (5,632 / 8 = 704 per GPU).
 
+### Data Parallelism Implementation
+
+- **Data sharding**: Training data files are striped across DP ranks (nodes) in round-robin fashion. Each node processes a disjoint subset of the data, eliminating redundant work.
+- **Gradient synchronization**: After gradient accumulation, `dist.all_reduce(AVG)` on the DP process group averages gradients across all nodes before the optimizer step.
+- **Flexible scaling**: The code auto-detects the number of nodes at launch. Adding or removing nodes requires no code changes — only the `torchrun` launch command changes.
+- **Checkpointing**: Only the first DP node (dp_rank=0) saves checkpoints. All nodes can resume from the same checkpoint.
+
 ### Checkpointing
 
-- Checkpoints saved periodically, including **model state, optimizer state, scheduler state, and exact data position** (file index, byte offset, chunk offset).
+- Checkpoints saved periodically from DP rank 0, including **model state, optimizer state, scheduler state, and exact data position** (file index, byte offset, chunk offset).
 - Automatic pruning of old checkpoints (configurable, default keeps last 50).
 - **Per-block gradient checkpointing** enabled for memory efficiency.
 - Training is fully resumable — `resume_pretrain_tensor.py` automatically locates the latest checkpoint and restores the data stream to the exact position.
+- Checkpoints are compatible between single-node (TP only) and multi-node (TP+DP) setups — the same checkpoint can be loaded regardless of how many nodes are used.
 
 ## Repository Structure
 
 ```
 ArgonneAI/
 ├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
-├── training.py                 # Initial training with auto batch size tuning + tensor parallelism
-├── resume_pretrain_tensor.py   # Resume training from checkpoints
+├── training.py                 # Initial training with auto batch size tuning + TP + DP
+├── resume_pretrain_tensor.py   # Resume training from checkpoints with TP + DP
 ├── data_processing.py          # Tokenization, collation, and data loading utilities
 ├── training_utils.py           # CosineWarmupScheduler, checkpoint I/O, token/data resolution
 ├── test_param_count.py         # Parameter count verification script
 └── README.md                   # This file
+```
+
+### Multi-Node Launch (PBS)
+
+For PBS-managed clusters (e.g., ALCF Polaris, Midway3), use `torchrun` with `--rdzv-backend=c10d`:
+
+```bash
+# Example: 3 nodes × 8 GPUs = 24 total ranks
+# TP=8 (intra-node), DP=3 (inter-node)
+torchrun \
+    --nnodes=$NUM_NODES \
+    --nproc_per_node=8 \
+    --rdzv_id=$PBS_JOBID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:29500 \
+    resume_pretrain_tensor.py --tokenizer-path ../Qwen3-0.6B
+```
+
+For single-node runs, the existing `--standalone` mode still works:
+
+```bash
+torchrun --standalone --nproc_per_node=8 resume_pretrain_tensor.py --tokenizer-path ../Qwen3-0.6B
 ```
 
 ---

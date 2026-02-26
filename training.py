@@ -507,11 +507,91 @@ def cleanup_old_checkpoints(directory: str, keep: int = 3, rank: int = 0) -> Non
 
 
 def init_tensor_parallel_group(world_size: int, rank: int) -> None:
-    """Initialize distributed process group for tensor parallelism"""
+    """Initialize distributed process group for tensor parallelism.
+
+    When running on multiple nodes, this also creates two sub-groups:
+    * **TP group** – ranks on the *same* node (same ``local_rank`` set)
+    * **DP group** – ranks with the *same* ``local_rank`` across nodes
+
+    The groups are stored as module-level globals so that ``TensorParallelModel``
+    and the training loops can reference them.  For single-node runs the TP
+    group is simply the world group and the DP group is ``None``.
+    """
+    global _TP_GROUP, _DP_GROUP, _TP_SIZE, _DP_SIZE, _TP_RANK, _DP_RANK
+
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+    num_nodes = world_size // local_world_size
+
+    if num_nodes > 1:
+        # ---------- TP groups (intra-node) ----------
+        for node_idx in range(num_nodes):
+            tp_ranks = list(range(node_idx * local_world_size, (node_idx + 1) * local_world_size))
+            group = dist.new_group(tp_ranks)
+            if rank in tp_ranks:
+                _TP_GROUP = group
+                _TP_RANK = tp_ranks.index(rank)
+
+        # ---------- DP groups (inter-node, same local_rank) ----------
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        for lr in range(local_world_size):
+            dp_ranks = [node_idx * local_world_size + lr for node_idx in range(num_nodes)]
+            group = dist.new_group(dp_ranks)
+            if lr == local_rank:
+                _DP_GROUP = group
+                _DP_RANK = dp_ranks.index(rank)
+
+        _TP_SIZE = local_world_size
+        _DP_SIZE = num_nodes
+    else:
+        # Single-node: TP spans the whole world, no DP needed
+        _TP_GROUP = None  # None means "use default world group"
+        _DP_GROUP = None
+        _TP_SIZE = world_size
+        _DP_SIZE = 1
+        _TP_RANK = rank
+        _DP_RANK = 0
+
     if rank == 0:
-        print(f"Initialized tensor parallel group: rank {rank}/{world_size}")
+        print(f"Initialized process groups: tp_size={_TP_SIZE}, dp_size={_DP_SIZE}, "
+              f"world_size={world_size}")
+
+
+# Module-level globals for process groups
+_TP_GROUP: Optional[dist.ProcessGroup] = None
+_DP_GROUP: Optional[dist.ProcessGroup] = None
+_TP_SIZE: int = 1
+_DP_SIZE: int = 1
+_TP_RANK: int = 0
+_DP_RANK: int = 0
+
+
+def get_tp_group() -> Optional[dist.ProcessGroup]:
+    """Return the tensor-parallel process group (None = world group)."""
+    return _TP_GROUP
+
+
+def get_dp_group() -> Optional[dist.ProcessGroup]:
+    """Return the data-parallel process group (None = no DP)."""
+    return _DP_GROUP
+
+
+def get_tp_size() -> int:
+    return _TP_SIZE
+
+
+def get_dp_size() -> int:
+    return _DP_SIZE
+
+
+def get_tp_rank() -> int:
+    return _TP_RANK
+
+
+def get_dp_rank() -> int:
+    return _DP_RANK
 
 
 def shard_attention_layer(layer: torch.nn.Module, world_size: int, rank: int) -> None:
@@ -648,13 +728,23 @@ def shard_tensor_parallel_correctly(model: ArgonneModel, world_size: int, rank: 
 
 
 class TensorParallelModel(torch.nn.Module):
-    """Wrapper for ArgonneModel that implements tensor parallelism."""
-    def __init__(self, base_model: ArgonneModel, world_size: int, rank: int):
+    """Wrapper for ArgonneModel that implements tensor parallelism.
+
+    When running with hybrid TP+DP, ``world_size`` and ``rank`` refer to the
+    *tensor-parallel* group (i.e. intra-node), and ``tp_group`` is the NCCL
+    sub-group used for all-reduce.  ``local_rank`` is used to select the CUDA
+    device.
+    """
+    def __init__(self, base_model: ArgonneModel, world_size: int, rank: int,
+                 tp_group: Optional[dist.ProcessGroup] = None,
+                 local_rank: Optional[int] = None):
         super().__init__()
         self.base_model = base_model
         self.world_size = world_size
         self.rank = rank
-        self.device = torch.device(f"cuda:{rank}")
+        self.tp_group = tp_group
+        _local_rank = local_rank if local_rank is not None else rank
+        self.device = torch.device(f"cuda:{_local_rank}")
         self.gradient_checkpointing = False
         
         # Move model to device first
@@ -677,7 +767,7 @@ class TensorParallelModel(torch.nn.Module):
 
         attn_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            attn_reduce = dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, async_op=True)
+            attn_reduce = dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, async_op=True, group=self.tp_group)
 
         if attn_reduce is not None:
             attn_reduce.wait()
@@ -693,7 +783,7 @@ class TensorParallelModel(torch.nn.Module):
 
         mlp_reduce: Optional[dist.Work] = None
         if self.world_size > 1:
-            mlp_reduce = dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM, async_op=True)
+            mlp_reduce = dist.all_reduce(mlp_output, op=dist.ReduceOp.SUM, async_op=True, group=self.tp_group)
 
         if mlp_reduce is not None:
             mlp_reduce.wait()
@@ -756,25 +846,32 @@ class TensorParallelModel(torch.nn.Module):
         was_training = self.training
         self.eval()
 
+        # Determine the global rank that is TP-rank 0 in our group for broadcasts
+        if self.tp_group is not None:
+            tp_global_ranks = dist.get_process_group_ranks(self.tp_group)
+            tp_src_global = tp_global_ranks[0]
+        else:
+            tp_src_global = 0
+
         try:
             if not torch.is_tensor(input_ids):
                 raise TypeError("input_ids must be a torch.Tensor")
 
             input_ids = input_ids.to(self.device)
 
-            # Make sure all ranks start with the same prompt
+            # Make sure all TP ranks start with the same prompt
             if self.world_size > 1 and dist.is_initialized():
                 prompt_length = torch.tensor([input_ids.shape[1]], device=self.device, dtype=torch.long)
-                dist.broadcast(prompt_length, src=0)
+                dist.broadcast(prompt_length, src=tp_src_global, group=self.tp_group)
 
                 if input_ids.shape[1] != int(prompt_length.item()):
                     new_prompt = torch.zeros(input_ids.shape[0], prompt_length.item(), dtype=input_ids.dtype, device=self.device)
                     if self.rank == 0:
                         new_prompt.copy_(input_ids[:, :prompt_length.item()])
-                    dist.broadcast(new_prompt, src=0)
+                    dist.broadcast(new_prompt, src=tp_src_global, group=self.tp_group)
                     input_ids = new_prompt
                 else:
-                    dist.broadcast(input_ids, src=0)
+                    dist.broadcast(input_ids, src=tp_src_global, group=self.tp_group)
 
             generated = input_ids
 
@@ -826,7 +923,7 @@ class TensorParallelModel(torch.nn.Module):
                             next_token = torch.empty((generated.size(0), 1), dtype=torch.long, device=self.device)
 
                     if self.world_size > 1 and dist.is_initialized():
-                        dist.broadcast(next_token, src=0)
+                        dist.broadcast(next_token, src=tp_src_global, group=self.tp_group)
 
                     generated = torch.cat([generated, next_token], dim=-1)
 
@@ -888,8 +985,17 @@ def _execute_training_attempt(
     because the optimizer / NCCL state may already be inconsistent.
     """
 
+    tp_group = get_tp_group()
+    dp_group = get_dp_group()
+    tp_size = get_tp_size()
+    dp_size = get_dp_size()
+    tp_rank = get_tp_rank()
+    dp_rank = get_dp_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
     base_model = ArgonneModel(config)
-    model = TensorParallelModel(base_model, world_size, rank)
+    model = TensorParallelModel(base_model, tp_size, tp_rank,
+                                 tp_group=tp_group, local_rank=local_rank)
 
     if use_gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -920,6 +1026,8 @@ def _execute_training_attempt(
         print(f"  - Learning rate: {lr:.2e}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Grad accumulation: {grad_accum_steps}")
+        print(f"  - TP size: {tp_size} (intra-node)")
+        print(f"  - DP size: {dp_size} (inter-node)")
         print(f"  - World size: {world_size}")
         if supports_bf16:
             print("✓ Using torch.bfloat16 autocast")
@@ -950,8 +1058,17 @@ def _execute_training_attempt(
         return prefetched_batches.popleft()
 
     data_position = DataPosition(streaming=True)
+
+    # Shard data files across DP ranks so each node processes different data
+    if dp_size > 1:
+        dp_data_files = data_files[dp_rank::dp_size]
+        if is_main_process:
+            print(f"  DP data sharding: node {dp_rank} gets {len(dp_data_files)}/{len(data_files)} files")
+    else:
+        dp_data_files = data_files
+
     token_gen = streaming_token_generator(
-        data_files,
+        dp_data_files,
         tokenizer,
         block_size,
         rank=rank,
@@ -1065,7 +1182,7 @@ def _execute_training_attempt(
                         print("End of dataset - restarting")
                     data_position.next_epoch()
                     token_gen = streaming_token_generator(
-                        data_files,
+                        dp_data_files,
                         tokenizer,
                         block_size,
                         rank=rank,
@@ -1074,13 +1191,14 @@ def _execute_training_attempt(
 
                 token_buffer.append(tokens)
                 data_position.update_streaming_position(
-                    file_idx, position, chunk_idx, data_files[file_idx]
+                    file_idx, position, chunk_idx,
+                    dp_data_files[file_idx] if file_idx < len(dp_data_files) else ""
                 )
 
                 if shard_name != active_shard:
                     active_shard = shard_name
                     if is_main_process:
-                        print(f"Processing shard {file_idx + 1}/{len(data_files)}: {shard_name}")
+                        print(f"Processing shard {file_idx + 1}/{len(dp_data_files)}: {shard_name}")
 
                 if len(token_buffer) < batch_size:
                     continue
@@ -1170,6 +1288,12 @@ def _execute_training_attempt(
                 micro_step += 1
 
                 if micro_step >= grad_accum_steps:
+                    # ---- DP gradient all-reduce across nodes ----
+                    if dp_group is not None and dp_size > 1:
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dp_group)
+
                     current_lr = scheduler.step(global_step)
 
                     if scaler is not None:
@@ -1214,67 +1338,80 @@ def _execute_training_attempt(
                                 f"\n--- Generated text at step {global_step} ---\n{generated_text}\n"
                             )
 
-                        # Save all TP shards via filesystem (avoids GPU memory from gather_object)
-                        import gc as _gc
-                        os.makedirs("pretrained", exist_ok=True)
-                        shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
-                        local_state = cast_state_dict_to_dtype(
-                            _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
-                        )
-                        safe_torch_save(local_state, shard_path)
-                        del local_state
-                        _gc.collect()
-
-                        dist.barrier()  # wait for all ranks to finish writing
-
-                        if is_main_process:
-                            shard_list = []
-                            for r in range(world_size):
-                                rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
-                                shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
-
-                            checkpoint_state = {
-                                "global_step": global_step,
-                                "tokens_processed": tokens_processed,
-                                "model_state_dict": {},
-                                "tensor_parallel_shards": shard_list,
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "lr_ramp_state": None,
-                                "gradient_accumulation_steps": grad_accum_steps,
-                                "loss": last_loss_value,
-                                "data_position": data_position.get_state(),
-                                "model_dtype": str(amp_dtype),
-                                "tensor_parallel": True,
-                                "world_size": world_size,
-                                "rank": rank,
-                                "batch_size": batch_size,
-                            }
-                            save_path = (
-                                f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                        # Save checkpoint from DP rank 0 node only
+                        # (all TP ranks on that node write their shard)
+                        if dp_rank == 0:
+                            import gc as _gc
+                            os.makedirs("pretrained", exist_ok=True)
+                            shard_path = f"pretrained/.shard_rank{tp_rank}_step{global_step}.pt"
+                            local_state = cast_state_dict_to_dtype(
+                                _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
                             )
-                            safe_torch_save(checkpoint_state, save_path)
-                            print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                            del checkpoint_state, shard_list
+                            safe_torch_save(local_state, shard_path)
+                            del local_state
+                            _gc.collect()
 
-                            # Clean up temp shard files
-                            for r in range(world_size):
-                                rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
-                                try:
-                                    os.remove(rpath)
-                                except OSError:
-                                    pass
+                            # Wait for all TP ranks on this node
+                            if tp_group is not None:
+                                dist.barrier(group=tp_group)
+                            else:
+                                dist.barrier()
 
-                        dist.barrier()  # wait for rank 0 to finish before others proceed
-                        _gc.collect()
-                        torch.cuda.empty_cache()
+                            if is_main_process:
+                                shard_list = []
+                                for r in range(tp_size):
+                                    rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+
+                                checkpoint_state = {
+                                    "global_step": global_step,
+                                    "tokens_processed": tokens_processed,
+                                    "model_state_dict": {},
+                                    "tensor_parallel_shards": shard_list,
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "scheduler_state_dict": scheduler.state_dict(),
+                                    "lr_ramp_state": None,
+                                    "gradient_accumulation_steps": grad_accum_steps,
+                                    "loss": last_loss_value,
+                                    "data_position": data_position.get_state(),
+                                    "model_dtype": str(amp_dtype),
+                                    "tensor_parallel": True,
+                                    "world_size": tp_size,
+                                    "dp_world_size": dp_size,
+                                    "rank": rank,
+                                    "batch_size": batch_size,
+                                }
+                                save_path = (
+                                    f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                )
+                                safe_torch_save(checkpoint_state, save_path)
+                                print(f"Checkpoint saved @ step {global_step} -> {save_path}")
+                                del checkpoint_state, shard_list
+
+                                # Clean up temp shard files
+                                for r in range(tp_size):
+                                    rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    try:
+                                        os.remove(rpath)
+                                    except OSError:
+                                        pass
+
+                            if tp_group is not None:
+                                dist.barrier(group=tp_group)
+                            else:
+                                dist.barrier()
+                            _gc.collect()
+                            torch.cuda.empty_cache()
+
+                        # All-world barrier to sync all DP ranks
+                        dist.barrier()
 
             except StopIteration:
                 if is_main_process:
                     print("StopIteration - restarting dataset")
                 data_position.next_epoch()
                 token_gen = streaming_token_generator(
-                    data_files,
+                    dp_data_files,
                     tokenizer,
                     block_size,
                     rank=rank,
@@ -1305,17 +1442,18 @@ def train_from_scratch_tensor_parallel(
     tokenizer_path: str,
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
-    initial_batch_size: int = 16,
+    initial_batch_size: int = 4,
     min_batch_size: int = 1,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
     warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
-    gradient_accumulation_steps: int = 4,
+    gradient_accumulation_steps: int = 8,
     disable_gradient_checkpointing: bool = False,
 ):
-    """Train model from scratch with tensor parallelism and automatic batch size tuning."""
+    """Train model from scratch with tensor parallelism (intra-node) and
+    data parallelism (inter-node) with automatic batch size tuning."""
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -1324,11 +1462,16 @@ def train_from_scratch_tensor_parallel(
     init_tensor_parallel_group(world_size, rank)
     is_main_process = (rank == 0)
 
+    tp_size = get_tp_size()
+    dp_size = get_dp_size()
+
     if is_main_process:
         print("=" * 70)
-        print("STARTING FRESH TRAINING FROM SCRATCH (TENSOR PARALLEL)")
+        print("STARTING FRESH TRAINING FROM SCRATCH (TP + DP)")
         print("=" * 70)
         print(f"World size: {world_size} GPUs")
+        print(f"TP size: {tp_size} (intra-node)")
+        print(f"DP size: {dp_size} (inter-node)")
         print(f"Rank: {rank}")
 
     cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
@@ -1514,7 +1657,7 @@ def parse_args():
     parser.add_argument(
         "--initial-batch-size",
         type=int,
-        default=32,
+        default=4,
         help="Initial batch size to try (will be reduced on OOM).",
     )
     parser.add_argument(
@@ -1555,7 +1698,7 @@ def parse_args():
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=4,
+        default=8,
         help="Number of micro-batches to accumulate before each optimizer step.",
     )
     parser.add_argument(
