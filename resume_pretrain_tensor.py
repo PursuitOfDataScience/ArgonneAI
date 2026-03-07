@@ -926,18 +926,41 @@ def resume_training(
     optimizer_restored = False
     if load_checkpoint and resolved_checkpoint:
         if load_shards_after_wrap:
-            # Same world_size → parameter shapes match → optimizer state is compatible
-            saved_optim = ckpt.get("optimizer_state_dict")
-            if saved_optim:
+            # Try per-rank optimizer shards first (correct approach)
+            opt_shards = ckpt.get("optimizer_shards")
+            if isinstance(opt_shards, (list, tuple)) and len(opt_shards) == world_size:
                 try:
-                    optimizer.load_state_dict(saved_optim)
+                    optimizer.load_state_dict(opt_shards[rank])
                     optimizer_restored = True
                     if is_main_process:
-                        print("✓ Optimizer state restored (same TP layout)")
+                        print(f"✓ Optimizer state restored from per-rank shards (rank {rank}/{world_size})")
                 except Exception as opt_err:
                     if is_main_process:
-                        print(f"⚠ Could not restore optimizer state: {opt_err}")
+                        print(f"⚠ Could not restore optimizer shard for rank {rank}: {opt_err}")
                         print("  Using fresh AdamW optimizer")
+            else:
+                # Legacy checkpoint: only rank 0's optimizer state was saved.
+                # Only rank 0 can use it; other ranks start fresh.
+                saved_optim = ckpt.get("optimizer_state_dict")
+                if saved_optim and rank == 0:
+                    try:
+                        optimizer.load_state_dict(saved_optim)
+                        optimizer_restored = True
+                        if is_main_process:
+                            print("✓ Optimizer state restored for rank 0 from legacy checkpoint")
+                            print("  ⚠ Ranks 1-%d will use fresh optimizer (legacy checkpoint had only rank 0 state)" % (world_size - 1))
+                    except Exception as opt_err:
+                        if is_main_process:
+                            print(f"⚠ Could not restore optimizer state: {opt_err}")
+                            print("  Using fresh AdamW optimizer")
+                elif saved_optim and rank != 0:
+                    # Non-zero ranks: the saved state has wrong shapes for our parameters
+                    if is_main_process:
+                        pass  # rank 0 already printed
+                else:
+                    if is_main_process:
+                        print("⚠ No optimizer state found in checkpoint")
+
         if not optimizer_restored and is_main_process:
             print("⚠ Optimizer state not restored (different TP layout or missing)")
             print("  Using fresh AdamW optimizer - expect small loss spike initially")
@@ -1188,28 +1211,40 @@ def resume_training(
                             # Save all TP shards via filesystem (avoids GPU memory from gather_object)
                             import gc as _gc
                             os.makedirs("pretrained", exist_ok=True)
+
+                            # Each rank saves its own model shard
                             shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
                             local_state = cast_state_dict_to_dtype(
                                 _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
                             )
                             safe_torch_save(local_state, shard_path)
                             del local_state
+
+                            # Each rank saves its own optimizer shard (different TP ranks
+                            # have different parameter shapes → different optimizer states)
+                            opt_shard_path = f"pretrained/.opt_rank{rank}_step{global_step}.pt"
+                            safe_torch_save(optimizer.state_dict(), opt_shard_path)
+
                             _gc.collect()
 
                             dist.barrier()  # wait for all ranks to finish writing
 
                             if is_main_process:
                                 shard_list = []
+                                opt_shards = []
                                 for r in range(world_size):
                                     rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
                                     shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                                    opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                    opt_shards.append(safe_torch_load(opath, map_location="cpu", weights_only=True))
 
                                 checkpoint_state = {
                                     "global_step": global_step,
                                     "tokens_processed": current_total_tokens,
                                     "model_state_dict": {},
                                     "tensor_parallel_shards": shard_list,
-                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "optimizer_shards": opt_shards,
+                                    "optimizer_state_dict": opt_shards[0],  # backward compat
                                     "scheduler_state_dict": scheduler.state_dict(),
                                     "lr_ramp_state": (
                                         dict(lr_ramp_tracker)
@@ -1230,13 +1265,18 @@ def resume_training(
                                 )
                                 safe_torch_save(checkpoint_state, save_path)
                                 print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                                del checkpoint_state, shard_list
+                                del checkpoint_state, shard_list, opt_shards
 
                                 # Clean up temp shard files
                                 for r in range(world_size):
                                     rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
                                     try:
                                         os.remove(rpath)
+                                    except OSError:
+                                        pass
+                                    try:
+                                        os.remove(opath)
                                     except OSError:
                                         pass
 

@@ -1217,28 +1217,40 @@ def _execute_training_attempt(
                         # Save all TP shards via filesystem (avoids GPU memory from gather_object)
                         import gc as _gc
                         os.makedirs("pretrained", exist_ok=True)
+
+                        # Each rank saves its own model shard
                         shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
                         local_state = cast_state_dict_to_dtype(
                             _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
                         )
                         safe_torch_save(local_state, shard_path)
                         del local_state
+
+                        # Each rank saves its own optimizer shard (different TP ranks
+                        # have different parameter shapes → different optimizer states)
+                        opt_shard_path = f"pretrained/.opt_rank{rank}_step{global_step}.pt"
+                        safe_torch_save(optimizer.state_dict(), opt_shard_path)
+
                         _gc.collect()
 
                         dist.barrier()  # wait for all ranks to finish writing
 
                         if is_main_process:
                             shard_list = []
+                            opt_shards = []
                             for r in range(world_size):
                                 rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
                                 shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                                opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                opt_shards.append(safe_torch_load(opath, map_location="cpu", weights_only=True))
 
                             checkpoint_state = {
                                 "global_step": global_step,
                                 "tokens_processed": tokens_processed,
                                 "model_state_dict": {},
                                 "tensor_parallel_shards": shard_list,
-                                "optimizer_state_dict": optimizer.state_dict(),
+                                "optimizer_shards": opt_shards,
+                                "optimizer_state_dict": opt_shards[0],  # backward compat
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "lr_ramp_state": None,
                                 "gradient_accumulation_steps": grad_accum_steps,
@@ -1255,13 +1267,18 @@ def _execute_training_attempt(
                             )
                             safe_torch_save(checkpoint_state, save_path)
                             print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                            del checkpoint_state, shard_list
+                            del checkpoint_state, shard_list, opt_shards
 
                             # Clean up temp shard files
                             for r in range(world_size):
                                 rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
                                 try:
                                     os.remove(rpath)
+                                except OSError:
+                                    pass
+                                try:
+                                    os.remove(opath)
                                 except OSError:
                                     pass
 
