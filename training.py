@@ -994,6 +994,12 @@ def _execute_training_attempt(
     dp_rank = get_dp_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+    # Auto-adjust grad accumulation for multi-node DP so effective batch stays constant
+    grad_accum_steps_original = grad_accum_steps
+    grad_accum_steps = max(1, grad_accum_steps // dp_size)
+    if is_main_process:
+        print(f"  DP auto-adjusted grad_accum: {grad_accum_steps_original} -> {grad_accum_steps} (dp_size={dp_size})")
+
     base_model = ArgonneModel(config)
     model = TensorParallelModel(base_model, tp_size, tp_rank,
                                  tp_group=tp_group, local_rank=local_rank)
@@ -1346,12 +1352,19 @@ def _execute_training_attempt(
                         if dp_rank == 0:
                             import gc as _gc
                             os.makedirs("pretrained", exist_ok=True)
+
+                            # Each TP rank saves its own model shard
                             shard_path = f"pretrained/.shard_rank{tp_rank}_step{global_step}.pt"
                             local_state = cast_state_dict_to_dtype(
                                 _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
                             )
                             safe_torch_save(local_state, shard_path)
                             del local_state
+
+                            # Each TP rank saves its own optimizer shard
+                            opt_shard_path = f"pretrained/.opt_rank{tp_rank}_step{global_step}.pt"
+                            safe_torch_save(_state_dict_to_cpu(optimizer.state_dict()), opt_shard_path)
+
                             _gc.collect()
 
                             # Wait for all TP ranks on this node
@@ -1362,16 +1375,21 @@ def _execute_training_attempt(
 
                             if is_main_process:
                                 shard_list = []
+                                opt_shards = []
                                 for r in range(tp_size):
                                     rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
                                     shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                                    opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                    opt_shards.append(safe_torch_load(opath, map_location="cpu", weights_only=True))
 
                                 checkpoint_state = {
                                     "global_step": global_step,
                                     "tokens_processed": tokens_processed,
                                     "model_state_dict": {},
                                     "tensor_parallel_shards": shard_list,
-                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "optimizer_shards": opt_shards,
+                                    # Keep for backward compat (rank 0 only)
+                                    "optimizer_state_dict": opt_shards[0] if opt_shards else {},
                                     "scheduler_state_dict": scheduler.state_dict(),
                                     "lr_ramp_state": None,
                                     "gradient_accumulation_steps": grad_accum_steps,
@@ -1389,13 +1407,18 @@ def _execute_training_attempt(
                                 )
                                 safe_torch_save(checkpoint_state, save_path)
                                 print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                                del checkpoint_state, shard_list
+                                del checkpoint_state, shard_list, opt_shards
 
                                 # Clean up temp shard files
                                 for r in range(tp_size):
                                     rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                    opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
                                     try:
                                         os.remove(rpath)
+                                    except OSError:
+                                        pass
+                                    try:
+                                        os.remove(opath)
                                     except OSError:
                                         pass
 
@@ -1452,7 +1475,7 @@ def train_from_scratch_tensor_parallel(
     warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
-    gradient_accumulation_steps: int = 16,
+    gradient_accumulation_steps: int = 4,
     disable_gradient_checkpointing: bool = False,
     checkpoint_interval: int = 100,
 ):
@@ -1703,8 +1726,8 @@ def parse_args():
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=16,
-        help="Number of micro-batches to accumulate before each optimizer step.",
+        default=4,
+        help="Base number of micro-batches to accumulate before each optimizer step. Auto-adjusted by DP size.",
     )
     parser.add_argument(
         "--disable-gradient-checkpointing",

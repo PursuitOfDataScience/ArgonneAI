@@ -581,7 +581,7 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
-    gradient_accumulation_steps: int = 16,
+    gradient_accumulation_steps: int = 4,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
     warmup_steps: int = 2000,
@@ -609,7 +609,13 @@ def resume_training(
     dp_size = get_dp_size()
     tp_rank = get_tp_rank()
     dp_rank = get_dp_rank()
-    
+
+    # Auto-adjust grad accumulation for multi-node DP so effective batch stays constant
+    grad_accum_steps_original = grad_accum_steps
+    grad_accum_steps = max(1, grad_accum_steps // dp_size)
+    if is_main_process:
+        print(f"  DP auto-adjusted grad_accum: {grad_accum_steps_original} -> {grad_accum_steps} (dp_size={dp_size})")
+
     if is_main_process:
         cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
     
@@ -950,17 +956,38 @@ def resume_training(
     if load_checkpoint and resolved_checkpoint:
         if load_shards_after_wrap:
             # Same world_size → parameter shapes match → optimizer state is compatible
-            saved_optim = ckpt.get("optimizer_state_dict")
-            if saved_optim:
+            # Prefer per-TP-rank optimizer shards if available
+            opt_shards = ckpt.get("optimizer_shards")
+            if opt_shards and len(opt_shards) == tp_size:
                 try:
-                    optimizer.load_state_dict(saved_optim)
+                    optimizer.load_state_dict(opt_shards[tp_rank])
                     optimizer_restored = True
                     if is_main_process:
-                        print("✓ Optimizer state restored (same TP layout)")
+                        print(f"✓ Optimizer state restored from per-rank shards (tp_rank={tp_rank})")
                 except Exception as opt_err:
                     if is_main_process:
-                        print(f"⚠ Could not restore optimizer state: {opt_err}")
-                        print("  Using fresh AdamW optimizer")
+                        print(f"⚠ Could not restore optimizer shard for tp_rank={tp_rank}: {opt_err}")
+                        print("  Falling back to legacy optimizer_state_dict")
+
+            # Fallback: old checkpoints only have rank 0's optimizer state
+            if not optimizer_restored:
+                saved_optim = ckpt.get("optimizer_state_dict")
+                if saved_optim:
+                    if tp_rank == 0:
+                        try:
+                            optimizer.load_state_dict(saved_optim)
+                            optimizer_restored = True
+                            if is_main_process:
+                                print("✓ Optimizer state restored from legacy checkpoint (rank 0 only)")
+                        except Exception as opt_err:
+                            if is_main_process:
+                                print(f"⚠ Could not restore optimizer state: {opt_err}")
+                                print("  Using fresh AdamW optimizer")
+                    else:
+                        if is_main_process:
+                            print(f"⚠ Legacy checkpoint has no optimizer shard for tp_rank={tp_rank}")
+                            print("  Non-zero TP ranks will use fresh optimizer state")
+
         if not optimizer_restored and is_main_process:
             print("⚠ Optimizer state not restored (different TP layout or missing)")
             print("  Using fresh AdamW optimizer - expect small loss spike initially")
@@ -1223,12 +1250,19 @@ def resume_training(
                             if dp_rank == 0:
                                 import gc as _gc
                                 os.makedirs("pretrained", exist_ok=True)
+
+                                # Each TP rank saves its own model shard
                                 shard_path = f"pretrained/.shard_rank{tp_rank}_step{global_step}.pt"
                                 local_state = cast_state_dict_to_dtype(
                                     _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
                                 )
                                 safe_torch_save(local_state, shard_path)
                                 del local_state
+
+                                # Each TP rank saves its own optimizer shard
+                                opt_shard_path = f"pretrained/.opt_rank{tp_rank}_step{global_step}.pt"
+                                safe_torch_save(_state_dict_to_cpu(optimizer.state_dict()), opt_shard_path)
+
                                 _gc.collect()
 
                                 # Wait for all TP ranks on this node
@@ -1239,16 +1273,21 @@ def resume_training(
 
                                 if is_main_process:
                                     shard_list = []
+                                    opt_shards = []
                                     for r in range(tp_size):
                                         rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
                                         shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                                        opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                        opt_shards.append(safe_torch_load(opath, map_location="cpu", weights_only=True))
 
                                     checkpoint_state = {
                                         "global_step": global_step,
                                         "tokens_processed": current_total_tokens,
                                         "model_state_dict": {},
                                         "tensor_parallel_shards": shard_list,
-                                        "optimizer_state_dict": optimizer.state_dict(),
+                                        "optimizer_shards": opt_shards,
+                                        # Keep for backward compat (rank 0 only)
+                                        "optimizer_state_dict": opt_shards[0] if opt_shards else {},
                                         "scheduler_state_dict": scheduler.state_dict(),
                                         "lr_ramp_state": (
                                             dict(lr_ramp_tracker)
@@ -1270,13 +1309,18 @@ def resume_training(
                                     )
                                     safe_torch_save(checkpoint_state, save_path)
                                     print(f"Checkpoint saved @ step {global_step} -> {save_path}")
-                                    del checkpoint_state, shard_list
+                                    del checkpoint_state, shard_list, opt_shards
 
                                     # Clean up temp shard files
                                     for r in range(tp_size):
                                         rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                        opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
                                         try:
                                             os.remove(rpath)
+                                        except OSError:
+                                            pass
+                                        try:
+                                            os.remove(opath)
                                         except OSError:
                                             pass
 
@@ -1401,8 +1445,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=16,
-        help="Number of micro-batches to accumulate before each optimizer step.",
+        default=4,
+        help="Base number of micro-batches to accumulate before each optimizer step. Auto-adjusted by DP size.",
     )
     parser.add_argument(
         "--learning-rate",
