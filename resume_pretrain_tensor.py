@@ -581,7 +581,7 @@ def resume_training(
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
     batch_size: int = 4,
-    gradient_accumulation_steps: int = 8,
+    gradient_accumulation_steps: int = 16,
     lr: float = 1e-4,
     min_lr: float = 1e-5,
     warmup_steps: int = 2000,
@@ -592,6 +592,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
+    checkpoint_interval: int = 100,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -982,7 +983,7 @@ def resume_training(
         print(f"  - Tokens processed: {total_tokens_processed:,}")
         print(f"  - Learning rate: {lr:.2e}")
         print(f"  - TP size: {tp_size} (intra-node)")
-        print(f"  - DP size: {dp_size} (inter-node)")
+        print(f"  - DP size: {dp_size} (inter-node, {dp_size} node(s))")
         print(f"  - World size: {world_size}")
     
     # Setup data position
@@ -1123,7 +1124,7 @@ def resume_training(
                         x_local, y_local = pop_prefetched()
 
                     batch_tokens = x_local.numel()
-                    tokens_in_this_session += batch_tokens
+                    tokens_in_this_session += batch_tokens * dp_size
 
                     autocast_context = torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available() else contextlib.nullcontext()
 
@@ -1198,9 +1199,9 @@ def resume_training(
 
                         if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
-                            print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
+                            print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} ({dp_size} node(s)) | LR: {current_lr:.6e}")
 
-                        if global_step % 430 == 0:
+                        if global_step % checkpoint_interval == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                             # Generate on all TP ranks to keep collectives in sync
@@ -1348,7 +1349,7 @@ def resume_training(
 
     if is_main_process:
         print(f"\n===== TRAINING COMPLETE =====")
-        print(f"Total tokens: {final_token_count:,}")
+        print(f"Total tokens: {final_token_count:,} (across {dp_size} node(s))")
         print(f"Final step: {global_step}")
 
         if not merged_state:
@@ -1400,7 +1401,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=8,
+        default=16,
         help="Number of micro-batches to accumulate before each optimizer step.",
     )
     parser.add_argument(
@@ -1455,6 +1456,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
     )
     parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=100,
+        help="Save a checkpoint and generate sample text every N optimizer steps.",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1483,6 +1490,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
 

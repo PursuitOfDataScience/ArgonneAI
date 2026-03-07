@@ -973,6 +973,7 @@ def _execute_training_attempt(
     supports_bf16: bool,
     use_gradient_checkpointing: bool,
     is_main_process: bool,
+    checkpoint_interval: int = 100,
 ) -> Tuple[int, int]:
     """Run a single end-to-end training attempt.
 
@@ -1022,13 +1023,15 @@ def _execute_training_attempt(
     scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
 
     if is_main_process:
+        effective_tokens_per_step = batch_size * block_size * grad_accum_steps * dp_size
         print(f"✓ Model initialized with tensor parallelism")
         print(f"  - Learning rate: {lr:.2e}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Grad accumulation: {grad_accum_steps}")
         print(f"  - TP size: {tp_size} (intra-node)")
-        print(f"  - DP size: {dp_size} (inter-node)")
+        print(f"  - DP size: {dp_size} (inter-node, {dp_size} node(s))")
         print(f"  - World size: {world_size}")
+        print(f"  - Effective tokens/step: {effective_tokens_per_step:,} (across all {dp_size} DP rank(s))")
         if supports_bf16:
             print("✓ Using torch.bfloat16 autocast")
         elif amp_dtype == torch.float16:
@@ -1283,7 +1286,7 @@ def _execute_training_attempt(
                         )
                 # ---- end OOM-safe block ------------------------------------------
 
-                tokens_processed += batch_tokens
+                tokens_processed += batch_tokens * dp_size
 
                 micro_step += 1
 
@@ -1318,10 +1321,10 @@ def _execute_training_attempt(
 
                     if global_step % 50 == 0 and last_loss_value is not None and is_main_process:
                         print(
-                            f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {tokens_processed:,} | LR: {current_lr:.6e}"
+                            f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {tokens_processed:,} ({dp_size} node(s)) | LR: {current_lr:.6e}"
                         )
 
-                    if global_step % 430 == 0:
+                    if global_step % checkpoint_interval == 0:
                         prompt_tensor = cached_prompt_tensor.to(first_device)
                         generated = model.generate(
                             prompt_tensor,
@@ -1428,7 +1431,7 @@ def _execute_training_attempt(
         print(f"\n{'='*70}")
         print("TRAINING COMPLETE")
         print(f"{'='*70}")
-        print(f"Total tokens: {tokens_processed:,}")
+        print(f"Total tokens: {tokens_processed:,} (across {dp_size} node(s))")
         print(f"Final step: {global_step}")
 
     if dist.is_initialized():
@@ -1449,8 +1452,9 @@ def train_from_scratch_tensor_parallel(
     warmup_steps: int = 2000,
     weight_decay: float = 0.1,
     trust_remote_code: bool = False,
-    gradient_accumulation_steps: int = 8,
+    gradient_accumulation_steps: int = 16,
     disable_gradient_checkpointing: bool = False,
+    checkpoint_interval: int = 100,
 ):
     """Train model from scratch with tensor parallelism (intra-node) and
     data parallelism (inter-node) with automatic batch size tuning."""
@@ -1554,6 +1558,7 @@ def train_from_scratch_tensor_parallel(
                 supports_bf16=supports_bf16,
                 use_gradient_checkpointing=not disable_gradient_checkpointing,
                 is_main_process=is_main_process,
+                checkpoint_interval=checkpoint_interval,
             )
 
             if largest_successful_batch is None or batch_size > largest_successful_batch:
@@ -1698,13 +1703,19 @@ def parse_args():
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=8,
+        default=16,
         help="Number of micro-batches to accumulate before each optimizer step.",
     )
     parser.add_argument(
         "--disable-gradient-checkpointing",
         action="store_true",
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=100,
+        help="Save a checkpoint and generate sample text every N optimizer steps.",
     )
     parser.add_argument(
         "--local_rank",
@@ -1731,6 +1742,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         disable_gradient_checkpointing=args.disable_gradient_checkpointing,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
 
