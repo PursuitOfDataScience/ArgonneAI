@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -586,6 +587,7 @@ def resume_training(
     force_from_scratch: bool = False,
     rewarmup_steps: int = 100,
     use_gradient_checkpointing: bool = True,
+    wall_time: int = 43200,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -595,7 +597,15 @@ def resume_training(
     is_main_process = (rank == 0)
     grad_accum_steps = max(1, int(gradient_accumulation_steps))
     compile_guard = contextlib.ExitStack()
-    
+
+    # Wall-time checkpoint: save one final checkpoint 5 minutes before wall time expires
+    job_start_time = time.monotonic()
+    wall_time_deadline = job_start_time + wall_time - 300  # 5 minutes buffer
+    wall_time_checkpoint_saved = False
+    if is_main_process:
+        print(f"Wall time: {wall_time}s ({wall_time / 3600:.1f}h), "
+              f"will save final checkpoint ~5 min before termination")
+
     if is_main_process:
         cleanup_old_checkpoints("pretrained", keep=50, rank=rank)
     
@@ -1284,6 +1294,93 @@ def resume_training(
                             _gc.collect()
                             torch.cuda.empty_cache()
 
+                        # --- Wall-time checkpoint: save before job termination ---
+                        if not wall_time_checkpoint_saved and time.monotonic() >= wall_time_deadline:
+                            # Skip if we just saved a regular checkpoint at this step
+                            if global_step % 430 != 0:
+                                current_total_tokens = total_tokens_processed + tokens_in_this_session
+                                if is_main_process:
+                                    elapsed = time.monotonic() - job_start_time
+                                    print(f"\n⏰ Wall-time checkpoint triggered at step {global_step} "
+                                          f"(elapsed: {elapsed/3600:.2f}h)")
+
+                                import gc as _gc
+                                os.makedirs("pretrained", exist_ok=True)
+
+                                shard_path = f"pretrained/.shard_rank{rank}_step{global_step}.pt"
+                                local_state = cast_state_dict_to_dtype(
+                                    _state_dict_to_cpu(model.base_model.state_dict()), amp_dtype
+                                )
+                                safe_torch_save(local_state, shard_path)
+                                del local_state
+
+                                opt_shard_path = f"pretrained/.opt_rank{rank}_step{global_step}.pt"
+                                safe_torch_save(optimizer.state_dict(), opt_shard_path)
+
+                                _gc.collect()
+                                dist.barrier()
+
+                                if is_main_process:
+                                    shard_list = []
+                                    opt_shards = []
+                                    for r in range(world_size):
+                                        rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                        shard_list.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                                        opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                        opt_shards.append(safe_torch_load(opath, map_location="cpu", weights_only=True))
+
+                                    checkpoint_state = {
+                                        "global_step": global_step,
+                                        "tokens_processed": current_total_tokens,
+                                        "model_state_dict": {},
+                                        "tensor_parallel_shards": shard_list,
+                                        "optimizer_shards": opt_shards,
+                                        "optimizer_state_dict": opt_shards[0],
+                                        "scheduler_state_dict": scheduler.state_dict(),
+                                        "lr_ramp_state": (
+                                            dict(lr_ramp_tracker)
+                                            if lr_ramp_tracker is not None
+                                            else None
+                                        ),
+                                        "gradient_accumulation_steps": grad_accum_steps,
+                                        "loss": last_loss_value,
+                                        "data_position": data_position.get_state(),
+                                        "model_dtype": str(amp_dtype),
+                                        "tensor_parallel": True,
+                                        "world_size": world_size,
+                                        "rank": rank,
+                                        "batch_size": batch_size,
+                                    }
+                                    save_path = f"pretrained/streaming_checkpoint_step_{global_step}.pth"
+                                    safe_torch_save(checkpoint_state, save_path)
+                                    print(f"⏰ Wall-time checkpoint saved @ step {global_step} -> {save_path}")
+                                    del checkpoint_state, shard_list, opt_shards
+
+                                    for r in range(world_size):
+                                        rpath = f"pretrained/.shard_rank{r}_step{global_step}.pt"
+                                        opath = f"pretrained/.opt_rank{r}_step{global_step}.pt"
+                                        try:
+                                            os.remove(rpath)
+                                        except OSError:
+                                            pass
+                                        try:
+                                            os.remove(opath)
+                                        except OSError:
+                                            pass
+
+                                dist.barrier()
+                                _gc.collect()
+                                torch.cuda.empty_cache()
+                            else:
+                                if is_main_process:
+                                    print(f"\n⏰ Wall-time deadline reached at step {global_step} "
+                                          f"(regular checkpoint already saved)")
+
+                            wall_time_checkpoint_saved = True
+                            if is_main_process:
+                                print("Exiting training loop due to wall-time limit.")
+                            break
+
                 except StopIteration:
                     if is_main_process:
                         print("StopIteration - restarting dataset")
@@ -1445,6 +1542,13 @@ def parse_args() -> argparse.Namespace:
         help="Disable gradient checkpointing to speed up training (requires more GPU memory).",
     )
     parser.add_argument(
+        "--wall-time",
+        type=int,
+        default=43200,
+        help="Job wall time in seconds (default: 43200 = 12 hours). "
+             "A checkpoint will be saved ~5 minutes before this deadline.",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
@@ -1473,6 +1577,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         force_from_scratch=args.force_from_scratch,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        wall_time=args.wall_time,
     )
 
 
