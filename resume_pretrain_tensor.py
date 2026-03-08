@@ -934,6 +934,7 @@ def resume_training(
 
     # Restore optimizer state if the checkpoint was produced with the same TP layout
     optimizer_restored = False
+    optimizer_restored_from_shards = False  # True only when per-rank shards loaded
     if load_checkpoint and resolved_checkpoint:
         if load_shards_after_wrap:
             # Try per-rank optimizer shards first (correct approach)
@@ -942,6 +943,7 @@ def resume_training(
                 try:
                     optimizer.load_state_dict(opt_shards[rank])
                     optimizer_restored = True
+                    optimizer_restored_from_shards = True
                     if is_main_process:
                         print(f"✓ Optimizer state restored from per-rank shards (rank {rank}/{world_size})")
                 except Exception as opt_err:
@@ -950,23 +952,22 @@ def resume_training(
                         print("  Using fresh AdamW optimizer")
             else:
                 # Legacy checkpoint: only rank 0's optimizer state was saved.
-                # Only rank 0 can use it; other ranks start fresh.
+                # ALL ranks load it — momentum/variance won't match perfectly
+                # for ranks 1-7 but it is far more stable than fresh state
+                # (fresh AdamW variance=0 causes gradient/sqrt(0+eps) to
+                # produce extremely large updates that destabilise training).
                 saved_optim = ckpt.get("optimizer_state_dict")
-                if saved_optim and rank == 0:
+                if saved_optim:
                     try:
                         optimizer.load_state_dict(saved_optim)
                         optimizer_restored = True
                         if is_main_process:
-                            print("✓ Optimizer state restored for rank 0 from legacy checkpoint")
-                            print("  ⚠ Ranks 1-%d will use fresh optimizer (legacy checkpoint had only rank 0 state)" % (world_size - 1))
+                            print("✓ Optimizer state restored on ALL ranks from legacy checkpoint (rank 0 state)")
+                            print("  Momentum/variance is approximate for ranks 1-%d — LR ramp will be applied" % (world_size - 1))
                     except Exception as opt_err:
                         if is_main_process:
                             print(f"⚠ Could not restore optimizer state: {opt_err}")
                             print("  Using fresh AdamW optimizer")
-                elif saved_optim and rank != 0:
-                    # Non-zero ranks: the saved state has wrong shapes for our parameters
-                    if is_main_process:
-                        pass  # rank 0 already printed
                 else:
                     if is_main_process:
                         print("⚠ No optimizer state found in checkpoint")
@@ -979,11 +980,14 @@ def resume_training(
         # Don't load scheduler state - we're intentionally re-warming
         # The effective_warmup setting above handles the restart
 
-        # If optimizer was restored, disable the LR ramp — momentum is already warm
-        if optimizer_restored and lr_ramp_tracker is not None:
+        # Only skip the LR ramp when per-rank optimizer shards were loaded
+        # (every rank has its exact momentum/variance).  For legacy checkpoints
+        # all ranks received rank 0's state so the momentum is approximate —
+        # the ramp is still needed to stabilise the first few hundred steps.
+        if optimizer_restored_from_shards and lr_ramp_tracker is not None:
             lr_ramp_tracker = None
             if is_main_process:
-                print("  Skipping LR ramp (optimizer momentum already restored)")
+                print("  Skipping LR ramp (all ranks have exact optimizer state from per-rank shards)")
     else:
         scheduler.step(global_step)
     
