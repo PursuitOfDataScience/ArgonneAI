@@ -1023,6 +1023,19 @@ def resume_training(
         if is_main_process:
             print("  Starting from beginning of dataset")
 
+    # Free checkpoint data that is no longer needed to reclaim CPU memory.
+    # On multi-node runs every rank loaded the full checkpoint (all TP shards
+    # + optimizer shards), which can consume many GBs per process.
+    if load_checkpoint and resolved_checkpoint:
+        del ckpt
+        if checkpoint_tensor_shards is not None:
+            del checkpoint_tensor_shards
+            checkpoint_tensor_shards = None
+        import gc as _gc
+        _gc.collect()
+        if is_main_process:
+            print("✓ Freed checkpoint CPU memory")
+
     # Setup mixed precision
     use_grad_scaler = amp_dtype == torch.float16 and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
@@ -1060,6 +1073,78 @@ def resume_training(
     tokens_in_this_session = 0
     last_loss_value: Optional[float] = None
     current_lr = lr
+
+    # ---- Synchronise all ranks before entering the training loop ----
+    # Without this barrier a rank that crashes during checkpoint loading
+    # (or simply takes much longer) would cause NCCL errors on the DP
+    # groups because the healthy ranks start their first all-reduce while
+    # the failed rank is absent.
+    if dist.is_initialized():
+        dist.barrier()
+        if is_main_process:
+            print("✓ All ranks synchronised after setup")
+
+    # ---- Memory probe: run one dummy forward + backward to catch OOM ----
+    # This mirrors the probe in training.py.  If any rank OOMs the flag is
+    # broadcast so every rank can exit cleanly instead of cascading NCCL errors.
+    oom_flag = torch.zeros(1, dtype=torch.int32, device=first_device)
+    probe_oom = False
+
+    if using_cuda:
+        torch.cuda.synchronize(first_device)
+        free_mem = torch.cuda.mem_get_info(first_device)[0]
+        bytes_per_sample = block_size * config.hidden_size * config.num_hidden_layers * 10
+        estimated_need = batch_size * bytes_per_sample
+        headroom_ratio = free_mem / max(estimated_need, 1)
+        if is_main_process:
+            print(f"  Free GPU memory: {free_mem / 1e9:.2f} GB, estimated need: {estimated_need / 1e9:.2f} GB (ratio: {headroom_ratio:.2f})")
+        if headroom_ratio < 0.5:
+            probe_oom = True
+            if is_main_process:
+                print(f"  ✗ Insufficient headroom (ratio {headroom_ratio:.2f} < 0.5) — skipping probe")
+
+    if not probe_oom:
+        if is_main_process:
+            print("Running memory probe (1 forward + backward on dummy batch)...")
+        try:
+            dummy_x = torch.randint(0, config.vocab_size, (batch_size, block_size - 1), device=first_device)
+            dummy_y = torch.randint(0, config.vocab_size, (batch_size, block_size - 1), device=first_device)
+            autocast_ctx = (
+                torch.amp.autocast("cuda", dtype=amp_dtype) if torch.cuda.is_available()
+                else contextlib.nullcontext()
+            )
+            with autocast_ctx:
+                probe_out = model(input_ids=dummy_x)
+                probe_loss = F.cross_entropy(
+                    probe_out.logits.view(-1, probe_out.logits.size(-1)),
+                    dummy_y.view(-1),
+                    ignore_index=-100,
+                )
+            (probe_loss / grad_accum_steps).backward()
+            optimizer.zero_grad(set_to_none=True)
+            del dummy_x, dummy_y, probe_out, probe_loss
+            torch.cuda.empty_cache()
+            if is_main_process:
+                print(f"✓ Memory probe passed for batch_size={batch_size}")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as probe_err:
+            err_msg = str(probe_err)
+            if isinstance(probe_err, torch.cuda.OutOfMemoryError) or "out of memory" in err_msg.lower():
+                probe_oom = True
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                if is_main_process:
+                    print(f"✗ Memory probe OOM: {probe_err}")
+            else:
+                raise
+
+    # All ranks agree on probe result — prevents one-sided NCCL hangs
+    oom_flag.fill_(1 if probe_oom else 0)
+    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+    if oom_flag.item() > 0:
+        if is_main_process:
+            print("FATAL: At least one rank failed the memory probe. Aborting.")
+        dist.destroy_process_group()
+        raise RuntimeError("Memory probe failed on one or more ranks — reduce batch_size or enable gradient checkpointing.")
 
     optimizer.zero_grad(set_to_none=True)
 
