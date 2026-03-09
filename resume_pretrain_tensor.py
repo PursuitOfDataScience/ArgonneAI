@@ -1381,9 +1381,9 @@ def resume_training(
                                           f"(regular checkpoint already saved)")
 
                             wall_time_checkpoint_saved = True
-                            if is_main_process:
-                                print("Exiting training loop due to wall-time limit.")
-                            break
+                            # Don't break — let training continue until the job
+                            # scheduler actually kills the process.  Every extra
+                            # step is useful and the checkpoint is already safe.
 
                 except StopIteration:
                     if is_main_process:
@@ -1406,54 +1406,63 @@ def resume_training(
 
     final_token_count = total_tokens_processed + tokens_in_this_session
 
-    # Gather tensor-parallel shards and export a full model + tokenizer for final use
-    import gc as _gc
-    local_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model.base_model.state_dict()), torch.float32)
+    training_finished = (global_step >= total_training_steps)
 
-    merged_state: Optional[Dict[str, torch.Tensor]] = None
-    if dist.is_initialized() and world_size > 1:
-        os.makedirs("pretrained", exist_ok=True)
-        shard_path = f"pretrained/.final_shard_rank{rank}.pt"
-        safe_torch_save(local_state, shard_path)
-        del local_state
-        _gc.collect()
-        torch.cuda.empty_cache()
+    if training_finished:
+        # Gather tensor-parallel shards and export a full model + tokenizer for final use
+        import gc as _gc
+        local_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model.base_model.state_dict()), torch.float32)
 
-        dist.barrier()
+        merged_state: Optional[Dict[str, torch.Tensor]] = None
+        if dist.is_initialized() and world_size > 1:
+            os.makedirs("pretrained", exist_ok=True)
+            shard_path = f"pretrained/.final_shard_rank{rank}.pt"
+            safe_torch_save(local_state, shard_path)
+            del local_state
+            _gc.collect()
+            torch.cuda.empty_cache()
 
-        if rank == 0:
-            all_shards: List[Mapping[str, torch.Tensor]] = []
-            for r in range(world_size):
-                rpath = f"pretrained/.final_shard_rank{r}.pt"
-                all_shards.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
-            merged_state = merge_tensor_parallel_shards(all_shards)
-            del all_shards
-            # Clean up temp files
-            for r in range(world_size):
-                try:
-                    os.remove(f"pretrained/.final_shard_rank{r}.pt")
-                except OSError:
-                    pass
+            dist.barrier()
+
+            if rank == 0:
+                all_shards: List[Mapping[str, torch.Tensor]] = []
+                for r in range(world_size):
+                    rpath = f"pretrained/.final_shard_rank{r}.pt"
+                    all_shards.append(safe_torch_load(rpath, map_location="cpu", weights_only=True))
+                merged_state = merge_tensor_parallel_shards(all_shards)
+                del all_shards
+                # Clean up temp files
+                for r in range(world_size):
+                    try:
+                        os.remove(f"pretrained/.final_shard_rank{r}.pt")
+                    except OSError:
+                        pass
+        else:
+            merged_state = local_state
+
+        if is_main_process:
+            print(f"\n===== TRAINING COMPLETE =====")
+            print(f"Total tokens: {final_token_count:,}")
+            print(f"Final step: {global_step}")
+
+            if not merged_state:
+                raise RuntimeError("Unable to merge tensor-parallel shards for final model export")
+
+            export_model = ArgonneModel(config)
+            export_model.load_state_dict(merged_state, strict=True)
+
+            output_dir = "Argonne2.5"
+            os.makedirs(output_dir, exist_ok=True)
+            export_model.save_pretrained(output_dir, safe_serialization=False)
+            hf_tokenizer.save_pretrained(output_dir)
+
+            print(f"✓ Final model saved to {output_dir}")
     else:
-        merged_state = local_state
-
-    if is_main_process:
-        print(f"\n===== TRAINING COMPLETE =====")
-        print(f"Total tokens: {final_token_count:,}")
-        print(f"Final step: {global_step}")
-
-        if not merged_state:
-            raise RuntimeError("Unable to merge tensor-parallel shards for final model export")
-
-        export_model = ArgonneModel(config)
-        export_model.load_state_dict(merged_state, strict=True)
-
-        output_dir = "Argonne2.5"
-        os.makedirs(output_dir, exist_ok=True)
-        export_model.save_pretrained(output_dir, safe_serialization=False)
-        hf_tokenizer.save_pretrained(output_dir)
-
-        print(f"✓ Final model saved to {output_dir}")
+        if is_main_process:
+            print(f"\nTraining interrupted (wall-time or signal) at step {global_step}")
+            print(f"  Tokens processed this session: {tokens_in_this_session:,}")
+            print(f"  Total tokens: {final_token_count:,}")
+            print(f"  Resume from the latest checkpoint in pretrained/")
 
     if dist.is_initialized():
         dist.barrier()
