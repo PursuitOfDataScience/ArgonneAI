@@ -110,12 +110,44 @@ Each GPU holds **2 query heads and 1 KV head** (16/8 = 2 Q heads per GPU, 8/8 = 
 ArgonneAI/
 ├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
 ├── training.py                 # Initial training with auto batch size tuning + tensor parallelism
-├── resume_pretrain_tensor.py   # Resume training from checkpoints
+├── resume_pretrain_tensor.py   # Resume training from checkpoints (tensor parallelism)
+├── resume_pretrain_dp.py       # Resume training from checkpoints (data parallelism / DDP)
 ├── data_processing.py          # Tokenization, collation, and data loading utilities
 ├── training_utils.py           # CosineWarmupScheduler, checkpoint I/O, token/data resolution
 ├── test_param_count.py         # Parameter count verification script
 └── README.md                   # This file
 ```
+
+## Data Parallelism (DDP) Training
+
+In addition to tensor parallelism, Argonne 2.5 supports training with PyTorch's `DistributedDataParallel` (DDP) via `resume_pretrain_dp.py`. This enables direct comparison between tensor-parallel and data-parallel training strategies on the same model and data.
+
+### Key Features
+
+- **Seamless TP → DP conversion**: Loads a tensor-parallel checkpoint, merges the sharded weights into a full model, and continues training with DDP. Each GPU holds a complete copy of the model.
+- **Self-resumable**: DP checkpoints (saved to `dp_pretrained/`) contain all information needed to resume: model weights, optimizer state, scheduler state, data position, and batch size. The script automatically detects and loads its own checkpoints on subsequent runs.
+- **torch.compile by default**: `torch.compile` is enabled by default for DDP training to improve throughput. If compilation fails at runtime the script automatically falls back to eager mode and retries, so training is never blocked. Can be disabled with `--disable-compile`.
+- **Automatic batch-size probing**: On the first launch the script probes memory starting from an initial batch size (default 32) and reduces by 4 on OOM until a working size is found (minimum 2). The discovered batch size is saved in the checkpoint so subsequent runs skip the probing.
+- **Wall-time checkpoint**: Just like the TP script, a checkpoint is saved ~5 minutes before the job wall-time expires, ensuring no progress is lost.
+- **Round-robin data sharding**: Packed sequences from the streaming generator are distributed across ranks in round-robin fashion so every GPU sees disjoint data.
+
+### DP Checkpoint Contents
+
+Each DP checkpoint (`dp_pretrained/dp_checkpoint_step_<N>.pth`) stores:
+
+| Field | Description |
+|-------|-------------|
+| `model_state_dict` | Full (unsharded) model weights |
+| `optimizer_state_dict` | Full AdamW optimizer state |
+| `scheduler_state_dict` | Cosine warmup scheduler state |
+| `data_position` | Exact streaming data position (file index, byte offset) |
+| `batch_size` | Per-GPU micro-batch size |
+| `gradient_accumulation_steps` | Gradient accumulation factor |
+| `global_step` | Training step counter |
+| `tokens_processed` | Cumulative tokens seen |
+| `loss` | Last recorded loss value |
+| `lr_ramp_state` | LR ramp tracker (if active) |
+| `data_parallel` | `True` (distinguishes from TP checkpoints) |
 
 ---
 
