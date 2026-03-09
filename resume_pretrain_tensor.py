@@ -1204,7 +1204,7 @@ def resume_training(
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
                             print(f"Step {global_step} | Loss: {last_loss_value:.4f} | Tokens: {current_total_tokens:,} | LR: {current_lr:.6e}")
 
-                        if global_step % 430 == 0:
+                        if global_step % 500 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
 
                             # Generate on all ranks to keep collectives in sync
@@ -1301,7 +1301,7 @@ def resume_training(
                         # --- Wall-time checkpoint: save before job termination ---
                         if not wall_time_checkpoint_saved and time.monotonic() >= wall_time_deadline:
                             # Skip if we just saved a regular checkpoint at this step
-                            if global_step % 430 != 0:
+                            if global_step % 500 != 0:
                                 current_total_tokens = total_tokens_processed + tokens_in_this_session
                                 if is_main_process:
                                     elapsed = time.monotonic() - job_start_time
