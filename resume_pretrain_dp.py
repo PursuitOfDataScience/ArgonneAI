@@ -948,10 +948,16 @@ def resume_training_dp(
     compiled = False
     if use_torch_compile:
         try:
+            # Disable DDP optimizer so torch.compile doesn't try to split the
+            # graph around allreduce boundaries (unsupported with higher-order
+            # ops).  Gradient allreduce will still happen but won't overlap with
+            # backward — acceptable for a 1B model vs the kernel fusion gains.
+            import torch._dynamo
+            torch._dynamo.config.optimize_ddp = False
             ddp_model = torch.compile(ddp_model)
             compiled = True
             if is_main_process:
-                print("✓ torch.compile enabled (will compile on first forward pass)")
+                print("✓ torch.compile enabled (optimize_ddp=False, compiles on first forward pass)")
         except Exception as compile_err:
             if is_main_process:
                 print(f"⚠ torch.compile failed: {compile_err}")
@@ -1319,7 +1325,9 @@ def resume_training_dp(
                         x_local, y_local = pop_prefetched()
 
                     batch_tokens = x_local.numel()
-                    tokens_in_this_session += batch_tokens
+                    # Each rank processes its own disjoint batch; multiply by
+                    # world_size to get the true cluster-wide token count.
+                    tokens_in_this_session += batch_tokens * world_size
 
                     autocast_context = (
                         torch.amp.autocast("cuda", dtype=amp_dtype)
