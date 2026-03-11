@@ -952,7 +952,6 @@ def resume_training_dp(
             # graph around allreduce boundaries (unsupported with higher-order
             # ops).  Gradient allreduce will still happen but won't overlap with
             # backward — acceptable for a 1B model vs the kernel fusion gains.
-            import torch._dynamo
             torch._dynamo.config.optimize_ddp = False
             ddp_model = torch.compile(ddp_model)
             compiled = True
