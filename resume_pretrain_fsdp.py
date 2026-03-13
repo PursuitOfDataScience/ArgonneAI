@@ -51,9 +51,9 @@ from training_utils import (
     safe_torch_save,
     resolve_data_files,
     validate_tokenizer_path,
-    DataPosition,
-    streaming_token_generator,
 )
+
+from resume_pretrain_dp import DataPosition, streaming_token_generator
 
 # Enable TF32 precision on Ampere/Hopper GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
