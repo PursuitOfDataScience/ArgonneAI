@@ -94,6 +94,35 @@ COLUMN_PARALLEL_BIAS_SUFFIXES = (
 )
 
 
+def _unwrap_model(model) -> torch.nn.Module:
+    """Unwrap a model through torch.compile (OptimizedModule) and DDP layers.
+
+    Returns the bare underlying nn.Module regardless of wrapping order.
+    """
+    raw = model
+    # torch.compile wraps with OptimizedModule which has _orig_mod
+    if hasattr(raw, "_orig_mod"):
+        raw = raw._orig_mod
+    # DDP wraps with .module
+    if isinstance(raw, DDP):
+        raw = raw.module
+    return raw
+
+
+def _strip_state_dict_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip ``_orig_mod.`` and ``module.`` prefixes from state-dict keys.
+
+    Handles keys produced by any combination of torch.compile and DDP wrapping,
+    e.g. ``_orig_mod.module.layers.0.weight`` → ``layers.0.weight``.
+    """
+    cleaned: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        k = k.removeprefix("_orig_mod.")
+        k = k.removeprefix("module.")
+        cleaned[k] = v
+    return cleaned
+
+
 def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     cpu_state: Dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -624,21 +653,15 @@ def _memory_probe(model, config, batch_size, block_size, amp_dtype, grad_accum_s
         else:
             scaled_loss.backward()
 
-        # Cleanup
-        if isinstance(model, DDP):
-            model.module.zero_grad(set_to_none=True)
-        else:
-            model.zero_grad(set_to_none=True)
+        # Cleanup — unwrap through compile/DDP to reach the base module
+        _unwrap_model(model).zero_grad(set_to_none=True)
         del dummy_x, dummy_y, out, loss, scaled_loss
         torch.cuda.empty_cache()
         return True
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         err_msg = str(e)
         if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in err_msg.lower():
-            if isinstance(model, DDP):
-                model.module.zero_grad(set_to_none=True)
-            else:
-                model.zero_grad(set_to_none=True)
+            _unwrap_model(model).zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             return False
         raise
@@ -668,11 +691,9 @@ def _save_dp_checkpoint(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # Get full model state dict (unwrap DDP)
-    if isinstance(model, DDP):
-        model_state = _state_dict_to_cpu(model.module.state_dict())
-    else:
-        model_state = _state_dict_to_cpu(model.state_dict())
+    # Unwrap through torch.compile and DDP to get the bare model state dict
+    bare_model = _unwrap_model(model)
+    model_state = _state_dict_to_cpu(bare_model.state_dict())
 
     model_state = cast_state_dict_to_dtype(model_state, amp_dtype)
 
@@ -848,25 +869,31 @@ def resume_training_dp(
             if not model_state:
                 raise RuntimeError("DP checkpoint does not contain model_state_dict")
 
-            # Normalize _orig_mod keys if present
-            if any(k.startswith("_orig_mod.") for k in model_state):
-                model_state = {
-                    k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k: v
-                    for k, v in model_state.items()
-                }
+            # Strip _orig_mod. and module. prefixes that may have been saved
+            # by older versions of this script (before the save-path fix)
+            model_state = _strip_state_dict_prefixes(model_state)
 
             model_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model_state), torch.float32)
 
-            try:
-                model.load_state_dict(model_state, strict=True)
+            # Validate key match before loading
+            model_keys = set(model.state_dict().keys())
+            ckpt_keys = set(model_state.keys())
+            missing = model_keys - ckpt_keys
+            unexpected = ckpt_keys - model_keys
+            if missing or unexpected:
                 if is_main_process:
-                    print("✓ Loaded DP checkpoint weights with strict=True")
-            except RuntimeError as e:
-                if is_main_process:
-                    print(f"⚠ Strict loading failed: {e}, trying non-strict...")
-                model.load_state_dict(model_state, strict=False)
-                if is_main_process:
-                    print("✓ Loaded DP checkpoint weights with strict=False")
+                    print(f"ERROR: State dict key mismatch after prefix stripping!")
+                    print(f"  Missing from checkpoint ({len(missing)}): {list(missing)[:5]}")
+                    print(f"  Unexpected in checkpoint ({len(unexpected)}): {list(unexpected)[:5]}")
+                raise RuntimeError(
+                    f"DP checkpoint key mismatch: {len(missing)} missing, "
+                    f"{len(unexpected)} unexpected. This likely indicates a "
+                    f"model architecture difference or corrupted checkpoint."
+                )
+
+            model.load_state_dict(model_state, strict=True)
+            if is_main_process:
+                print("✓ Loaded DP checkpoint weights with strict=True")
 
             saved_batch_size = ckpt.get("batch_size")
 
@@ -878,12 +905,7 @@ def resume_training_dp(
             def _normalize_keys(sd):
                 if not sd:
                     return {}
-                if any(k.startswith("_orig_mod.") for k in sd.keys()):
-                    return {
-                        (k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k): v
-                        for k, v in sd.items()
-                    }
-                return dict(sd)
+                return _strip_state_dict_prefixes(dict(sd))
 
             raw_state_dict = _normalize_keys(raw_state_dict)
 
@@ -1405,7 +1427,7 @@ def resume_training_dp(
                             ddp_model.eval()
                             if is_main_process:
                                 with torch.no_grad():
-                                    gen_model = ddp_model.module
+                                    gen_model = _unwrap_model(ddp_model)
                                     gen_ids = gen_model.generate(
                                         cached_prompt_tensor,
                                         max_length=cached_prompt_tensor.shape[1] + 100,
@@ -1490,7 +1512,7 @@ def resume_training_dp(
 
             # Export full model
             export_model = ArgonneModel(config)
-            export_state = _state_dict_to_cpu(ddp_model.module.state_dict())
+            export_state = _state_dict_to_cpu(_unwrap_model(ddp_model).state_dict())
             export_model.load_state_dict(export_state, strict=True)
 
             output_dir = "Argonne2.5-DP"
