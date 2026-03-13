@@ -13,6 +13,7 @@ Key differences from resume_pretrain_dp.py:
 
 import argparse
 import contextlib
+import functools
 import gc
 import os
 import re
@@ -31,16 +32,15 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, BackwardPrefetch
-from torch.distributed.fsdp import checkpoint_wrapper
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
-from torch.distributed.checkpoint import StateDict, FileSystemReader
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from tqdm import tqdm
 
 from data_processing import (
     collate_batch,
     load_tokenizer,
 )
-from model import ArgonneConfig, ArgonneModel
+from model import ArgonneConfig, ArgonneModel, Block
 from training_utils import (
     CosineWarmupScheduler,
     DEFAULT_MAX_TRAINING_STEPS,
@@ -90,6 +90,18 @@ def _unwrap_model(model) -> torch.nn.Module:
     return raw
 
 
+def _get_fsdp_instance(model) -> FSDP:
+    """Peel torch.compile wrapper to get the FSDP instance for API calls.
+
+    When torch.compile is enabled, the model is wrapped in OptimizedModule.
+    FSDP API calls check isinstance(model, FSDP) internally, so we need
+    to peel the compile wrapper first.
+    """
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod
+    return model
+
+
 def _strip_state_dict_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Strip ``_orig_mod.`` and ``module.`` prefixes from state-dict keys.
 
@@ -114,44 +126,20 @@ def _state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torc
     return cpu_state
 
 
-def merge_tensor_parallel_shards(
-    shard_states: Sequence[Mapping[str, torch.Tensor]]
-) -> Dict[str, torch.Tensor]:
-    """Reconstruct full weights from tensor-parallel shards."""
-    shard_list: List[Mapping[str, torch.Tensor]] = list(shard_states)
-    if not shard_list:
-        return {}
-
-    all_keys: set = set()
-    for shard in shard_list:
-        all_keys.update(shard.keys())
-
-    merged: Dict[str, torch.Tensor] = {}
-    for key in all_keys:
-        shards_for_key = [s[key] for key, s in zip([key] * len(shard_list), shard_list) if key in s]
-        if not shards_for_key:
-            continue
-
-        if any(key.endswith(suffix) for suffix in COLUMN_PARALLEL_WEIGHT_SUFFIXES):
-            # Concatenate along dim=0
-            merged[key] = torch.cat(shards_for_key, dim=0)
-        elif any(key.endswith(suffix) for suffix in ROW_PARALLEL_WEIGHT_SUFFIXES):
-            # Concatenate along dim=1
-            merged[key] = torch.cat(shards_for_key, dim=1)
-        elif any(key.endswith(suffix) for suffix in COLUMN_PARALLEL_BIAS_SUFFIXES):
-            # Concatenate biases
-            merged[key] = torch.cat(shards_for_key, dim=0)
+def _strip_state_dict_to_cpu(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip FSDP prefixes and move to CPU in one pass."""
+    cpu_state: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        key = key.removeprefix("_orig_mod.")
+        key = key.removeprefix("module.")
+        if isinstance(value, torch.Tensor):
+            cpu_state[key] = value.detach().cpu()
         else:
-            # Assume duplicate weights, take first
-            merged[key] = shards_for_key[0].clone()
-            for shard in shards_for_key[1:]:
-                merged[key] += shard
-            merged[key] /= len(shards_for_key)
-
-    return merged
+            cpu_state[key] = value
+    return cpu_state
 
 
-# ---------- Helper functions -----------------------------------------------
+# ---------- TP shard merging helpers (same as DP script) ------------------
 
 COLUMN_PARALLEL_WEIGHT_SUFFIXES = (
     ".attn.q_proj.weight",
@@ -174,6 +162,41 @@ COLUMN_PARALLEL_BIAS_SUFFIXES = (
     ".mlp.up_proj.bias",
 )
 
+
+def merge_tensor_parallel_shards(
+    shard_states: Sequence[Mapping[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    """Reconstruct full weights from tensor-parallel shards."""
+    shard_list: List[Mapping[str, torch.Tensor]] = list(shard_states)
+    if not shard_list:
+        return {}
+
+    all_keys: set = set()
+    for shard in shard_list:
+        all_keys.update(shard.keys())
+
+    full_state: Dict[str, torch.Tensor] = {}
+    for key in sorted(all_keys):
+        values = [shard.get(key) for shard in shard_list]
+        tensors = [v for v in values if isinstance(v, torch.Tensor)]
+        if not tensors:
+            continue
+
+        if key.endswith(COLUMN_PARALLEL_WEIGHT_SUFFIXES):
+            full_state[key] = torch.cat(tensors, dim=0)
+        elif key.endswith(COLUMN_PARALLEL_BIAS_SUFFIXES):
+            full_state[key] = torch.cat(tensors, dim=0)
+        elif key.endswith(ROW_PARALLEL_WEIGHT_SUFFIXES):
+            ordered = [v for v in values if isinstance(v, torch.Tensor)]
+            full_state[key] = torch.cat(ordered, dim=1)
+        else:
+            # Replicated parameters (embeddings, norms, lm_head) - take first
+            full_state[key] = tensors[0]
+
+    return full_state
+
+
+# ---------- Helper functions -----------------------------------------------
 
 def cleanup_old_checkpoints(directory: str, keep: int = 50, rank: int = 0) -> None:
     """Keep only the most recent checkpoint files in a directory."""
@@ -371,7 +394,7 @@ def _memory_probe(model, config, batch_size, block_size, amp_dtype, grad_accum_s
 # ---------- Save FSDP checkpoint --------------------------------------------
 
 def _save_fsdp_checkpoint(
-    model,
+    fsdp_model,
     optimizer,
     scheduler,
     global_step,
@@ -386,23 +409,42 @@ def _save_fsdp_checkpoint(
     lr_ramp_tracker,
     save_dir="fsdp_pretrained",
 ):
-    """Save a full FSDP checkpoint from rank 0."""
+    """Save a full FSDP checkpoint from rank 0.
+
+    Uses FSDP's state dict API to properly gather all shards before saving.
+    All ranks must participate in the collective calls; only rank 0 writes to disk.
+    """
+    # Peel torch.compile wrapper if present (FSDP APIs require actual FSDP instance)
+    fsdp_instance = _get_fsdp_instance(fsdp_model)
+
+    # ALL ranks must participate in the FSDP gather collectives
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(fsdp_instance, StateDictType.FULL_STATE_DICT, save_policy):
+        full_model_state = fsdp_instance.state_dict()
+
+    # ALL ranks must participate in optimizer state gather
+    full_optim_state = FSDP.full_optim_state_dict(fsdp_instance, optimizer)
+
+    # Only rank 0 has the gathered data and writes to disk
     if rank != 0:
+        del full_model_state
+        del full_optim_state
         return
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # Unwrap through torch.compile and FSDP to get the bare model state dict
-    bare_model = _unwrap_model(model)
-    model_state = _state_dict_to_cpu(bare_model.state_dict())
-
+    # Now we have the full state dict - strip prefixes and convert dtype
+    model_state = _strip_state_dict_to_cpu(full_model_state)
     model_state = cast_state_dict_to_dtype(model_state, amp_dtype)
+
+    optim_state = _state_dict_to_cpu(full_optim_state)
+    optim_state = cast_state_dict_to_dtype(optim_state, amp_dtype)
 
     checkpoint_state = {
         "global_step": global_step,
         "tokens_processed": total_tokens,
         "model_state_dict": model_state,
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optim_state,
         "scheduler_state_dict": scheduler.state_dict(),
         "lr_ramp_state": dict(lr_ramp_tracker) if lr_ramp_tracker is not None else None,
         "gradient_accumulation_steps": grad_accum_steps,
@@ -420,7 +462,7 @@ def _save_fsdp_checkpoint(
     save_path = os.path.join(save_dir, f"fsdp_checkpoint_step_{global_step}.pth")
     safe_torch_save(checkpoint_state, save_path)
     print(f"FSDP checkpoint saved @ step {global_step} -> {save_path}")
-    del checkpoint_state, model_state
+    del checkpoint_state, model_state, optim_state, full_model_state, full_optim_state
 
 
 # ---------- Main training function ------------------------------------------
@@ -431,7 +473,7 @@ def resume_training_fsdp(
     checkpoint_path: Optional[str] = None,
     total_training_steps: int = DEFAULT_MAX_TRAINING_STEPS,
     block_size: int = 4096,
-    initial_batch_size: int = 32,
+    initial_batch_size: int = 24,
     min_batch_size: int = 2,
     batch_size_step: int = 4,
     gradient_accumulation_steps: int = 4,
@@ -565,15 +607,14 @@ def resume_training_fsdp(
                 % (saved_grad_accum, grad_accum_steps)
             )
 
-        if ckpt_type == "fsdp" or ckpt_type == "dp":
-            # FSDP or DP checkpoint: full model_state_dict directly
+        if ckpt_type == "fsdp":
+            # FSDP checkpoint: full model_state_dict directly
             model_state = ckpt.get("model_state_dict", {})
             if not model_state:
-                raise RuntimeError(f"{ckpt_type.upper()} checkpoint does not contain model_state_dict")
+                raise RuntimeError("FSDP checkpoint does not contain model_state_dict")
 
-            # Strip _orig_mod. and module. prefixes that may have been saved
+            # Strip prefixes that may have been saved
             model_state = _strip_state_dict_prefixes(model_state)
-
             model_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model_state), torch.float32)
 
             # Validate key match before loading
@@ -587,14 +628,46 @@ def resume_training_fsdp(
                     print(f"  Missing from checkpoint ({len(missing)}): {list(missing)[:5]}")
                     print(f"  Unexpected in checkpoint ({len(unexpected)}): {list(unexpected)[:5]}")
                 raise RuntimeError(
-                    f"{ckpt_type.upper()} checkpoint key mismatch: {len(missing)} missing, "
+                    f"FSDP checkpoint key mismatch: {len(missing)} missing, "
                     f"{len(unexpected)} unexpected. This likely indicates a "
                     f"model architecture difference or corrupted checkpoint."
                 )
 
             model.load_state_dict(model_state, strict=True)
             if is_main_process:
-                print(f"✓ Loaded {ckpt_type.upper()} checkpoint weights with strict=True")
+                print("✓ Loaded FSDP checkpoint weights with strict=True")
+
+            saved_batch_size = ckpt.get("batch_size")
+
+        elif ckpt_type == "dp":
+            # DP checkpoint: full model_state_dict directly
+            model_state = ckpt.get("model_state_dict", {})
+            if not model_state:
+                raise RuntimeError("DP checkpoint does not contain model_state_dict")
+
+            # Strip prefixes that may have been saved
+            model_state = _strip_state_dict_prefixes(model_state)
+            model_state = cast_state_dict_to_dtype(_state_dict_to_cpu(model_state), torch.float32)
+
+            # Validate key match before loading
+            model_keys = set(model.state_dict().keys())
+            ckpt_keys = set(model_state.keys())
+            missing = model_keys - ckpt_keys
+            unexpected = ckpt_keys - model_keys
+            if missing or unexpected:
+                if is_main_process:
+                    print(f"ERROR: State dict key mismatch after prefix stripping!")
+                    print(f"  Missing from checkpoint ({len(missing)}): {list(missing)[:5]}")
+                    print(f"  Unexpected in checkpoint ({len(unexpected)}): {list(unexpected)[:5]}")
+                raise RuntimeError(
+                    f"DP checkpoint key mismatch: {len(missing)} missing, "
+                    f"{len(unexpected)} unexpected. This likely indicates a "
+                    f"model architecture difference or corrupted checkpoint."
+                )
+
+            model.load_state_dict(model_state, strict=True)
+            if is_main_process:
+                print("✓ Loaded DP checkpoint weights with strict=True")
 
             saved_batch_size = ckpt.get("batch_size")
 
@@ -664,10 +737,16 @@ def resume_training_fsdp(
     model = model.to(device)
 
     # Set up FSDP with sharding strategy
+    # Set up auto-wrap policy to shard per Block layer (better memory savings)
+    auto_wrap_policy_fn = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Block},
+    )
+
     fsdp_kwargs = {
         "sharding_strategy": ShardingStrategy.FULL_SHARD,
-        "cpu_offload": False,
-        "auto_wrap_policy": None,
+        "cpu_offload": None,
+        "auto_wrap_policy": auto_wrap_policy_fn,
         "backward_prefetch": BackwardPrefetch.BACKWARD_PRE,
         "mixed_precision": MixedPrecision(param_dtype=amp_dtype, reduce_dtype=amp_dtype) if amp_dtype != torch.float32 else None,
         "device_id": local_rank,
@@ -677,7 +756,7 @@ def resume_training_fsdp(
     fsdp_model = FSDP(model, **fsdp_kwargs)
 
     if is_main_process:
-        print(f"✓ Model wrapped with FullyShardedDataParallel on {world_size} GPUs")
+        print(f"✓ Model wrapped with FullyShardedDataParallel on {world_size} GPUs (sharded per Block)")
 
     # ---- torch.compile (best-effort) ---------------------------------------
     compiled = False
@@ -700,11 +779,12 @@ def resume_training_fsdp(
             print("  torch.compile disabled by flag")
 
     # ---- Create optimizer --------------------------------------------------
+    # Note: Using fused=False for compatibility with FSDP's FlatParameter
     optimizer = torch.optim.AdamW(
         fsdp_model.parameters(),
         lr=lr,
         weight_decay=weight_decay,
-        fused=True,
+        fused=False,  # Set to False for FSDP compatibility
     )
 
     # ---- Batch-size probing ------------------------------------------------
@@ -717,7 +797,7 @@ def resume_training_fsdp(
     if saved_batch_size is not None and isinstance(saved_batch_size, int) and saved_batch_size > 0:
         batch_size = saved_batch_size
         if is_main_process:
-            print(f"✓ Using batch size from {ckpt_type.upper()} checkpoint: {batch_size}")
+            print(f"✓ Using batch size from {ckpt_type.upper() if ckpt_type else 'checkpoint'} checkpoint: {batch_size}")
     else:
         # Probe for the right batch size
         batch_size = initial_batch_size
@@ -778,7 +858,7 @@ def resume_training_fsdp(
 
                 # Re-create optimizer on the unwrapped model
                 optimizer = torch.optim.AdamW(
-                    fsdp_model.parameters(), lr=lr, weight_decay=weight_decay, fused=True,
+                    fsdp_model.parameters(), lr=lr, weight_decay=weight_decay, fused=False,
                 )
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -820,19 +900,30 @@ def resume_training_fsdp(
     saved_lr_ramp_state = None
     optimizer_restored = False
 
-    if load_checkpoint and ckpt is not None and (ckpt_type == "fsdp" or ckpt_type == "dp"):
+    if load_checkpoint and ckpt is not None and ckpt_type == "fsdp":
+        # FSDP checkpoint: optimizer state is full (not sharded), need to shard it
         saved_optim = ckpt.get("optimizer_state_dict")
         if saved_optim:
             try:
-                optimizer.load_state_dict(saved_optim)
+                # Peel torch.compile wrapper if present (FSDP APIs require actual FSDP instance)
+                fsdp_instance = _get_fsdp_instance(fsdp_model)
+                # Shard the full optimizer state to match FSDP's parameter layout
+                sharded_optim_state = FSDP.shard_full_optim_state_dict(saved_optim, fsdp_instance)
+                optimizer.load_state_dict(sharded_optim_state)
                 optimizer_restored = True
                 if is_main_process:
-                    print("✓ Optimizer state restored from FSDP/DP checkpoint")
+                    print("✓ Optimizer state restored from FSDP checkpoint (sharded)")
             except Exception as opt_err:
                 if is_main_process:
                     print(f"⚠ Could not restore optimizer state: {opt_err}")
                     print("  Using fresh AdamW optimizer")
         saved_lr_ramp_state = ckpt.get("lr_ramp_state")
+    elif load_checkpoint and ckpt is not None and ckpt_type == "dp":
+        # DP checkpoint: optimizer state format is incompatible with FSDP (different parameter naming).
+        # Skip optimizer restore and use LR ramp - same as TP->FSDP transition.
+        if is_main_process:
+            print("⚠ DP checkpoint: optimizer state format incompatible with FSDP — using fresh optimizer")
+            print(f"  LR ramp over {rewarmup_steps} steps will stabilize training")
     elif load_checkpoint and ckpt is not None and ckpt_type == "tp":
         # TP checkpoint: optimizer states are sharded for TP layout,
         # they don't match FSDP parameter shapes → start fresh optimizer
@@ -1132,21 +1223,28 @@ def resume_training_fsdp(
                         if global_step % 500 == 0:
                             current_total_tokens = total_tokens_processed + tokens_in_this_session
 
+                            # Barrier to ensure all ranks are synchronized before collective
+                            dist.barrier()
+
                             # Text generation (only rank 0 samples, others wait)
+                            # ALL ranks must enter summon_full_params - it's a collective
+                            # Peel torch.compile wrapper first
+                            fsdp_instance = _get_fsdp_instance(fsdp_model)
                             fsdp_model.eval()
-                            if is_main_process:
-                                with torch.no_grad():
+                            with FSDP.summon_full_params(fsdp_instance, writeback=False):
+                                if is_main_process:
                                     gen_model = _unwrap_model(fsdp_model)
-                                    gen_ids = gen_model.generate(
-                                        cached_prompt_tensor,
-                                        max_length=cached_prompt_tensor.shape[1] + 100,
-                                        do_sample=True,
-                                        temperature=0.7,
-                                        top_k=50,
-                                        top_p=0.9,
-                                    )
-                                    generated_text = hf_tokenizer.decode(gen_ids[0].tolist())
-                                    print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+                                    with torch.no_grad():
+                                        gen_ids = gen_model.generate(
+                                            cached_prompt_tensor,
+                                            max_length=cached_prompt_tensor.shape[1] + 100,
+                                            do_sample=True,
+                                            temperature=0.7,
+                                            top_k=50,
+                                            top_p=0.9,
+                                        )
+                                        generated_text = hf_tokenizer.decode(gen_ids[0].tolist())
+                                        print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
                             fsdp_model.train()
 
                             # Save checkpoint (rank 0 only)
@@ -1214,14 +1312,25 @@ def resume_training_fsdp(
     training_finished = (global_step >= total_training_steps)
 
     if training_finished:
+        # Barrier to ensure all ranks are synchronized before collective
+        dist.barrier()
+
+        # Peel torch.compile wrapper if present (FSDP APIs require actual FSDP instance)
+        fsdp_instance = _get_fsdp_instance(fsdp_model)
+
+        # ALL ranks must participate in the FSDP gather
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(fsdp_instance, StateDictType.FULL_STATE_DICT, save_policy):
+            full_state = fsdp_instance.state_dict()
+
+        # Only rank 0 has the gathered data and saves
         if is_main_process:
             print(f"\n===== TRAINING COMPLETE =====")
             print(f"Total tokens: {final_token_count:,}")
             print(f"Final step: {global_step}")
 
-            # Export full model
             export_model = ArgonneModel(config)
-            export_state = _state_dict_to_cpu(_unwrap_model(fsdp_model).state_dict())
+            export_state = _state_dict_to_cpu(_strip_state_dict_prefixes(full_state))
             export_model.load_state_dict(export_state, strict=True)
 
             output_dir = "Argonne2.5-FSDP"
@@ -1229,6 +1338,8 @@ def resume_training_fsdp(
             export_model.save_pretrained(output_dir, safe_serialization=False)
             hf_tokenizer.save_pretrained(output_dir)
             print(f"✓ Final model saved to {output_dir}")
+
+        del full_state
     else:
         if is_main_process:
             print(f"\nTraining interrupted (wall-time or signal) at step {global_step}")
