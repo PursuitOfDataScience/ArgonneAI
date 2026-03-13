@@ -448,7 +448,7 @@ class ArgonneModel(PreTrainedModel):
         if isinstance(new_embeddings, nn.Linear):
             self.config.vocab_size = new_embeddings.out_features
 
-    def tie_weights(self) -> None:
+    def tie_weights(self, **kwargs) -> None:
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
@@ -750,12 +750,17 @@ class ArgonneModel(PreTrainedModel):
             hidden_states = hidden_states.to(self.output_device)
         else:
             device = self.embed_tokens.weight.device
-            hidden_states = self.embed_tokens(input_ids.to(device))
+            # Skip redundant .to(device) if already on correct device (fixes torch.compile CUDA graphs issue)
+            if input_ids.device != device:
+                input_ids = input_ids.to(device)
+            hidden_states = self.embed_tokens(input_ids)
             
             # Prepare 4D attention mask
             if attention_mask is not None:
+                # Skip redundant .to(device) if already on correct device
+                am = attention_mask if attention_mask.device == device else attention_mask.to(device)
                 attention_mask = self._prepare_attention_mask(
-                    attention_mask.to(device),
+                    am,
                     batch_size,
                     seq_length,
                     device,
