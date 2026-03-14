@@ -7,8 +7,6 @@ processed_data/*
 instruct_data/*
 *.sh
 report/
-train_llm_c.py
-preprocess_data.py
 plot_loss.py
 Argonne_LLM/*
 argonne_instruct_finetuned/*
