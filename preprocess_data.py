@@ -98,7 +98,7 @@ def main(args):
     results = []
     with Pool(num_workers) as pool:
         with tqdm(total=len(tasks), desc="Tokenizing", unit="file") as pbar:
-            for result in pool.imap_unordered(process_parquet, tasks):
+            for result in pool.map(process_parquet, tasks):
                 results.append(result)
                 file_idx, filename, _, tok_count, doc_count, rate, elapsed = result
                 tqdm.write(
@@ -137,8 +137,8 @@ def main(args):
 
     with open(final_file, "r+b") as f:
         f.seek(8)
-        f.write(np.array([total_tokens & 0xFFFFFFFF], dtype=np.int32).tobytes())
-        f.write(np.array([total_tokens >> 32], dtype=np.int32).tobytes())
+        f.write(np.array([total_tokens & 0xFFFFFFFF], dtype=np.uint32).tobytes())
+        f.write(np.array([total_tokens >> 32], dtype=np.uint32).tobytes())
 
     print("Saving tokenizer alongside data...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)

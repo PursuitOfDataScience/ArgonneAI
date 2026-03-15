@@ -1,7 +1,6 @@
 import math
 import importlib.util
-from bisect import bisect_left, bisect_right
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -426,9 +425,6 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
-        self.pipeline_partitions: Optional[List[Tuple[int, int, torch.device]]] = None
-        self.devices: List[torch.device] = []
-        self.output_device: torch.device = self.embed_tokens.weight.device
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -472,237 +468,6 @@ class ArgonneModel(PreTrainedModel):
     def gradient_checkpointing_disable(self) -> None:
         self.set_gradient_checkpointing(False)
 
-    def distribute_model(self, device_ids: Optional[List[str]] = None) -> None:
-        if device_ids is None:
-            num_gpus = torch.cuda.device_count()
-            if num_gpus < 1:
-                raise ValueError("No CUDA devices available for distribution.")
-            device_ids = [f"cuda:{i}" for i in range(num_gpus)]
-
-        if not device_ids:
-            raise ValueError("device_ids must contain at least one device identifier.")
-
-        self.devices = [torch.device(d) for d in device_ids]
-        num_blocks = len(self.blocks)
-
-        if num_blocks == 0:
-            raise ValueError("The model has no transformer blocks to distribute.")
-
-        block_param_bytes: List[int] = []
-        for block in self.blocks:
-            size_bytes = 0
-            for param in block.parameters():
-                size_bytes += param.numel() * param.element_size()
-            block_param_bytes.append(size_bytes)
-
-        block_cumsum: List[int] = [0]
-        for size in block_param_bytes:
-            block_cumsum.append(block_cumsum[-1] + size)
-
-        embed_bytes = sum(p.numel() * p.element_size() for p in self.embed_tokens.parameters())
-        rotary_bytes = sum(p.numel() * p.element_size() for p in self.rotary_emb.parameters())
-        norm_bytes = sum(p.numel() * p.element_size() for p in self.norm.parameters())
-        head_dtype_size = self.embed_tokens.weight.element_size()
-        head_bytes = self.config.hidden_size * self.config.vocab_size * head_dtype_size
-        if self.config.tie_word_embeddings and len(self.devices) == 1:
-            head_bytes = 0
-
-        total_bytes = (
-            block_cumsum[-1]
-            + norm_bytes
-            + head_bytes
-            + embed_bytes
-            + rotary_bytes
-        )
-        per_device_target = total_bytes / len(self.devices)
-
-        per_device_counts: List[int] = [0] * len(self.devices)
-        prev_cut = 0
-        for idx, _ in enumerate(self.devices):
-            remaining_devices = len(self.devices) - idx
-            remaining_blocks = num_blocks - prev_cut
-            if remaining_blocks <= 0:
-                per_device_counts[idx] = 0
-                continue
-            if remaining_devices == 1:
-                cut = num_blocks
-            else:
-                reserve = max(0, min(remaining_devices - 1, remaining_blocks - 1))
-                max_cut = prev_cut + (remaining_blocks - reserve)
-                lo = prev_cut + 1
-                device_overhead = 0
-                if idx == 0:
-                    device_overhead = embed_bytes + rotary_bytes
-                available_block_bytes = per_device_target - device_overhead
-                if available_block_bytes <= 0:
-                    cut = lo
-                else:
-                    target_total = block_cumsum[prev_cut] + available_block_bytes
-                    cut = bisect_right(block_cumsum, target_total, lo=lo, hi=max_cut + 1) - 1
-                    if cut < lo:
-                        cut = lo
-            per_device_counts[idx] = cut - prev_cut
-            prev_cut = cut
-
-        def compute_device_block_bytes() -> List[int]:
-            device_block_bytes: List[int] = []
-            cursor = 0
-            first_partition_idx = next(
-                (i for i, count in enumerate(per_device_counts) if count > 0),
-                0,
-            )
-            for idx, block_count in enumerate(per_device_counts):
-                if block_count <= 0:
-                    device_block_bytes.append(0)
-                    continue
-                next_cursor = min(cursor + block_count, num_blocks)
-                block_bytes = block_cumsum[next_cursor] - block_cumsum[cursor]
-                if idx == first_partition_idx:
-                    block_bytes += embed_bytes + rotary_bytes
-                device_block_bytes.append(block_bytes)
-                cursor = next_cursor
-            if len(device_block_bytes) < len(self.devices):
-                device_block_bytes.extend(
-                    [0] * (len(self.devices) - len(device_block_bytes))
-                )
-            return device_block_bytes
-
-        output_payload = norm_bytes + head_bytes
-
-        device_block_bytes = compute_device_block_bytes()
-        positive_indices = [i for i, count in enumerate(per_device_counts) if count > 0]
-        if positive_indices:
-            last_idx = positive_indices[-1]
-            while True:
-                if per_device_counts[last_idx] <= 1:
-                    break
-                other_indices = positive_indices[:-1]
-                if not other_indices:
-                    break
-                other_loads = [device_block_bytes[i] for i in other_indices]
-                max_other = max(other_loads) if other_loads else 0
-                if max_other == 0:
-                    break
-                last_load_with_head = device_block_bytes[last_idx] + output_payload
-                if last_load_with_head <= max_other:
-                    break
-                prev_idx = other_indices[-1]
-                if per_device_counts[prev_idx] <= 0:
-                    break
-                per_device_counts[last_idx] -= 1
-                per_device_counts[prev_idx] += 1
-                device_block_bytes = compute_device_block_bytes()
-                positive_indices = [
-                    i for i, count in enumerate(per_device_counts) if count > 0
-                ]
-                last_idx = positive_indices[-1]
-
-        device_block_bytes = compute_device_block_bytes()
-        positive_indices = [i for i, count in enumerate(per_device_counts) if count > 0]
-        last_active_idx = positive_indices[-1] if positive_indices else 0
-
-        partitions: List[Tuple[int, int, torch.device]] = []
-        start_idx = 0
-        for device, block_count in zip(self.devices, per_device_counts):
-            if block_count <= 0 or start_idx >= num_blocks:
-                continue
-            end_idx = min(start_idx + block_count, num_blocks)
-            for block in self.blocks[start_idx:end_idx]:
-                block.to(device)
-            partitions.append((start_idx, end_idx, device))
-            start_idx = end_idx
-
-        if not partitions:
-            partitions.append((0, num_blocks, self.devices[0]))
-            if per_device_counts:
-                per_device_counts[0] = num_blocks
-                if not device_block_bytes:
-                    device_block_bytes.append(block_cumsum[num_blocks])
-            if not device_block_bytes:
-                device_block_bytes = [block_cumsum[num_blocks]]
-
-        self.pipeline_partitions = partitions
-        self.output_device = partitions[-1][2]
-        output_device_idx = last_active_idx
-
-        first_device = partitions[0][2]
-        self.embed_tokens = self.embed_tokens.to(first_device)
-        self.rotary_emb = self.rotary_emb.to(first_device)
-        self.norm = self.norm.to(self.output_device)
-
-        if self.config.tie_word_embeddings and len(self.devices) > 1:
-            untied_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-            untied_head.to(self.output_device)
-            with torch.no_grad():
-                untied_head.weight.copy_(self.embed_tokens.weight.to(self.output_device))
-            self.lm_head = untied_head
-            self.config.tie_word_embeddings = False
-        else:
-            self.lm_head = self.lm_head.to(self.output_device)
-
-        print(f"Model distributed across {len(self.devices)} devices.")
-        running = 0
-        for idx, (block_count, device) in enumerate(zip(per_device_counts, self.devices)):
-            if block_count <= 0:
-                print(f"  Stage {idx}: no transformer blocks on {device}")
-                continue
-            start = running
-            end = start + block_count
-            running = end
-            print(f"  Stage {idx}: layers {start}-{end - 1} on {device}")
-            estimated_gb = device_block_bytes[idx] / (1024 ** 3)
-            print(f"           ≈{estimated_gb:.2f} GB of parameters")
-        print(
-            "  Final RMSNorm and LM head on "
-            f"{self.output_device} (stage {output_device_idx})"
-        )
-        output_gb = (device_block_bytes[output_device_idx] + norm_bytes + head_bytes) / (
-            1024 ** 3
-        )
-        print(f"           Estimated post-head load: ≈{output_gb:.2f} GB")
-
-    def _prepare_attention_mask(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        batch_size: int,
-        seq_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        """Prepare 4D attention mask from 2D mask (batch_size, seq_length).
-        
-        Returns a 4D mask suitable for scaled_dot_product_attention.
-        The mask should be additive (0 for attend, -inf for mask out).
-        """
-        if attention_mask is None:
-            return None
-        
-        # Convert 2D mask to 4D: (batch_size, seq_length) -> (batch_size, 1, seq_length, seq_length)
-        # Create causal mask
-        causal_mask = torch.triu(
-            torch.ones(seq_length, seq_length, dtype=torch.bool, device=device),
-            diagonal=1,
-        )
-        
-        # Expand attention_mask from (batch, seq) to (batch, 1, 1, seq)
-        expanded_mask = attention_mask[:, None, None, :].expand(batch_size, 1, seq_length, seq_length)
-        
-        # Combine: positions that are either causally masked OR padding should be masked
-        # attention_mask is 1 for attend, 0 for mask -> invert for additive mask
-        # Use a large negative value instead of -inf to avoid numerical issues in bfloat16
-        # -65504 is approximately the most negative value representable in float16
-        # Using a more conservative value for numerical stability
-        min_dtype = torch.finfo(dtype).min if dtype.is_floating_point else -1e9
-        mask_value = max(min_dtype, -65504.0)  # Clamp to avoid true -inf
-        
-        combined_mask = torch.where(
-            causal_mask | (expanded_mask == 0),
-            torch.tensor(mask_value, dtype=dtype, device=device),
-            torch.tensor(0.0, dtype=dtype, device=device),
-        )
-        
-        return combined_mask
-
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -711,76 +476,29 @@ class ArgonneModel(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
-        batch_size, seq_length = input_ids.shape
+        _, seq_length = input_ids.shape
 
-        if self.pipeline_partitions:
-            first_device = self.pipeline_partitions[0][2]
-            hidden_states = self.embed_tokens(input_ids.to(first_device))
-            
-            # Prepare 4D attention mask
-            if attention_mask is not None:
-                attention_mask = self._prepare_attention_mask(
-                    attention_mask.to(first_device),
-                    batch_size,
-                    seq_length,
-                    first_device,
-                    hidden_states.dtype,
+        device = self.embed_tokens.weight.device
+        if input_ids.device != device:
+            input_ids = input_ids.to(device)
+        hidden_states = self.embed_tokens(input_ids)
+
+        # The training path does not use attention masks.
+        attention_mask = None
+        cos, sin = self.rotary_emb(hidden_states, seq_length)
+        rotary = (cos, sin)
+
+        for layer in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    rotary,
+                    attention_mask,
+                    use_reentrant=False,
                 )
-            
-            cos, sin = self.rotary_emb(hidden_states, seq_length)
-
-            for start, end, device in self.pipeline_partitions:
-                if hidden_states.device != device:
-                    hidden_states = hidden_states.to(device)
-                rotary = (cos.to(device), sin.to(device))
-                attn_mask = attention_mask.to(device) if attention_mask is not None else None
-
-                for layer in self.blocks[start:end]:
-                    if self.gradient_checkpointing and self.training:
-                        hidden_states = torch.utils.checkpoint.checkpoint(
-                            layer,
-                            hidden_states,
-                            rotary,
-                            attn_mask,
-                            use_reentrant=False,
-                        )
-                    else:
-                        hidden_states = layer(hidden_states, rotary, attn_mask)
-
-            hidden_states = hidden_states.to(self.output_device)
-        else:
-            device = self.embed_tokens.weight.device
-            # Skip redundant .to(device) if already on correct device (fixes torch.compile CUDA graphs issue)
-            if input_ids.device != device:
-                input_ids = input_ids.to(device)
-            hidden_states = self.embed_tokens(input_ids)
-            
-            # Prepare 4D attention mask
-            if attention_mask is not None:
-                # Skip redundant .to(device) if already on correct device
-                am = attention_mask if attention_mask.device == device else attention_mask.to(device)
-                attention_mask = self._prepare_attention_mask(
-                    am,
-                    batch_size,
-                    seq_length,
-                    device,
-                    hidden_states.dtype,
-                )
-            
-            cos, sin = self.rotary_emb(hidden_states, seq_length)
-            rotary = (cos, sin)
-
-            for layer in self.blocks:
-                if self.gradient_checkpointing and self.training:
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        layer,
-                        hidden_states,
-                        rotary,
-                        attention_mask,
-                        use_reentrant=False,
-                    )
-                else:
-                    hidden_states = layer(hidden_states, rotary, attention_mask)
+            else:
+                hidden_states = layer(hidden_states, rotary, attention_mask)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -818,7 +536,7 @@ class ArgonneModel(PreTrainedModel):
         do_sample: bool = True,
     ) -> torch.Tensor:
         self.eval()
-        device = self.pipeline_partitions[0][2] if self.pipeline_partitions else self.embed_tokens.weight.device
+        device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
         while input_ids.shape[1] < max_length:
             chunk = input_ids[:, -self.config.max_position_embeddings :]
