@@ -1,10 +1,12 @@
 """
-LLM.c style training for Argonne model using Qwen tokenizer and fineweb-edu data.
-Uses DistributedDataParallel for multi-GPU training.
+DDP training for Argonne model.
+Supports pretraining, continued pretraining on new data (--reset_schedule),
+and automatic checkpoint resume.
 """
 
 import os
 import sys
+import glob
 import time
 import argparse
 import numpy as np
@@ -46,6 +48,7 @@ parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help
 parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
 parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
+parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 args = parser.parse_args()
 
 # Distributed setup
@@ -169,7 +172,7 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
 def main():
     if IS_MAIN:
         print("=" * 60)
-        print("LLM.c Style Training for Argonne Model (DDP)")
+        print("Argonne Model Training (DDP)")
         print("=" * 60)
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         print(f"Using device: {DEVICE}, World size: {WORLD_SIZE}")
@@ -260,7 +263,6 @@ def main():
     # Resume from checkpoint
     resume_from = args.resume_from
     if not resume_from:
-        import glob
         checkpoints = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_step_*.pt"))
         if checkpoints:
             steps = [int(f.split("_step_")[-1].replace(".pt", "")) for f in checkpoints]
@@ -273,19 +275,33 @@ def main():
         checkpoint = torch.load(resume_from, map_location=DEVICE, weights_only=False)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler and checkpoint.get('scheduler_state_dict'):
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        global_step = checkpoint['global_step']
-        tokens_processed = checkpoint['tokens_processed']
-        data_position = checkpoint.get('data_position', 0)
-        train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
-        train_loader.epoch = tokens_processed // num_tokens
-        for _ in range(global_step):
-            scheduler.step()
-        if IS_MAIN:
-            print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}")
-        is_resumed = True
+
+        if args.reset_schedule == 1:
+            if IS_MAIN:
+                print("Reset schedule mode: fresh optimizer, scheduler, step counter, data position")
+                print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                betas=(args.adam_beta1, args.adam_beta2),
+                weight_decay=args.weight_decay,
+            )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            global_step = 0
+            tokens_processed = 0
+            is_resumed = False
+        else:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            for _ in range(checkpoint['global_step']):
+                scheduler.step()
+            global_step = checkpoint['global_step']
+            tokens_processed = checkpoint['tokens_processed']
+            data_position = checkpoint.get('data_position', 0)
+            train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
+            train_loader.epoch = tokens_processed // num_tokens
+            if IS_MAIN:
+                print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}, LR: {scheduler.get_last_lr()[0]:.2e}")
+            is_resumed = True
     else:
         is_resumed = False
 
@@ -301,6 +317,8 @@ def main():
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         if args.wall_time > 0:
             print(f"Wall time: {args.wall_time}s, will save checkpoint at {WALL_TIME_SAVE}s")
+        if args.reset_schedule == 1:
+            print("Mode: continued pretraining (fresh schedule)")
         print("-" * 60)
 
     if not is_resumed:
