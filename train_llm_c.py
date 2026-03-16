@@ -83,6 +83,17 @@ ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 # Wall time: save 3 minutes before limit
 WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
 
+# Autocast setup
+if args.precision == "bf16":
+    AUTOCAST_DTYPE = torch.bfloat16
+    USE_AUTOCAST = True
+elif args.precision == "fp16":
+    AUTOCAST_DTYPE = torch.float16
+    USE_AUTOCAST = True
+else:
+    AUTOCAST_DTYPE = None
+    USE_AUTOCAST = False
+
 # Data loading
 def load_data_shard(filename):
     with open(filename, "rb") as f:
@@ -146,7 +157,8 @@ def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
         max_length = input_ids.shape[1] + max_new_tokens
         gen_model = get_base_model(model)
-        output = gen_model.generate(input_ids, max_length=max_length, do_sample=True, temperature=0.8, top_p=0.95)
+        with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+            output = gen_model.generate(input_ids, max_length=max_length, do_sample=True, temperature=0.8, top_p=0.95)
         generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
     model.train()
     return generated_text
@@ -201,13 +213,8 @@ def main():
     config._keep_in_fp32_modules = []
     model = ArgonneModel(config)
     model = model.to(DEVICE)
-
-    if args.precision == "fp32":
-        model = model.to(torch.float32)
-    elif args.precision == "fp16":
-        model = model.to(torch.float16)
-    else:
-        model = model.to(torch.bfloat16)
+    # Model stays in fp32 — autocast handles bf16/fp16 for forward pass
+    # This keeps optimizer states in fp32 for proper precision
 
     # Gradient checkpointing (before DDP and compile)
     if args.gradient_checkpointing == 1 and args.torch_compile == 0:
@@ -231,6 +238,7 @@ def main():
     if IS_MAIN:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params:,}")
+        print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
 
     # Create data loader
     train_loader = DataLoader(args.data_path, args.batch_size, args.block_size, RANK, WORLD_SIZE)
@@ -347,12 +355,14 @@ def main():
 
             if WORLD_SIZE > 1 and micro_step < GRAD_ACCUM_STEPS - 1:
                 with model.no_sync():
-                    outputs = model(x, labels=y)
-                    loss = outputs.loss / GRAD_ACCUM_STEPS
+                    with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                        outputs = model(x, labels=y)
+                        loss = outputs.loss / GRAD_ACCUM_STEPS
                     loss.backward()
             else:
-                outputs = model(x, labels=y)
-                loss = outputs.loss / GRAD_ACCUM_STEPS
+                with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                    outputs = model(x, labels=y)
+                    loss = outputs.loss / GRAD_ACCUM_STEPS
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
@@ -458,7 +468,8 @@ def main():
                 x = x.to(DEVICE, non_blocking=True)
                 y = y.to(DEVICE, non_blocking=True)
 
-                outputs = model(x, labels=y)
+                with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                    outputs = model(x, labels=y)
                 val_losses.append(outputs.loss.item())
 
             train_loader.current_position = original_pos

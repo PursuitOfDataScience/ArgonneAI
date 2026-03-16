@@ -16,15 +16,42 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-# Autocast setup (keep model weights/optimizer states in fp32)
-AUTOCAST_DTYPE = None
-USE_AUTOCAST = False
-
 # Model architecture
 HIDDEN_SIZE = 2048
 NUM_LAYERS = 16
 NUM_HEADS = 16
 NUM_KV_HEADS = 8  # GQA
+
+# Parse arguments
+parser = argparse.ArgumentParser()
+# Paths
+parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
+parser.add_argument("--data_path", type=str, required=True, help="Path to training data (.bin)")
+parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
+# Training hyperparameters
+parser.add_argument("--lr", type=float, required=True, help="Learning rate")
+parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Min LR as ratio of LR")
+parser.add_argument("--batch_size", type=int, required=True, help="Batch size per GPU")
+parser.add_argument("--total_batch_size", type=int, required=True, help="Total batch size in tokens")
+parser.add_argument("--block_size", type=int, required=True, help="Sequence length")
+parser.add_argument("--warmup_steps", type=int, default=0, help="Warmup steps")
+parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
+parser.add_argument("--adam_beta2", type=float, default=0.999, help="Adam beta2")
+parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
+parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
+parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
+parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
+parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
+parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help="Use torch.compile for speedup")
+parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
+parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
+parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
+parser.add_argument("--use_attn_res", type=int, default=0, choices=[0, 1], help="Use Attention Residuals (Block AttnRes) instead of standard residuals")
+parser.add_argument("--attn_res_block_size", type=int, default=4, help="AttnRes block size in sub-layers (4 = 2 transformer layers per block)")
+args = parser.parse_args()
 
 # Distributed setup
 def setup_distributed():
@@ -41,6 +68,33 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+RANK, LOCAL_RANK, WORLD_SIZE = setup_distributed()
+IS_MAIN = RANK == 0
+DEVICE = f"cuda:{LOCAL_RANK}"
+
+# Compute gradient accumulation
+TOKENS_PER_MICRO = args.batch_size * WORLD_SIZE * args.block_size
+GRAD_ACCUM_STEPS = args.total_batch_size // TOKENS_PER_MICRO
+assert GRAD_ACCUM_STEPS >= 1, (
+    f"total_batch_size ({args.total_batch_size}) too small for "
+    f"{WORLD_SIZE} GPU(s) x batch_size {args.batch_size} x block_size {args.block_size}"
+)
+ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
+
+# Wall time: save 3 minutes before limit
+WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
+
+# Autocast setup
+if args.precision == "bf16":
+    AUTOCAST_DTYPE = torch.bfloat16
+    USE_AUTOCAST = True
+elif args.precision == "fp16":
+    AUTOCAST_DTYPE = torch.float16
+    USE_AUTOCAST = True
+else:
+    AUTOCAST_DTYPE = None
+    USE_AUTOCAST = False
 
 # Data loading
 def load_data_shard(filename):
@@ -141,17 +195,6 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    global AUTOCAST_DTYPE, USE_AUTOCAST
-    if args.precision == "bf16":
-        AUTOCAST_DTYPE = torch.bfloat16
-        USE_AUTOCAST = True
-    elif args.precision == "fp16":
-        AUTOCAST_DTYPE = torch.float16
-        USE_AUTOCAST = True
-    else:
-        AUTOCAST_DTYPE = None
-        USE_AUTOCAST = False
-
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
@@ -168,12 +211,14 @@ def main():
         max_position_embeddings=args.block_size,
         use_flash_attention=args.flash_attention == 1,
         tie_word_embeddings=False,
+        use_attn_res=args.use_attn_res == 1,
+        attn_res_block_size=args.attn_res_block_size,
     )
     config._keep_in_fp32_modules = []
     model = ArgonneModel(config)
     model = model.to(DEVICE)
-
-    # Keep model weights in fp32 — autocast handles bf16/fp16 for forward pass
+    # Model stays in fp32 — autocast handles bf16/fp16 for forward pass
+    # This keeps optimizer states in fp32 for proper precision
 
     # Gradient checkpointing (before DDP and compile)
     if args.gradient_checkpointing == 1 and args.torch_compile == 0:
@@ -198,6 +243,12 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params:,}")
         print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
+        if args.use_attn_res == 1:
+            lpb = args.attn_res_block_size // 2
+            num_blocks = (NUM_LAYERS + lpb - 1) // lpb
+            print(f"Attention Residuals: ON (block_size={args.attn_res_block_size}, {lpb} layers/block, ~{num_blocks} blocks)")
+        else:
+            print("Attention Residuals: OFF (standard residuals)")
 
     # Create data loader
     train_loader = DataLoader(args.data_path, args.batch_size, args.block_size, RANK, WORLD_SIZE)
@@ -244,13 +295,9 @@ def main():
         base_model.load_state_dict(checkpoint['model_state_dict'])
 
         if args.reset_schedule == 1:
-            # Continued pretraining on new data:
-            # Keep model weights, fresh optimizer momentum, fresh schedule,
-            # reset step counter and data position
             if IS_MAIN:
                 print("Reset schedule mode: fresh optimizer, scheduler, step counter, data position")
                 print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
-            # Rebuild fresh optimizer (clears Adam momentum from old data)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=args.lr,
@@ -478,47 +525,4 @@ def main():
     cleanup_distributed()
 
 if __name__ == "__main__":
-    # Parse arguments
-    parser = argparse.ArgumentParser()
-    # Paths
-    parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to training data (.bin)")
-    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
-    # Training hyperparameters
-    parser.add_argument("--lr", type=float, required=True, help="Learning rate")
-    parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Min LR as ratio of LR")
-    parser.add_argument("--batch_size", type=int, required=True, help="Batch size per GPU")
-    parser.add_argument("--total_batch_size", type=int, required=True, help="Total batch size in tokens")
-    parser.add_argument("--block_size", type=int, required=True, help="Sequence length")
-    parser.add_argument("--warmup_steps", type=int, default=0, help="Warmup steps")
-    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="Adam beta2")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
-    parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
-    parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
-    parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
-    parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
-    parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help="Use torch.compile for speedup")
-    parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
-    parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
-    parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
-    parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
-    args = parser.parse_args()
-
-    RANK, LOCAL_RANK, WORLD_SIZE = setup_distributed()
-    IS_MAIN = RANK == 0
-    DEVICE = f"cuda:{LOCAL_RANK}"
-
-    TOKENS_PER_MICRO = args.batch_size * WORLD_SIZE * args.block_size
-    GRAD_ACCUM_STEPS = args.total_batch_size // TOKENS_PER_MICRO
-    assert GRAD_ACCUM_STEPS >= 1, (
-        f"total_batch_size ({args.total_batch_size}) too small for "
-        f"{WORLD_SIZE} GPU(s) x batch_size {args.batch_size} x block_size {args.block_size}"
-    )
-    ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
-
-    WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
-
     main()
