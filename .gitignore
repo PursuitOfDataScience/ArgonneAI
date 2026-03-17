@@ -17,4 +17,6 @@ pretrained/*
 make_plot.py
 argonne_synthetic_finetuned/*
 dev/
-att_res/*.md
+att_res/**/*.md
+att_res/**/*.out
+att_res/**/*.err
