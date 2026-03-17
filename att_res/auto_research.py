@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import os
 import re
 import statistics
 import subprocess
@@ -125,6 +124,92 @@ def make_base_cfg():
         "label": "baseline-like",
         "notes": "baseline-like",
     }
+
+
+def to_int(val, default=0):
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def to_float(val, default=None):
+    try:
+        if val == "":
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+
+def parse_extra_settings(extra):
+    parsed = {}
+    for item in extra.split(";"):
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        parsed[k.strip()] = v.strip()
+    return parsed
+
+
+def load_existing_results():
+    records = []
+    planned_sigs = set()
+    max_exp_id = 0
+    if not RESULTS_TSV.exists():
+        return records, planned_sigs, max_exp_id
+
+    lines = RESULTS_TSV.read_text(errors="ignore").splitlines()
+    if len(lines) <= 1:
+        return records, planned_sigs, max_exp_id
+
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 16:
+            continue
+        exp_id = to_int(parts[0], 0)
+        if exp_id <= 0:
+            continue
+        cfg = make_base_cfg()
+        cfg["batch_size"] = to_int(parts[1], cfg["batch_size"])
+        cfg["block_size"] = to_int(parts[2], cfg["block_size"])
+        cfg["grad_accum"] = to_int(parts[3], cfg["grad_accum"])
+        cfg["precision"] = parts[5] or cfg["precision"]
+        cfg["torch_compile"] = to_int(parts[6], cfg["torch_compile"])
+        cfg["gradient_checkpointing"] = to_int(parts[7], cfg["gradient_checkpointing"])
+        cfg["flash_attention"] = to_int(parts[8], cfg["flash_attention"])
+        extras = parse_extra_settings(parts[9])
+        cfg["torch_compile_mode"] = extras.get("compile_mode", cfg["torch_compile_mode"])
+        cfg["alloc_conf"] = extras.get("alloc", cfg["alloc_conf"])
+        cfg["cpus_per_task"] = to_int(extras.get("cpus", cfg["cpus_per_task"]), cfg["cpus_per_task"])
+        mem_raw = extras.get("mem", f"{cfg['mem_gb']}G")
+        cfg["mem_gb"] = to_int(mem_raw.replace("G", ""), cfg["mem_gb"])
+        cfg["attn_res_block_size"] = to_int(
+            extras.get("attn_res_block", cfg["attn_res_block_size"]),
+            cfg["attn_res_block_size"],
+        )
+        cfg["label"] = f"resume-exp{exp_id}"
+        cfg["notes"] = parts[15]
+
+        planned_sigs.add(cfg_signature(cfg))
+        max_exp_id = max(max_exp_id, exp_id)
+        records.append(
+            {
+                "exp_id": exp_id,
+                "config": cfg,
+                "job_id": "",
+                "state": "",
+                "steps_completed": to_int(parts[10], 0),
+                "s_per_step": to_float(parts[11], None),
+                "tokens_per_sec": to_float(parts[12], None),
+                "last_loss": to_float(parts[13], None),
+                "status": parts[14],
+                "notes": parts[15],
+            }
+        )
+    return records, planned_sigs, max_exp_id
 
 
 def build_stage1():
@@ -329,8 +414,8 @@ def write_run_script(exp_id, cfg):
         source /software/python-miniforge-25.3.0-el8-x86_64/bin/activate AI
 
         export PYTHONUNBUFFERED=1
-        export PYTORCH_CUDA_ALLOC_CONF="{cfg['alloc_conf']}"
-        export NCCL_ASYNC_ERROR_HANDLING=1
+        export PYTORCH_ALLOC_CONF="{cfg['alloc_conf']}"
+        export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
         """
     )
     if cfg["nccl_p2p_disable"]:
@@ -487,12 +572,21 @@ def append_result(
 def commit_experiment(exp_id, cfg, status, s_per_step):
     sps = "na" if s_per_step is None else f"{s_per_step:.4f}"
     msg = f"exp {exp_id}: {cfg['label']} ({status}, {sps} s/step)"
-    add = run(
-        f"git --no-pager add run_{exp_id}.sh report/{exp_id}-train.out report/{exp_id}-train.err results.tsv",
+    add_results = run(
+        "git --no-pager add results.tsv",
         cwd=WORKDIR,
         check=False,
     )
-    if add.returncode != 0:
+    add_artifacts = run(
+        f"git --no-pager add -f run_{exp_id}.sh report/{exp_id}-train.out report/{exp_id}-train.err",
+        cwd=WORKDIR,
+        check=False,
+    )
+    if add_results.returncode != 0 or add_artifacts.returncode != 0:
+        print(
+            f"[exp {exp_id}] git add issue | results_rc={add_results.returncode} artifacts_rc={add_artifacts.returncode}",
+            flush=True,
+        )
         return
     commit = run(
         f'git --no-pager commit -m "{msg}" -m "{COAUTHOR}"',
@@ -500,7 +594,12 @@ def commit_experiment(exp_id, cfg, status, s_per_step):
         check=False,
     )
     if commit.returncode != 0:
-        print(f"[exp {exp_id}] commit skipped: {commit.stderr.strip()}")
+        print(
+            f"[exp {exp_id}] commit skipped | stdout={commit.stdout.strip()} | stderr={commit.stderr.strip()}",
+            flush=True,
+        )
+    else:
+        print(f"[exp {exp_id}] committed: {msg}", flush=True)
 
 
 def run_one_experiment(exp_id, cfg):
@@ -527,7 +626,13 @@ def run_one_experiment(exp_id, cfg):
     err_text = err_file.read_text(errors="ignore") if err_file.exists() else ""
     both = f"{out_text}\n{err_text}"
 
-    oom = bool(re.search(r"CUDA out of memory|out of memory|OUT_OF_MEMORY", both, flags=re.IGNORECASE))
+    oom = bool(
+        re.search(
+            r"CUDA out of memory|out of memory|out-of-memory|oom-kill|OUT_OF_MEMORY",
+            both,
+            flags=re.IGNORECASE,
+        )
+    ) or state.startswith("OUT_OF_MEMORY")
     steps_completed, last_loss = parse_steps_and_loss(out_text, err_text)
     s_per_step = parse_s_per_step(err_text)
     tps = (total_tokens(cfg) / s_per_step) if s_per_step else None
@@ -577,9 +682,14 @@ def main():
     git_init_if_needed()
     ensure_results_file()
 
-    records = []
-    planned_sigs = set()
+    records, planned_sigs, max_existing_exp = load_existing_results()
     queue = []
+
+    if max_existing_exp >= args.max_experiments:
+        print(
+            f"Already completed {max_existing_exp} experiments (max={args.max_experiments}). Nothing to do."
+        )
+        return
 
     stage1 = build_stage1()
     for cfg in stage1:
@@ -590,7 +700,7 @@ def main():
         queue.append(cfg)
 
     stage = 1
-    exp_id = 1
+    exp_id = max_existing_exp + 1
     while exp_id <= args.max_experiments:
         if not queue:
             if stage == 1:

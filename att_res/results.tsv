@@ -1,2 +1,4 @@
 exp_id	batch_size	block_size	grad_accum	total_batch_tokens	precision	torch_compile	gradient_checkpointing	flash_attention	extra_settings	steps_completed	s_per_step	tokens_per_sec	last_loss	status	notes
 0	1	1024	4	8192	bf16	1	1	1	none	9104	1.01	8100	4.0048	CANCELLED	baseline - cancelled by slurm after 2.6h
+1	2	1024	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
+2	4	1024	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
