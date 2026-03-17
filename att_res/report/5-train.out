@@ -1,0 +1,14 @@
+============================================================
+Argonne Model Training (DDP)
+============================================================
+Using device: cuda:0, World size: 2
+Vocab size: 151669, EOS token ID: 151643
+Using 2 GPUs with DistributedDataParallel
+Compiling model with torch.compile...
+Model parameters: 1,376,278,528
+Mixed precision: autocast bf16
+Attention Residuals: OFF (standard residuals)
+DataLoader: 20,839,021,454 tokens
+Training for 1 epoch(s) ~= 2543825 steps (20,839,021,454 tokens)
+
+=== Resuming from checkpoint: /project/rcc/youzhi/llm.c/test/checkpoint_step_8813.pt ===
