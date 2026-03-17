@@ -4,7 +4,7 @@
 #SBATCH --partition=test
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:2
 #SBATCH --constraint=a100
@@ -17,7 +17,7 @@ unset CONDA_PREFIX CONDA_PREFIX_1 CONDA_DEFAULT_ENV CONDA_SHLVL
 source /software/python-miniforge-25.3.0-el8-x86_64/bin/activate AI
 
 export PYTHONUNBUFFERED=1
-export PYTORCH_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 cd /home/youzhi/ArgonneAI/att_res
@@ -28,14 +28,15 @@ CKPT_DIR=/project/rcc/youzhi/llm.c/test
 NGPUS=2
 
 BATCH_SIZE=2
-BLOCK_SIZE=512
-GRAD_ACCUM=4
+BLOCK_SIZE=1024
+GRAD_ACCUM=2
 TOTAL_BATCH_SIZE=$((BATCH_SIZE * NGPUS * BLOCK_SIZE * GRAD_ACCUM))
 
 torchrun --nproc_per_node=$NGPUS train_llm_c.py \
   --tokenizer_path $TOKENIZER \
   --data_path $DATA \
   --checkpoint_dir $CKPT_DIR \
+  --resume_from /tmp/no_resume_checkpoint.pt \
   --lr 1e-4 \
   --batch_size $BATCH_SIZE \
   --total_batch_size $TOTAL_BATCH_SIZE \
