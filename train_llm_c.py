@@ -280,7 +280,7 @@ def main():
     if resume_from and os.path.exists(resume_from):
         if IS_MAIN:
             print(f"\n=== Resuming from checkpoint: {resume_from} ===")
-        checkpoint = torch.load(resume_from, map_location=DEVICE, weights_only=False)
+        checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
 
