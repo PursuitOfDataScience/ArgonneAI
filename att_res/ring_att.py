@@ -36,7 +36,8 @@ def _ring_send_recv_kv(
 ):
     """
     Send KV to next rank in ring, receive from previous rank.
-    Uses non-blocking sends overlapped with blocking receives.
+    Uses batched non-blocking P2P ops to avoid communicator instability seen
+    with unbatched isend/recv on some NCCL setups.
     Ring direction: rank -> rank+1 (wraps around)
     """
     rank = dist.get_rank(group)
@@ -44,13 +45,18 @@ def _ring_send_recv_kv(
     send_to = (rank + 1) % world_size
     recv_from = (rank - 1) % world_size
 
-    ops = []
-    ops.append(dist.isend(k_send.contiguous(), dst=send_to, group=group))
-    ops.append(dist.isend(v_send.contiguous(), dst=send_to, group=group))
-    dist.recv(k_recv, src=recv_from, group=group)
-    dist.recv(v_recv, src=recv_from, group=group)
-    for op in ops:
-        op.wait()
+    # Keep contiguous send buffers alive until requests complete.
+    k_send_buf = k_send.contiguous()
+    v_send_buf = v_send.contiguous()
+    ops = [
+        dist.P2POp(dist.isend, k_send_buf, send_to, group),
+        dist.P2POp(dist.irecv, k_recv, recv_from, group),
+        dist.P2POp(dist.isend, v_send_buf, send_to, group),
+        dist.P2POp(dist.irecv, v_recv, recv_from, group),
+    ]
+    reqs = dist.batch_isend_irecv(ops)
+    for req in reqs:
+        req.wait()
 
 
 # ============================================================
@@ -158,38 +164,47 @@ def _chunk_attention_bwd(
             torch.zeros_like(v),
         )
 
+    # Mixed precision safe path: compute chunk backward in fp32, then cast back.
+    compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
+    grad_output_f = grad_output.to(compute_dtype)
+    q_f = q.to(compute_dtype)
+    k_f = k.to(compute_dtype)
+    v_f = v.to(compute_dtype)
+    o_global_f = o_global.to(compute_dtype)
+    lse_global_f = lse_global.to(compute_dtype)
+
     # Recompute scores
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, Sq, Sk]
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale  # [B, H, Sq, Sk]
 
     if is_same_chunk:
-        Sq, Sk = q.shape[-2], k.shape[-2]
+        Sq, Sk = q_f.shape[-2], k_f.shape[-2]
         causal = torch.triu(
-            torch.ones(Sq, Sk, dtype=torch.bool, device=q.device),
+            torch.ones(Sq, Sk, dtype=torch.bool, device=q_f.device),
             diagonal=1,
         )
         scores = scores.masked_fill(causal, float('-inf'))
 
     # Globally-normalized weights: P = exp(scores - lse_global)
-    P = torch.exp(scores - lse_global)  # [B, H, Sq, Sk]
+    P = torch.exp(scores - lse_global_f)  # [B, H, Sq, Sk]
     P = torch.nan_to_num(P, nan=0.0)
 
     # dv = P^T @ grad_output
-    dv = torch.matmul(P.transpose(-2, -1), grad_output)  # [B, H, Sk, D]
+    dv = torch.matmul(P.transpose(-2, -1), grad_output_f)  # [B, H, Sk, D]
 
     # dp = grad_output @ v^T
-    dp_raw = torch.matmul(grad_output, v.transpose(-2, -1))  # [B, H, Sq, Sk]
+    dp_raw = torch.matmul(grad_output_f, v_f.transpose(-2, -1))  # [B, H, Sq, Sk]
 
     # Softmax backward: dscores = P * (dp_raw - sum(grad_output * o_global, dim=-1))
-    correction = (grad_output * o_global).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
+    correction = (grad_output_f * o_global_f).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
     dscores = P * (dp_raw - correction)  # [B, H, Sq, Sk]
 
     # dq = dscores @ k * scale
-    dq = torch.matmul(dscores, k) * scale  # [B, H, Sq, D]
+    dq = torch.matmul(dscores, k_f) * scale  # [B, H, Sq, D]
 
     # dk = dscores^T @ q * scale
-    dk = torch.matmul(dscores.transpose(-2, -1), q) * scale  # [B, H, Sk, D]
+    dk = torch.matmul(dscores.transpose(-2, -1), q_f) * scale  # [B, H, Sk, D]
 
-    return dq, dk, dv
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
 # ============================================================
@@ -543,17 +558,39 @@ def context_parallel_cross_entropy(
     logits: torch.Tensor,    # [B, S_local, V]
     labels: torch.Tensor,    # [B, S_local]
     cp_group=None,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Compute cross-entropy loss on local chunk, then average across CP group.
     Each GPU computes loss on its own chunk, then we all-reduce.
+
+    Args:
+        logits: [B, S_local, V]
+        labels: [B, S_local]
+        cp_group: context parallel process group
+        chunk_size: optional sequence chunk size for memory-friendly CE.
     """
-    loss_local = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
-        ignore_index=-100,
-        reduction='sum',
-    )
+    if chunk_size is None or chunk_size <= 0 or logits.size(1) <= chunk_size:
+        loss_local = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction='sum',
+        )
+    else:
+        B, S, V = logits.shape
+        loss_local = None
+        for start in range(0, S, chunk_size):
+            end = min(start + chunk_size, S)
+            chunk_loss = torch.nn.functional.cross_entropy(
+                logits[:, start:end, :].reshape(-1, V),
+                labels[:, start:end].reshape(-1),
+                ignore_index=-100,
+                reduction='sum',
+            )
+            loss_local = chunk_loss if loss_local is None else (loss_local + chunk_loss)
+        if loss_local is None:
+            loss_local = torch.zeros([], device=logits.device, dtype=logits.dtype)
 
     # Count valid tokens (float for all_reduce)
     valid_tokens = (labels != -100).sum().float()
