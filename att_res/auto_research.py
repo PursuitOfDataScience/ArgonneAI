@@ -314,7 +314,6 @@ def write_run_script(exp_id, cfg):
         #SBATCH --job-name=attres-{exp_id}
         #SBATCH --account=rcc-staff
         #SBATCH --partition=test
-        #SBATCH --exclude=midway3-0423,midway3-0315
         #SBATCH --nodes=1
         #SBATCH --ntasks=1
         #SBATCH --cpus-per-task={cfg['cpus_per_task']}
