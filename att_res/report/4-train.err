@@ -1,9 +1,9 @@
-W0317 17:23:45.510000 982758 site-packages/torch/distributed/run.py:803] 
-W0317 17:23:45.510000 982758 site-packages/torch/distributed/run.py:803] *****************************************
-W0317 17:23:45.510000 982758 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-W0317 17:23:45.510000 982758 site-packages/torch/distributed/run.py:803] *****************************************
-W0317 17:24:25.207000 982758 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 982781 closing signal SIGTERM
-E0317 17:24:25.823000 982758 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: -9) local_rank: 0 (pid: 982780) of binary: /software/python-miniforge-25.3.0-el8-x86_64/envs/AI/bin/python3.11
+W0317 17:33:22.487000 986974 site-packages/torch/distributed/run.py:803] 
+W0317 17:33:22.487000 986974 site-packages/torch/distributed/run.py:803] *****************************************
+W0317 17:33:22.487000 986974 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0317 17:33:22.487000 986974 site-packages/torch/distributed/run.py:803] *****************************************
+W0317 17:33:53.267000 986974 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 986991 closing signal SIGTERM
+E0317 17:33:53.735000 986974 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: -9) local_rank: 0 (pid: 986990) of binary: /software/python-miniforge-25.3.0-el8-x86_64/envs/AI/bin/python3.11
 Traceback (most recent call last):
   File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/bin/torchrun", line 6, in <module>
     sys.exit(main())
@@ -29,11 +29,11 @@ Failures:
 -------------------------------------------------------
 Root Cause (first observed failure):
 [0]:
-  time      : 2026-03-17_17:24:25
+  time      : 2026-03-17_17:33:53
   host      : midway3-0315.rcc.local
   rank      : 0 (local_rank: 0)
-  exitcode  : -9 (pid: 982780)
+  exitcode  : -9 (pid: 986990)
   error_file: <N/A>
-  traceback : Signal 9 (SIGKILL) received by PID 982780
+  traceback : Signal 9 (SIGKILL) received by PID 986990
 =======================================================
-slurmstepd: error: Detected 1 oom-kill event(s) in StepId=47216353.batch cgroup. Some of your processes may have been killed by the cgroup out-of-memory handler.
+slurmstepd: error: Detected 2 oom-kill event(s) in StepId=47217250.batch cgroup. Some of your processes may have been killed by the cgroup out-of-memory handler.
