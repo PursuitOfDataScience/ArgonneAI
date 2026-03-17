@@ -5,3 +5,4 @@ exp_id	batch_size	block_size	grad_accum	total_batch_tokens	precision	torch_compi
 3	1	1024	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
 4	2	1024	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
 5	4	1024	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
+6	1	512	8	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
