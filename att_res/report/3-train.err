@@ -1,0 +1,39 @@
+W0317 17:22:40.723000 982231 site-packages/torch/distributed/run.py:803] 
+W0317 17:22:40.723000 982231 site-packages/torch/distributed/run.py:803] *****************************************
+W0317 17:22:40.723000 982231 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0317 17:22:40.723000 982231 site-packages/torch/distributed/run.py:803] *****************************************
+W0317 17:23:18.836000 982231 site-packages/torch/distributed/elastic/multiprocessing/api.py:908] Sending process 982246 closing signal SIGTERM
+E0317 17:23:19.301000 982231 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: -9) local_rank: 0 (pid: 982245) of binary: /software/python-miniforge-25.3.0-el8-x86_64/envs/AI/bin/python3.11
+Traceback (most recent call last):
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/lib/python3.11/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/lib/python3.11/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/software/python-miniforge-25.3.0-el8-x86_64/envs/AI/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+=======================================================
+train_llm_c.py FAILED
+-------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+-------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-03-17_17:23:18
+  host      : midway3-0315.rcc.local
+  rank      : 0 (local_rank: 0)
+  exitcode  : -9 (pid: 982245)
+  error_file: <N/A>
+  traceback : Signal 9 (SIGKILL) received by PID 982245
+=======================================================
+slurmstepd: error: Detected 1 oom-kill event(s) in StepId=47216133.batch cgroup. Some of your processes may have been killed by the cgroup out-of-memory handler.
