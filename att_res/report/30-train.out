@@ -1,0 +1,25 @@
+HOSTNAME=midway3-0315.rcc.local
+NVIDIA A100-SXM4-40GB, 40960 MiB, 00000000:17:00.0
+NVIDIA A100-SXM4-40GB, 40960 MiB, 00000000:B1:00.0
+============================================================
+Argonne Model Training (DDP)
+============================================================
+Using device: cuda:0, World size: 2
+Vocab size: 151669, EOS token ID: 151643
+Using 2 GPUs with DistributedDataParallel
+Model parameters: 1,376,278,528
+Mixed precision: autocast bf16
+Attention Residuals: OFF (standard residuals)
+DataLoader: 20,839,021,454 tokens
+Training for 1 epoch(s) ~= 2543825 steps (20,839,021,454 tokens)
+
+Starting training...
+GPUs: 2, Batch size per GPU: 128
+Sequence length: 32
+Total batch size: 8192 tokens (requested: 8192)
+Gradient accumulation steps: 1
+Training for 1 epoch(s) (estimated ~2543825 steps)
+LR: 0.0001, Warmup: 1000, Min LR Ratio: 0.1, Precision: bf16, TorchCompile: 0
+Checkpoint interval: 999999 seconds
+Mode: continued pretraining (fresh schedule)
+------------------------------------------------------------
