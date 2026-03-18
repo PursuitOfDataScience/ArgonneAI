@@ -616,10 +616,6 @@ class ArgonneModel(PreTrainedModel):
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
-        # Check for NaN in logits and handle gracefully
-        if torch.isnan(logits).any():
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=65504.0, neginf=-65504.0)
-
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
@@ -631,8 +627,6 @@ class ArgonneModel(PreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            if torch.isnan(loss):
-                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
 
         return CausalLMOutput(logits=logits, loss=loss)
 
