@@ -1,32 +1,39 @@
-exp_id	batch_size	block_size	grad_accum	total_batch_tokens	precision	torch_compile	gradient_checkpointing	flash_attention	extra_settings	steps_completed	s_per_step	tokens_per_sec	last_loss	status	notes
-0	1	1024	4	8192	bf16	1	1	1	none	9104	1.01	8100	4.0048	CANCELLED	baseline - cancelled by slurm after 2.6h
-1	2	1024	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
-2	4	1024	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
-3	1	1024	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=4;mem=32G;attn_res_block=4	0				OOM	stage1 micro-batch/sequence/attnres sweep at ~8192 tokens; slurm_state=OUT_OF_MEMORY; oom_detected
-4	2	1024	2	8192	bf16	0	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4	0				OOM	start manual loop; bs2@1024 with compile0+gc1; slurm_state=OUT_OF_MEMORY; oom_detected
-5	2	512	4	8192	bf16	0	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4	0				OOM	bs2@512 compile0+gc1 still OOM before first step; likely host-memory OOM from auto-resume checkpoint load; slurm_state=OUT_OF_MEMORY; oom_detected
-6	1	1024	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	1560	0.6667	12288.00	6.6622	OK	baseline-like with --resume_from nonexistent to skip large checkpoint load; slurm_state=TIMEOUT; first stable run
-7	2	1024	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	1				OOM	no-resume test: true CUDA OOM at torch.compile with bs2@1024 (attempted +594MiB with ~39.3GiB used); slurm_state=FAILED; oom_detected
-8	2	1024	2	8192	bf16	0	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	0				OOM	no-resume compile0 still CUDA OOM in logits/cross-entropy allocation (~592MiB) at bs2@1024; slurm_state=FAILED; oom_detected
-9	1	1024	4	8192	bf16	1	1	1	compile_mode=reduce-overhead;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	0				ERROR	torch_compile_mode=reduce-overhead failed with CUDAGraph overwritten tensor runtime error during backward; slurm_state=FAILED
-10	1	1024	4	8192	bf16	1	1	1	compile_mode=max-autotune;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	0				ERROR	torch_compile_mode=max-autotune failed with same CUDAGraph overwritten tensor runtime error during backward; slurm_state=FAILED
-11	2	512	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent	1550	0.6711	12206.08	5.6144	OK	bs2@512 no-resume ran stably but slightly slower than exp6; slurm_state=TIMEOUT
-12	1	1024	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	2130	0.5405	15155.20	6.1831	OK	disabling Attention Residuals gave major speedup vs exp6; slurm_state=TIMEOUT
-13	2	512	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	2100	0.5348	15319.04	6.8261	OK	best so far: attn_res off with bs2@512 improved over exp12; slurm_state=TIMEOUT
-14	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	2160	0.5319	15400.96	7.1226	OK	new best: bs4@256 with attn_res off marginally faster than exp13; slurm_state=TIMEOUT
-15	8	128	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	1205	0.8547	9584.65	6.9183	OK	bs8@128 with attn_res off regressed badly vs exp14; likely kernel-launch/overhead dominated at very short sequence; slurm_state=TIMEOUT
-16	8	256	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	1299	0.7812	10485.76	6.8590	OK	bs8@256 ga2 with attn_res off improved over exp15 but still much slower than exp14; slurm_state=TIMEOUT
-17	4	256	4	8192	fp16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	1262	0.9091	9011.20	10.1262	OK	fp16 precision severely regressed throughput and quality signal (higher loss) vs bf16 baseline at same config; slurm_state=TIMEOUT
-18	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;code=loss_sync_optimization	1278	0.9091	9011.20	7.1017	OK	code tweak to reduce per-micro-step loss.item sync unexpectedly regressed throughput heavily vs exp14; slurm_state=TIMEOUT
-19	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0	1388	0.8065	10158.08	6.2173	OK	replay of exp14 config after reverting code changes remained much slower, indicating strong node-level throughput variance; slurm_state=TIMEOUT
-20	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;hostname=beagle3-0010;gpu=A100-PCIE-40GB	1420	0.8065	10158.08	7.5025	OK	added host/GPU diagnostics; repeated run landed again on beagle3-0010 and reproduced 0.8065 s/step exactly; slurm_state=TIMEOUT
-21	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;exclude=beagle3-0010;hostname=midway3-0315;gpu=A100-SXM4-40GB	2180	0.5319	15400.96	5.8502	OK	excluding beagle node forced placement on midway3-0315 (A100-SXM4) and fully recovered fast path; slurm_state=TIMEOUT
-22	4	256	4	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	2306	0.4975	16465.92	6.8438	OK	new best and first sub-0.5 s/step: removed per-forward NaN guard scans in model forward on SXM4 node; slurm_state=TIMEOUT
-23	8	256	2	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	2827	0.4082	20070.40	6.9236	OK	new best by large margin: bs8@256 with ga2 on SXM4 plus NaN-guard removal greatly reduced overhead; slurm_state=TIMEOUT
-24	16	256	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3365	0.3425	23920.64	6.1999	OK	ga1 with bs16@256 delivered another major jump over exp23 at same total batch on SXM4; slurm_state=TIMEOUT
-25	32	128	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3354	0.3401	24084.48	6.4450	OK	new best: shorter sequence (128) with bs32/ga1 improved over bs16x256/ga1 at same total batch on SXM4; slurm_state=TIMEOUT
-26	64	64	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3387	0.3390	24166.40	6.6158	OK	new best (marginal): further reduced sequence length to 64 with bs64/ga1 at same total batch on SXM4; slurm_state=TIMEOUT
-27	128	32	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3456	0.3367	24330.24	6.4373	OK	new best (marginal): reducing sequence to 32 with bs128/ga1 improved throughput slightly at fixed total batch; slurm_state=TIMEOUT
-28	256	16	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3420	0.3367	24330.24	6.3916	OK	matched exp27 speed within noise; further shortening sequence to 16 did not improve over block32 configuration; slurm_state=TIMEOUT
-29	512	8	1	8192	bf16	1	1	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	3395	0.3401	24084.48	7.1649	OK	very short sequence (8) regressed slightly vs best; indicates throughput plateau around block32-64 regime at fixed total batch; slurm_state=TIMEOUT
-30	128	32	1	8192	bf16	0	0	1	compile_mode=default;alloc=expandable_segments:True;cpus=8;mem=32G;attn_res_block=4;resume_override=nonexistent;use_attn_res=0;nodelist=midway3-0315;hostname=midway3-0315;gpu=A100-SXM4-40GB;code=remove_nan_guards	1				OOM	compile disabled (and gc off) caused CUDA OOM during cross-entropy allocation (+2.24GiB) at bs128/block32; slurm_state=FAILED
+exp_idstatusjob_idbatch_sizetotal_batch_sizegrad_accumprecisiontorch_compilecompile_modegradient_checkpointingflash_attentionattn_res_block_sizemax_stepswarmup_stepsmeasured_tokens_per_secavg_measured_step_smeasured_stepsnotes
+0BASELINE-13276816bf161default104NANA14602.882.2439NAbest from round1 exp22
+17OK4726249113276816bf161default1041206014510.952.258260beagle3 200G baseline verification
+18PENDING_CANCELLED4726276313276816bf161default11412060NANANApending>10m flash_attention=1
+18OK4726300813276816bf161default1141206014519.962.256860flash_attention=1
+19OK4726322713276816bf161default1081206015301.862.141460attn_res_block_size=8 IMPROVEMENT
+20OK4726344013276816bf161default10161206015835.622.069360attn_res_block_size=16 IMPROVEMENT
+21OK4726393113276816bf161default10321206015932.532.056760attn_res_block_size=32 IMPROVEMENT
+22OK4726418213276816bf161default10641206015994.312.048760attn_res_block_size=64
+23OK4726443813276816bf161default11321206015903.572.060460attn_res_block_size=32+flash1
+24OK4726475613276816fp161default10321206016462.411.990560fp16+block32 NEW_BEST
+25	DONE	47265232	1	32768	16	fp16	1	reduce-overhead	1	0	64	120	60	16544.73	1.9806	60	fp16+block64
+26	FAILED	47265467	1	32768	16	fp16	1	reduce-overhead	1	0	128	120	60	NA	NA	NA	bad_script_missing_args
+26b	FAILED	47265505	1	32768	16	fp16	1	reduce-overhead	1	0	128	120	60	NA	NA	NA	bad_arg_compile_mode
+26c	FAILED	47265525	1	32768	16	fp16	1	reduce-overhead	1	0	128	120	60	NA	NA	NA	cudagraph_error_block128
+26d	OK	47265561	1	32768	16	fp16	1	default	1	0	128	120	60	19690.72	1.6641	60	fp16+block128+default_compile NEW_BEST
+29	OK	47265681	1	32768	16	fp16	1	default	1	0	256	120	60	19567.76	1.6746	60	fp16+block256+default
+30	OK	47265751	1	32768	16	fp16	1	default	1	0	512	120	60	19487.75	1.6815	60	fp16+block512+default
+31	OK	47265813	1	32768	16	fp16	1	default	1	0	1024	120	60	19521.46	1.6786	60	fp16+block1024+default
+32	OK	47265893	1	32768	16	fp16	1	default	0	0	128	120	60	19698.68	1.6635	60	fp16+block128+default+no_grad_ckpt
+33	OK	47266015	1	32768	16	bf16	1	default	1	0	128	120	60	18886.88	1.7350	60	bf16+block128+default
+34	OK	47266475	1	32768	16	fp16	1	default	1	1	128	120	60	19469.05	1.6831	60	fp16+block128+default+flash1
+35	FAILED	47266544	1	32768	16	fp16	1	max-autotune	1	0	128	120	60	NA	NA	NA	max-autotune_failed
+36	OK	47266595	1	32768	16	fp16	0	NA	1	0	128	120	60	12131.28	2.7011	60	fp16+block128+no_compile
+37	OK	47266916	1	65536	32	fp16	1	default	1	0	128	120	60	22044.83	2.9729	60	fp16+block128+grad32 NEW_BEST
+38	OK	47267119	1	131072	64	fp16	1	default	1	0	128	120	60	23415.60	5.5976	60	fp16+block128+grad64 NEW_BEST
+39	TIMEOUT	47268571	1	262144	128	fp16	1	default	1	0	128	120	60	NA	NA	NA	grad128_timeout_10.85s_per_step
+40	OK	47268836	1	131072	64	fp16	1	default	1	0	256	120	60	23462.94	5.5863	60	fp16+block256+grad64
+41	OK	47269127	1	131072	64	bf16	1	default	1	0	128	120	60	22714.40	5.7704	60	bf16+block128+grad64
+42	TIMEOUT	47269299	1	131072	64	fp16	1	default	1	1	128	120	60	NA	NA	NA	flash1_compile_timeout
+43	PENDING_CANCELLED	47269516	1	131072	64	fp16	1	default	1	0	64	120	60	NA	NA	NA	pending_cancelled
+43b	PENDING_CANCELLED	47269990	1	131072	64	fp16	1	default	1	0	64	120	60	NA	NA	NA	pending_cancelled
+44	PENDING_CANCELLED	47271304	1	131072	64	fp16	1	default	0	0	128	120	60	NA	NA	NA	pending_cancelled
+45	PENDING_CANCELLED	47273467	1	131072	64	fp16	1	default	0	0	128	120	60	NA	NA	NA	pending_cancelled_gpu
+46	TIMEOUT	47274683	1	131072	64	fp16	1	default	0	0	128	120	60	NA	NA	NA	15min_timeout_no_grad_ckpt
+47	OK	47275250	1	65536	32	fp16	1	default	1	0	256	120	60	22160.09	2.9574	60	fp16+block256+grad32
+48	OK	47275803	1	98304	48	fp16	1	default	1	0	128	120	60	22628.18	4.3443	60	fp16+block128+grad48
+49	OK	47276199	1	131072	64	fp16	1	default	1	0	128	120	60	23196.51	5.6505	60	fp16+block128+grad64_verify
+50	OK	47276714	1	131072	64	fp16	1	default	1	0	64	120	60	23022.68	5.6932	60	fp16+block64+grad64

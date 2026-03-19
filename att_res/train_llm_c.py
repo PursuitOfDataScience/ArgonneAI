@@ -9,6 +9,7 @@ import sys
 import glob
 import time
 import argparse
+import inspect
 import numpy as np
 import torch
 import torch.nn as nn
@@ -51,6 +52,10 @@ parser.add_argument("--wall_time", type=int, default=0, help="Wall time in secon
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 parser.add_argument("--use_attn_res", type=int, default=0, choices=[0, 1], help="Use Attention Residuals (Block AttnRes) instead of standard residuals")
 parser.add_argument("--attn_res_block_size", type=int, default=4, help="AttnRes block size in sub-layers (4 = 2 transformer layers per block)")
+parser.add_argument("--max_steps", type=int, default=0, help="If > 0, stop after this many optimizer steps")
+parser.add_argument("--benchmark_warmup_steps", type=int, default=100, help="Exclude first N steps from measured speed")
+parser.add_argument("--skip_eval", type=int, default=0, choices=[0, 1], help="Skip validation at end of run")
+parser.add_argument("--skip_final_checkpoint", type=int, default=0, choices=[0, 1], help="Skip final checkpoint/model save")
 args = parser.parse_args()
 
 # Distributed setup
@@ -260,12 +265,16 @@ def main():
         print(f"Training for {args.max_epochs} epoch(s) ~= {estimated_steps} steps ({num_tokens * args.max_epochs:,} tokens)")
 
     # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
-    )
+    optimizer_kwargs = {
+        "lr": args.lr,
+        "betas": (args.adam_beta1, args.adam_beta2),
+        "weight_decay": args.weight_decay,
+    }
+    if DEVICE.startswith("cuda") and "fused" in inspect.signature(torch.optim.AdamW).parameters:
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    if IS_MAIN:
+        print(f"Optimizer fused kernels: {'ON' if optimizer_kwargs.get('fused', False) else 'OFF'}")
 
     # Cosine scheduler with warmup
     min_lr = args.lr * args.min_lr_ratio
@@ -298,12 +307,7 @@ def main():
             if IS_MAIN:
                 print("Reset schedule mode: fresh optimizer, scheduler, step counter, data position")
                 print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                betas=(args.adam_beta1, args.adam_beta2),
-                weight_decay=args.weight_decay,
-            )
+            optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             global_step = 0
             tokens_processed = 0
@@ -344,7 +348,10 @@ def main():
         tokens_processed = 0
     last_checkpoint_time = time.time()
     training_start_time = time.time()
-    train_losses = []
+    train_loss_sum = 0.0
+    train_loss_count = 0
+    measured_step_time = 0.0
+    measured_steps = 0
 
     pbar = None
     if IS_MAIN:
@@ -356,7 +363,7 @@ def main():
 
     while True:
         start_time = time.time()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             x, y = train_loader.next_batch()
@@ -376,13 +383,18 @@ def main():
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
-            train_losses.append(loss.item() * GRAD_ACCUM_STEPS)
+            train_loss_sum += loss.item() * GRAD_ACCUM_STEPS
+            train_loss_count += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
 
         global_step += 1
+        step_time = time.time() - start_time
+        if global_step > args.benchmark_warmup_steps:
+            measured_step_time += step_time
+            measured_steps += 1
         if pbar:
             pbar.update(1)
 
@@ -394,6 +406,11 @@ def main():
             print(f"Step {global_step} | Loss: {loss_val:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}")
             if pbar:
                 pbar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
+
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            if IS_MAIN:
+                print(f"\nReached max_steps={args.max_steps}. Stopping training loop.")
+            break
 
         # Synchronized checkpoint decision
         should_checkpoint = torch.tensor([0], device=DEVICE)
@@ -456,13 +473,28 @@ def main():
     if pbar:
         pbar.close()
 
+    elapsed_time = time.time() - training_start_time
+    train_loss = train_loss_sum / max(1, train_loss_count)
+    measured_tokens_per_sec = 0.0
+    avg_measured_step_s = 0.0
+    if measured_steps > 0 and measured_step_time > 0:
+        avg_measured_step_s = measured_step_time / measured_steps
+        measured_tokens_per_sec = (measured_steps * ACTUAL_TOTAL_BATCH) / measured_step_time
+
     if IS_MAIN:
         print("-" * 60)
-        elapsed_time = time.time() - training_start_time
         print(f"Training completed in {elapsed_time:.1f} seconds!")
+        print(
+            "SPEED_SUMMARY: "
+            f"total_tokens_per_sec={tokens_processed / max(elapsed_time, 1e-9):.2f} "
+            f"measured_tokens_per_sec={measured_tokens_per_sec:.2f} "
+            f"avg_measured_step_s={avg_measured_step_s:.4f} "
+            f"measured_steps={measured_steps} total_steps={global_step}"
+        )
 
     # Evaluate on validation (rank 0 only)
-    if IS_MAIN:
+    val_loss = float("nan")
+    if IS_MAIN and args.skip_eval == 0:
         print("\nEvaluating on validation...")
         model.eval()
         val_losses = []
@@ -484,11 +516,13 @@ def main():
 
             train_loader.current_position = original_pos
 
-        train_loss = np.mean(train_losses) if train_losses else 0
         val_loss = np.mean(val_losses) if val_losses else 0
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+    elif IS_MAIN:
+        print("\nSkipping validation (--skip_eval=1)")
 
-        # Save final training checkpoint
+    # Save final training checkpoint
+    if IS_MAIN and args.skip_final_checkpoint == 0:
         print("\nSaving final checkpoint...")
         data_position = train_loader.get_position()
         checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, train_loss, data_position, args.checkpoint_dir)
@@ -513,10 +547,20 @@ def main():
         tokenizer.save_pretrained(final_model_dir)
         config.save_pretrained(final_model_dir)
         print(f"Final model + tokenizer + config saved to: {final_model_dir}")
+    elif IS_MAIN:
+        print("\nSkipping final checkpoint/model save (--skip_final_checkpoint=1)")
 
-        elapsed_time = time.time() - training_start_time
+    if IS_MAIN:
+        val_loss_str = f"{val_loss:.4f}" if np.isfinite(val_loss) else "nan"
         print("\n" + "=" * 60)
-        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss:.4f} tokens_per_sec={tokens_processed/elapsed_time:.2f} steps={global_step}")
+        print(
+            "SUMMARY: "
+            f"train_loss={train_loss:.4f} "
+            f"val_loss={val_loss_str} "
+            f"tokens_per_sec={tokens_processed/max(elapsed_time, 1e-9):.2f} "
+            f"measured_tokens_per_sec={measured_tokens_per_sec:.2f} "
+            f"steps={global_step}"
+        )
         print("=" * 60)
 
     if WORLD_SIZE > 1:

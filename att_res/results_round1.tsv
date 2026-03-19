@@ -1,0 +1,52 @@
+exp_id	status	job_id	batch_size	total_batch_size	grad_accum	precision	torch_compile	compile_mode	gradient_checkpointing	flash_attention	max_steps	warmup_steps	measured_tokens_per_sec	avg_measured_step_s	measured_steps	notes
+0	BASELINE	47105972	1	8192	4	bf16	1	default	1	1	NA	NA	8110.89	1.0100	NA	from report/0-train.err final pace
+1	OK	47241604	1	8192	4	bf16	1	default	1	1	160	80	5847.65	1.4009	80	pilot run
+2	OOM	47242126	1	8192	4	bf16	0	default	0	1	120	30	NA	NA	NA	cuda oom
+3	OOM	47242130	2	8192	2	bf16	0	default	0	1	120	30	NA	NA	NA	cuda oom
+4	OOM	47242283	1	8192	4	bf16	0	default	1	1	120	30	NA	NA	NA	cuda oom
+5	OK	47242552	1	8192	4	bf16	1	default	1	1	120	60	5843.49	1.4019	60	ok
+6	ERROR	47242822	1	8192	4	bf16	1	reduce-overhead	1	1	120	60	NA	NA	NA	no SPEED_SUMMARY
+7	ERROR	47242885	1	8192	4	bf16	1	max-autotune	1	1	140	80	NA	NA	NA	no SPEED_SUMMARY
+8	OK	47243515	1	16384	8	bf16	1	default	1	1	120	60	8026.95	2.0411	60	ok
+9	PENDING_CANCELLED	47243680	1	8192	4	bf16	1	default	1	1	120	60	NA	NA	NA	pending>5m cancelled
+10	OK	47243792	1	16384	8	bf16	1	default	1	1	120	60	12692.75	1.2908	60	ok
+11	PENDING_CANCELLED	47243986	1	32768	16	bf16	1	default	1	1	120	60	NA	NA	NA	pending>5m cancelled
+12	OOM	47244293	2	8192	2	bf16	1	default	1	1	120	60	NA	NA	NA	cuda oom
+13	PENDING_CANCELLED	47244332	2	16384	4	bf16	1	default	1	1	120	60	NA	NA	NA	pending>5m cancelled
+14	OOM	47244483	2	32768	8	bf16	1	default	1	1	120	60	NA	NA	NA	cuda oom
+15	PENDING_CANCELLED	47244535	4	8192	1	bf16	1	default	1	1	100	40	NA	NA	NA	pending>5m cancelled
+16	OOM	47244670	4	16384	2	bf16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+17	PENDING_CANCELLED	47244732	4	32768	4	bf16	1	default	1	1	100	40	NA	NA	NA	pending>5m cancelled
+18	OOM	47244958	8	16384	1	bf16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+19	OOM	47245028	8	32768	2	bf16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+20	PENDING_CANCELLED	47245126	1	8192	4	bf16	1	default	1	0	120	60	NA	NA	NA	pending>5m cancelled
+21	OK	47245886	1	16384	8	bf16	1	default	1	0	120	60	12714.05	1.2887	60	ok
+22	OK	47246328	1	32768	16	bf16	1	default	1	0	120	60	14602.88	2.2439	60	ok
+23	PENDING_CANCELLED	47246533	2	8192	2	bf16	1	default	1	0	120	60	NA	NA	NA	pending>5m cancelled
+24	OOM	47246613	2	16384	4	bf16	1	default	1	0	120	60	NA	NA	NA	cuda oom
+25	PENDING_CANCELLED	47247160	2	32768	8	bf16	1	default	1	0	120	60	NA	NA	NA	pending>5m cancelled
+26	OOM	47247461	4	8192	1	bf16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+27	PENDING_CANCELLED	47247657	4	16384	2	bf16	1	default	1	0	100	40	NA	NA	NA	pending>5m cancelled
+28	OOM	47247894	4	32768	4	bf16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+29	OOM	47248100	8	16384	1	bf16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+30	OOM	47248486	8	32768	2	bf16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+31	OK	47248877	1	8192	4	fp16	1	default	1	1	120	60	10264.25	0.7981	60	ok
+32	OK	47249186	1	16384	8	fp16	1	default	1	1	120	60	13132.68	1.2476	60	ok
+33	OK	47249440	1	32768	16	fp16	1	default	1	1	120	60	14499.50	2.2599	60	ok
+34	OOM	47249791	2	8192	2	fp16	1	default	1	1	120	60	NA	NA	NA	cuda oom
+35	OOM	47249860	2	16384	4	fp16	1	default	1	1	120	60	NA	NA	NA	cuda oom
+36	OOM	47249935	2	32768	8	fp16	1	default	1	1	120	60	NA	NA	NA	cuda oom
+37	OOM	47249986	4	8192	1	fp16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+38	OOM	47250102	4	16384	2	fp16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+39	OOM	47250226	4	32768	4	fp16	1	default	1	1	100	40	NA	NA	NA	cuda oom
+40	PENDING_CANCELLED	47250278	8	16384	1	fp16	1	default	1	1	100	40	NA	NA	NA	pending>5m cancelled
+41	PENDING_CANCELLED	47250356	8	32768	2	fp16	1	default	1	1	100	40	NA	NA	NA	pending>5m cancelled
+42	OK	47250468	1	8192	4	fp16	1	default	1	0	120	60	9934.12	0.8246	60	ok
+43	OK	47250643	1	16384	8	fp16	1	default	1	0	120	60	12495.54	1.3112	60	ok
+44	OK	47250759	1	32768	16	fp16	1	default	1	0	120	60	14426.33	2.2714	60	ok
+45	OOM	47251180	2	8192	2	fp16	1	default	1	0	120	60	NA	NA	NA	cuda oom
+46	OOM	47251333	2	16384	4	fp16	1	default	1	0	120	60	NA	NA	NA	cuda oom
+47	OOM	47252522	2	32768	8	fp16	1	default	1	0	120	60	NA	NA	NA	cuda oom
+48	OOM	47252696	4	8192	1	fp16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+49	OOM	47253770	4	16384	2	fp16	1	default	1	0	100	40	NA	NA	NA	cuda oom
+50	PENDING_CANCELLED	47253938	4	32768	4	fp16	1	default	1	0	100	40	NA	NA	NA	pending>5m cancelled
