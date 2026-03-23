@@ -338,9 +338,11 @@ def main():
 
     pbar = None
     if IS_MAIN:
-        pbar = tqdm(total=estimated_steps, desc="Training", unit="step")
+        initial_steps = 0
         if is_resumed:
-            pbar.update(global_step)
+            # Use token-based progress so resumed runs remain accurate even if batch config changed.
+            initial_steps = min(estimated_steps, int(tokens_processed // ACTUAL_TOTAL_BATCH))
+        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step")
 
     model.train()
 
