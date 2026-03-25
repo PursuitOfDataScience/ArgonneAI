@@ -32,6 +32,8 @@ parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory
 # Training hyperparameters
 parser.add_argument("--lr", type=float, required=True, help="Learning rate")
 parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Min LR as ratio of LR")
+parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "wsd"], help="LR schedule type")
+parser.add_argument("--cooldown", type=int, default=0, choices=[0, 1], help="WSD cooldown mode (1=linear decay, 0=stable)")
 parser.add_argument("--batch_size", type=int, required=True, help="Batch size per GPU")
 parser.add_argument("--total_batch_size", type=int, required=True, help="Total batch size in tokens")
 parser.add_argument("--block_size", type=int, required=True, help="Sequence length")
@@ -278,16 +280,28 @@ def main():
 
     # Cosine scheduler with warmup
     min_lr = args.lr * args.min_lr_ratio
-    def lr_lambda(step):
-        if step < args.warmup_steps:
-            return step / max(1, args.warmup_steps)
-        else:
-            progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
-            return max(min_lr / args.lr, 0.5 * (1.0 + np.cos(np.pi * progress)))
+    if args.schedule == "wsd":
+        def lr_lambda(step):
+            if step < args.warmup_steps:
+                return step / max(1, args.warmup_steps)
+            elif args.cooldown == 1:
+                progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
+                return max(min_lr / args.lr, 1.0 - progress * (1.0 - min_lr / args.lr))
+            else:
+                return 1.0
+    else:
+        def lr_lambda(step):
+            if step < args.warmup_steps:
+                return step / max(1, args.warmup_steps)
+            else:
+                progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
+                return max(min_lr / args.lr, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume from checkpoint
+    global_step = 0
+    tokens_processed = 0
     resume_from = args.resume_from
     if not resume_from:
         checkpoints = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_step_*.pt"))
@@ -304,20 +318,29 @@ def main():
         base_model.load_state_dict(checkpoint['model_state_dict'])
 
         if args.reset_schedule == 1:
+            # New-data continuation mode:
+            # fresh optimizer/scheduler/data position, but keep cumulative token count
             if IS_MAIN:
+                prev_step = checkpoint.get('global_step', 0)
+                prev_tokens = checkpoint.get('tokens_processed', checkpoint.get('global_step', 0) * ACTUAL_TOTAL_BATCH)
                 print("Reset schedule mode: fresh optimizer, scheduler, step counter, data position")
-                print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
+                print(f"Previous training: {prev_tokens:,} tokens, step {prev_step}")
             optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            global_step = 0
-            tokens_processed = 0
+            # Keep global step continuity in logs/checkpoints while schedule restarts fresh.
+            global_step = checkpoint.get('global_step', 0)
+            tokens_processed = checkpoint.get('tokens_processed', checkpoint.get('global_step', 0) * ACTUAL_TOTAL_BATCH)
             is_resumed = False
         else:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            for _ in range(checkpoint['global_step']):
-                scheduler.step()
-            global_step = checkpoint['global_step']
-            tokens_processed = checkpoint['tokens_processed']
+            scheduler_state = checkpoint.get('scheduler_state_dict')
+            if scheduler_state is not None:
+                scheduler.load_state_dict(scheduler_state)
+            else:
+                for _ in range(checkpoint['global_step']):
+                    scheduler.step()
+            global_step = checkpoint.get('global_step', 0)
+            tokens_processed = checkpoint.get('tokens_processed', global_step * ACTUAL_TOTAL_BATCH)
             data_position = checkpoint.get('data_position', 0)
             train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
             train_loader.epoch = tokens_processed // num_tokens
@@ -340,12 +363,10 @@ def main():
         if args.wall_time > 0:
             print(f"Wall time: {args.wall_time}s, will save checkpoint at {WALL_TIME_SAVE}s")
         if args.reset_schedule == 1:
-            print("Mode: continued pretraining (fresh schedule)")
+            print("Mode: continued pretraining (fresh schedule/data position, cumulative token counter)")
         print("-" * 60)
 
-    if not is_resumed:
-        global_step = 0
-        tokens_processed = 0
+    run_step = 0
     last_checkpoint_time = time.time()
     training_start_time = time.time()
     train_loss_sum = 0.0
@@ -391,8 +412,9 @@ def main():
         scheduler.step()
 
         global_step += 1
+        run_step += 1
         step_time = time.time() - start_time
-        if global_step > args.benchmark_warmup_steps:
+        if run_step > args.benchmark_warmup_steps:
             measured_step_time += step_time
             measured_steps += 1
         if pbar:
@@ -407,7 +429,7 @@ def main():
             if pbar:
                 pbar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
 
-        if args.max_steps > 0 and global_step >= args.max_steps:
+        if args.max_steps > 0 and run_step >= args.max_steps:
             if IS_MAIN:
                 print(f"\nReached max_steps={args.max_steps}. Stopping training loop.")
             break
