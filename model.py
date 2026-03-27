@@ -405,7 +405,7 @@ class Block(nn.Module):
 class ArgonneModel(PreTrainedModel):
     config_class = ArgonneConfig
     _no_split_modules = ["Block"]
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
 
     def __init__(self, config: ArgonneConfig) -> None:
         super().__init__(config)
@@ -510,13 +510,11 @@ class ArgonneModel(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if shift_labels.device != shift_logits.device:
-                shift_labels = shift_labels.to(shift_logits.device)
+            if labels.device != logits.device:
+                labels = labels.to(logits.device)
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
                 ignore_index=-100,
             )
             # Handle NaN loss

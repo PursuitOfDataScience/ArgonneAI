@@ -17,10 +17,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 # Model architecture
-HIDDEN_SIZE = 2048
-NUM_LAYERS = 16
-NUM_HEADS = 16
-NUM_KV_HEADS = 8  # GQA
+HIDDEN_SIZE = 1792
+NUM_LAYERS = 28
+NUM_HEADS = 14
+NUM_KV_HEADS = 7  # GQA
 
 # Parse arguments
 parser = argparse.ArgumentParser()
@@ -37,7 +37,9 @@ parser.add_argument("--block_size", type=int, required=True, help="Sequence leng
 parser.add_argument("--warmup_steps", type=int, default=0, help="Warmup steps")
 parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
 parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
-parser.add_argument("--adam_beta2", type=float, default=0.999, help="Adam beta2")
+parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2")
+parser.add_argument("--schedule", type=str, default="wsd", choices=["cosine", "wsd"], help="LR schedule")
+parser.add_argument("--cooldown", type=int, default=0, help="Cooldown steps at end of WSD schedule")
 parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
 parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
@@ -49,6 +51,7 @@ parser.add_argument("--torch_compile_mode", type=str, default="default", choices
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
 parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
+parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
 args = parser.parse_args()
 
 # Distributed setup
@@ -208,7 +211,7 @@ def main():
         num_key_value_heads=NUM_KV_HEADS,
         max_position_embeddings=args.block_size,
         use_flash_attention=args.flash_attention == 1,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
     )
     config._keep_in_fp32_modules = []
     model = ArgonneModel(config)
@@ -242,6 +245,9 @@ def main():
 
     # Create data loader
     train_loader = DataLoader(args.data_path, args.batch_size, args.block_size, RANK, WORLD_SIZE)
+    val_loader = None
+    if IS_MAIN and args.val_data_path:
+        val_loader = DataLoader(args.val_data_path, args.batch_size, args.block_size, rank=0, world_size=1)
 
     # Estimate steps for scheduler
     num_tokens = len(train_loader.tokens)
@@ -257,14 +263,27 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # Cosine scheduler with warmup
+    # Scheduler with warmup (cosine or WSD)
     min_lr = args.lr * args.min_lr_ratio
+    min_lr_scale = min_lr / args.lr
+
     def lr_lambda(step):
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
-        else:
+
+        if args.schedule == "cosine":
             progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
-            return max(min_lr / args.lr, 0.5 * (1.0 + np.cos(np.pi * progress)))
+            return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+        if args.cooldown <= 0:
+            return 1.0
+
+        cooldown_start = max(args.warmup_steps, estimated_steps - args.cooldown)
+        if step < cooldown_start:
+            return 1.0
+
+        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, args.cooldown))
+        return 1.0 - cooldown_progress * (1.0 - min_lr_scale)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -323,6 +342,7 @@ def main():
         print(f"Training for {args.max_epochs} epoch(s) (estimated ~{estimated_steps} steps)")
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
+        print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
         if args.wall_time > 0:
             print(f"Wall time: {args.wall_time}s, will save checkpoint at {WALL_TIME_SAVE}s")
         if args.reset_schedule == 1:
@@ -349,6 +369,7 @@ def main():
     while True:
         start_time = time.time()
         optimizer.zero_grad()
+        step_loss_total = 0.0
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             x, y = train_loader.next_batch()
@@ -359,16 +380,21 @@ def main():
                 with model.no_sync():
                     with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
                         outputs = model(x, labels=y)
-                        loss = outputs.loss / GRAD_ACCUM_STEPS
+                        micro_loss = outputs.loss
+                        loss = micro_loss / GRAD_ACCUM_STEPS
                     loss.backward()
             else:
                 with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
                     outputs = model(x, labels=y)
-                    loss = outputs.loss / GRAD_ACCUM_STEPS
+                    micro_loss = outputs.loss
+                    loss = micro_loss / GRAD_ACCUM_STEPS
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
-            train_losses.append(loss.item() * GRAD_ACCUM_STEPS)
+            step_loss_total += micro_loss.detach().float().item()
+            train_losses.append(micro_loss.detach().float().item())
+
+        step_loss = step_loss_total / GRAD_ACCUM_STEPS
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -381,11 +407,10 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
 
         if IS_MAIN and global_step % 10 == 0:
-            loss_val = loss.item() * GRAD_ACCUM_STEPS
-            perplexity = np.exp(loss_val)
-            print(f"Step {global_step} | Loss: {loss_val:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}")
+            perplexity = np.exp(step_loss)
+            print(f"Step {global_step} | Loss: {step_loss:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}")
             if pbar:
-                pbar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
+                pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
 
         # Synchronized checkpoint decision
         should_checkpoint = torch.tensor([0], device=DEVICE)
@@ -401,7 +426,7 @@ def main():
                 print("\n" + "=" * 60)
                 print("Saving checkpoint...")
                 data_position = train_loader.get_position()
-                checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, loss.item() * GRAD_ACCUM_STEPS, data_position, args.checkpoint_dir)
+                checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
                 print(f"Checkpoint saved: {checkpoint_path}")
 
                 print("\nGenerating sample text...")
@@ -427,7 +452,7 @@ def main():
                 if IS_MAIN:
                     print(f"\nApproaching wall time ({args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
-                    checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, loss.item() * GRAD_ACCUM_STEPS, data_position, args.checkpoint_dir)
+                    checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
                 if WORLD_SIZE > 1:
                     dist.barrier()
@@ -455,30 +480,34 @@ def main():
 
     # Evaluate on validation (rank 0 only)
     if IS_MAIN:
-        print("\nEvaluating on validation...")
-        model.eval()
         val_losses = []
-        val_tokens = min(1_000_000, len(train_loader.tokens) // 2)
-        val_batches = val_tokens // (args.batch_size * args.block_size)
+        if val_loader is not None:
+            print("\nEvaluating on validation...")
+            model.eval()
+            val_tokens = min(1_000_000, len(val_loader.tokens))
+            val_batches = val_tokens // (args.batch_size * args.block_size)
 
-        with torch.no_grad():
-            original_pos = train_loader.current_position
-            train_loader.current_position = 0
+            with torch.no_grad():
+                original_pos = val_loader.current_position
+                val_loader.current_position = 0
 
-            for _ in range(min(val_batches, 100)):
-                x, y = train_loader.next_batch()
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
+                for _ in range(min(val_batches, 100)):
+                    x, y = val_loader.next_batch()
+                    x = x.to(DEVICE, non_blocking=True)
+                    y = y.to(DEVICE, non_blocking=True)
 
-                with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                    outputs = model(x, labels=y)
-                val_losses.append(outputs.loss.item())
+                    with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                        outputs = model(x, labels=y)
+                    val_losses.append(outputs.loss.item())
 
-            train_loader.current_position = original_pos
+                val_loader.current_position = original_pos
+        else:
+            print("\nValidation skipped: no held-out validation file was provided.")
 
         train_loss = np.mean(train_losses) if train_losses else 0
-        val_loss = np.mean(val_losses) if val_losses else 0
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        val_loss = np.mean(val_losses) if val_losses else float("nan")
+        val_loss_str = f"{val_loss:.4f}" if val_losses else "n/a"
+        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss_str}")
 
         # Save final training checkpoint
         print("\nSaving final checkpoint...")
@@ -508,7 +537,7 @@ def main():
 
         elapsed_time = time.time() - training_start_time
         print("\n" + "=" * 60)
-        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss:.4f} tokens_per_sec={tokens_processed/elapsed_time:.2f} steps={global_step}")
+        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} tokens_per_sec={tokens_processed/elapsed_time:.2f} steps={global_step}")
         print("=" * 60)
 
     if WORLD_SIZE > 1:
