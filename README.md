@@ -1,55 +1,64 @@
 # Argonne LLM Training
 
-LLM.c style training for the Argonne model using Qwen tokenizer and FineWeb data.
+Distributed PyTorch training pipeline for the Argonne causal LM using Qwen-family tokenizers and llm.c-style binary token data.
 
-## File Structure
+## Project Layout
 
-```
+```text
 ArgonneAI/
-├── train_llm_c.py       # Main training script (DDP multi-GPU)
-├── preprocess_data.py    # Convert parquet data to binary format
-├── model.py             # Argonne model architecture
-├── run_full_training.sh # SLURM script to launch training
-├── preprocess_job.sh    # SLURM script to preprocess data
-└── report/              # Training logs (gitignored)
+├── model.py              # Argonne model + Hugging Face registration (model_type="argonne2")
+├── train_llm_c.py        # Main DDP pretraining script
+├── continue.py           # Continued pretraining script (new-data continuation workflow)
+├── preprocess_data.py    # Parquet -> train.bin converter
+├── run_full_training.sh  # Example SLURM launch for train_llm_c.py
+├── continue.sh           # Example SLURM launch for continue.py
+├── preprocess_job.sh     # Example SLURM launch for preprocess_data.py
+├── report/               # Job logs
+└── test/                 # Experiment scripts/results
 ```
 
 ## Requirements
 
-- Python with PyTorch
-- Transformers library
-- Flash Attention
-- Qwen tokenizer (e.g., Qwen3-0.6B-Base)
+- Python 3 with CUDA-enabled PyTorch
+- `transformers`
+- `numpy`
+- `pyarrow`
+- `tqdm`
+- Optional but recommended: `flash-attn` (falls back automatically when unavailable)
 
 ## Quick Start
 
-### 1. Preprocess Data
+### 1) Preprocess parquet data
 
-Convert parquet files to binary format:
+Creates `train.bin` with the expected magic/header format and saves a tokenizer copy in `<output_dir>/tokenizer`.
 
 ```bash
 python3 preprocess_data.py \
   --tokenizer_path /path/to/Qwen3-0.6B-Base \
-  --data_dir /path/to/fineweb-parquets \
-  --output_dir /path/to/output \
-  --workers 32
+  --data_dir /path/to/parquet_dir \
+  --output_dir /path/to/output_dir \
+  --text_column text \
+  --workers 16
 ```
 
-Or use the SLURM script:
+SLURM example:
+
 ```bash
 sbatch preprocess_job.sh
 ```
 
-### 2. Train
+### 2) Train (new run or resume)
+
+`train_llm_c.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
 
 ```bash
 torchrun --nproc_per_node=2 train_llm_c.py \
-  --tokenizer_path /path/to/Qwen3-0.6B-Base \
+  --tokenizer_path /path/to/tokenizer \
   --data_path /path/to/train.bin \
   --checkpoint_dir /path/to/checkpoints \
-  --lr 1e-4 \
+  --lr 3e-4 \
   --batch_size 20 \
-  --total_batch_size 81920 \
+  --total_batch_size 163840 \
   --block_size 1024 \
   --precision bf16 \
   --flash_attention 1 \
@@ -57,47 +66,94 @@ torchrun --nproc_per_node=2 train_llm_c.py \
   --gradient_checkpointing 1
 ```
 
-Or use the SLURM script:
+SLURM example:
+
 ```bash
 sbatch run_full_training.sh
 ```
 
-## Training Arguments
+### 3) Continue pretraining on new data
+
+`continue.py` is intended for continued pretraining and is commonly used with `--reset_schedule 1`.
+
+```bash
+torchrun --nproc_per_node=2 continue.py \
+  --tokenizer_path /path/to/tokenizer \
+  --data_path /path/to/new_train.bin \
+  --checkpoint_dir /path/to/checkpoints \
+  --lr 3e-4 \
+  --batch_size 16 \
+  --total_batch_size 131072 \
+  --block_size 1024 \
+  --reset_schedule 1
+```
+
+SLURM example:
+
+```bash
+sbatch continue.sh
+```
+
+## Common Training Arguments (`train_llm_c.py` and `continue.py`)
 
 | Argument | Description | Default |
-|----------|-------------|---------|
+|---|---|---|
 | `--tokenizer_path` | Path to tokenizer | Required |
-| `--data_path` | Path to training data (.bin) | Required |
-| `--checkpoint_dir` | Directory for checkpoints | Required |
+| `--data_path` | Path to training tokens (`.bin`) | Required |
+| `--checkpoint_dir` | Checkpoint/model output directory | Required |
 | `--lr` | Learning rate | Required |
-| `--batch_size` | Batch size per GPU | Required |
-| `--total_batch_size` | Total batch size in tokens | Required |
+| `--batch_size` | Micro-batch size per GPU | Required |
+| `--total_batch_size` | Target total batch size in tokens | Required |
 | `--block_size` | Sequence length | Required |
-| `--precision` | Training precision (fp32/fp16/bf16) | bf16 |
-| `--flash_attention` | Use flash attention (0/1) | 1 |
-| `--torch_compile` | Use torch.compile (0/1) | 0 |
-| `--torch_compile_mode` | torch.compile mode (default/reduce-overhead/max-autotune) | default |
-| `--ddp_static_graph` | Enable DDP static_graph optimization when available (0/1) | 0 |
-| `--ddp_gradient_as_bucket_view` | Enable DDP gradient_as_bucket_view when available (0/1) | 0 |
-| `--ddp_broadcast_buffers` | Broadcast DDP buffers every forward pass (0/1) | 1 |
-| `--gradient_checkpointing` | Use gradient checkpointing (0/1) | 1 |
-| `--resume_from` | Resume from checkpoint file | None |
-| `--wall_time` | Wall time in seconds (save checkpoint 3 min before limit) | 0 (disabled) |
+| `--min_lr_ratio` | Final/min LR as a ratio of `--lr` | `0.1` |
+| `--warmup_steps` | Warmup steps | `0` |
+| `--weight_decay` | AdamW weight decay | `0.1` |
+| `--adam_beta1` | AdamW beta1 | `0.9` |
+| `--adam_beta2` | AdamW beta2 | `0.95` |
+| `--schedule` | LR schedule (`cosine` or `wsd`) | `wsd` |
+| `--cooldown` | WSD cooldown steps at end | `0` |
+| `--grad_clip` | Gradient norm clipping | `1.0` |
+| `--precision` | Autocast precision (`fp32`, `fp16`, `bf16`) | `bf16` |
+| `--flash_attention` | Enable flash-attention paths (`0/1`) | `1` |
+| `--checkpoint_interval` | Periodic checkpoint interval (seconds) | `1800` |
+| `--max_epochs` | Stop after this many data epochs | `1` |
+| `--gradient_checkpointing` | Enable gradient checkpointing (`0/1`) | `1` |
+| `--torch_compile` | Enable `torch.compile` (`0/1`) | `0` |
+| `--torch_compile_mode` | Compile mode (`default`, `reduce-overhead`, `max-autotune`) | `default` |
+| `--resume_from` | Explicit checkpoint path | `None` |
+| `--wall_time` | If `>0`, save and exit ~3 minutes before limit (seconds) | `0` (disabled) |
+| `--reset_schedule` | Reset behavior on resume (see below) | `0` |
+| `--val_data_path` | Optional held-out validation `.bin` | `None` |
 
-## Model Architecture
+### Important `--reset_schedule` difference
 
-- **Hidden Size**: 2048
-- **Layers**: 16
-- **Attention Heads**: 16
-- **KV Heads**: 8 (GQA)
-- Based on Qwen tokenizer (151936 vocab size)
+- In `train_llm_c.py`, `--reset_schedule 1` resets LR schedule, step counter, token counter, and data position (fresh-run counters).
+- In `continue.py`, `--reset_schedule 1` resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed` from the loaded checkpoint.
 
-## Features
+## Checkpointing and Outputs
 
-- DistributedDataParallel (DDP) for multi-GPU training
-- Flash Attention support
-- torch.compile for speedup
-- Gradient checkpointing for memory efficiency
-- BF16/FP16/FP32 precision support
-- Automatic checkpointing with wall time limit
-- Resume training from checkpoint
+- Checkpoints are written as `checkpoint_step_<N>.pt`.
+- Checkpoints include: model state, optimizer state, scheduler state, `global_step`, `tokens_processed`, and data position.
+- On periodic checkpoints, rank 0 also prints a sampled generation.
+- At end of run, scripts save:
+  - Final training checkpoint
+  - `final_model/` containing model weights, tokenizer, and config via `save_pretrained`.
+
+## Model Notes (`model.py`)
+
+- Hugging Face-compatible model/config (`ArgonneConfig`, `ArgonneModel`), registered for `AutoConfig`, `AutoModel`, and `AutoModelForCausalLM`.
+- Uses grouped-query attention (GQA), SwiGLU MLP, RMSNorm, RoPE.
+- Attention path selection: FlashAttention 2 (if available) -> PyTorch SDPA -> math fallback.
+- Includes numerical-stability guards for NaNs/Infs in logits/loss.
+
+### Training preset used by scripts
+
+`train_llm_c.py` and `continue.py` instantiate the model with:
+
+- Hidden size: `1792`
+- Layers: `28`
+- Attention heads: `14`
+- KV heads: `7`
+- `max_position_embeddings = --block_size`
+
+The defaults inside `ArgonneConfig` are different and are mainly for config-level compatibility.
