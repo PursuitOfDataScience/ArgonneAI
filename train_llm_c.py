@@ -181,7 +181,30 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
     torch.save(checkpoint, checkpoint_path)
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
+    latest_tmp_path = latest_path + ".tmp"
+    try:
+        if os.path.lexists(latest_tmp_path):
+            os.remove(latest_tmp_path)
+        os.symlink(os.path.basename(checkpoint_path), latest_tmp_path)
+        os.replace(latest_tmp_path, latest_path)
+    except OSError:
+        pass
     return checkpoint_path
+
+
+def get_latest_checkpoint_path(checkpoint_dir):
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
+    if os.path.exists(latest_path):
+        return latest_path
+
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt"))
+    if not checkpoints:
+        return None
+
+    steps = [int(f.split("_step_")[-1].replace(".pt", "")) for f in checkpoints]
+    latest_step = max(steps)
+    return os.path.join(checkpoint_dir, f"checkpoint_step_{latest_step}.pt")
 
 
 def main():
@@ -288,13 +311,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume from checkpoint
-    resume_from = args.resume_from
-    if not resume_from:
-        checkpoints = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_step_*.pt"))
-        if checkpoints:
-            steps = [int(f.split("_step_")[-1].replace(".pt", "")) for f in checkpoints]
-            latest_step = max(steps)
-            resume_from = os.path.join(args.checkpoint_dir, f"checkpoint_step_{latest_step}.pt")
+    resume_from = args.resume_from or get_latest_checkpoint_path(args.checkpoint_dir)
 
     if resume_from and os.path.exists(resume_from):
         if IS_MAIN:
@@ -319,8 +336,12 @@ def main():
             is_resumed = False
         else:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            for _ in range(checkpoint['global_step']):
-                scheduler.step()
+            scheduler_state = checkpoint.get('scheduler_state_dict')
+            if scheduler_state:
+                scheduler.load_state_dict(scheduler_state)
+            else:
+                for _ in range(checkpoint['global_step']):
+                    scheduler.step()
             global_step = checkpoint['global_step']
             tokens_processed = checkpoint['tokens_processed']
             data_position = checkpoint.get('data_position', 0)

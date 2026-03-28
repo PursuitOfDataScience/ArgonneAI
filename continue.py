@@ -126,7 +126,30 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
     torch.save(checkpoint, checkpoint_path)
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
+    latest_tmp_path = latest_path + ".tmp"
+    try:
+        if os.path.lexists(latest_tmp_path):
+            os.remove(latest_tmp_path)
+        os.symlink(os.path.basename(checkpoint_path), latest_tmp_path)
+        os.replace(latest_tmp_path, latest_path)
+    except OSError:
+        pass
     return checkpoint_path
+
+
+def get_latest_checkpoint_path(checkpoint_dir):
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
+    if os.path.exists(latest_path):
+        return latest_path
+
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt"))
+    if not checkpoints:
+        return None
+
+    steps = [int(f.split("_step_")[-1].replace(".pt", "")) for f in checkpoints]
+    latest_step = max(steps)
+    return os.path.join(checkpoint_dir, f"checkpoint_step_{latest_step}.pt")
 
 
 def main():
@@ -244,14 +267,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume from checkpoint
-    resume_from = args.resume_from
+    resume_from = args.resume_from or get_latest_checkpoint_path(args.checkpoint_dir)
     checkpoint = None
-    if not resume_from:
-        checkpoints = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint_step_*.pt"))
-        if checkpoints:
-            steps = [int(f.split("_step_")[-1].replace(".pt", "")) for f in checkpoints]
-            latest_step = max(steps)
-            resume_from = os.path.join(args.checkpoint_dir, f"checkpoint_step_{latest_step}.pt")
+    initial_steps = 0
 
     if resume_from and os.path.exists(resume_from):
         if IS_MAIN:
@@ -259,37 +277,33 @@ def main():
         checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler_state = checkpoint.get('scheduler_state_dict')
+        if scheduler_state:
+            scheduler.load_state_dict(scheduler_state)
+        else:
+            for _ in range(checkpoint['global_step']):
+                scheduler.step()
+        global_step = checkpoint['global_step']
+        tokens_processed = checkpoint['tokens_processed']
 
         if args.reset_schedule == 1:
             # Continued pretraining on new data:
-            # Keep model weights, fresh optimizer momentum, fresh schedule,
-            # reset data position while preserving cumulative counters
+            # keep model, optimizer, and scheduler state; restart the data cursor.
             if IS_MAIN:
-                print("Reset schedule mode: fresh optimizer, scheduler, data position; preserving cumulative step/tokens")
+                print("Reset schedule mode: preserving optimizer/scheduler state and restarting the data position")
                 print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
-            # Rebuild fresh optimizer (clears Adam momentum from old data)
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                betas=(args.adam_beta1, args.adam_beta2),
-                weight_decay=args.weight_decay,
-            )
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            global_step = checkpoint['global_step']
-            tokens_processed = checkpoint['tokens_processed']
+            train_loader.set_position(RANK * args.batch_size * args.block_size)
+            train_loader.epoch = 0
             is_resumed = False
         else:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            for _ in range(checkpoint['global_step']):
-                scheduler.step()
-            global_step = checkpoint['global_step']
-            tokens_processed = checkpoint['tokens_processed']
             data_position = checkpoint.get('data_position', 0)
             train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
             train_loader.epoch = tokens_processed // num_tokens
             if IS_MAIN:
                 print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}, LR: {scheduler.get_last_lr()[0]:.2e}")
             is_resumed = True
+            initial_steps = min(estimated_steps, int(tokens_processed // ACTUAL_TOTAL_BATCH))
     else:
         is_resumed = False
 
@@ -307,14 +321,11 @@ def main():
         if args.wall_time > 0:
             print(f"Wall time: {args.wall_time}s, will save checkpoint at {WALL_TIME_SAVE}s")
         if args.reset_schedule == 1:
-            print("Mode: continued pretraining (fresh schedule)")
+            print("Mode: continued pretraining (restart data cursor, preserve optimizer/scheduler)")
         print("-" * 60)
 
     if not is_resumed:
-        if args.reset_schedule == 1 and checkpoint is not None:
-            global_step = checkpoint['global_step']
-            tokens_processed = checkpoint['tokens_processed']
-        else:
+        if checkpoint is None:
             global_step = 0
             tokens_processed = 0
     last_checkpoint_time = time.time()
@@ -323,9 +334,7 @@ def main():
 
     pbar = None
     if IS_MAIN:
-        pbar = tqdm(total=estimated_steps, desc="Training", unit="step")
-        if is_resumed:
-            pbar.update(global_step)
+        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step")
 
     model.train()
 
@@ -537,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
     parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
-    parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule and data position when resuming; preserve cumulative step/token counters. Use for continued pretraining on new data.")
+    parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Restart the data position from the beginning of the current dataset when resuming, while preserving optimizer, scheduler, and cumulative step/token counters.")
     parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
     args = parser.parse_args()
 
