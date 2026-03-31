@@ -6,15 +6,13 @@ Distributed PyTorch training pipeline for the Argonne causal LM using Qwen-famil
 
 ```text
 ArgonneAI/
-├── model.py              # Argonne model + Hugging Face registration (model_type="argonne2")
-├── train_llm_c.py        # Main DDP pretraining script
-├── continue.py           # Continued pretraining script (new-data continuation workflow)
-├── preprocess_data.py    # Parquet -> train.bin converter
-├── run_full_training.sh  # Example SLURM launch for train_llm_c.py
-├── continue.sh           # Example SLURM launch for continue.py
-├── preprocess_job.sh     # Example SLURM launch for preprocess_data.py
-├── report/               # Job logs
-└── test/                 # Experiment scripts/results
+├── model.py                 # Argonne model + Hugging Face registration (model_type="argonne2")
+├── pretrain.py              # Main DDP pretraining script
+├── continue_pretrain.py     # Continued pretraining script (new-data continuation workflow)
+├── sft.py                   # Supervised fine-tuning script
+├── cot-sft.py               # Chain-of-thought SFT script
+├── preprocess_data.py       # Parquet -> train.bin converter
+└── test/                    # Experiment scripts/results
 ```
 
 ## Requirements
@@ -49,10 +47,10 @@ sbatch preprocess_job.sh
 
 ### 2) Train (new run or resume)
 
-`train_llm_c.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
+`pretrain.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
 
 ```bash
-torchrun --nproc_per_node=2 train_llm_c.py \
+torchrun --nproc_per_node=2 pretrain.py \
   --tokenizer_path /path/to/tokenizer \
   --data_path /path/to/train.bin \
   --checkpoint_dir /path/to/checkpoints \
@@ -74,10 +72,10 @@ sbatch run_full_training.sh
 
 ### 3) Continue pretraining on new data
 
-`continue.py` is intended for continued pretraining and is commonly used with `--reset_schedule 1`.
+`continue_pretrain.py` is intended for continued pretraining and is commonly used with `--reset_schedule 1`.
 
 ```bash
-torchrun --nproc_per_node=2 continue.py \
+torchrun --nproc_per_node=2 continue_pretrain.py \
   --tokenizer_path /path/to/tokenizer \
   --data_path /path/to/new_train.bin \
   --checkpoint_dir /path/to/checkpoints \
@@ -94,7 +92,7 @@ SLURM example:
 sbatch continue.sh
 ```
 
-## Common Training Arguments (`train_llm_c.py` and `continue.py`)
+## Common Training Arguments (`pretrain.py` and `continue_pretrain.py`)
 
 | Argument | Description | Default |
 |---|---|---|
@@ -127,8 +125,8 @@ sbatch continue.sh
 
 ### Important `--reset_schedule` difference
 
-- In `train_llm_c.py`, `--reset_schedule 1` resets LR schedule, step counter, token counter, and data position (fresh-run counters).
-- In `continue.py`, `--reset_schedule 1` resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed` from the loaded checkpoint.
+- In `pretrain.py`, `--reset_schedule 1` resets LR schedule, step counter, token counter, and data position (fresh-run counters).
+- In `continue_pretrain.py`, `--reset_schedule 1` resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed` from the loaded checkpoint.
 
 ## Checkpointing and Outputs
 
@@ -148,7 +146,7 @@ sbatch continue.sh
 
 ### Training preset used by scripts
 
-`train_llm_c.py` and `continue.py` instantiate the model with:
+`pretrain.py` and `continue_pretrain.py` instantiate the model with:
 
 - Hidden size: `1792`
 - Layers: `28`
