@@ -488,7 +488,7 @@ def main():
         print(f"Final checkpoint saved: {checkpoint_path}")
 
         # Save complete model + tokenizer + config
-        final_model_dir = os.path.join(args.checkpoint_dir, "final_model")
+        final_model_dir = os.path.join(args.checkpoint_dir, "final_model_complete")
         os.makedirs(final_model_dir, exist_ok=True)
         save_model = get_base_model(model)
 
