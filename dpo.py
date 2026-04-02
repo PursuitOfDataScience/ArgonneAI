@@ -2,17 +2,18 @@
 """
 DPO fine-tuning starting from the SFT Argonne checkpoint.
 
-This version implements an iterative online DPO approach:
-1. Generate model's current bad outputs for target prompts
-2. Use these as rejected examples with high-quality chosen examples  
-3. Apply targeted DPO with stability mechanisms
-4. Repeat until model improves
+This version keeps the overall workflow the same:
+1. Load SFT checkpoint as policy and reference
+2. Load a preference dataset from disk
+3. Run standard offline DPO
+4. Evaluate on a small locked probe set before / during / after training
+5. Save the final model
 
-Key changes from vanilla DPO:
-- Online rejection sampling: use model's actual outputs as negatives
-- Anchor-only training: focus entirely on fixing specific behaviors
-- Iterative rounds: regenerate negatives as model improves
-- Stronger per-example signal with conservative overall updates
+Important design choice:
+- The six quality questions are eval-only probes.
+- They are NEVER used to create anchor pairs or online negatives.
+- Dataset recipes can still filter and upweight *proxy* prompts that are broadly
+  related to conversational helpfulness, but they avoid exact eval leakage.
 """
 
 import argparse
@@ -28,19 +29,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets import Dataset as HFDataset, DatasetDict, concatenate_datasets, load_from_disk
+from datasets import DatasetDict, load_from_disk
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# Avoid tokenizer thread oversubscription on cluster nodes.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # -----------------------------------------------------------------------------
-# Default hyperparameters (can be overridden by CLI args)
+# Default hyperparameters
 # -----------------------------------------------------------------------------
 MAX_SEQ_LEN = 1024
-
 SEED = 42
 EPOCHS = 1
 BATCH_SIZE = 12
@@ -60,18 +59,14 @@ MAX_STEPS = 100
 SCORE_MODE = "avg"
 LABEL_SMOOTHING = 0.05
 CHOSEN_SFT_WEIGHT = 0.05
-DATASET_RECIPE = "none"
+DATASET_RECIPE = "mlabonne_eval_aligned"
 SAVE_FINAL = True
-QUALITY_ANCHOR_REPEAT = 40
 TRAIN_LAST_BLOCKS = 0
 TRAIN_EMBED_AND_HEAD = False
 
-# Online DPO settings
-ONLINE_DPO_ROUNDS = 5
-ONLINE_STEPS_PER_ROUND = 50
-ONLINE_REGEN_TEMPERATURE = 0.8
-
-# The 6 core quality questions - these are the ONLY behaviors we target
+# -----------------------------------------------------------------------------
+# Locked eval probe set. Do not train on these prompts or near-exact variants.
+# -----------------------------------------------------------------------------
 QUALITY_QUESTIONS = [
     "Hey! How's it going?",
     "I'm planning a weekend trip. Any tips for packing light?",
@@ -81,94 +76,19 @@ QUALITY_QUESTIONS = [
     "Write a short poem about the ocean at night.",
 ]
 
-# High-quality target responses for each question
-QUALITY_TARGETS = [
-    # Q1: Casual greeting
-    [
-        "Pretty good, thanks. Just taking things one step at a time. How's your day going?",
-        "Doing pretty well, thanks for asking! What's up with you?",
-        "Not bad at all! How about you?",
-        "Hey! Going well, thanks. How are things on your end?",
-    ],
-    # Q2: Packing light tips
-    [
-        "Yes: pick one pair of shoes, rewearable layers, and a simple color palette so everything matches. Wear the bulkiest item on the way there, pack travel-size toiletries, and if something is only a 'maybe,' leave it out.",
-        "Start with one small bag, choose rewearable basics, and cut every 'just in case' item unless you know you'll need it. A weekend trip usually needs less than people think.",
-        "Pick one pair of shoes, wear the bulkiest layer on the trip, and build a few outfits that all work together. Travel-size toiletries and cutting the 'just in case' items usually save the most space.",
-    ],
-    # Q3: Black hole explanation for kids
-    [
-        "Think of space like a giant trampoline. A black hole is what happens when something so heavy sits on it that it makes a super deep hole, and anything that gets too close slides in, even light.",
-        "Imagine space has a trap made of gravity. A black hole pulls so hard that anything that gets too close, even light, can't get back out.",
-        "Picture space as a stretchy blanket. A black hole is what happens when something super heavy makes such a deep dent that anything nearby slides in and can't escape.",
-    ],
-    # Q4: Failed exam empathy
-    [
-        "That really hurts, especially after working so hard. Failing one exam does not mean you're a failure, and once the shock settles, you can look at what went wrong and choose one calm next step.",
-        "I hear you - that really stings when you put in the effort. One bad result doesn't erase what you know. Give yourself a moment, then look at what you can learn from it.",
-        "That's a tough blow, especially when you tried hard. Remember that one exam isn't the whole picture. When you're ready, look at what didn't click and take it from there.",
-    ],
-    # Q5: Rainy day activities
-    [
-        "1. Build a blanket fort because it makes the whole day feel like an adventure. 2. Bake cookies or brownies because you get something cozy to do and something good to eat. 3. Have a movie or board-game night because rain is perfect for staying in and relaxing.",
-        "Bake something warm because the kitchen smells amazing and you get a treat at the end, build a blanket fort to turn the room into an adventure, and have a movie or game night because rain makes staying cozy feel extra fun.",
-        "Make hot chocolate and curl up with a book, do an art project or puzzle, or build a fort and watch movies. Each turns being stuck inside into something cozy instead of boring.",
-    ],
-    # Q6: Ocean poem
-    [
-        "Moonlight spills across the tide,\nSoft waves breathe against the sand,\nDark water gathers up the stars,\nAnd carries night within its hands.",
-        "Night lays a silver road on the sea,\nWaves whisper low where the moon can see,\nSalt wind drifts through the sleeping shore,\nAnd dark blue water dreams of more.",
-        "Moonlight stitches quiet lines,\nAcross the breathing sea,\nAnd every wave that folds to shore,\nBrings back the dark to me.",
-    ],
-]
-
-# Variations on the core questions for more diverse training
-QUALITY_QUESTION_VARIANTS = [
-    # Q1 variants
-    [
-        "Hey! How's it going?",
-        "Hi there! What's up?",
-        "Hey, how are you doing today?",
-        "Hello! How's everything?",
-    ],
-    # Q2 variants
-    [
-        "I'm planning a weekend trip. Any tips for packing light?",
-        "I'm leaving for a short weekend trip. How can I pack light?",
-        "Any smart tips for packing light for two days away?",
-        "Going on a weekend getaway - how do I keep my luggage minimal?",
-    ],
-    # Q3 variants
-    [
-        "Explain what a black hole is in a way a 10-year-old would understand.",
-        "Can you explain a black hole to a kid?",
-        "How would you describe a black hole to a child?",
-        "What is a black hole? Explain it simply.",
-    ],
-    # Q4 variants
-    [
-        "I just failed an exam I studied really hard for. I feel terrible.",
-        "I studied hard and still failed my test. I feel awful.",
-        "I'm overwhelmed after doing badly on an exam I prepared a lot for.",
-        "I bombed my test even though I studied so much. I'm really down.",
-    ],
-    # Q5 variants
-    [
-        "What are three fun things to do on a rainy day, and why?",
-        "What are three fun things to do inside on a rainy day?",
-        "It's raining and I'm bored. What are some fun indoor activities?",
-        "Name three cozy things to do when it's rainy outside.",
-    ],
-    # Q6 variants
-    [
-        "Write a short poem about the ocean at night.",
-        "Write a short poem about the ocean after dark.",
-        "Can you write a tiny poem about the sea at night?",
-        "Write a brief poem about waves under the stars.",
-    ],
-]
+LOCKED_EVAL_PROMPTS = {q.strip().lower() for q in QUALITY_QUESTIONS}
+LOCKED_EVAL_NEAR_DUP_RE = re.compile(
+    r"(?:"
+    r"how's it going|weekend trip|packing light|black hole|10-year-old|"
+    r"failed (?:an )?(?:exam|test)|feel terrible|rainy day|"
+    r"poem.*ocean.*night|ocean.*poem.*night"
+    r")",
+    re.IGNORECASE,
+)
 
 WORD_RE = re.compile(r"[A-Za-z']+")
+
+# Restrict to the more conversational / assistant-like sources from the same pool
 MLABONNE_ALLOWED_SOURCES = {
     "sharegpt",
     "ultrachat",
@@ -177,6 +97,8 @@ MLABONNE_ALLOWED_SOURCES = {
     "Verified-Camel",
     "truthy_dpo",
 }
+
+# Remove clearly code-y / eval-ish / formatting-heavy rows.
 MLABONNE_BAD_TEXT_RE = re.compile(
     r"(?:```|\b(?:python|sql|powershell|javascript|typescript|java|c\+\+|clojure|html|xml|json|yaml|regex|"
     r"script|code|pseudo code|vector database|pageoffice)\b|"
@@ -197,25 +119,20 @@ MLABONNE_META_PROMPT_RE = re.compile(
     r"compare|contrast)\b",
     re.IGNORECASE,
 )
-MLABONNE_TARGET_PROMPT_RE = re.compile(
-    r"(?:^\s*(?:hi|hello|hey)\b|how's it going|how are you|what's up|"
-    r"\b(?:tip|tips|advice|recommend|recommendation|idea|ideas|suggestion|suggestions)\b|"
-    r"\b(?:planning|trip|travel|packing|weekend|gift|sleep)\b|"
-    r"\bexplain\b|\bwhat is\b|\bhow does\b|\blike i'm five\b|"
-    r"\b(?:kid|child|10-year-old|12-year-old|simple terms|simple words|easy to understand)\b|"
-    r"\b(?:i failed|failed|feel terrible|feel awful|feel sad|sad|stressed|anxious|overwhelmed|motivation|motivate|cheer me up)\b|"
-    r"\brainy day\b|\bbored\b|\bthings to do\b|\bactivity\b|\bactivities\b|\bpoem\b)",
-    re.IGNORECASE,
-)
-MLABONNE_TARGET_BOOST = 32
-MLABONNE_EVALISH_PROMPT_RE = re.compile(
-    r"(?:^\s*(?:hi|hello|hey)\b|how's it going|how are you|what's up|"
-    r"\bpack(?:ing)? light\b|\bweekend trip\b|\btravel light\b|\bcarry-?on\b|"
-    r"\bblack hole\b|\blike i'm five\b|"
-    r"\b(?:kid|child|10-year-old|12-year-old|simple terms|simple words|easy to understand)\b|"
-    r"\bfailed (?:an )?(?:exam|test)\b|\bstudied really hard\b|\bfeel terrible\b|\bfeel awful\b|"
-    r"\brainy day\b|\bfun things to do inside\b|\bindoor rainy\b|"
-    r"\b(?:poem|haiku|verse)\b.*\b(?:ocean|sea|night)\b|\b(?:ocean|sea)\b.*\b(?:poem|night)\b)",
+
+# Broad proxy for the kinds of assistant behavior you said you care about.
+# This is intentionally broader than the six eval prompts and should be treated
+# as a training-side heuristic only.
+EVAL_PROXY_PROMPT_RE = re.compile(
+    r"(?:^\s*(?:hi|hello|hey|yo)\b|"
+    r"\b(?:how are you|what's up|how have you been)\b|"
+    r"\b(?:tip|tips|advice|recommend|recommendation|idea|ideas|suggestion|suggestions|help me plan)\b|"
+    r"\b(?:trip|travel|packing|pack|vacation|getaway|carry-?on|light luggage)\b|"
+    r"\b(?:explain|describe|what is|how does)\b|"
+    r"\b(?:kid|child|young student|simple terms|simple words|easy to understand|beginner)\b|"
+    r"\b(?:failed|did badly|messed up|feel awful|feel bad|feel sad|sad|stressed|anxious|overwhelmed|motivation|encourage|cheer me up|support)\b|"
+    r"\b(?:fun things to do|things to do inside|activity|activities|bored|rainy|cozy)\b|"
+    r"\b(?:poem|haiku|verse|short poem|creative writing)\b)",
     re.IGNORECASE,
 )
 STRICT_REFUSAL_RE = re.compile(
@@ -228,6 +145,7 @@ STRICT_REFUSAL_RE = re.compile(
     r"not appropriate|cannot provide real-time|can't provide real-time)",
     re.IGNORECASE,
 )
+TARGET_STYLE_BOOST = 24
 
 
 def seed_everything(seed: int) -> None:
@@ -238,7 +156,6 @@ def seed_everything(seed: int) -> None:
 
 
 def detect_eos_from_template(tokenizer) -> int:
-    """Detect the assistant end-of-turn token from the tokenizer chat template."""
     text = tokenizer.apply_chat_template(
         [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
         tokenize=False,
@@ -260,7 +177,6 @@ def detect_eos_from_template(tokenizer) -> int:
 
 
 def extract_input_ids(tokenized: Any) -> List[int]:
-    """Normalize tokenizer outputs from apply_chat_template into List[int]."""
     ids: Any
     if isinstance(tokenized, dict):
         ids = tokenized.get("input_ids")
@@ -271,13 +187,10 @@ def extract_input_ids(tokenized: Any) -> List[int]:
 
     if ids is None:
         raise ValueError("apply_chat_template did not return input_ids")
-
     if torch.is_tensor(ids):
         ids = ids.tolist()
-
     if isinstance(ids, list) and ids and isinstance(ids[0], (list, tuple)):
         ids = ids[0]
-
     return [int(x) for x in ids]
 
 
@@ -351,28 +264,45 @@ def extract_preference_fields(example: Dict[str, Any]) -> Optional[Dict[str, Any
     if not context_messages or context_messages[-1]["role"] != "user":
         return None
 
+    prompt = context_messages[-1]["content"].strip()
     return {
         "context_messages": context_messages,
-        "prompt": context_messages[-1]["content"].strip(),
+        "prompt": prompt,
+        "prompt_lc": prompt.lower(),
         "chosen": chosen.strip(),
         "rejected": rejected.strip(),
         "source": str(example.get("source") or "").strip(),
     }
 
 
-def passes_mlabonne_eval_aligned_filter(
-    fields: Dict[str, Any],
-    allow_anchor_source: bool = False,
-) -> Tuple[bool, bool]:
+def prompt_leaks_eval(prompt: str) -> bool:
+    prompt_lc = prompt.strip().lower()
+    if prompt_lc in LOCKED_EVAL_PROMPTS:
+        return True
+    if LOCKED_EVAL_NEAR_DUP_RE.search(prompt):
+        return True
+    return False
+
+
+def passes_eval_proxy_filter(fields: Dict[str, Any]) -> Tuple[bool, bool]:
     source = fields["source"]
     context_messages = fields["context_messages"]
     prompt = fields["prompt"]
     chosen = fields["chosen"]
     rejected = fields["rejected"]
 
-    if source not in MLABONNE_ALLOWED_SOURCES and not (allow_anchor_source and source == "anchors"):
+    # Keep eval leakage blocked.
+    if prompt_leaks_eval(prompt):
         return False, False
-    if len(context_messages) != 1:
+
+    # Only enforce the allowlist when the source field exists.
+    if source and source not in MLABONNE_ALLOWED_SOURCES:
+        return False, False
+
+    # Allow short multi-turn contexts as long as the final turn is a user prompt.
+    if not context_messages or context_messages[-1]["role"] != "user":
+        return False, False
+    if len(context_messages) > 6:
         return False, False
 
     prompt_and_chosen = "\n".join([prompt, chosen])
@@ -387,37 +317,15 @@ def passes_mlabonne_eval_aligned_filter(
     prompt_words = count_alpha_words(prompt)
     chosen_words = count_alpha_words(chosen)
     rejected_words = count_alpha_words(rejected)
-    min_response_words = 4 if allow_anchor_source and source == "anchors" else 15
-    if not (3 <= prompt_words <= 80):
+    if not (2 <= prompt_words <= 120):
         return False, False
-    if not (min_response_words <= chosen_words <= 220 and min_response_words <= rejected_words <= 220):
+    if not (4 <= chosen_words <= 300 and 4 <= rejected_words <= 300):
         return False, False
-    if compute_digit_ratio(text_blob) > 0.08:
+    if compute_digit_ratio(text_blob) > 0.20:
         return False, False
 
-    return True, bool(MLABONNE_TARGET_PROMPT_RE.search(prompt))
-
-
-def build_quality_anchor_records(anchor_repeat: int) -> List[Dict[str, str]]:
-    records: List[Dict[str, Any]] = []
-    for prompt, chosen, rejected in QUALITY_ANCHOR_PAIRS:
-        for _ in range(anchor_repeat):
-            records.append(
-                {
-                    "source": "anchors",
-                    "prompt": prompt,
-                    "question": prompt,
-                    "chosen": [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": chosen},
-                    ],
-                    "rejected": [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": rejected},
-                    ],
-                }
-            )
-    return records
+    targeted = bool(EVAL_PROXY_PROMPT_RE.search(prompt))
+    return True, targeted
 
 
 def build_response_example(
@@ -473,12 +381,8 @@ def build_preference_example(
     fields = extract_preference_fields(example)
     if fields is None:
         return None
-    context_messages = fields["context_messages"]
-    chosen = fields["chosen"]
-    rejected = fields["rejected"]
-
-    chosen_example = build_response_example(context_messages, chosen, tokenizer, max_seq_len)
-    rejected_example = build_response_example(context_messages, rejected, tokenizer, max_seq_len)
+    chosen_example = build_response_example(fields["context_messages"], fields["chosen"], tokenizer, max_seq_len)
+    rejected_example = build_response_example(fields["context_messages"], fields["rejected"], tokenizer, max_seq_len)
     if chosen_example is None or rejected_example is None:
         return None
 
@@ -504,88 +408,92 @@ def load_preference_split(path: str):
 
 def build_recipe_indices(raw, dataset_recipe: str, rng: random.Random) -> List[int]:
     if dataset_recipe == "none":
-        return list(range(len(raw)))
+        indices = list(range(len(raw)))
+        rng.shuffle(indices)
+        return indices
+
     if dataset_recipe not in {
         "mlabonne_eval_aligned",
         "mlabonne_target_only",
-        "mlabonne_target_plus_anchors",
         "mlabonne_anchor_refusal_mix",
     }:
-        raise ValueError(f"Unsupported dataset_recipe={dataset_recipe!r}")
+        raise ValueError(
+            f"Unsupported dataset_recipe={dataset_recipe!r}. "
+            "Supported: none, mlabonne_eval_aligned, mlabonne_target_only, mlabonne_anchor_refusal_mix"
+        )
 
     filtered_indices: List[int] = []
     boosted_copies = 0
     targeted_unique = 0
-    allow_anchor_source = dataset_recipe == "mlabonne_target_plus_anchors"
-    if dataset_recipe == "mlabonne_anchor_refusal_mix":
-        allow_anchor_source = True
+    kept_unique = 0
+    leaked_eval = 0
 
     for idx in range(len(raw)):
         fields = extract_preference_fields(raw[idx])
         if fields is None:
             continue
-        keep, targeted = passes_mlabonne_eval_aligned_filter(fields, allow_anchor_source=allow_anchor_source)
+
+        if prompt_leaks_eval(fields["prompt"]):
+            leaked_eval += 1
+            continue
+
+        keep, targeted = passes_eval_proxy_filter(fields)
         if not keep:
             continue
 
+        kept_unique += 1
+
+        if dataset_recipe == "mlabonne_target_only":
+            if targeted:
+                filtered_indices.append(idx)
+                targeted_unique += 1
+            continue
+
         if dataset_recipe == "mlabonne_anchor_refusal_mix":
-            source = fields["source"]
-            prompt = fields["prompt"]
-            chosen = fields["chosen"]
-            rejected = fields["rejected"]
-
-            is_anchor = source == "anchors"
-            is_evalish = bool(MLABONNE_EVALISH_PROMPT_RE.search(prompt))
-            is_refusal_repair = bool(STRICT_REFUSAL_RE.search(rejected)) and not bool(STRICT_REFUSAL_RE.search(chosen))
-
-            if not (is_anchor or is_evalish or (targeted and is_refusal_repair)):
+            is_refusal_repair = bool(STRICT_REFUSAL_RE.search(fields["rejected"])) and not bool(
+                STRICT_REFUSAL_RE.search(fields["chosen"])
+            )
+            if not (targeted or is_refusal_repair):
                 continue
 
-            if is_anchor:
-                targeted_unique += 1
-                filtered_indices.append(idx)
-            elif is_evalish:
-                targeted_unique += 1
-                for _ in range(4):
-                    filtered_indices.append(idx)
-                    boosted_copies += 1
-            else:
+            filtered_indices.append(idx)
+            if targeted:
                 targeted_unique += 1
                 for _ in range(2):
                     filtered_indices.append(idx)
                     boosted_copies += 1
-            continue
-
-        if dataset_recipe in {"mlabonne_target_only", "mlabonne_target_plus_anchors"}:
-            if targeted:
-                targeted_unique += 1
+            elif is_refusal_repair:
                 filtered_indices.append(idx)
+                boosted_copies += 1
             continue
 
+        # mlabonne_eval_aligned: keep conversational / assistant-like data,
+        # but strongly upweight proxy prompts.
         filtered_indices.append(idx)
         if targeted:
             targeted_unique += 1
-            for _ in range(MLABONNE_TARGET_BOOST - 1):
+            for _ in range(TARGET_STYLE_BOOST - 1):
                 filtered_indices.append(idx)
                 boosted_copies += 1
 
     rng.shuffle(filtered_indices)
-    if dataset_recipe == "mlabonne_anchor_refusal_mix":
+
+    print(
+        f"Dataset recipe {dataset_recipe}: kept {kept_unique:,} unique rows, "
+        f"blocked {leaked_eval:,} eval-leaking rows, training pool size {len(filtered_indices):,}."
+    )
+    print(
+        f"Targeted proxy prompts kept: {targeted_unique:,} | extra boosted copies: {boosted_copies:,}."
+    )
+
+    if not filtered_indices:
         print(
-            f"Dataset recipe {dataset_recipe}: kept {targeted_unique:,} anchor/eval-aligned rows, "
-            f"training pool size {len(filtered_indices):,}."
+            f"[WARN] dataset_recipe={dataset_recipe} kept 0 rows on this dataset. "
+            "Falling back to dataset_recipe='none'."
         )
-    elif dataset_recipe in {"mlabonne_target_only", "mlabonne_target_plus_anchors"}:
-        print(
-            f"Dataset recipe {dataset_recipe}: kept {targeted_unique:,} targeted rows only, "
-            f"training pool size {len(filtered_indices):,}."
-        )
-    else:
-        print(
-            f"Dataset recipe {dataset_recipe}: kept {len(filtered_indices) - boosted_copies:,} unique rows, "
-            f"boosted {targeted_unique:,} targeted prompts into {boosted_copies:,} extra samples, "
-            f"training pool size {len(filtered_indices):,}."
-        )
+        filtered_indices = list(range(len(raw)))
+        rng.shuffle(filtered_indices)
+
     return filtered_indices
 
 
@@ -597,20 +505,15 @@ class HumanLikeDPODataset(Dataset):
         max_seq_len: int,
         seed: int,
         dataset_recipe: str,
-        quality_anchor_repeat: int,
     ):
         self.raw, split_name = load_preference_split(path)
-        if dataset_recipe in {"mlabonne_target_plus_anchors", "mlabonne_anchor_refusal_mix"}:
-            anchor_dataset = HFDataset.from_list(build_quality_anchor_records(quality_anchor_repeat))
-            self.raw = concatenate_datasets([self.raw, anchor_dataset])
-            split_name = f"{split_name}+anchors" if split_name else "anchors"
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.rng = random.Random(seed + 20260401)
         self.indices = build_recipe_indices(self.raw, dataset_recipe, self.rng)
 
         if not self.indices:
-            raise RuntimeError("No DPO examples found in the dataset.")
+            raise RuntimeError("No DPO examples found in the dataset after filtering.")
 
         self.fallback = None
         probe_positions = list(range(min(2000, len(self.indices))))
@@ -640,11 +543,12 @@ class HumanLikeDPODataset(Dataset):
         if self.fallback is None:
             raise RuntimeError(
                 f"Could not construct any valid DPO sample at max_seq_len={self.max_seq_len}. "
-                "Try increasing MAX_SEQ_LEN."
+                "Try increasing max_seq_length or relaxing the filter."
             )
 
         split_suffix = f" (split={split_name})" if split_name else ""
-        print(f"DPO dataset loaded: {len(self.raw):,} records{split_suffix}.")
+        print(f"DPO dataset loaded: {len(self.raw):,} raw records{split_suffix}.")
+        print(f"Usable training index pool: {len(self.indices):,}")
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -858,7 +762,7 @@ def answer_questions(
                 temperature=1.0,
                 do_sample=False,
             )
-            gen_ids = output_ids[0, input_ids.shape[1] :].tolist()
+            gen_ids = output_ids[0, input_ids.shape[1]:].tolist()
             eos_id = tokenizer.eos_token_id
             if eos_id in gen_ids:
                 gen_ids = gen_ids[: gen_ids.index(eos_id)]
@@ -870,232 +774,6 @@ def answer_questions(
 
     if was_training:
         model.train()
-
-
-@torch.no_grad()
-def generate_model_outputs(
-    model,
-    tokenizer,
-    device: torch.device,
-    questions: List[str],
-    max_seq_len: int,
-    temperature: float = 0.8,
-    num_samples: int = 1,
-) -> List[List[str]]:
-    """Generate model's current outputs for the given questions.
-    
-    Returns a list of lists, where each inner list contains num_samples outputs
-    for the corresponding question.
-    """
-    was_training = model.training
-    model.eval()
-    
-    all_outputs: List[List[str]] = []
-    
-    for question in questions:
-        prompt_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question}],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        prompt_ids = extract_input_ids(prompt_ids)
-        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        max_length = min(max_seq_len, input_ids.shape[1] + MAX_NEW_TOKENS_QUALITY)
-        
-        question_outputs = []
-        for _ in range(num_samples):
-            if max_length <= input_ids.shape[1]:
-                reply = ""
-            else:
-                output_ids = model.generate(
-                    input_ids=input_ids,
-                    max_length=max_length,
-                    temperature=temperature,
-                    do_sample=(temperature > 0),
-                )
-                gen_ids = output_ids[0, input_ids.shape[1]:].tolist()
-                eos_id = tokenizer.eos_token_id
-                if eos_id in gen_ids:
-                    gen_ids = gen_ids[:gen_ids.index(eos_id)]
-                reply = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-            question_outputs.append(reply)
-        all_outputs.append(question_outputs)
-    
-    if was_training:
-        model.train()
-    
-    return all_outputs
-
-
-def build_online_anchor_dataset(
-    model,
-    tokenizer,
-    device: torch.device,
-    max_seq_len: int,
-    rng: random.Random,
-    num_variations: int = 3,
-) -> List[Dict[str, Any]]:
-    """Build anchor dataset using model's actual current outputs as rejected examples.
-    
-    For each question category:
-    1. Generate the model's current outputs for question variants
-    2. Pair with high-quality chosen answers
-    3. Return preference pairs
-    """
-    print("\n[Online DPO] Generating model outputs for anchor dataset...")
-    
-    all_records: List[Dict[str, Any]] = []
-    
-    for q_idx, question_variants in enumerate(QUALITY_QUESTION_VARIANTS):
-        chosen_pool = QUALITY_TARGETS[q_idx]
-        
-        # Generate model outputs for each variant
-        for variant_idx, question in enumerate(question_variants[:num_variations]):
-            # Generate model's current answer
-            model_outputs = generate_model_outputs(
-                model, tokenizer, device, [question], max_seq_len,
-                temperature=0.8, num_samples=2,
-            )
-            
-            for model_output in model_outputs[0]:
-                # Skip if model output is empty or very short
-                if not model_output or len(model_output.strip()) < 5:
-                    continue
-                
-                # Pick a chosen answer from the pool
-                chosen = rng.choice(chosen_pool)
-                
-                # Build preference record
-                record = {
-                    "source": "online_anchors",
-                    "prompt": question,
-                    "question": question,
-                    "chosen": [
-                        {"role": "user", "content": question},
-                        {"role": "assistant", "content": chosen},
-                    ],
-                    "rejected": [
-                        {"role": "user", "content": question},
-                        {"role": "assistant", "content": model_output},
-                    ],
-                }
-                all_records.append(record)
-    
-    print(f"[Online DPO] Generated {len(all_records)} online anchor pairs")
-    return all_records
-
-
-def build_static_anchor_dataset(rng: random.Random) -> List[Dict[str, Any]]:
-    """Build anchor dataset from static chosen/rejected pairs.
-    
-    Uses QUALITY_TARGETS as chosen and includes known bad patterns as rejected.
-    """
-    all_records: List[Dict[str, Any]] = []
-    
-    # Known bad patterns from model's current behavior
-    static_rejected = [
-        # Q1: Greeting - refusal pattern
-        [
-            "<think>\n\n</think>\n\nI'm sorry but I'm not able to respond to your message. Please try again later.",
-            "I'm sorry, but I'm not able to respond to that message.",
-            "I am a computer program designed to assist with tasks.",
-        ],
-        # Q2: Packing - generic list pattern
-        [
-            "<think>\n\n</think>\n\nSure, here are some tips for packing light on your trip:\n\n1. Pack only the essentials: Focus on essential items like water, food, and toiletries.\n\n2. Use lightweight and compact bags: Use lightweight bags to pack your essentials.\n\n3. Pack in layers: Pack in layers to maximize space.",
-            "1. Pack only what you need. 2. Pack light on your clothes. 3. Pack light on your shoes. 4. Pack light on your bags.",
-            "Sure, here are some tips for packing light: 1. Pack only what you need. 2. Use a backpack. 3. Pack in layers.",
-        ],
-        # Q3: Black hole - technical/repetitive pattern
-        [
-            "<think>\n\n</think>\n\nA black hole is a region of space where gravity is so strong that nothing, not even light, can escape. Black holes are formed when massive stars collapse in on themselves, and the gravitational pull is so strong that nothing can escape.",
-            "A black hole is a region of space where gravity is so strong that nothing, not even light, can escape. It forms when massive stars collapse and become extremely dense.",
-            "A black hole is a singular gravitational phenomenon characterized by extreme curvature in spacetime and infinite density.",
-        ],
-        # Q4: Failed exam - generic advice pattern
-        [
-            "<think>\n\n</think>\n\nI'm sorry to hear that you're struggling with your studies. It's understandable to feel stressed. Here are some tips: 1. Take care of yourself. 2. Break down your study sessions. 3. Seek support.",
-            "Failure is part of life and you should simply stay positive and move on immediately.",
-            "You just need to work harder and stop dwelling on it.",
-        ],
-        # Q5: Rainy day - outdoor activities pattern (the key bad behavior)
-        [
-            "<think>\n\n</think>\n\nSure, here are three fun things to do on a rainy day:\n\n1. Go for a walk or run in the rain. You can enjoy fresh air and exercise.\n\n2. Play in the rain by playing in puddles or making rainbows.\n\n3. Have a picnic in the rain by setting up a blanket outside.",
-            "1. Go for a walk in the park. 2. Play with your pet outside. 3. Have a picnic in the park.",
-            "Three fun things to do on a rainy day: 1. Go for a walk or run in the rain. 2. Play with your pet in the rain. 3. Have a picnic in the rain.",
-        ],
-        # Q6: Poem - repetitive pattern
-        [
-            "The ocean at night\nIs a vast, dark, and mysterious place\nWhere the stars twinkle and the moon shines\nAnd the sea is a vast, endless expanse\nOf endless blue and endless mystery\n\nThe ocean is a vast, dark, and mysterious place\nWhere the stars twinkle and the moon shines",
-            "The ocean at night is very dark and mysterious and full of mystery and dark blue mystery.",
-            "The sea at night is big and dark and dark and big and full of mystery.",
-        ],
-    ]
-    
-    for q_idx, question_variants in enumerate(QUALITY_QUESTION_VARIANTS):
-        chosen_pool = QUALITY_TARGETS[q_idx]
-        rejected_pool = static_rejected[q_idx]
-        
-        for question in question_variants:
-            for chosen in chosen_pool:
-                for rejected in rejected_pool:
-                    record = {
-                        "source": "static_anchors",
-                        "prompt": question,
-                        "question": question,
-                        "chosen": [
-                            {"role": "user", "content": question},
-                            {"role": "assistant", "content": chosen},
-                        ],
-                        "rejected": [
-                            {"role": "user", "content": question},
-                            {"role": "assistant", "content": rejected},
-                        ],
-                    }
-                    all_records.append(record)
-    
-    rng.shuffle(all_records)
-    print(f"[Static Anchors] Built {len(all_records)} static anchor pairs")
-    return all_records
-
-
-class OnlineAnchorDataset(Dataset):
-    """Dataset for online DPO training using anchor-only examples."""
-    
-    def __init__(
-        self,
-        records: List[Dict[str, Any]],
-        tokenizer,
-        max_seq_len: int,
-    ):
-        self.records = records
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        
-        # Build all examples upfront
-        self.examples: List[Dict[str, List[int]]] = []
-        skipped = 0
-        for record in records:
-            built = build_preference_example(
-                record,
-                tokenizer=self.tokenizer,
-                max_seq_len=self.max_seq_len,
-            )
-            if built is not None:
-                self.examples.append(built)
-            else:
-                skipped += 1
-        
-        if not self.examples:
-            raise RuntimeError("No valid DPO examples could be built from anchor records.")
-        
-        print(f"[OnlineAnchorDataset] Built {len(self.examples)} examples (skipped {skipped})")
-    
-    def __len__(self) -> int:
-        return len(self.examples)
-    
-    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        return self.examples[idx]
 
 
 def sequence_logps(
@@ -1140,28 +818,12 @@ def compute_dpo_loss(
     if score_mode not in {"sum", "avg"}:
         raise ValueError(f"Unsupported score_mode={score_mode!r}; expected 'sum' or 'avg'")
 
-    policy_chosen_stats = sequence_logps(
-        policy_model,
-        chosen_input_ids,
-        chosen_labels,
-    )
-    policy_rejected_stats = sequence_logps(
-        policy_model,
-        rejected_input_ids,
-        rejected_labels,
-    )
+    policy_chosen_stats = sequence_logps(policy_model, chosen_input_ids, chosen_labels)
+    policy_rejected_stats = sequence_logps(policy_model, rejected_input_ids, rejected_labels)
 
     with torch.no_grad():
-        ref_chosen_stats = sequence_logps(
-            reference_model,
-            chosen_input_ids,
-            chosen_labels,
-        )
-        ref_rejected_stats = sequence_logps(
-            reference_model,
-            rejected_input_ids,
-            rejected_labels,
-        )
+        ref_chosen_stats = sequence_logps(reference_model, chosen_input_ids, chosen_labels)
+        ref_rejected_stats = sequence_logps(reference_model, rejected_input_ids, rejected_labels)
 
     score_key = "avg_logps" if score_mode == "avg" else "seq_logps"
     policy_chosen_scores = policy_chosen_stats[score_key]
@@ -1196,8 +858,26 @@ def compute_dpo_loss(
     return loss, metrics
 
 
+def save_model_and_tokenizer(model, tokenizer, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    state_dict = model.state_dict()
+
+    from safetensors.torch import save_file
+
+    save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
+    tokenizer.save_pretrained(output_dir)
+
+    # Best effort config copy
+    try:
+        model.config.save_pretrained(output_dir)
+    except Exception:
+        pass
+
+    print(f"Saved final model and tokenizer to: {output_dir}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DPO training on Human-Like-DPO-Dataset")
+    parser = argparse.ArgumentParser(description="DPO training on local preference dataset")
     parser.add_argument("--argonne_root", type=str, required=True, help="Path to ArgonneAI directory")
     parser.add_argument("--model_path", type=str, required=True, help="Path to SFT model checkpoint")
     parser.add_argument(
@@ -1208,11 +888,11 @@ def main() -> None:
     )
     parser.add_argument("--data_path", type=str, required=True, help="Path to DPO dataset directory")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for final model")
-    parser.add_argument("--max_seq_length", type=int, default=1024, help="Maximum sequence length")
-    parser.add_argument("--batch_size", type=int, default=12, help="Batch size")
-    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--max_seq_length", type=int, default=MAX_SEQ_LEN, help="Maximum sequence length")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
+    parser.add_argument("--grad_accum", type=int, default=GRAD_ACCUM_STEPS, help="Gradient accumulation steps")
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
+    parser.add_argument("--num_epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--warmup_steps", type=int, default=WARMUP_STEPS, help="Number of warmup steps")
     parser.add_argument("--max_steps", type=int, default=MAX_STEPS, help="Maximum optimizer steps (<=0 means full run)")
     parser.add_argument("--beta", type=float, default=DPO_BETA, help="DPO beta parameter")
@@ -1239,33 +919,8 @@ def main() -> None:
         "--dataset_recipe",
         type=str,
         default=DATASET_RECIPE,
-        choices=[
-            "none",
-            "mlabonne_eval_aligned",
-            "mlabonne_target_only",
-            "mlabonne_target_plus_anchors",
-            "mlabonne_anchor_refusal_mix",
-            "online_anchors_only",
-        ],
-        help="Optional dataset filtering and upsampling recipe",
-    )
-    parser.add_argument(
-        "--quality_anchor_repeat",
-        type=int,
-        default=QUALITY_ANCHOR_REPEAT,
-        help="Number of times to repeat each quality anchor pair when anchors are enabled",
-    )
-    parser.add_argument(
-        "--online_dpo_rounds",
-        type=int,
-        default=ONLINE_DPO_ROUNDS,
-        help="Number of online DPO rounds (regenerate rejected samples each round)",
-    )
-    parser.add_argument(
-        "--online_steps_per_round",
-        type=int,
-        default=ONLINE_STEPS_PER_ROUND,
-        help="Optimizer steps per online DPO round",
+        choices=["none", "mlabonne_eval_aligned", "mlabonne_target_only", "mlabonne_anchor_refusal_mix"],
+        help="Optional dataset filtering recipe. Locked eval prompts are always excluded.",
     )
     parser.add_argument(
         "--train_last_blocks",
@@ -1287,34 +942,16 @@ def main() -> None:
         choices=[0, 1],
         help="Whether to save the final model and tokenizer",
     )
-    parser.add_argument("--quality_every", type=int, default=QUALITY_EVERY, help="Run quality generations every N optimizer steps")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-
+    parser.add_argument(
+        "--quality_every",
+        type=int,
+        default=QUALITY_EVERY,
+        help="Run quality generations every N optimizer steps",
+    )
+    parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
     args = parser.parse_args()
 
-    seed = args.seed
-    epochs = args.num_epochs
-    batch_size = args.batch_size
-    grad_accum_steps = args.grad_accum
-    learning_rate = args.lr
-    warmup_steps = args.warmup_steps
-    max_steps = args.max_steps
-    max_seq_len = args.max_seq_length
-    beta = args.beta
-    score_mode = args.score_mode
-    label_smoothing = args.label_smoothing
-    chosen_sft_weight = args.chosen_sft_weight
-    dataset_recipe = args.dataset_recipe
-    save_final = bool(args.save_final)
-    quality_every = args.quality_every
-    quality_anchor_repeat = args.quality_anchor_repeat
-    train_last_blocks = args.train_last_blocks
-    train_embed_and_head = bool(args.train_embed_and_head)
-    reference_model_path = args.reference_model_path or args.model_path
-    online_dpo_rounds = args.online_dpo_rounds
-    online_steps_per_round = args.online_steps_per_round
-
-    seed_everything(seed)
+    seed_everything(args.seed)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1324,6 +961,10 @@ def main() -> None:
         raise RuntimeError("CUDA is required for this script.")
 
     device = torch.device("cuda")
+    reference_model_path = args.reference_model_path or args.model_path
+    train_embed_and_head = bool(args.train_embed_and_head)
+    save_final = bool(args.save_final)
+
     print("=" * 90)
     print("Argonne SFT checkpoint DPO on local preference dataset")
     print("=" * 90)
@@ -1331,16 +972,16 @@ def main() -> None:
     print(f"Data: {args.data_path}")
     print(f"Policy checkpoint: {args.model_path}")
     print(f"Reference checkpoint: {reference_model_path}")
-    print(f"Max sequence length: {max_seq_len}")
-    print(f"Batch size: {batch_size} | Grad accum: {grad_accum_steps}")
+    print(f"Max sequence length: {args.max_seq_length}")
+    print(f"Batch size: {args.batch_size} | Grad accum: {args.grad_accum}")
     print(
-        f"LR: {learning_rate} | Warmup: {warmup_steps} | Beta: {beta} | "
-        f"Score mode: {score_mode} | Label smoothing: {label_smoothing} | "
-        f"Chosen SFT weight: {chosen_sft_weight} | Max steps: {max_steps}"
+        f"LR: {args.lr} | Warmup: {args.warmup_steps} | Beta: {args.beta} | "
+        f"Score mode: {args.score_mode} | Label smoothing: {args.label_smoothing} | "
+        f"Chosen SFT weight: {args.chosen_sft_weight} | Max steps: {args.max_steps}"
     )
     print(
-        f"Dataset recipe: {dataset_recipe} | Anchor repeat: {quality_anchor_repeat} | "
-        f"Save final: {int(save_final)}"
+        f"Dataset recipe: {args.dataset_recipe} | Save final: {int(save_final)} | "
+        f"Locked eval probes: {len(QUALITY_QUESTIONS)}"
     )
     print("Intermediate checkpoint saving: disabled")
     print(f"Final model save dir: {args.output_dir}")
@@ -1349,65 +990,82 @@ def main() -> None:
         device,
         args.argonne_root,
         args.model_path,
-        max_seq_len,
+        args.max_seq_length,
         enable_gradient_checkpointing=True,
     )
     trainable_params, total_params = configure_trainable_policy(
         policy_model,
-        train_last_blocks,
+        args.train_last_blocks,
         train_embed_and_head,
     )
     print(
         f"Policy trainable parameters: {trainable_params:,} / {total_params:,} "
-        f"(train_last_blocks={train_last_blocks}, train_embed_and_head={int(train_embed_and_head)})"
+        f"(train_last_blocks={args.train_last_blocks}, train_embed_and_head={int(train_embed_and_head)})"
     )
+
     reference_model, _ = build_model_and_tokenizer(
         device,
         args.argonne_root,
         reference_model_path,
-        max_seq_len,
+        args.max_seq_length,
         enable_gradient_checkpointing=False,
     )
     reference_model.eval()
     for param in reference_model.parameters():
         param.requires_grad_(False)
 
-    # Determine if we're using online DPO mode
-    use_online_dpo = dataset_recipe == "online_anchors_only"
-    
-    if use_online_dpo:
-        print("\n" + "=" * 90)
-        print("ONLINE DPO MODE: Training with iterative online anchor generation")
-        print(f"Rounds: {online_dpo_rounds} | Steps per round: {online_steps_per_round}")
-        print("=" * 90)
-    else:
-        # Standard dataset loading for non-online modes
-        probe_ds, probe_split_name = load_preference_split(args.data_path)
-        probe_valid = 0
-        for i in range(min(256, len(probe_ds))):
-            ex = probe_ds[i]
-            built = build_preference_example(
-                ex,
-                tokenizer=tokenizer,
-                max_seq_len=max_seq_len,
-            )
-            if built is not None:
-                probe_valid += 1
-        split_suffix = f" on split={probe_split_name}" if probe_split_name else ""
-        print(f"Sanity valid-in-first-{min(256, len(probe_ds))}{split_suffix}: {probe_valid}")
+    probe_ds, probe_split_name = load_preference_split(args.data_path)
+    probe_valid = 0
+    for i in range(min(256, len(probe_ds))):
+        ex = probe_ds[i]
+        built = build_preference_example(ex, tokenizer=tokenizer, max_seq_len=args.max_seq_length)
+        if built is not None:
+            probe_valid += 1
+    split_suffix = f" on split={probe_split_name}" if probe_split_name else ""
+    print(f"Sanity valid-in-first-{min(256, len(probe_ds))}{split_suffix}: {probe_valid}")
 
+    train_dataset = HumanLikeDPODataset(
+        path=args.data_path,
+        tokenizer=tokenizer,
+        max_seq_len=args.max_seq_length,
+        seed=args.seed,
+        dataset_recipe=args.dataset_recipe,
+    )
     collator = PreferenceCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
-    
-    # Create optimizer
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collator,
+    )
+
     optimizer = torch.optim.AdamW(
         [p for p in policy_model.parameters() if p.requires_grad],
-        lr=learning_rate,
+        lr=args.lr,
         betas=(ADAM_BETA1, ADAM_BETA2),
         weight_decay=WEIGHT_DECAY,
     )
 
-    min_lr = learning_rate * MIN_LR_RATIO
-    min_lr_scale = min_lr / learning_rate
+    steps_per_epoch = max(1, len(train_loader) // max(1, args.grad_accum))
+    total_optimizer_steps = steps_per_epoch * args.num_epochs
+    if args.max_steps > 0:
+        total_optimizer_steps = min(total_optimizer_steps, args.max_steps)
+    print(f"Estimated optimizer steps: {total_optimizer_steps}")
+
+    min_lr = args.lr * MIN_LR_RATIO
+    min_lr_scale = min_lr / args.lr
+
+    def lr_lambda(step: int) -> float:
+        if step < args.warmup_steps:
+            return step / max(1, args.warmup_steps)
+        progress = (step - args.warmup_steps) / max(1, total_optimizer_steps - args.warmup_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return max(min_lr_scale, cosine)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     answer_questions(
         policy_model,
@@ -1416,316 +1074,122 @@ def main() -> None:
         QUALITY_QUESTIONS,
         tag="BEFORE_DPO",
         step=0,
-        max_seq_len=max_seq_len,
+        max_seq_len=args.max_seq_length,
     )
 
     global_step = 0
     tokens_seen = 0
-    rng = random.Random(seed + 12345)
+    running_loss = 0.0
+    running_dpo_loss = 0.0
+    running_chosen_sft_loss = 0.0
+    running_reward_accuracy = 0.0
+    running_reward_margin = 0.0
+    log_updates = 0
 
-    if use_online_dpo:
-        # =========================================================================
-        # ONLINE DPO TRAINING LOOP
-        # =========================================================================
-        total_steps = online_dpo_rounds * online_steps_per_round
-        
-        def lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-            return max(min_lr_scale, cosine)
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        
-        for round_idx in range(online_dpo_rounds):
-            print(f"\n{'='*90}")
-            print(f"ONLINE DPO ROUND {round_idx + 1}/{online_dpo_rounds}")
-            print(f"{'='*90}")
-            
-            # Generate online anchors with current model outputs as rejected
-            online_records = build_online_anchor_dataset(
-                policy_model, tokenizer, device, max_seq_len, rng,
-                num_variations=4,  # Use all variants
-            )
-            
-            # Also add static anchor pairs for diversity
-            static_records = build_static_anchor_dataset(rng)
-            
-            # Combine and shuffle
-            all_records = online_records + static_records
-            rng.shuffle(all_records)
-            
-            # Repeat records to have enough for the steps
-            needed_examples = online_steps_per_round * batch_size * grad_accum_steps
-            if len(all_records) < needed_examples:
-                repeat_factor = (needed_examples // len(all_records)) + 1
-                all_records = all_records * repeat_factor
-            all_records = all_records[:needed_examples + batch_size * grad_accum_steps]
-            rng.shuffle(all_records)
-            
-            # Build dataset and loader
-            try:
-                anchor_dataset = OnlineAnchorDataset(all_records, tokenizer, max_seq_len)
-            except RuntimeError as e:
-                print(f"[Warning] Could not build anchor dataset: {e}")
+    policy_model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    stop_training = False
+    for epoch in range(args.num_epochs):
+        if stop_training:
+            break
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}", unit="batch")
+        for micro_step, batch in enumerate(pbar, start=1):
+            chosen_input_ids = batch["chosen_input_ids"].to(device, non_blocking=True)
+            chosen_labels = batch["chosen_labels"].to(device, non_blocking=True)
+            rejected_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
+            rejected_labels = batch["rejected_labels"].to(device, non_blocking=True)
+
+            tokens_seen += int(batch["chosen_attention_mask"].sum().item())
+            tokens_seen += int(batch["rejected_attention_mask"].sum().item())
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                loss, metrics = compute_dpo_loss(
+                    policy_model=policy_model,
+                    reference_model=reference_model,
+                    chosen_input_ids=chosen_input_ids,
+                    chosen_labels=chosen_labels,
+                    rejected_input_ids=rejected_input_ids,
+                    rejected_labels=rejected_labels,
+                    beta=args.beta,
+                    score_mode=args.score_mode,
+                    label_smoothing=args.label_smoothing,
+                    chosen_sft_weight=args.chosen_sft_weight,
+                )
+                loss = loss / args.grad_accum
+
+            loss.backward()
+
+            running_loss += float(loss.detach().item()) * args.grad_accum
+            running_dpo_loss += metrics["dpo_loss"]
+            running_chosen_sft_loss += metrics["chosen_sft_loss"]
+            running_reward_accuracy += metrics["reward_accuracy"]
+            running_reward_margin += metrics["reward_margin"]
+            log_updates += 1
+
+            if micro_step % args.grad_accum != 0:
+                pbar.set_postfix(
+                    loss=f"{running_loss / max(1, log_updates):.4f}",
+                    reward_acc=f"{running_reward_accuracy / max(1, log_updates):.3f}",
+                    step=global_step,
+                )
                 continue
-            
-            loader = DataLoader(
-                anchor_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                drop_last=True,
-                num_workers=0,
-                pin_memory=True,
-                collate_fn=collator,
-            )
-            
-            # Training loop for this round
-            policy_model.train()
-            optimizer.zero_grad(set_to_none=True)
-            
-            round_step = 0
-            micro_step = 0
-            running_loss = 0.0
-            running_dpo_loss = 0.0
-            running_chosen_sft_loss = 0.0
-            running_reward_accuracy = 0.0
-            running_reward_margin = 0.0
-            
-            pbar = tqdm(loader, desc=f"Round {round_idx + 1}", unit="batch")
-            for batch in pbar:
-                chosen_input_ids = batch["chosen_input_ids"].to(device, non_blocking=True)
-                chosen_labels = batch["chosen_labels"].to(device, non_blocking=True)
-                rejected_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
-                rejected_labels = batch["rejected_labels"].to(device, non_blocking=True)
-                
-                tokens_seen += int(batch["chosen_attention_mask"].sum().item())
-                tokens_seen += int(batch["rejected_attention_mask"].sum().item())
-                
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-                    loss, metrics = compute_dpo_loss(
-                        policy_model=policy_model,
-                        reference_model=reference_model,
-                        chosen_input_ids=chosen_input_ids,
-                        chosen_labels=chosen_labels,
-                        rejected_input_ids=rejected_input_ids,
-                        rejected_labels=rejected_labels,
-                        beta=beta,
-                        score_mode=score_mode,
-                        label_smoothing=label_smoothing,
-                        chosen_sft_weight=chosen_sft_weight,
-                    )
-                    scaled_loss = loss / grad_accum_steps
-                
-                scaled_loss.backward()
-                running_loss += float(loss.detach().item())
-                running_dpo_loss += metrics["dpo_loss"]
-                running_chosen_sft_loss += metrics["chosen_sft_loss"]
-                running_reward_accuracy += metrics["reward_accuracy"]
-                running_reward_margin += metrics["reward_margin"]
-                micro_step += 1
-                
-                if micro_step % grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), GRAD_CLIP)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    global_step += 1
-                    round_step += 1
-                    
-                    if round_step % LOG_EVERY == 0:
-                        denom = LOG_EVERY * grad_accum_steps
-                        avg_loss = running_loss / denom
-                        avg_dpo_loss = running_dpo_loss / denom
-                        avg_chosen_sft_loss = running_chosen_sft_loss / denom
-                        avg_reward_accuracy = running_reward_accuracy / denom
-                        avg_reward_margin = running_reward_margin / denom
-                        running_loss = 0.0
-                        running_dpo_loss = 0.0
-                        running_chosen_sft_loss = 0.0
-                        running_reward_accuracy = 0.0
-                        running_reward_margin = 0.0
-                        lr = optimizer.param_groups[0]["lr"]
-                        print(
-                            f"Step {global_step:>6} (round {round_idx+1} step {round_step}) | "
-                            f"loss {avg_loss:.4f} | "
-                            f"dpo_loss {avg_dpo_loss:.4f} | "
-                            f"chosen_sft {avg_chosen_sft_loss:.4f} | "
-                            f"reward_acc {avg_reward_accuracy:.4f} | "
-                            f"reward_margin {avg_reward_margin:.4f} | "
-                            f"tokens {tokens_seen:,} | "
-                            f"lr {lr:.2e}"
-                        )
-                    
-                    if round_step >= online_steps_per_round:
-                        break
-                
-                pbar.set_postfix({
-                    "step": round_step,
-                    "loss": f"{loss.detach().item():.4f}",
-                    "acc": f"{metrics['reward_accuracy']:.2f}",
-                })
-            
-            # Show quality after each round
-            answer_questions(
-                policy_model,
-                tokenizer,
-                device,
-                QUALITY_QUESTIONS,
-                tag=f"AFTER_ROUND_{round_idx + 1}",
-                step=global_step,
-                max_seq_len=max_seq_len,
-            )
-            
-            # Clean up
-            del loader, anchor_dataset, all_records
-            gc.collect()
-            torch.cuda.empty_cache()
-    
-    else:
-        # =========================================================================
-        # STANDARD DPO TRAINING LOOP
-        # =========================================================================
-        dataset = HumanLikeDPODataset(
-            args.data_path,
-            tokenizer,
-            max_seq_len,
-            seed,
-            dataset_recipe=dataset_recipe,
-            quality_anchor_repeat=quality_anchor_repeat,
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=collator,
-        )
-        
-        steps_per_epoch = len(loader) // grad_accum_steps
-        epoch_total_steps = max(1, steps_per_epoch * epochs)
-        total_steps = epoch_total_steps if max_steps <= 0 else min(epoch_total_steps, max_steps)
-        print(f"DataLoader batches/epoch: {len(loader):,}")
-        print(f"Optimizer steps/epoch: {steps_per_epoch:,}")
-        print(f"Planned optimizer steps: {total_steps:,}")
-        
-        def lr_lambda(step: int) -> float:
-            if step < warmup_steps:
-                return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-            return max(min_lr_scale, cosine)
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        
-        policy_model.train()
-        optimizer.zero_grad(set_to_none=True)
-        
-        micro_step = 0
-        running_loss = 0.0
-        running_dpo_loss = 0.0
-        running_chosen_sft_loss = 0.0
-        running_reward_accuracy = 0.0
-        running_reward_margin = 0.0
-        
-        for epoch in range(epochs):
-            print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
-            pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", unit="batch")
-            
-            for batch in pbar:
-                chosen_input_ids = batch["chosen_input_ids"].to(device, non_blocking=True)
-                chosen_labels = batch["chosen_labels"].to(device, non_blocking=True)
-                rejected_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
-                rejected_labels = batch["rejected_labels"].to(device, non_blocking=True)
-                
-                tokens_seen += int(batch["chosen_attention_mask"].sum().item())
-                tokens_seen += int(batch["rejected_attention_mask"].sum().item())
-                
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-                    loss, metrics = compute_dpo_loss(
-                        policy_model=policy_model,
-                        reference_model=reference_model,
-                        chosen_input_ids=chosen_input_ids,
-                        chosen_labels=chosen_labels,
-                        rejected_input_ids=rejected_input_ids,
-                        rejected_labels=rejected_labels,
-                        beta=beta,
-                        score_mode=score_mode,
-                        label_smoothing=label_smoothing,
-                        chosen_sft_weight=chosen_sft_weight,
-                    )
-                    scaled_loss = loss / grad_accum_steps
-                
-                scaled_loss.backward()
-                running_loss += float(loss.detach().item())
-                running_dpo_loss += metrics["dpo_loss"]
-                running_chosen_sft_loss += metrics["chosen_sft_loss"]
-                running_reward_accuracy += metrics["reward_accuracy"]
-                running_reward_margin += metrics["reward_margin"]
-                micro_step += 1
-                
-                if micro_step % grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), GRAD_CLIP)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    global_step += 1
-                    
-                    if global_step % LOG_EVERY == 0:
-                        denom = LOG_EVERY * grad_accum_steps
-                        avg_loss = running_loss / denom
-                        avg_dpo_loss = running_dpo_loss / denom
-                        avg_chosen_sft_loss = running_chosen_sft_loss / denom
-                        avg_reward_accuracy = running_reward_accuracy / denom
-                        avg_reward_margin = running_reward_margin / denom
-                        running_loss = 0.0
-                        running_dpo_loss = 0.0
-                        running_chosen_sft_loss = 0.0
-                        running_reward_accuracy = 0.0
-                        running_reward_margin = 0.0
-                        lr = optimizer.param_groups[0]["lr"]
-                        print(
-                            f"Step {global_step:>6} | "
-                            f"loss {avg_loss:.4f} | "
-                            f"dpo_loss {avg_dpo_loss:.4f} | "
-                            f"chosen_sft {avg_chosen_sft_loss:.4f} | "
-                            f"reward_acc {avg_reward_accuracy:.4f} | "
-                            f"reward_margin {avg_reward_margin:.4f} | "
-                            f"tokens {tokens_seen:,} | "
-                            f"lr {lr:.2e}"
-                        )
-                    
-                    if quality_every > 0 and global_step % quality_every == 0:
-                        answer_questions(
-                            policy_model,
-                            tokenizer,
-                            device,
-                            QUALITY_QUESTIONS,
-                            tag="DURING_DPO",
-                            step=global_step,
-                            max_seq_len=max_seq_len,
-                        )
-                    
-                    if global_step >= total_steps:
-                        break
-                
-                pbar.set_postfix({
-                    "step": global_step,
-                    "loss": f"{loss.detach().item():.4f}",
-                    "acc": f"{metrics['reward_accuracy']:.2f}",
-                })
-            
-            if global_step >= total_steps:
-                break
 
-    print("\nTraining finished.")
-    print(f"Optimizer steps: {global_step:,}")
-    print(f"Total tokens seen: {tokens_seen:,}")
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in policy_model.parameters() if p.requires_grad],
+                GRAD_CLIP,
+            )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+
+            mean_loss = running_loss / max(1, log_updates)
+            mean_dpo_loss = running_dpo_loss / max(1, log_updates)
+            mean_sft_loss = running_chosen_sft_loss / max(1, log_updates)
+            mean_reward_acc = running_reward_accuracy / max(1, log_updates)
+            mean_reward_margin = running_reward_margin / max(1, log_updates)
+            pbar.set_postfix(
+                loss=f"{mean_loss:.4f}",
+                reward_acc=f"{mean_reward_acc:.3f}",
+                step=global_step,
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+            )
+
+            if global_step % LOG_EVERY == 0:
+                print(
+                    f"[step {global_step}] loss={mean_loss:.4f} dpo={mean_dpo_loss:.4f} "
+                    f"chosen_sft={mean_sft_loss:.4f} reward_acc={mean_reward_acc:.3f} "
+                    f"reward_margin={mean_reward_margin:.4f} tokens_seen={tokens_seen:,} "
+                    f"lr={scheduler.get_last_lr()[0]:.3e}"
+                )
+                running_loss = 0.0
+                running_dpo_loss = 0.0
+                running_chosen_sft_loss = 0.0
+                running_reward_accuracy = 0.0
+                running_reward_margin = 0.0
+                log_updates = 0
+
+            if args.quality_every > 0 and global_step % args.quality_every == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+                answer_questions(
+                    policy_model,
+                    tokenizer,
+                    device,
+                    QUALITY_QUESTIONS,
+                    tag="MID_DPO",
+                    step=global_step,
+                    max_seq_len=args.max_seq_length,
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+                policy_model.train()
+
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                stop_training = True
+                break
 
     answer_questions(
         policy_model,
@@ -1734,16 +1198,13 @@ def main() -> None:
         QUALITY_QUESTIONS,
         tag="AFTER_DPO",
         step=global_step,
-        max_seq_len=max_seq_len,
+        max_seq_len=args.max_seq_length,
     )
 
     if save_final:
-        os.makedirs(args.output_dir, exist_ok=True)
-        policy_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        print(f"Saved model and tokenizer to: {args.output_dir}")
-    else:
-        print("Final model save skipped (--save_final=0).")
+        save_model_and_tokenizer(policy_model, tokenizer, args.output_dir)
+
+    print("Training complete.")
 
 
 if __name__ == "__main__":
