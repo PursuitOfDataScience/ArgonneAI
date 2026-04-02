@@ -860,20 +860,20 @@ def compute_dpo_loss(
 
 def save_model_and_tokenizer(model, tokenizer, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    state_dict = model.state_dict()
 
-    from safetensors.torch import save_file
+    from safetensors.torch import save_model
 
-    save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
+    # Handles tied weights correctly
+    save_model(model, os.path.join(output_dir, "model.safetensors"))
     tokenizer.save_pretrained(output_dir)
 
-    # Best effort config copy
+    # Save model config alongside the final weights for normal HF loading.
     try:
         model.config.save_pretrained(output_dir)
     except Exception:
         pass
 
-    print(f"Saved final model and tokenizer to: {output_dir}")
+    print(f"Saved final DPO model to: {output_dir}/model.safetensors")
 
 
 def main() -> None:
