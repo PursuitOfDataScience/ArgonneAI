@@ -2,6 +2,8 @@
 
 Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
 
+Source code and release scripts live in the main branch of this repo: [GitHub main branch](https://github.com/PursuitOfDataScience/ArgonneAI/tree/main)
+
 ## Training loss curve
 
 ![Argonne 2.5 loss curve](plots/argonne2_5_loss_curve.png)
@@ -34,10 +36,10 @@ Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, r
 | **Effective batch** | 245,760 tokens |
 | **Learning rate** | 3e-4 |
 | **Min LR ratio** | 0.1 |
-| **Warmup** | 0 steps |
+| **Warmup** | 1,000 steps |
 | **Precision** | bf16 autocast |
 | **torch.compile** | Enabled |
-| **GPUs** | 3 (DDP) |
+| **GPUs** | 3× H2000s (DDP) |
 
 ## Training data
 
@@ -45,6 +47,13 @@ Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, r
 - FineWeb-Edu
 - Final stage training shard: 55.2B tokens
 - Cumulative training across the full run: 76.05B tokens
+
+## Repository scripts
+
+- `inference.py` generates text from a local checkpoint or Hugging Face repo.
+- `push_model_to_hf.py` publishes Argonne 2.5 base or instruct checkpoints to Hugging Face.
+- `sft.py` and `sft.sh` run the UltraChat SFT stage.
+- `dpo.py` and `dpo.sh` run the chatbot_arena_binarized DPO stage.
 
 ## Inference
 
