@@ -1,3 +1,83 @@
+# Argonne 2.5
+
+Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
+
+## Training loss curve
+
+![Argonne 2.5 loss curve](plots/argonne2_5_loss_curve.png)
+
+## Model architecture
+
+| Component | Specification |
+|-----------|--------------|
+| **Parameters** | 1,273,807,360 (~1.27B) |
+| **Layers** | 28 transformer blocks |
+| **Hidden size** | 1,792 |
+| **Attention heads** | 14 query / 7 key-value (GQA) |
+| **Head dimension** | 128 |
+| **Feed-forward** | SwiGLU MLP, 4,864 intermediate dim |
+| **Context length** | 1,024 tokens |
+| **Vocabulary size** | 151,669 |
+| **Normalization** | RMSNorm (ε = 1e-6) |
+| **Position encoding** | RoPE (θ = 10,000) |
+
+## Training details
+
+| Item | Value |
+|------|-------|
+| **Total steps** | 425,975 |
+| **Tokens processed** | ~76.05B |
+| **Final train loss** | 2.6119 |
+| **Sequence length** | 1,024 |
+| **Batch size per GPU** | 20 |
+| **Gradient accumulation** | 4 |
+| **Effective batch** | 245,760 tokens |
+| **Learning rate** | 3e-4 |
+| **Min LR ratio** | 0.1 |
+| **Warmup** | 0 steps |
+| **Precision** | bf16 autocast |
+| **torch.compile** | Enabled |
+| **GPUs** | 3 (DDP) |
+
+## Training data
+
+- FineWeb
+- FineWeb-Edu
+- Final stage training shard: 55.2B tokens
+- Cumulative training across the full run: 76.05B tokens
+
+## Inference
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_id = "PursuitOfDataScience/Argonne2.5-base"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    dtype=torch.bfloat16,
+)
+
+prompt = "Write a short paragraph about scientific computing at Argonne National Laboratory."
+inputs = tokenizer(prompt, return_tensors="pt")
+input_ids = inputs["input_ids"].to(model.device)
+
+output_ids = model.generate(
+    input_ids,
+    max_length=input_ids.shape[1] + 128,
+    temperature=0.8,
+    top_p=0.95,
+    top_k=50,
+    do_sample=True,
+)
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+```
+
+---
+
 # Argonne LLM Training
 
 Distributed PyTorch training pipeline for the Argonne causal LM using Qwen-family tokenizers and llm.c-style binary token data.
