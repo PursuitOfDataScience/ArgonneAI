@@ -1,278 +1,237 @@
-# Argonne LLM
+# Argonne 2.5
 
-Author: Youzhi Yu
+Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
 
-# Argonne 2.0
+## Training loss curve
 
-A **4.9 billion parameter** decoder-only transformer language model trained from scratch using tensor parallelism on a single DGX A100 node.
+![Argonne 2.5 loss curve](plots/argonne2_5_loss_curve.png)
 
-## Training Loss Curve
-
-![Training Loss vs Tokens](plots/training_loss_vs_tokens.png)
-
-The model was trained on **~22 billion tokens** from FineWeb (CC-MAIN-2025-26), achieving a final loss of approximately **2.5–3.5** after 1.35 million training steps.
-
-## Model Architecture
+## Model architecture
 
 | Component | Specification |
 |-----------|--------------|
-| **Parameters** | 4,918,072,800 (~4.9B) |
-| **Layers** | 24 transformer blocks |
-| **Hidden Size** | 4,080 |
-| **Attention Heads** | 24 query heads / 8 key-value heads (Grouped-Query Attention) |
-| **Head Dimension** | 170 |
-| **Feed-Forward** | SwiGLU MLP (~10,880 intermediate dim) |
-| **Context Length** | 4,096 tokens |
-| **Vocabulary Size** | 151,665 (Qwen2.5-3B-Instruct tokenizer) |
+| **Parameters** | 1,273,807,360 (~1.27B) |
+| **Layers** | 28 transformer blocks |
+| **Hidden size** | 1,792 |
+| **Attention heads** | 14 query / 7 key-value (GQA) |
+| **Head dimension** | 128 |
+| **Feed-forward** | SwiGLU MLP, 4,864 intermediate dim |
+| **Context length** | 1,024 tokens |
+| **Vocabulary size** | 151,669 |
 | **Normalization** | RMSNorm (ε = 1e-6) |
-| **Position Encoding** | Rotary Position Embeddings (RoPE) |
-| **Precision** | bfloat16 mixed precision |
+| **Position encoding** | RoPE (θ = 10,000) |
 
-### Key Architectural Features
+## Training details
 
-- **Grouped-Query Attention (GQA)**: Uses 24 query heads with 8 key-value heads (3:1 ratio), reducing memory bandwidth requirements while maintaining model quality.
-- **SwiGLU Activation**: Employs the SwiGLU activation function in the MLP layers for improved training dynamics.
-- **Flash Attention 2**: Uses FlashAttention 2 kernels when available (with rotary + GQA support) for higher throughput and lower memory use; falls back to PyTorch's `scaled_dot_product_attention` otherwise.
-- **RoPE**: Rotary position embeddings enable better length generalization compared to absolute positional encodings.
+| Item | Value |
+|------|-------|
+| **Total steps** | 425,975 |
+| **Tokens processed** | ~76.05B |
+| **Final train loss** | 2.6119 |
+| **Sequence length** | 1,024 |
+| **Batch size per GPU** | 20 |
+| **Gradient accumulation** | 4 |
+| **Effective batch** | 245,760 tokens |
+| **Learning rate** | 3e-4 |
+| **Min LR ratio** | 0.1 |
+| **Warmup** | 0 steps |
+| **Precision** | bf16 autocast |
+| **torch.compile** | Enabled |
+| **GPUs** | 3 (DDP) |
 
-#### FlashAttention 2 notes
+## Training data
 
-- Install the optional dependency with `pip install flash-attn>=2.5.6` (compile-time CUDA toolkit required).
-- FlashAttention 2 is enabled when `config.use_flash_attention=True`, tensors are in bf16/fp16, and no explicit attention mask is provided; otherwise the model automatically falls back to PyTorch's fused attention or the math implementation.
-- Sliding-window attention (if configured) is forwarded to the FlashAttention kernel via `window_size` for better cache locality.
+- FineWeb
+- FineWeb-Edu
+- Final stage training shard: 55.2B tokens
+- Cumulative training across the full run: 76.05B tokens
 
-## Training Details
+## Inference
 
-### Hardware Configuration
-
-- **Node**: 1× DGX A100 (8× NVIDIA A100 80GB GPUs)
-- **Parallelism**: Tensor parallelism across 8 GPUs
-- **Interconnect**: NVLink for high-bandwidth GPU-to-GPU communication
-
-### Training Hyperparameters
-
-| Parameter | Value |
-|-----------|-------|
-| **Total Training Steps** | 1,347,890 |
-| **Tokens Processed** | ~21.9 billion |
-| **Micro-batch Size** | 2–4 per GPU |
-| **Gradient Accumulation** | 4 steps |
-| **Effective Batch Size** | ~64–128 sequences |
-| **Learning Rate** | 1e-4 (peak) → 1e-5 (cosine decay) |
-| **Warmup Steps** | 2,000 |
-| **Weight Decay** | 0.1 |
-| **Gradient Clipping** | 1.0 |
-| **Optimizer** | AdamW (fused) |
-
-### Training Data
-
-The model was trained on **FineWeb (CC-MAIN-2025-26)** data:
-- 250 Parquet shards streamed sequentially
-- Documents tokenized with BOS/EOS boundary markers
-- Aggressive filtering of low-quality content (high digit ratio, low alpha ratio)
-- Chunked into 4,096-token sequences
-
-### Tensor Parallelism Implementation
-
-The training uses a custom tensor parallel implementation (`TensorParallelModel`) that:
-- **Shards attention projections**: Q/K/V/O projections are split across GPUs
-- **Shards MLP layers**: Gate, up, and down projections distributed across GPUs
-- **Replicates embeddings and norms**: Token embeddings and layer norms remain replicated for simplicity
-- **Async all-reduce**: Uses asynchronous collective operations for overlapping communication with computation
-
-Each GPU holds 1/8th of the attention heads (3 Q heads, 1 KV head per GPU) and 1/8th of the MLP hidden dimension.
-
-### Checkpointing
-
-- Checkpoints saved every ~430 steps
-- Per-block gradient checkpointing enabled to reduce memory footprint
-- Automatic pruning of old checkpoints (keeps last 50)
-- Resumable training with exact data position tracking
-
-## Training Progress
-
-### Loss Progression
-
-| Milestone | Steps | Tokens | Loss |
-|-----------|-------|--------|------|
-| Start | 0 | 0 | ~9.3 |
-| 1K steps | 1,000 | 16M | ~6.5 |
-| 10K steps | 10,000 | 164M | ~5.5 |
-| 100K steps | 100,000 | 1.6B | ~4.0 |
-| 500K steps | 500,000 | 8.2B | ~3.5 |
-| 1M steps | 1,000,000 | 16.4B | ~3.0 |
-| Final | 1,347,890 | 21.9B | ~2.5–3.5 |
-
-### Sample Generations
-
-**At step 1,347,190:**
-> "Long long time ago, 5,000 years ago, I have been told it is more than 10,000 times. It is not the same as the 10,000 years ago. You just have to have a very good reason for believing that you are a good person and that you are good..."
-
-The model demonstrates emergent capabilities in generating coherent English text, though quality varies with the inherent noise of web-scale pretraining data.
-
-## Repository Structure
-
-```
-ArgonneAI/
-├── model.py                    # Model architecture (ArgonneConfig, ArgonneModel)
-├── training.py                 # Fresh training with tensor parallelism
-├── resume_pretrain_tensor.py   # Resume training from checkpoints
-├── data_processing.py          # Tokenization and data loading utilities
-├── training_utils.py           # Schedulers, checkpoint utilities
-├── inference.py                # Inference utilities
-├── model-distillation.py       # Knowledge distillation experiments
-├── IMPLEMENTATION_NOTES.md     # Architectural decisions
-├── TENSOR_PARALLEL_FIX.md      # Debugging notes for TP issues
-└── TENSOR_PARALLEL_USAGE.md    # TP launch instructions
-```
-
-## Argonne 1.5
-
-### 🤗 Hugging Face Model
-
-The pretrained model weights and detailed model card are available on Hugging Face:
-
-[👉 https://huggingface.co/PursuitOfDataScience/Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5)
-
-
-
-### Improvements
-
-Compared to Argonne-1.0 pretraining, significant amount of changes were made to improve the model pretraining phase, listed below:
-
-- `torch.compile()` used to boost up pretraining speed
-- flash attention implemented to gain additional 2.6x times memeory efficiency, 
-translated by training batch size
-- More layers and attention heads for the model
-- GPU hardware harnessed much more efficiently
-- Integrated to Hugging Face AutoModel class for ease of usage
-- More support for text generation
-
-### Data
-
-The same as Argonne-1.0. Total processed tokens: 15,453,927,424.
-
-
-### Model
-
-The model has 356,516,640 parameters in total with the following parameters:
-
-```
-block_size = 2048
-n_layer = 16
-n_head = 16
-n_embd = 1296
-batch_size = 756
-```
-
-
-### Training
-
-We trained the model on one DGX node with 8× A100 GPUs (80 GB HBM each).
-
-- Total training cost: **1248 GPU hours**.
-- Total training steps: **80,000 global steps**
-
-Below is the training loss curve over time:
-
-![](plots/v1.5_pretraining_loss_plot.png)
-
-### Inference
-
-```
+```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-model_path = "PursuitOfDataScience/Argonne-1.5"
+model_id = "PursuitOfDataScience/Argonne2.5-base"
 
-# 1) Load the custom Argonne model with trust_remote_code=True
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    trust_remote_code=True
+    model_id,
+    trust_remote_code=True,
+    dtype=torch.bfloat16,
 )
 
-# 2) Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-# 3) Inference
-prompt = "The meaning of life is "
+prompt = "Write a short paragraph about scientific computing at Argonne National Laboratory."
 inputs = tokenizer(prompt, return_tensors="pt")
+input_ids = inputs["input_ids"].to(model.device)
 
-# call generate with typical HF params
-outputs = model.generate(**inputs, max_length=150, do_sample=True, top_k=50, top_p=0.95, temperature=0.7)
-print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+output_ids = model.generate(
+    input_ids,
+    max_length=input_ids.shape[1] + 128,
+    temperature=0.8,
+    top_p=0.95,
+    top_k=50,
+    do_sample=True,
+)
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 ```
 
-Sample generation text:
+---
 
-<pre>
-The meaning of life is tamed in many ways. It is a state of mental and physical development. It is a state of deep emotional strength and confidence, and it is a state of physical and mental balance. In this article, we will explore the meaning of life, the different ways life is defined, and how we can apply this concept to our own lives.
-</pre>
+# Argonne LLM Training
 
+Distributed PyTorch training pipeline for the Argonne causal LM using Qwen-family tokenizers and llm.c-style binary token data.
 
+## Project Layout
 
-
-## Argonne 1.0
-
-### 🤗 Hugging Face Model
-
-The pretrained model weights and detailed model card are available on Hugging Face:
-
-[👉 https://huggingface.co/PursuitOfDataScience/Argonne-1.0](https://huggingface.co/PursuitOfDataScience/Argonne-1.0)
-
-
-### Data
-
-We use Fineweb-Edu (CC-MAIN-2024-10) for model pretraining. This dataset is hosted on Hugging Face: [Fineweb-Edu on Hugging Face](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu)).
-
-### Model
-The model has 275,827,680 parameters in total with the following parameters:
-
+```text
+ArgonneAI/
+├── model.py                 # Argonne model + Hugging Face registration (model_type="argonne2")
+├── pretrain.py              # Main DDP pretraining script
+├── continue_pretrain.py     # Continued pretraining script (new-data continuation workflow)
+├── sft.py                   # Supervised fine-tuning script
+├── cot-sft.py               # Chain-of-thought SFT script
+├── preprocess_data.py       # Parquet -> train.bin converter
+└── test/                    # Experiment scripts/results
 ```
-block_size = 2048
-n_layer = 12
-n_head = 12
-n_embd = 1296
-dropout = 0.1
+
+## Requirements
+
+- Python 3 with CUDA-enabled PyTorch
+- `transformers`
+- `numpy`
+- `pyarrow`
+- `tqdm`
+- Optional but recommended: `flash-attn` (falls back automatically when unavailable)
+
+## Quick Start
+
+### 1) Preprocess parquet data
+
+Creates `train.bin` with the expected magic/header format and saves a tokenizer copy in `<output_dir>/tokenizer`.
+
+```bash
+python3 preprocess_data.py \
+  --tokenizer_path /path/to/Qwen3-0.6B-Base \
+  --data_dir /path/to/parquet_dir \
+  --output_dir /path/to/output_dir \
+  --text_column text \
+  --workers 16
 ```
-The learning rate (LR) was initially set to 3e-5 until step 62,000, after which it was increased to 5e-5. Correspondingly, the batch size was increased from 48 to 60 at the same step.
 
-### Training
+SLURM example:
 
-We trained the model on a single DGX node with 8× A100 GPUs (80 GB HBM each).
+```bash
+sbatch preprocess_job.sh
+```
 
-- Total training cost: **1440 GPU hours**.
-- Total training steps: **160,000 global steps**
+### 2) Train (new run or resume)
 
-Below is the training loss curve over time:
+`pretrain.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
 
-![](plots/pretrain_loss_20250303.png)
+```bash
+torchrun --nproc_per_node=2 pretrain.py \
+  --tokenizer_path /path/to/tokenizer \
+  --data_path /path/to/train.bin \
+  --checkpoint_dir /path/to/checkpoints \
+  --lr 3e-4 \
+  --batch_size 20 \
+  --total_batch_size 163840 \
+  --block_size 1024 \
+  --precision bf16 \
+  --flash_attention 1 \
+  --torch_compile 1 \
+  --gradient_checkpointing 1
+```
 
-### Repository Scripts
+SLURM example:
 
-The repository contains the following key scripts:
+```bash
+sbatch run_full_training.sh
+```
 
-- **mp_pretrain.py**: Core pretraining script with model-parallel training architecture
-- **inference.py**: Clean inference script for generating text with the trained model
-- **convert_model.py**: Utility to convert a pipeline-parallel model to single-GPU format
-- **instruct_finetuning.py**: Fine-tuning script for instruction-based learning on a single GPU
-- **run_instruct_finetuning.sh**: PBS batch script to run distributed fine-tuning
+### 3) Continue pretraining on new data
 
-### Inference
+`continue_pretrain.py` is intended for continued pretraining and is commonly used with `--reset_schedule 1`.
 
-Please refer to (🤗 Model Card)[https://huggingface.co/PursuitOfDataScience/Argonne-1.0#inference] for details.
+```bash
+torchrun --nproc_per_node=2 continue_pretrain.py \
+  --tokenizer_path /path/to/tokenizer \
+  --data_path /path/to/new_train.bin \
+  --checkpoint_dir /path/to/checkpoints \
+  --lr 3e-4 \
+  --batch_size 16 \
+  --total_batch_size 131072 \
+  --block_size 1024 \
+  --reset_schedule 1
+```
 
-Below is an example of text generated by our pre-trained LLM using some typical prompts:
+SLURM example:
 
-<pre>
-The meaning of life is tantamount to an inescapable reality. It can be seen as an inescapable reality where life is lived in a vacuum, or a mere absence of life. Life can be considered as the ultimate reality, where life is no more, where life has no purpose, and life has no meaning.
-Life is a form of art, rather than a mere collection or an endless expanse. It is a realm where art, music, philosophy, philosophy, and science come together to create something new, beautiful, and meaningful. It is the boundlessness of existence that creates the essence of art, music, philosophy and science.
-So, what does a life mean? It means something
-</pre>
+```bash
+sbatch continue.sh
+```
 
-<pre>
-In the future, artificial intelligence will tame the need for new ways to understand and control our lives. AI is already being used to do tasks that previously took human intelligence. But is it possible to predict what will come in the future, what will happen in the future, and how much will we be willing to pay for AI?
-Evolutionary scientists have been developing new technologies that can be used to create artificial intelligence. For example, AI algorithms can be used to detect objects in a scene. These algorithms have been used in the design and manufacturing of many different products.
-Similarly, AI algorithms can be used to predict the future by analyzing historical data and patterns in it. This information can be used to predict the future and make predictions accordingly.
-</pre>
+## Common Training Arguments (`pretrain.py` and `continue_pretrain.py`)
 
+| Argument | Description | Default |
+|---|---|---|
+| `--tokenizer_path` | Path to tokenizer | Required |
+| `--data_path` | Path to training tokens (`.bin`) | Required |
+| `--checkpoint_dir` | Checkpoint/model output directory | Required |
+| `--lr` | Learning rate | Required |
+| `--batch_size` | Micro-batch size per GPU | Required |
+| `--total_batch_size` | Target total batch size in tokens | Required |
+| `--block_size` | Sequence length | Required |
+| `--min_lr_ratio` | Final/min LR as a ratio of `--lr` | `0.1` |
+| `--warmup_steps` | Warmup steps | `0` |
+| `--weight_decay` | AdamW weight decay | `0.1` |
+| `--adam_beta1` | AdamW beta1 | `0.9` |
+| `--adam_beta2` | AdamW beta2 | `0.95` |
+| `--schedule` | LR schedule (`cosine` or `wsd`) | `wsd` |
+| `--cooldown` | WSD cooldown steps at end | `0` |
+| `--grad_clip` | Gradient norm clipping | `1.0` |
+| `--precision` | Autocast precision (`fp32`, `fp16`, `bf16`) | `bf16` |
+| `--flash_attention` | Enable flash-attention paths (`0/1`) | `1` |
+| `--checkpoint_interval` | Periodic checkpoint interval (seconds) | `1800` |
+| `--max_epochs` | Stop after this many data epochs | `1` |
+| `--gradient_checkpointing` | Enable gradient checkpointing (`0/1`) | `1` |
+| `--torch_compile` | Enable `torch.compile` (`0/1`) | `0` |
+| `--torch_compile_mode` | Compile mode (`default`, `reduce-overhead`, `max-autotune`) | `default` |
+| `--resume_from` | Explicit checkpoint path | `None` |
+| `--wall_time` | If `>0`, save and exit ~3 minutes before limit (seconds) | `0` (disabled) |
+| `--reset_schedule` | Reset behavior on resume (see below) | `0` |
+| `--val_data_path` | Optional held-out validation `.bin` | `None` |
+
+### Important `--reset_schedule` difference
+
+- In `pretrain.py`, `--reset_schedule 1` resets LR schedule, step counter, token counter, and data position (fresh-run counters).
+- In `continue_pretrain.py`, `--reset_schedule 1` resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed` from the loaded checkpoint.
+
+## Checkpointing and Outputs
+
+- Checkpoints are written as `checkpoint_step_<N>.pt`.
+- Checkpoints include: model state, optimizer state, scheduler state, `global_step`, `tokens_processed`, and data position.
+- On periodic checkpoints, rank 0 also prints a sampled generation.
+- At end of run, scripts save:
+  - Final training checkpoint
+  - `final_model/` containing model weights, tokenizer, and config via `save_pretrained`.
+
+## Model Notes (`model.py`)
+
+- Hugging Face-compatible model/config (`ArgonneConfig`, `ArgonneModel`), registered for `AutoConfig`, `AutoModel`, and `AutoModelForCausalLM`.
+- Uses grouped-query attention (GQA), SwiGLU MLP, RMSNorm, RoPE.
+- Attention path selection: FlashAttention 2 (if available) -> PyTorch SDPA -> math fallback.
+- Includes numerical-stability guards for NaNs/Infs in logits/loss.
+
+### Training preset used by scripts
+
+`pretrain.py` and `continue_pretrain.py` instantiate the model with:
+
+- Hidden size: `1792`
+- Layers: `28`
+- Attention heads: `14`
+- KV heads: `7`
+- `max_position_embeddings = --block_size`
+
+The defaults inside `ArgonneConfig` are different and are mainly for config-level compatibility.
