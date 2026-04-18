@@ -7,6 +7,7 @@ processed_data/*
 instruct_data/*
 *.sh
 report/
+cot_experiments/
 plot_loss.py
 Argonne_LLM/*
 argonne_instruct_finetuned/*

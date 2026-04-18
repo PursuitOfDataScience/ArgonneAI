@@ -168,6 +168,16 @@ def extract_input_ids(tokenized: Any) -> List[int]:
     return [int(x) for x in ids]
 
 
+def wrap_empty_think_answer(content: str) -> str:
+    """Train normal SFT answers to follow the always-think response contract."""
+    answer = (content or "").strip()
+    if not answer:
+        return answer
+    if "<think>" in answer and "</think>" in answer:
+        return answer
+    return f"<think>\n\n</think>\n\n{answer}"
+
+
 def build_training_example(
     prompt: str,
     messages: List[Dict[str, Any]],
@@ -181,7 +191,10 @@ def build_training_example(
         return None
 
     context_all = conversation[:target_idx]  # x (full history before final assistant)
-    target_turn = conversation[target_idx]  # y (final assistant answer)
+    target_turn = {
+        **conversation[target_idx],
+        "content": wrap_empty_think_answer(conversation[target_idx]["content"]),
+    }  # y (empty think block + final assistant answer)
     # Keep the most recent context possible (drop oldest turns first)
     # so examples fit model context length while preserving multi-turn recency.
     last_user_idx = None
@@ -399,6 +412,7 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
         config_dict = json.load(f)
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
     config.max_position_embeddings = max_seq_len
+    config.block_size = max_seq_len
     config.use_flash_attention = True
     config._keep_in_fp32_modules = []
 
@@ -406,7 +420,11 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
 
     weights_path = os.path.join(model_path, "model.safetensors")
     state_dict = load_file(weights_path)
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(
+        f"State dict applied. missing_keys={len(missing_keys)} "
+        f"unexpected_keys={len(unexpected_keys)}"
+    )
     model.tie_weights()
 
     model.config.use_cache = False
@@ -499,10 +517,17 @@ def main() -> None:
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--quality_every", type=int, default=200, help="Run quality samples every N optimizer steps")
+    parser.add_argument("--max_new_tokens_quality", type=int, default=160, help="Max new tokens for quality samples")
+    parser.add_argument("--run_before_quality", type=int, default=1, choices=[0, 1], help="Run quality samples before SFT")
+    parser.add_argument("--run_after_quality", type=int, default=1, choices=[0, 1], help="Run quality samples after SFT")
+    parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, stop after this many optimizer steps")
+    parser.add_argument("--skip_final_save", action="store_true", help="Skip final save_pretrained output")
     
     args = parser.parse_args()
     
     # Set hyperparameters from args
+    global MAX_SEQ_LEN, QUALITY_EVERY, MAX_NEW_TOKENS_QUALITY
     SEED = args.seed
     EPOCHS = args.num_epochs
     BATCH_SIZE = args.batch_size
@@ -510,6 +535,8 @@ def main() -> None:
     LEARNING_RATE = args.lr
     WARMUP_STEPS = args.warmup_steps
     MAX_SEQ_LEN = args.max_seq_length
+    QUALITY_EVERY = args.quality_every
+    MAX_NEW_TOKENS_QUALITY = args.max_new_tokens_quality
     
     seed_everything(SEED)
 
@@ -588,7 +615,8 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Baseline quality before SFT.
-    answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="BEFORE_SFT", step=0)
+    if args.run_before_quality == 1:
+        answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="BEFORE_SFT", step=0)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -636,7 +664,7 @@ def main() -> None:
                         f"lr {lr:.2e}"
                     )
 
-                if global_step % QUALITY_EVERY == 0:
+                if QUALITY_EVERY > 0 and global_step % QUALITY_EVERY == 0:
                     answer_questions(
                         model,
                         tokenizer,
@@ -645,12 +673,23 @@ def main() -> None:
                         tag="DURING_SFT",
                         step=global_step,
                     )
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    break
 
             pbar.set_postfix({"step": global_step, "loss": f"{loss.detach().item():.4f}"})
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
 
     print("\nTraining finished.")
     print(f"Optimizer steps: {global_step:,}")
     print(f"Total tokens seen: {tokens_seen:,}")
+
+    if args.run_after_quality == 1:
+        answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="AFTER_SFT", step=global_step)
+
+    if args.skip_final_save:
+        print("Skipping final model/tokenizer save (--skip_final_save).")
+        return
 
     # Save final model and tokenizer for downstream CoT SFT.
     # Use save_pretrained for HF-compatible format (config.json + safetensors).

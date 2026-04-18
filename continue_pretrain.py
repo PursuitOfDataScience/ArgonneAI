@@ -112,7 +112,21 @@ def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new
     return generated_text
 
 
-def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, loss, data_position, checkpoint_dir):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    global_step,
+    tokens_processed,
+    loss,
+    data_position,
+    checkpoint_dir,
+    dataset_epoch,
+    dataset_base_global_step,
+    dataset_base_tokens_processed,
+    dataset_num_tokens,
+    dataset_path,
+):
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
     base_model = get_base_model(model)
@@ -121,6 +135,11 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         'tokens_processed': tokens_processed,
         'loss': loss,
         'data_position': data_position,
+        'dataset_epoch': dataset_epoch,
+        'dataset_base_global_step': dataset_base_global_step,
+        'dataset_base_tokens_processed': dataset_base_tokens_processed,
+        'dataset_num_tokens': dataset_num_tokens,
+        'dataset_path': dataset_path,
         'model_state_dict': base_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
@@ -231,6 +250,8 @@ def main():
     # Estimate steps for scheduler
     num_tokens = len(train_loader.tokens)
     estimated_steps = int((num_tokens * args.max_epochs) / ACTUAL_TOTAL_BATCH)
+    dataset_base_global_step = 0
+    dataset_base_tokens_processed = 0
     if IS_MAIN:
         print(f"Training for {args.max_epochs} epoch(s) ~= {estimated_steps} steps ({num_tokens * args.max_epochs:,} tokens)")
 
@@ -286,6 +307,12 @@ def main():
                 scheduler.step()
         global_step = checkpoint['global_step']
         tokens_processed = checkpoint['tokens_processed']
+        data_position = checkpoint.get('data_position', 0)
+        checkpoint_dataset_epoch = checkpoint.get('dataset_epoch')
+        checkpoint_dataset_num_tokens = checkpoint.get('dataset_num_tokens')
+        checkpoint_dataset_path = checkpoint.get('dataset_path')
+        checkpoint_dataset_base_step = checkpoint.get('dataset_base_global_step')
+        checkpoint_dataset_base_tokens = checkpoint.get('dataset_base_tokens_processed')
 
         if args.reset_schedule == 1:
             # Continued pretraining on new data:
@@ -295,15 +322,42 @@ def main():
                 print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
             train_loader.set_position(RANK * args.batch_size * args.block_size)
             train_loader.epoch = 0
+            dataset_base_global_step = global_step
+            dataset_base_tokens_processed = tokens_processed
             is_resumed = False
         else:
-            data_position = checkpoint.get('data_position', 0)
             train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
-            train_loader.epoch = tokens_processed // num_tokens
+            metadata_matches = (
+                checkpoint_dataset_base_step is not None
+                and checkpoint_dataset_num_tokens == num_tokens
+                and (checkpoint_dataset_path is None or checkpoint_dataset_path == args.data_path)
+            )
+            if metadata_matches:
+                dataset_base_global_step = int(checkpoint_dataset_base_step)
+                if checkpoint_dataset_base_tokens is not None:
+                    dataset_base_tokens_processed = int(checkpoint_dataset_base_tokens)
+                else:
+                    dataset_base_tokens_processed = max(0, tokens_processed - data_position)
+                train_loader.epoch = int(checkpoint_dataset_epoch) if checkpoint_dataset_epoch is not None else 0
+            else:
+                cursor_steps = int(max(0, data_position) // ACTUAL_TOTAL_BATCH)
+                dataset_base_global_step = max(0, global_step - cursor_steps)
+                dataset_base_tokens_processed = max(0, tokens_processed - data_position)
+                train_loader.epoch = 0
+                if IS_MAIN:
+                    print("Legacy or dataset-mismatched checkpoint metadata; inferring dataset-local progress from the saved data cursor.")
+            # Derive dataset-local progress from token deltas so resumes stay
+            # correct even when world size or gradient accumulation changes.
+            dataset_progress_tokens = max(0, tokens_processed - dataset_base_tokens_processed)
+            dataset_progress_steps = int(dataset_progress_tokens // ACTUAL_TOTAL_BATCH)
             if IS_MAIN:
-                print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}, LR: {scheduler.get_last_lr()[0]:.2e}")
+                print(
+                    f"Resumed from step {global_step}, tokens: {tokens_processed:,}, "
+                    f"dataset epoch: {train_loader.epoch}, dataset progress: {dataset_progress_steps}/{estimated_steps} step(s), "
+                    f"LR: {scheduler.get_last_lr()[0]:.2e}"
+                )
             is_resumed = True
-            initial_steps = min(estimated_steps, int(tokens_processed // ACTUAL_TOTAL_BATCH))
+            initial_steps = min(estimated_steps, dataset_progress_steps)
     else:
         is_resumed = False
 
@@ -315,6 +369,7 @@ def main():
         print(f"Total batch size: {ACTUAL_TOTAL_BATCH} tokens (requested: {args.total_batch_size})")
         print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
         print(f"Training for {args.max_epochs} epoch(s) (estimated ~{estimated_steps} steps)")
+        print(f"Dataset-local progress at launch: {initial_steps}/{estimated_steps} step(s), dataset epoch {train_loader.epoch}")
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
@@ -398,7 +453,21 @@ def main():
                 print("\n" + "=" * 60)
                 print("Saving checkpoint...")
                 data_position = train_loader.get_position()
-                checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
+                checkpoint_path = save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    tokens_processed,
+                    step_loss,
+                    data_position,
+                    args.checkpoint_dir,
+                    train_loader.epoch,
+                    dataset_base_global_step,
+                    dataset_base_tokens_processed,
+                    num_tokens,
+                    args.data_path,
+                )
                 print(f"Checkpoint saved: {checkpoint_path}")
 
                 print("\nGenerating sample text...")
@@ -424,7 +493,21 @@ def main():
                 if IS_MAIN:
                     print(f"\nApproaching wall time ({args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
-                    checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
+                    checkpoint_path = save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        global_step,
+                        tokens_processed,
+                        step_loss,
+                        data_position,
+                        args.checkpoint_dir,
+                        train_loader.epoch,
+                        dataset_base_global_step,
+                        dataset_base_tokens_processed,
+                        num_tokens,
+                        args.data_path,
+                    )
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
                 if WORLD_SIZE > 1:
                     dist.barrier()
@@ -484,7 +567,21 @@ def main():
         # Save final training checkpoint
         print("\nSaving final checkpoint...")
         data_position = train_loader.get_position()
-        checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, train_loss, data_position, args.checkpoint_dir)
+        checkpoint_path = save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            global_step,
+            tokens_processed,
+            train_loss,
+            data_position,
+            args.checkpoint_dir,
+            train_loader.epoch,
+            dataset_base_global_step,
+            dataset_base_tokens_processed,
+            num_tokens,
+            args.data_path,
+        )
         print(f"Final checkpoint saved: {checkpoint_path}")
 
         # Save complete model + tokenizer + config

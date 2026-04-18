@@ -1,5 +1,4 @@
 import math
-import importlib.util
 from typing import Optional, Tuple
 
 import torch
@@ -15,9 +14,13 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutput
 
 
-_flash_attn_available = importlib.util.find_spec("flash_attn") is not None
-if _flash_attn_available:
+try:
     from flash_attn.flash_attn_interface import flash_attn_func
+
+    _flash_attn_available = True
+except ImportError:
+    flash_attn_func = None
+    _flash_attn_available = False
 
 
 class ArgonneConfig(PretrainedConfig):
@@ -476,15 +479,47 @@ class ArgonneModel(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
-        _, seq_length = input_ids.shape
+        bsz, seq_length = input_ids.shape
 
         device = self.embed_tokens.weight.device
         if input_ids.device != device:
             input_ids = input_ids.to(device)
         hidden_states = self.embed_tokens(input_ids)
 
-        # The training path does not use attention masks.
-        attention_mask = None
+        if attention_mask is not None:
+            if attention_mask.device != device:
+                attention_mask = attention_mask.to(device)
+
+            if attention_mask.dim() == 2:
+                # Convert a (B, L) validity mask into an additive (B, 1, L, L)
+                # block that preserves causal direction and valid-token masking.
+                valid = attention_mask.to(torch.bool)
+                pair = valid.unsqueeze(1) & valid.unsqueeze(2)
+                causal = torch.tril(
+                    torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
+                ).unsqueeze(0).unsqueeze(0)
+                allow = pair.unsqueeze(1) & causal
+                additive = torch.zeros(
+                    (bsz, 1, seq_length, seq_length),
+                    dtype=hidden_states.dtype,
+                    device=device,
+                )
+                additive.masked_fill_(~allow, -65504.0)
+                attention_mask = additive
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            elif attention_mask.dim() != 4:
+                raise ValueError(
+                    f"attention_mask must have 2, 3, or 4 dims, got shape={tuple(attention_mask.shape)}"
+                )
+
+            if attention_mask.dtype == torch.bool:
+                additive = torch.zeros_like(attention_mask, dtype=hidden_states.dtype)
+                additive.masked_fill_(~attention_mask, -65504.0)
+                attention_mask = additive
+            elif attention_mask.dtype != hidden_states.dtype:
+                attention_mask = attention_mask.to(hidden_states.dtype)
+
         cos, sin = self.rotary_emb(hidden_states, seq_length)
         rotary = (cos, sin)
 
@@ -517,6 +552,7 @@ class ArgonneModel(PreTrainedModel):
                 labels.view(-1),
                 ignore_index=-100,
             )
+
             # Handle NaN loss
             if torch.isnan(loss):
                 loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
@@ -532,6 +568,8 @@ class ArgonneModel(PreTrainedModel):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> torch.Tensor:
         self.eval()
         device = self.embed_tokens.weight.device
@@ -540,6 +578,33 @@ class ArgonneModel(PreTrainedModel):
             chunk = input_ids[:, -self.config.max_position_embeddings :]
             outputs = self.forward(chunk)
             logits = outputs.logits[:, -1, :] / temperature
+
+            if repetition_penalty != 1.0:
+                for b in range(input_ids.shape[0]):
+                    seen_tokens = torch.unique(input_ids[b])
+                    seen_logits = logits[b, seen_tokens]
+                    adjusted = torch.where(
+                        seen_logits < 0,
+                        seen_logits * repetition_penalty,
+                        seen_logits / repetition_penalty,
+                    )
+                    logits[b, seen_tokens] = adjusted
+
+            if no_repeat_ngram_size > 0 and input_ids.shape[1] + 1 >= no_repeat_ngram_size:
+                n = int(no_repeat_ngram_size)
+                for b in range(input_ids.shape[0]):
+                    seq = input_ids[b].tolist()
+                    ngrams = {}
+                    for i in range(len(seq) - n + 1):
+                        prefix = tuple(seq[i : i + n - 1]) if n > 1 else tuple()
+                        next_token = seq[i + n - 1]
+                        if prefix not in ngrams:
+                            ngrams[prefix] = set()
+                        ngrams[prefix].add(next_token)
+                    current_prefix = tuple(seq[-(n - 1) :]) if n > 1 else tuple()
+                    banned = ngrams.get(current_prefix, set())
+                    if banned:
+                        logits[b, list(banned)] = float("-inf")
 
             if do_sample:
                 if top_k is not None:
