@@ -28,22 +28,22 @@ SFT_SHELL_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/sft
 DPO_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/dpo.py"
 INFERENCE_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/inference.py"
 MIDTRAINING_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/midtraining.py"
-BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne2.5-base"
-CTX13568_BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne-2.5-ctx13568"
+BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne3.0-base"
+CTX13568_BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne3.0-ctx13568"
 LONGMINO_DATASET_URL = "https://huggingface.co/datasets/allenai/dolma3_longmino_pool"
 ULTRACHAT_DATASET_URL = "https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k"
 CHATBOT_ARENA_DATASET_URL = "https://huggingface.co/datasets/KatoHF/chatbot_arena_binarized"
 CHECKPOINT_DTYPE = "bfloat16"
 DEFAULT_WEIGHT_SHARD_COUNT = 5
 TOKENIZER_NOTE = "This model uses the Qwen3 tokenizer family via the Qwen2Tokenizer compatibility class."
-DEFAULT_BASE_REPO_ID = "PursuitOfDataScience/Argonne2.5-base"
-DEFAULT_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne2.5-instruct"
-DEFAULT_MIDTRAINING_REPO_ID = "PursuitOfDataScience/Argonne-2.5-ctx13568"
-DEFAULT_BASE_MODEL_NAME = "Argonne 2.5-base"
-DEFAULT_INSTRUCT_MODEL_NAME = "Argonne 2.5-instruct"
-DEFAULT_MIDTRAINING_MODEL_NAME = "Argonne-2.5-ctx13568"
-DEFAULT_CTX13568_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne-2.5-ctx13568-instruct"
-DEFAULT_CTX13568_INSTRUCT_MODEL_NAME = "Argonne-2.5-ctx13568-instruct"
+DEFAULT_BASE_REPO_ID = "PursuitOfDataScience/Argonne3.0-base"
+DEFAULT_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne3.0-instruct"
+DEFAULT_MIDTRAINING_REPO_ID = "PursuitOfDataScience/Argonne3.0-ctx13568"
+DEFAULT_BASE_MODEL_NAME = "Argonne 3.0-base"
+DEFAULT_INSTRUCT_MODEL_NAME = "Argonne 3.0-instruct"
+DEFAULT_MIDTRAINING_MODEL_NAME = "Argonne3.0-ctx13568"
+DEFAULT_CTX13568_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne3.0-ctx13568-instruct"
+DEFAULT_CTX13568_INSTRUCT_MODEL_NAME = "Argonne3.0-ctx13568-instruct"
 INSTRUCT_RECOMMENDED_ROWS = [
     ("**Context length**", "1,024 tokens"),
     ("**Temperature**", "0.8"),
@@ -63,16 +63,16 @@ CTX13568_INSTRUCT_RECOMMENDED_ROWS = [
 ]
 
 ARCHITECTURE_ROWS = [
-    ("**Parameters**", "~1.27B"),
-    ("**Layers**", "28 transformer blocks"),
-    ("**Hidden size**", "1,792"),
-    ("**Attention heads**", "14 query / 7 key-value (GQA)"),
-    ("**Head dimension**", "128"),
-    ("**Feed-forward**", "SwiGLU MLP, 4,864 intermediate dim"),
+    ("**Parameters**", "~2.88B"),
+    ("**Layers**", "24 transformer blocks"),
+    ("**Hidden size**", "3,072"),
+    ("**Attention heads**", "12 query / 4 key-value (GQA)"),
+    ("**Head dimension**", "256"),
+    ("**Feed-forward**", "SwiGLU MLP, 8,192 intermediate dim"),
     ("**Context length**", "1,024 tokens"),
     ("**Vocabulary size**", "151,669"),
-    ("**Normalization**", "RMSNorm (ε = 1e-6)"),
-    ("**Position encoding**", "RoPE (θ = 10,000)"),
+    ("**Normalization**", "RMSNorm with QK/V/sandwich normalization"),
+    ("**Position encoding**", "RoPE (θ = 1,000,000)"),
 ]
 
 

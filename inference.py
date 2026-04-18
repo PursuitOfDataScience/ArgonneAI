@@ -22,10 +22,10 @@ except ModuleNotFoundError:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate text with Argonne 2.5.")
+    parser = argparse.ArgumentParser(description="Generate text with Argonne 3.0.")
     parser.add_argument(
         "--model-path",
-        default="PursuitOfDataScience/Argonne2.5-base",
+        default="PursuitOfDataScience/Argonne3.0-base",
         help="Local checkpoint directory or Hugging Face repo id.",
     )
     parser.add_argument(
