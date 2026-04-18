@@ -41,10 +41,18 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from continue_pretrain import (
+    ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+    ENABLE_QK_NORM,
+    ENABLE_SANDWICH_NORM,
+    ENABLE_V_NORM,
     HIDDEN_SIZE,
+    INTERMEDIATE_SIZE,
+    LOCAL_ATTENTION_WINDOW,
+    LOGIT_SOFTCAP,
     NUM_HEADS,
     NUM_KV_HEADS,
     NUM_LAYERS,
+    Z_LOSS_WEIGHT,
     DataLoader,
     cleanup_distributed,
     setup_distributed,
@@ -764,9 +772,17 @@ def main():
         num_hidden_layers=NUM_LAYERS,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_KV_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=args.block_size,
         rope_theta=args.rope_theta,
         use_flash_attention=args.flash_attention == 1,
+        qk_norm=ENABLE_QK_NORM,
+        v_norm=ENABLE_V_NORM,
+        sandwich_norm=ENABLE_SANDWICH_NORM,
+        z_loss_weight=Z_LOSS_WEIGHT,
+        interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+        local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
+        logit_softcap=LOGIT_SOFTCAP,
         tie_word_embeddings=True,
     )
     config.block_size = args.block_size

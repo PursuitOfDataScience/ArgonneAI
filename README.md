@@ -1,5 +1,53 @@
 # Argonne 2.5
 
+## Repository layout (argonne3.0)
+
+`argonne3.0` is a branch in `ArgonneAI`, created from `main` on 2026-04-18, containing the production recipe selected from the round-1/2/3 search sequence ending at exp_317. Handoff and evidence artifacts live in:
+- `nextrun3/handoff.txt`
+- `nextrun3/final_report.txt`
+- `nextrun3/seed_variance.txt`
+- `nextrun3/batch_sizing.txt`
+
+This branch was constructed via git plumbing (temporary index + commit-tree) without a working-tree checkout because `llm.c` jobs were active. There is no `ArgonneAI-argonne3.0/` directory; the branch exists in git object storage, and staging copies were written to `nextrun3/argonne3_staging/`.
+
+Inspect branch contents without checkout:
+```bash
+git show argonne3.0:<file>
+git ls-tree -r argonne3.0
+```
+
+Check out once `llm.c` work is done:
+```bash
+cd /home/youzhi/ArgonneAI
+git checkout argonne3.0
+```
+
+Push after checkout:
+```bash
+git push -u origin argonne3.0
+```
+
+End-to-end workflow on this branch:
+1. `preprocess_data.py` / `preprocess_job.sh`
+2. `pretrain.py` / `run_full_training.sh`
+3. `continue_pretrain.py` / `continue.sh`
+4. `midtraining.py` / `midtraining.sh`
+5. `sft.py` / `sft.sh`
+6. `cot-sft.py` / `cot-sft.sh`
+7. `dpo.py` / `dpo.sh`
+8. `push_model_to_hf.py`
+
+### argonne2.5 -> argonne3.0 changes
+
+| Area | argonne2.5 | argonne3.0 | Evidence |
+|---|---|---|---|
+| Core architecture | 1792 hidden, 28 layers, 14/7 heads | 3072 hidden, 24 layers, 12/4 heads, interleaved local/global window 256 | exp_244, exp_287, exp_293 |
+| Stability stack | Base RMSNorm/flash-attn recipe | QK-norm + V-norm + sandwich norms + RoPE theta 1e6 | exp_253, exp_257 |
+| Output stabilization | No final logit cap | Final-logit softcap, tightened to cap=15 | exp_300, exp_301, exp_314 |
+| Loss shaping | z-loss used in late 2.x stack | z-loss removed in final best | exp_317 |
+| Optimizer choice | AdamW baseline | AdamW retained; Muon deferred to larger-scale retry | exp_329, exp_330 |
+| Batch regime | smaller effective batch proxy | ~1M effective tokens via micro-batch=8 and scaled grad_accum | `nextrun3/batch_sizing.txt` |
+
 Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
 
 Source code and release scripts live in the main branch of this repo: [GitHub main branch](https://github.com/PursuitOfDataScience/ArgonneAI/tree/main)

@@ -9,6 +9,7 @@ import sys
 import glob
 import time
 import argparse
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,10 +18,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 # Model architecture
-HIDDEN_SIZE = 1792
-NUM_LAYERS = 28
-NUM_HEADS = 14
-NUM_KV_HEADS = 7  # GQA
+HIDDEN_SIZE = 3072
+NUM_LAYERS = 24
+NUM_HEADS = 12
+NUM_KV_HEADS = 4  # GQA
+ENABLE_QK_NORM = True
+ENABLE_V_NORM = True
+Z_LOSS_WEIGHT = 0.0
+ENABLE_SANDWICH_NORM = True
+ROPE_THETA = 1000000.0
+ENABLE_MTP = False
+MTP_HORIZON = 1
+MTP_LOSS_WEIGHT = 0.0
+ENABLE_INTERLEAVED_LOCAL_ATTENTION = True
+LOCAL_ATTENTION_WINDOW = 256
+LOGIT_SOFTCAP = 15.0
 
 # Parse arguments
 parser = argparse.ArgumentParser()
@@ -52,6 +64,7 @@ parser.add_argument("--resume_from", type=str, default=None, help="Resume from c
 parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
+parser.add_argument("--seed", type=int, default=444, help="Base random seed")
 args = parser.parse_args()
 
 # Distributed setup
@@ -73,6 +86,14 @@ def cleanup_distributed():
 RANK, LOCAL_RANK, WORLD_SIZE = setup_distributed()
 IS_MAIN = RANK == 0
 DEVICE = f"cuda:{LOCAL_RANK}"
+
+BASE_SEED = int(args.seed)
+RUN_SEED = BASE_SEED + RANK
+random.seed(RUN_SEED)
+np.random.seed(RUN_SEED)
+torch.manual_seed(RUN_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RUN_SEED)
 
 # Compute gradient accumulation
 TOKENS_PER_MICRO = args.batch_size * WORLD_SIZE * args.block_size
@@ -108,16 +129,22 @@ def load_data_shard(filename):
     return tokens
 
 class DataLoader:
-    def __init__(self, filename, B, T, rank=0, world_size=1):
+    def __init__(self, filename, B, T, rank=0, world_size=1, start_token_offset=0):
         self.B = B
         self.T = T
         self.rank = rank
         self.world_size = world_size
         self.tokens = load_data_shard(filename)
-        self.current_position = rank * B * T
+        self.start_token_offset = int(start_token_offset)
+        self.current_position = self.start_token_offset + rank * B * T
         self.epoch = 0
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            raise ValueError(
+                f"Start offset {self.start_token_offset} is too close to end of dataset "
+                f"for batch_size={B}, block_size={T}, world_size={world_size}"
+            )
         if rank == 0:
-            print(f"DataLoader: {len(self.tokens):,} tokens")
+            print(f"DataLoader: {len(self.tokens):,} tokens (start_offset={self.start_token_offset:,})")
 
     def next_batch(self):
         B = self.B
@@ -128,7 +155,7 @@ class DataLoader:
         y = (buf[1:]).view(B, T)
         self.current_position += B * T * self.world_size
         if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = self.rank * B * T
+            self.current_position = self.start_token_offset + self.rank * B * T
             self.epoch += 1
             if self.rank == 0:
                 print(f"\n*** Epoch {self.epoch} completed ***\n")
@@ -233,7 +260,17 @@ def main():
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_KV_HEADS,
         max_position_embeddings=args.block_size,
+        rope_theta=ROPE_THETA,
         use_flash_attention=args.flash_attention == 1,
+        qk_norm=ENABLE_QK_NORM,
+        v_norm=ENABLE_V_NORM,
+        sandwich_norm=ENABLE_SANDWICH_NORM,
+        z_loss_weight=Z_LOSS_WEIGHT,
+        mtp_horizon=MTP_HORIZON if ENABLE_MTP else 1,
+        mtp_loss_weight=MTP_LOSS_WEIGHT if ENABLE_MTP else 0.0,
+        interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+        local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
+        logit_softcap=LOGIT_SOFTCAP,
         tie_word_embeddings=True,
     )
     config._keep_in_fp32_modules = []
@@ -267,10 +304,24 @@ def main():
         print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
 
     # Create data loader
-    train_loader = DataLoader(args.data_path, args.batch_size, args.block_size, RANK, WORLD_SIZE)
+    train_loader = DataLoader(
+        args.data_path,
+        args.batch_size,
+        args.block_size,
+        RANK,
+        WORLD_SIZE,
+        start_token_offset=0,
+    )
     val_loader = None
     if IS_MAIN and args.val_data_path:
-        val_loader = DataLoader(args.val_data_path, args.batch_size, args.block_size, rank=0, world_size=1)
+        val_loader = DataLoader(
+            args.val_data_path,
+            args.batch_size,
+            args.block_size,
+            rank=0,
+            world_size=1,
+            start_token_offset=0,
+        )
 
     # Estimate steps for scheduler
     num_tokens = len(train_loader.tokens)
@@ -361,6 +412,14 @@ def main():
         print(f"Total batch size: {ACTUAL_TOTAL_BATCH} tokens (requested: {args.total_batch_size})")
         print(f"Gradient accumulation steps: {GRAD_ACCUM_STEPS}")
         print(f"Training for {args.max_epochs} epoch(s) (estimated ~{estimated_steps} steps)")
+        print(f"Seed: base={BASE_SEED}, rank_seed={RUN_SEED}")
+        print(
+            f"QK norm: {ENABLE_QK_NORM} | v_norm: {ENABLE_V_NORM} | "
+            f"sandwich_norm: {ENABLE_SANDWICH_NORM} | z_loss_weight: {Z_LOSS_WEIGHT} | "
+            f"rope_theta: {ROPE_THETA} | mtp: {ENABLE_MTP} (horizon={MTP_HORIZON}, weight={MTP_LOSS_WEIGHT}) | "
+            f"interleaved_local_attention: {ENABLE_INTERLEAVED_LOCAL_ATTENTION} (window={LOCAL_ATTENTION_WINDOW}) | "
+            f"logit_softcap: {LOGIT_SOFTCAP}"
+        )
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
@@ -383,7 +442,7 @@ def main():
         if is_resumed:
             # Use token-based progress so resumed runs remain accurate even if batch config changed.
             initial_steps = min(estimated_steps, int(tokens_processed // ACTUAL_TOTAL_BATCH))
-        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step")
+        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step", disable=True)
 
     model.train()
 
@@ -427,7 +486,7 @@ def main():
 
         current_lr = optimizer.param_groups[0]['lr']
 
-        if IS_MAIN and global_step % 10 == 0:
+        if IS_MAIN and global_step % 50 == 0:
             perplexity = np.exp(step_loss)
             print(f"Step {global_step} | Loss: {step_loss:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}")
             if pbar:
@@ -529,32 +588,6 @@ def main():
         val_loss = np.mean(val_losses) if val_losses else float("nan")
         val_loss_str = f"{val_loss:.4f}" if val_losses else "n/a"
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss_str}")
-
-        # Save final training checkpoint
-        print("\nSaving final checkpoint...")
-        data_position = train_loader.get_position()
-        checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, train_loss, data_position, args.checkpoint_dir)
-        print(f"Final checkpoint saved: {checkpoint_path}")
-
-        # Save complete model + tokenizer + config
-        final_model_dir = os.path.join(args.checkpoint_dir, "final_model")
-        os.makedirs(final_model_dir, exist_ok=True)
-        save_model = get_base_model(model)
-
-        actual_vocab = len(tokenizer)
-        embed = save_model.get_input_embeddings()
-        if embed.weight.shape[0] > actual_vocab:
-            print(f"Trimming embeddings from {embed.weight.shape[0]} to {actual_vocab}")
-            embed.weight = nn.Parameter(embed.weight[:actual_vocab])
-            lm_head = save_model.get_output_embeddings()
-            if lm_head is not None:
-                lm_head.weight = nn.Parameter(lm_head.weight[:actual_vocab])
-            save_model.config.vocab_size = actual_vocab
-
-        save_model.save_pretrained(final_model_dir)
-        tokenizer.save_pretrained(final_model_dir)
-        config.save_pretrained(final_model_dir)
-        print(f"Final model + tokenizer + config saved to: {final_model_dir}")
 
         elapsed_time = time.time() - training_start_time
         print("\n" + "=" * 60)

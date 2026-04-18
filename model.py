@@ -15,32 +15,46 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutput
 
 
-_flash_attn_available = importlib.util.find_spec("flash_attn") is not None
-if _flash_attn_available:
-    from flash_attn.flash_attn_interface import flash_attn_func
+flash_attn_func = None
+_flash_attn_available = False
+if importlib.util.find_spec("flash_attn") is not None:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func
+        _flash_attn_available = True
+    except ImportError:
+        _flash_attn_available = False
 
 
 class ArgonneConfig(PretrainedConfig):
-    """Configuration for the Argonne v2.5 family of models."""
+    """Configuration for the Argonne v3.0 family of models."""
 
     model_type = "argonne2"
 
     def __init__(
         self,
         vocab_size: int = 151936,
-        hidden_size: int = 2048,
-        num_hidden_layers: int = 16,
-        num_attention_heads: int = 16,
-        num_key_value_heads: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-        max_position_embeddings: int = 4096,
+        hidden_size: int = 3072,
+        num_hidden_layers: int = 24,
+        num_attention_heads: int = 12,
+        num_key_value_heads: Optional[int] = 4,
+        intermediate_size: Optional[int] = 8192,
+        max_position_embeddings: int = 1024,
         attention_dropout: float = 0.0,
         hidden_dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
-        rope_theta: float = 10000.0,
+        rope_theta: float = 1000000.0,
         sliding_window: Optional[int] = None,
         use_flash_attention: bool = True,
         use_gradient_checkpointing: bool = False,
+        qk_norm: bool = True,
+        v_norm: bool = True,
+        sandwich_norm: bool = True,
+        z_loss_weight: float = 0.0,
+        mtp_horizon: int = 1,
+        mtp_loss_weight: float = 0.0,
+        interleaved_local_attention: bool = True,
+        local_attention_window: Optional[int] = 256,
+        logit_softcap: float = 15.0,
         tie_word_embeddings: bool = True,
         attention_bias: bool = False,
         mlp_bias: bool = False,
@@ -95,6 +109,17 @@ class ArgonneConfig(PretrainedConfig):
         self.sliding_window = sliding_window
         self.use_flash_attention = use_flash_attention
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.qk_norm = qk_norm
+        self.v_norm = v_norm
+        self.sandwich_norm = sandwich_norm
+        self.z_loss_weight = z_loss_weight
+        self.mtp_horizon = max(1, int(mtp_horizon))
+        self.mtp_loss_weight = float(mtp_loss_weight)
+        self.interleaved_local_attention = bool(interleaved_local_attention)
+        self.local_attention_window = (
+            int(local_attention_window) if local_attention_window is not None and int(local_attention_window) > 0 else None
+        )
+        self.logit_softcap = float(logit_softcap)
         self.tie_word_embeddings = tie_word_embeddings
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
@@ -197,6 +222,8 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.sliding_window = config.sliding_window
+        self.qk_norm = config.qk_norm
+        self.v_norm = config.v_norm
 
         self.q_proj = nn.Linear(
             self.hidden_size,
@@ -222,6 +249,11 @@ class GroupedQueryAttention(nn.Module):
 
         self.attention_dropout = config.attention_dropout
         self.use_flash_attention = config.use_flash_attention
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        if self.v_norm:
+            self.v_norm_layer = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_key_value_groups == 1:
@@ -245,6 +277,11 @@ class GroupedQueryAttention(nn.Module):
         query = query.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value = value.view(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+        if self.v_norm:
+            value = self.v_norm_layer(value)
 
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
@@ -381,6 +418,10 @@ class Block(nn.Module):
         self.attn = GroupedQueryAttention(config)
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.sandwich_norm = config.sandwich_norm
+        if self.sandwich_norm:
+            self.attn_out_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp_out_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = SwiGLUMLP(config)
 
     def forward(
@@ -392,11 +433,15 @@ class Block(nn.Module):
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
         hidden_states = self.attn(hidden_states, position_embeddings, attention_mask)
+        if self.sandwich_norm:
+            hidden_states = self.attn_out_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.sandwich_norm:
+            hidden_states = self.mlp_out_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -413,6 +458,9 @@ class ArgonneModel(PreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([Block(config, idx) for idx in range(config.num_hidden_layers)])
+        if config.interleaved_local_attention and config.local_attention_window is not None:
+            for idx, block in enumerate(self.blocks):
+                block.attn.sliding_window = config.local_attention_window if (idx % 2 == 1) else None
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(
             config.hidden_size // config.num_attention_heads,
@@ -502,6 +550,9 @@ class ArgonneModel(PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        if self.config.logit_softcap > 0:
+            cap = self.config.logit_softcap
+            logits = torch.tanh(logits / cap) * cap
         
         # Check for NaN in logits and handle gracefully
         if torch.isnan(logits).any():
@@ -517,6 +568,27 @@ class ArgonneModel(PreTrainedModel):
                 labels.view(-1),
                 ignore_index=-100,
             )
+            if self.training and self.config.mtp_horizon > 1:
+                mtp_terms = []
+                max_horizon = min(self.config.mtp_horizon, labels.shape[1])
+                for horizon in range(2, max_horizon + 1):
+                    shift = horizon - 1
+                    shifted_logits = logits[:, :-shift, :]
+                    shifted_labels = labels[:, shift:]
+                    if shifted_logits.numel() == 0:
+                        continue
+                    mtp_loss = F.cross_entropy(
+                        shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                        shifted_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
+                    mtp_terms.append(mtp_loss / horizon)
+                if mtp_terms:
+                    loss = loss + (self.config.mtp_loss_weight * torch.stack(mtp_terms).mean()).to(loss.dtype)
+            if self.config.z_loss_weight > 0:
+                z = torch.logsumexp(logits.float(), dim=-1)
+                loss = loss + (self.config.z_loss_weight * z.pow(2).mean()).to(loss.dtype)
+
             # Handle NaN loss
             if torch.isnan(loss):
                 loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
@@ -532,6 +604,8 @@ class ArgonneModel(PreTrainedModel):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> torch.Tensor:
         self.eval()
         device = self.embed_tokens.weight.device
@@ -540,6 +614,33 @@ class ArgonneModel(PreTrainedModel):
             chunk = input_ids[:, -self.config.max_position_embeddings :]
             outputs = self.forward(chunk)
             logits = outputs.logits[:, -1, :] / temperature
+
+            if repetition_penalty != 1.0:
+                for b in range(input_ids.shape[0]):
+                    seen_tokens = torch.unique(input_ids[b])
+                    seen_logits = logits[b, seen_tokens]
+                    adjusted = torch.where(
+                        seen_logits < 0,
+                        seen_logits * repetition_penalty,
+                        seen_logits / repetition_penalty,
+                    )
+                    logits[b, seen_tokens] = adjusted
+
+            if no_repeat_ngram_size > 0 and input_ids.shape[1] + 1 >= no_repeat_ngram_size:
+                n = int(no_repeat_ngram_size)
+                for b in range(input_ids.shape[0]):
+                    seq = input_ids[b].tolist()
+                    ngrams = {}
+                    for i in range(len(seq) - n + 1):
+                        prefix = tuple(seq[i : i + n - 1]) if n > 1 else tuple()
+                        next_token = seq[i + n - 1]
+                        if prefix not in ngrams:
+                            ngrams[prefix] = set()
+                        ngrams[prefix].add(next_token)
+                    current_prefix = tuple(seq[-(n - 1) :]) if n > 1 else tuple()
+                    banned = ngrams.get(current_prefix, set())
+                    if banned:
+                        logits[b, list(banned)] = float("-inf")
 
             if do_sample:
                 if top_k is not None:
