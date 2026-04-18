@@ -36,9 +36,9 @@ NGPUS=2
 WALL_TIME=0
 
 # Training config
-BATCH_SIZE=8
+BATCH_SIZE=19
 BLOCK_SIZE=1024
-GRAD_ACCUM=61
+GRAD_ACCUM=26
 TOTAL_BATCH_SIZE=$((BATCH_SIZE * NGPUS * BLOCK_SIZE * GRAD_ACCUM))
 COOLDOWN_STEPS=4000
 
@@ -47,7 +47,7 @@ torchrun --nproc_per_node=$NGPUS pretrain.py \
   --data_path $DATA \
   --val_data_path $VAL_DATA \
   --checkpoint_dir $CKPT_DIR \
-  --lr 4e-4 \
+  --lr 6e-4 \
   --batch_size $BATCH_SIZE \
   --total_batch_size $TOTAL_BATCH_SIZE \
   --block_size $BLOCK_SIZE \
@@ -64,5 +64,5 @@ torchrun --nproc_per_node=$NGPUS pretrain.py \
   --checkpoint_interval 1800 \
   --max_epochs 1 \
   --torch_compile 1 \
-  --gradient_checkpointing 0 \
+  --gradient_checkpointing 1 \
   --wall_time $WALL_TIME

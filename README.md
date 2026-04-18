@@ -37,6 +37,8 @@ End-to-end workflow on this branch:
 7. `dpo.py` / `dpo.sh`
 8. `push_model_to_hf.py`
 
+Batch config was empirically probed on 1 H200 for the 2.88B exp_317 architecture with gradient checkpointing on and torch.compile on. Full measurements are in `nextrun3/probe_batch_v2/results.tsv`. Production config: micro-batch 19, grad_accum 26 per 2-GPU run (`run_full_training.sh`), effective batch 1,011,712 tokens; scaled settings are grad_accum 51 (1 GPU), 13 (4 GPU), and 6 (8 GPU).
+
 ### argonne2.5 -> argonne3.0 changes
 
 | Area | argonne2.5 | argonne3.0 | Evidence |
@@ -46,7 +48,7 @@ End-to-end workflow on this branch:
 | Output stabilization | No final logit cap | Final-logit softcap, tightened to cap=15 | exp_300, exp_301, exp_314 |
 | Loss shaping | z-loss used in late 2.x stack | z-loss removed in final best | exp_317 |
 | Optimizer choice | AdamW baseline | AdamW retained; Muon deferred to larger-scale retry | exp_329, exp_330 |
-| Batch regime | smaller effective batch proxy | ~1M effective tokens via micro-batch=8 and scaled grad_accum | `nextrun3/batch_sizing.txt` |
+| Batch regime | smaller effective batch proxy | ~1M effective tokens via micro-batch=19, grad_accum=26 (2 GPU), checkpointing on | `nextrun3/probe_batch_v2/results.tsv`, `nextrun3/batch_sizing.txt` |
 
 Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
 

@@ -41,10 +41,20 @@ parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to t
 parser.add_argument("--data_path", type=str, required=True, help="Path to training data (.bin)")
 parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
 # Training hyperparameters
-parser.add_argument("--lr", type=float, default=4.0e-4, help="Learning rate")
+# Production LR: 6e-4
+# Inherited from exp_317 (2.88B arch, tuned at 24K effective batch in nextrun3 search).
+# Production effective batch is ~1M tokens, ~41x larger. Batch-scaling rules suggest:
+#   - Linear: 6e-4 * 41 = 2.5e-2  (too aggressive, would diverge)
+#   - Sqrt:   6e-4 * 6.4 = 3.8e-3  (aggressive for cold start at this scale)
+# Counter-balancing effect: 2.88B is 2.2x larger than the 1.3B llm.c baseline,
+# which used LR=3e-4. Larger models typically want slightly lower LR at fixed batch.
+# Net: 6e-4 is a conservative, exp_317-validated starting point that survives
+# both adjustments. Verify at scale with a short probe (2-5B tokens) before
+# committing to a full run. Safe range to explore: 4e-4 to 1e-3.
+parser.add_argument("--lr", type=float, default=6.0e-4, help="Learning rate")
 parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Min LR as ratio of LR")
-parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
-parser.add_argument("--total_batch_size", type=int, default=999424, help="Total batch size in tokens")
+parser.add_argument("--batch_size", type=int, default=19, help="Batch size per GPU")
+parser.add_argument("--total_batch_size", type=int, default=1011712, help="Total batch size in tokens")
 parser.add_argument("--block_size", type=int, default=1024, help="Sequence length")
 parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
 parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
@@ -57,7 +67,7 @@ parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "f
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
-parser.add_argument("--gradient_checkpointing", type=int, default=0, help="Use gradient checkpointing")
+parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
 parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
@@ -280,7 +290,7 @@ def main():
     # This keeps optimizer states in fp32 for proper precision
 
     # Gradient checkpointing (before DDP and compile)
-    if args.gradient_checkpointing == 1 and args.torch_compile == 0:
+    if args.gradient_checkpointing == 1:
         if hasattr(model, 'gradient_checkpointing_enable'):
             model.gradient_checkpointing_enable()
             if IS_MAIN:
