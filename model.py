@@ -563,50 +563,20 @@ class ArgonneModel(PreTrainedModel):
     def generate(
         self,
         input_ids: torch.Tensor,
-        max_length: Optional[int] = None,
-        max_new_tokens: Optional[int] = None,
+        max_length: int = 1024,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
-        attention_mask: Optional[torch.Tensor] = None,
-        stopping_criteria=None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        **kwargs,
     ) -> torch.Tensor:
         self.eval()
         device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
-        if attention_mask is None:
-            pad_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
-            if pad_id is not None:
-                attention_mask = (input_ids != pad_id).long()
-            else:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        else:
-            attention_mask = attention_mask.to(device)
-
-        current_length = input_ids.shape[1]
-        target_length = max_length
-        if max_new_tokens is not None:
-            target_from_new_tokens = current_length + max_new_tokens
-            target_length = target_from_new_tokens if target_length is None else min(target_length, target_from_new_tokens)
-        if target_length is None:
-            target_length = current_length + 1024
-        if target_length <= current_length:
-            return input_ids.to(device)
-
-        if temperature <= 0:
-            temperature = 1.0
-
-        while input_ids.shape[1] < target_length:
-            window = self.config.max_position_embeddings
-            chunk = input_ids[:, -window:]
-            chunk_mask = attention_mask[:, -chunk.shape[1] :] if attention_mask is not None else None
-            outputs = self.forward(chunk, attention_mask=chunk_mask)
+        while input_ids.shape[1] < max_length:
+            chunk = input_ids[:, -self.config.max_position_embeddings :]
+            outputs = self.forward(chunk)
             logits = outputs.logits[:, -1, :] / temperature
 
             if repetition_penalty != 1.0:
@@ -654,24 +624,8 @@ class ArgonneModel(PreTrainedModel):
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
             input_ids = torch.cat([input_ids, next_token.to(input_ids.device)], dim=-1)
-            if attention_mask is not None:
-                next_mask = torch.ones(
-                    (attention_mask.shape[0], 1),
-                    device=device,
-                    dtype=attention_mask.dtype,
-                )
-                attention_mask = torch.cat([attention_mask, next_mask], dim=-1)
-
-            if stopping_criteria is not None:
-                stop = stopping_criteria(input_ids, None)
-                if isinstance(stop, torch.Tensor):
-                    stop = bool(stop.any().item())
-                elif isinstance(stop, (list, tuple)):
-                    stop = any(bool(item) for item in stop)
-                else:
-                    stop = bool(stop)
-                if stop:
-                    break
+            if input_ids.shape[1] >= max_length:
+                break
         return input_ids.to(device)
 
 
