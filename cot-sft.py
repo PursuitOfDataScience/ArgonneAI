@@ -62,6 +62,7 @@ QUALITY_FORCE_NON_MCQ_POSTPROCESS = True
 QUALITY_LOG_RAW = False
 QUALITY_NO_REPEAT_NGRAM = 10
 QUALITY_REPETITION_PENALTY = 1.0
+NO_TEXT_GENERATION = True
 QUALITY_TOKENS_AFTER_ANSWER = 96
 QUALITY_LOOP_NGRAM = 12
 QUALITY_LOOP_REPEATS = 4
@@ -1442,10 +1443,50 @@ class QualityCallback(TrainerCallback):
         self.every_steps = every_steps
 
     def on_step_end(self, args, state, control, **kwargs):
+        if NO_TEXT_GENERATION:
+            return control
         if state.global_step > 0 and state.global_step % self.every_steps == 0:
             model = kwargs.get("model")
             if model is not None:
                 answer_questions(model, self.tokenizer, QUALITY_QUESTIONS, "DURING_SFT", state.global_step)
+        return control
+
+
+class StopAfterCheckpointSaveCallback(TrainerCallback):
+    def __init__(self, enabled: bool = False, slice_steps: int = 0) -> None:
+        self.enabled = enabled
+        self.slice_steps = max(0, int(slice_steps))
+        self.start_step: Optional[int] = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_step = int(state.global_step)
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.enabled or self.slice_steps <= 0:
+            return control
+        if self.start_step is None:
+            self.start_step = max(0, int(state.global_step) - 1)
+        target_step = self.start_step + self.slice_steps
+        if int(state.global_step) >= target_step:
+            print(
+                f"Slice step target reached at step {state.global_step}; saving checkpoint.",
+                flush=True,
+            )
+            control.should_save = True
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self.enabled:
+            return control
+        max_steps = int(getattr(state, "max_steps", 0) or 0)
+        if max_steps > 0 and state.global_step >= max_steps:
+            return control
+        print(
+            f"Checkpoint saved at step {state.global_step}; stopping this training slice.",
+            flush=True,
+        )
+        control.should_training_stop = True
         return control
 
 
@@ -1590,6 +1631,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quality_force_non_mcq_postprocess", type=int, default=1, choices=[0, 1])
     p.add_argument("--quality_log_raw", type=int, default=0, choices=[0, 1])
     p.add_argument(
+        "--no_text_generation",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Skip all sample-question text generation probes when set to 1",
+    )
+    p.add_argument(
         "--quality_questions_file",
         type=str,
         default="/home/youzhi/ArgonneAI/cot_experiments/root_cause/quality_questions_mcq.txt",
@@ -1604,6 +1652,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--skip_final_save", action="store_true", help="Skip final save_pretrained output")
     p.add_argument("--resume_from_checkpoint", default=None, help="HF checkpoint path to resume from")
+    p.add_argument(
+        "--exit_after_checkpoint_save",
+        action="store_true",
+        help="Stop the training process after the next checkpoint save so the job wrapper can resubmit",
+    )
+    p.add_argument(
+        "--slice_steps",
+        type=int,
+        default=0,
+        help="If > 0 with --exit_after_checkpoint_save, force a checkpoint after this many resumed training steps",
+    )
     return p.parse_args()
 
 
@@ -1635,13 +1694,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    global QUALITY_QUESTIONS
-    if args.quality_questions_file:
-        QUALITY_QUESTIONS = load_quality_questions_from_file(args.quality_questions_file)
-
     global MAX_NEW_TOKENS_QUALITY, QUALITY_DO_SAMPLE, QUALITY_TEMPERATURE, QUALITY_TOP_P, QUALITY_TOP_K
     global QUALITY_SEED_THINK, QUALITY_FORCE_MCQ_POSTPROCESS, QUALITY_FORCE_NON_MCQ_POSTPROCESS
-    global QUALITY_LOG_RAW
+    global QUALITY_LOG_RAW, NO_TEXT_GENERATION
     global QUALITY_NO_REPEAT_NGRAM, QUALITY_REPETITION_PENALTY
     MAX_NEW_TOKENS_QUALITY = args.max_new_tokens_quality
     QUALITY_DO_SAMPLE = args.quality_do_sample == 1
@@ -1652,8 +1707,13 @@ def main() -> None:
     QUALITY_FORCE_MCQ_POSTPROCESS = args.quality_force_mcq_postprocess == 1
     QUALITY_FORCE_NON_MCQ_POSTPROCESS = args.quality_force_non_mcq_postprocess == 1
     QUALITY_LOG_RAW = args.quality_log_raw == 1
+    NO_TEXT_GENERATION = args.no_text_generation == 1
     QUALITY_NO_REPEAT_NGRAM = max(0, args.quality_no_repeat_ngram)
     QUALITY_REPETITION_PENALTY = max(1.0, args.quality_repetition_penalty)
+
+    global QUALITY_QUESTIONS
+    if not NO_TEXT_GENERATION and args.quality_questions_file:
+        QUALITY_QUESTIONS = load_quality_questions_from_file(args.quality_questions_file)
     if args.preserve_raw_reasoning == 1 and args.max_think_tokens > 0:
         print(
             f"WARNING: preserve_raw_reasoning=1 but max_think_tokens={args.max_think_tokens}; "
@@ -1661,7 +1721,8 @@ def main() -> None:
             flush=True,
         )
     if (
-        args.quality_force_non_mcq_postprocess == 1
+        not NO_TEXT_GENERATION
+        and args.quality_force_non_mcq_postprocess == 1
         and args.quality_force_mcq_postprocess == 0
         and "mcq" in os.path.basename(args.quality_questions_file).lower()
     ):
@@ -1811,7 +1872,7 @@ def main() -> None:
         is_rank0 = torch.distributed.get_rank() == 0
     else:
         is_rank0 = True
-    if is_rank0 and args.run_before_quality == 1:
+    if is_rank0 and args.run_before_quality == 1 and not NO_TEXT_GENERATION:
         answer_questions(model, tokenizer, QUALITY_QUESTIONS, "BEFORE_SFT", 0)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1846,7 +1907,13 @@ def main() -> None:
         args=train_args,
         train_dataset=train_dataset,
         data_collator=CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
-        callbacks=[QualityCallback(tokenizer=tokenizer, every_steps=args.quality_steps)],
+        callbacks=[
+            QualityCallback(tokenizer=tokenizer, every_steps=args.quality_steps),
+            StopAfterCheckpointSaveCallback(
+                enabled=args.exit_after_checkpoint_save,
+                slice_steps=args.slice_steps,
+            ),
+        ],
     )
 
     if args.resume_from_checkpoint:
@@ -1854,13 +1921,22 @@ def main() -> None:
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     else:
         trainer.train()
-    if is_rank0 and args.run_after_quality == 1:
+    if is_rank0 and args.run_after_quality == 1 and not NO_TEXT_GENERATION:
         answer_questions(model, tokenizer, QUALITY_QUESTIONS, "AFTER_SFT", int(trainer.state.global_step))
-    if args.skip_final_save:
+    trainer_max_steps = int(getattr(trainer.state, "max_steps", 0) or 0)
+    stopped_for_next_slice = (
+        args.exit_after_checkpoint_save
+        and trainer_max_steps > 0
+        and int(trainer.state.global_step) < trainer_max_steps
+    )
+    if stopped_for_next_slice:
+        print("Skipping final model/tokenizer save for incomplete checkpoint slice.")
+    elif args.skip_final_save:
         print("Skipping final model/tokenizer save (--skip_final_save).")
     else:
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        trainer.save_state()
         print(f"Saved final model/tokenizer to: {args.output_dir}")
 
 
