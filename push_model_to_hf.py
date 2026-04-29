@@ -23,6 +23,7 @@ if str(SCRIPT_DIR) not in sys.path:
 SOURCE_CODE_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/tree/main"
 MODEL_CODE_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/model.py"
 SFT_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/sft.py"
+COT_SFT_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/cot-sft.py"
 DPO_SHELL_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/dpo.sh"
 SFT_SHELL_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/sft.sh"
 DPO_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/dpo.py"
@@ -30,6 +31,7 @@ INFERENCE_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/m
 MIDTRAINING_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/midtraining.py"
 BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne2.5-base"
 CTX13568_BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne-2.5-ctx13568"
+THINKING_DATASET_URL = "https://huggingface.co/datasets/PursuitOfDataScience/0.5M-thinking"
 LONGMINO_DATASET_URL = "https://huggingface.co/datasets/allenai/dolma3_longmino_pool"
 ULTRACHAT_DATASET_URL = "https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k"
 CHATBOT_ARENA_DATASET_URL = "https://huggingface.co/datasets/KatoHF/chatbot_arena_binarized"
@@ -44,6 +46,8 @@ DEFAULT_INSTRUCT_MODEL_NAME = "Argonne 2.5-instruct"
 DEFAULT_MIDTRAINING_MODEL_NAME = "Argonne-2.5-ctx13568"
 DEFAULT_CTX13568_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne-2.5-ctx13568-instruct"
 DEFAULT_CTX13568_INSTRUCT_MODEL_NAME = "Argonne-2.5-ctx13568-instruct"
+DEFAULT_THINK_REPO_ID = "PursuitOfDataScience/Argonne-2.5-think"
+DEFAULT_THINK_MODEL_NAME = "Argonne-2.5-think"
 INSTRUCT_RECOMMENDED_ROWS = [
     ("**Context length**", "1,024 tokens"),
     ("**Temperature**", "0.8"),
@@ -60,6 +64,17 @@ CTX13568_INSTRUCT_RECOMMENDED_ROWS = [
     ("**No-repeat n-gram size**", "4"),
     ("**Seed**", "444"),
     ("**Continuation length**", "200 new tokens"),
+]
+THINK_RECOMMENDED_ROWS = [
+    ("**Context length**", "13,568 tokens"),
+    ("**Continuation length**", "1,024 new tokens"),
+    ("**Decoding**", "Sampling (`do_sample=True`)"),
+    ("**Temperature**", "0.7"),
+    ("**Top-p**", "0.9"),
+    ("**Top-k**", "40"),
+    ("**No-repeat n-gram size**", "10"),
+    ("**Repetition penalty**", "1.0"),
+    ("**Seed `<think>`**", "False"),
 ]
 
 ARCHITECTURE_ROWS = [
@@ -199,6 +214,56 @@ if eos_id in gen_ids:
 
 reply = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 print(reply)
+"""
+
+
+def build_think_inference_snippet(repo_id):
+    return f"""from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_id = "{repo_id}"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+model.eval()
+
+messages = [
+    {{"role": "user", "content": "Why were elements heavier than lithium not produced in large amounts during Big Bang nucleosynthesis?"}}
+]
+prompt_ids = tokenizer.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=True,
+    enable_thinking=True,
+)
+input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+with torch.no_grad():
+    output_ids = model.generate(
+        input_ids,
+        max_length=min(model.config.max_position_embeddings, input_ids.shape[1] + 1024),
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=40,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=10,
+    )
+
+gen_ids = output_ids[0, input_ids.shape[1]:].tolist()
+eos_id = tokenizer.eos_token_id
+if eos_id is not None and eos_id in gen_ids:
+    gen_ids = gen_ids[: gen_ids.index(eos_id)]
+
+print(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
 """
 
 
@@ -504,6 +569,107 @@ The released weights are stored in {CHECKPOINT_DTYPE} and published as {shard_co
 """
 
 
+def build_think_model_card(repo_id, model_name, parameter_count, shard_count):
+    base_model_link = f"[PursuitOfDataScience/Argonne-2.5-ctx13568]({CTX13568_BASE_MODEL_URL})"
+    thinking_data_link = f"[PursuitOfDataScience/0.5M-thinking]({THINKING_DATASET_URL})"
+    architecture_rows = [
+        ("**Parameters**", f"{parameter_count:,} (~1.27B)"),
+        ("**Layers**", "28 transformer blocks"),
+        ("**Hidden size**", "1,792"),
+        ("**Attention heads**", "14 query / 7 key-value (GQA)"),
+        ("**Context length**", "13,568 tokens"),
+        ("**Vocabulary size**", "151,669"),
+        ("**Position encoding**", "RoPE (theta = 10,000)"),
+    ]
+    training_rows = [
+        ("**Input model**", base_model_link),
+        ("**Training data**", thinking_data_link),
+        ("**Training script**", f"[`cot-sft.py`]({COT_SFT_SCRIPT_URL})"),
+        ("**Checkpoint dtype**", CHECKPOINT_DTYPE),
+        ("**Weight format**", f"{shard_count} sharded safetensors"),
+    ]
+    recommended_rows = markdown_table(THINK_RECOMMENDED_ROWS)
+    source_section = f"""## Source code
+
+The release was built from the GitHub main branch codebase: {SOURCE_CODE_URL}
+
+Code reference:
+- [`cot-sft.py`]({COT_SFT_SCRIPT_URL})
+
+"""
+    recommended_section = f"""## Recommended generation config
+
+{recommended_rows}
+
+"""
+    inference_section = f"""## Inference
+
+```python
+{build_think_inference_snippet(repo_id)}
+```
+
+"""
+    return f"""---
+license: apache-2.0
+language:
+- en
+library_name: transformers
+base_model: PursuitOfDataScience/Argonne-2.5-ctx13568
+datasets:
+- PursuitOfDataScience/0.5M-thinking
+tags:
+- text-generation
+- causal-lm
+- transformer
+- argonne
+- long-context
+- reasoning
+- thinking
+- sft
+pipeline_tag: text-generation
+---
+
+# {model_name}
+
+{model_name} is a reasoning SFT checkpoint trained from {base_model_link} on {thinking_data_link}.
+
+## Model architecture
+
+{markdown_table(architecture_rows, ("Component", "Specification"))}
+
+## Training details
+
+{markdown_table(training_rows)}
+
+## Tokenizer
+
+{TOKENIZER_NOTE}
+
+{source_section}
+{recommended_section}
+{inference_section}
+## Usage notes
+
+- Load with `trust_remote_code=True`.
+- Use the chat template via `tokenizer.apply_chat_template(..., add_generation_prompt=True, enable_thinking=True)`.
+- The custom `generate` method uses `max_length`, so the example sets `max_length=input_length + continuation_length`.
+- Weights are published as {shard_count} bf16 safetensor shards.
+- The checkpoint inherits the tokenizer and chat template from the long-context input model.
+
+## Citation
+
+```bibtex
+@misc{{argonne25think,
+  author = {{PursuitOfDataScience}},
+  title = {{{model_name}}},
+  year = {{2026}},
+  publisher = {{Hugging Face}},
+  url = {{https://huggingface.co/{repo_id}}}
+}}
+```
+"""
+
+
 def build_midtraining_model_card(repo_id, model_name, parameter_count, plot_repo_path, shard_count):
     base_model_link = f"[PursuitOfDataScience/Argonne2.5-base]({BASE_MODEL_URL})"
     longmino_link = f"[allenai/dolma3_longmino_pool]({LONGMINO_DATASET_URL})"
@@ -620,6 +786,8 @@ def build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_pa
         return build_midtraining_model_card(repo_id, model_name, parameter_count, plot_repo_path, shard_count)
     if profile == "ctx13568_instruct":
         return build_ctx13568_instruct_model_card(repo_id, model_name, parameter_count, shard_count)
+    if profile == "think":
+        return build_think_model_card(repo_id, model_name, parameter_count, shard_count)
     raise ValueError(f"Unknown profile: {profile}")
 
 
@@ -627,7 +795,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Push Argonne weights to the Hugging Face Hub.")
     parser.add_argument(
         "--profile",
-        choices=["base", "instruct", "midtraining", "ctx13568_instruct"],
+        choices=["base", "instruct", "midtraining", "ctx13568_instruct", "think"],
         default="base",
         help="Model card profile to publish.",
     )
@@ -770,7 +938,7 @@ def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, 
             continue
         if item.is_file():
             shutil.copy2(item, temp_path / item.name)
-        elif item.is_dir() and item.name not in {"__pycache__", ".git"}:
+        elif item.is_dir() and item.name not in {"__pycache__", ".git"} and not item.name.startswith("checkpoint-"):
             shutil.copytree(item, temp_path / item.name)
 
     state_dict = load_weight_tensors(model_path)
@@ -838,6 +1006,8 @@ def main():
             args.repo_id = DEFAULT_INSTRUCT_REPO_ID
         elif args.profile == "ctx13568_instruct":
             args.repo_id = DEFAULT_CTX13568_INSTRUCT_REPO_ID
+        elif args.profile == "think":
+            args.repo_id = DEFAULT_THINK_REPO_ID
         else:
             args.repo_id = DEFAULT_MIDTRAINING_REPO_ID
     if args.model_name is None:
@@ -847,6 +1017,8 @@ def main():
             args.model_name = DEFAULT_INSTRUCT_MODEL_NAME
         elif args.profile == "ctx13568_instruct":
             args.model_name = DEFAULT_CTX13568_INSTRUCT_MODEL_NAME
+        elif args.profile == "think":
+            args.model_name = DEFAULT_THINK_MODEL_NAME
         else:
             args.model_name = DEFAULT_MIDTRAINING_MODEL_NAME
     if args.commit_message is None:

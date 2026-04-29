@@ -22,12 +22,14 @@ import argparse
 import math
 import os
 import random
+import shutil
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from datasets import load_from_disk
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -35,6 +37,12 @@ from transformers import AutoTokenizer
 
 # Avoid tokenizer thread oversubscription on cluster nodes.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def is_rank0():
+    """Check if current process is rank 0 (for DDP)"""
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 # -----------------------------------------------------------------------------
 # Default hyperparameters (can be overridden by CLI args)
@@ -523,6 +531,11 @@ def main() -> None:
     parser.add_argument("--run_after_quality", type=int, default=1, choices=[0, 1], help="Run quality samples after SFT")
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, stop after this many optimizer steps")
     parser.add_argument("--skip_final_save", action="store_true", help="Skip final save_pretrained output")
+    parser.add_argument("--save_strategy", type=str, default="no", choices=["steps", "no"], help="Checkpoint saving strategy")
+    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X steps")
+    parser.add_argument("--save_total_limit", type=int, default=None, help="Limit the total amount of checkpoints")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--exit_after_checkpoint_save", action="store_true", help="Exit after saving a checkpoint for iterative training")
     
     args = parser.parse_args()
     
@@ -561,6 +574,35 @@ def main() -> None:
     print(f"Final model save dir: {args.output_dir}")
 
     model, tokenizer = build_model_and_tokenizer(device, args.argonne_root, args.model_path, MAX_SEQ_LEN)
+    
+    # Add checkpoint resuming support  
+    start_global_step = 0
+    start_scheduler_state = None
+    start_optimizer_state = None
+    if args.resume_from_checkpoint and os.path.isdir(args.resume_from_checkpoint):
+        checkpoint_path = args.resume_from_checkpoint
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        # Load model weights from checkpoint
+        weights_path = os.path.join(checkpoint_path, "model.safetensors")
+        if os.path.exists(weights_path):
+            from safetensors.torch import load_file
+            state_dict = load_file(weights_path)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            print(f"Resuming from checkpoint. missing_keys={missing_keys}, unexpected_keys={unexpected_keys}")
+            model.tie_weights()  # Re-tie after loading partial state dict
+        # Load tokenizer from checkpoint
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+        # Load training state
+        training_state_path = os.path.join(checkpoint_path, "training_state.bin")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location='cpu')
+            start_global_step = training_state.get('global_step', 0)
+            start_tokens_seen = training_state.get('tokens_seen', 0)
+            start_scheduler_state = training_state.get('scheduler_state_dict', None)
+            start_optimizer_state = training_state.get('optimizer_state_dict', None)
+            print(f"Resuming from global_step: {start_global_step}, tokens_seen: {start_tokens_seen}")
+    else:
+        start_tokens_seen = 0
 
     # Debug probe to ensure runtime tokenizer behavior matches local validation.
     probe_ds = load_from_disk(args.data_path)
@@ -579,20 +621,42 @@ def main() -> None:
 
     dataset = UltraChatLastAssistantDataset(args.data_path, tokenizer, MAX_SEQ_LEN)
     collator = CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
+
+    # Deterministic shuffled indices so jobs train on sequential chunks of the shuffled dataset
+    rng = torch.Generator().manual_seed(9786)  # Fixed seed for reproducible shuffle
+    all_indices = list(torch.randperm(len(dataset), generator=rng).tolist())
+
+    # Calculate chunk boundaries
+    batches_per_step = GRAD_ACCUM_STEPS  # micro-batches per optimizer step
+    samples_per_step = batches_per_step * BATCH_SIZE  # samples per optimizer step
+    start_sample = start_global_step * samples_per_step  # samples consumed so far
+
+    # Total steps for full epoch (used for scheduler)
+    full_steps_per_epoch = len(dataset) // samples_per_step
+    total_steps = max(1, full_steps_per_epoch * EPOCHS)
+
+    steps_this_job = total_steps - start_global_step  # steps remaining
+    chunksize = steps_this_job * samples_per_step  # samples for this job
+
+    if chunksize > 0:
+        chunk_indices = all_indices[start_sample:start_sample + chunksize]
+    else:
+        chunk_indices = all_indices[start_sample:]
+
+    chunk_dataset = torch.utils.data.Subset(dataset, chunk_indices) if chunk_indices else dataset
     loader = DataLoader(
-        dataset,
+        chunk_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,  # Already shuffled via indices
         drop_last=True,
-        num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
+        num_workers=0,
         pin_memory=True,
         collate_fn=collator,
     )
 
     steps_per_epoch = len(loader) // GRAD_ACCUM_STEPS
-    total_steps = max(1, steps_per_epoch * EPOCHS)
     print(f"DataLoader batches/epoch: {len(loader):,}")
-    print(f"Optimizer steps/epoch: {steps_per_epoch:,}")
+    print(f"Optimizer steps/epoch (this job): {steps_per_epoch:,}")
     print(f"Total optimizer steps: {total_steps:,}")
 
     optimizer = torch.optim.AdamW(
@@ -614,6 +678,19 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # Restore scheduler and optimizer state when resuming
+    if start_scheduler_state is not None:
+        scheduler.load_state_dict(start_scheduler_state)
+        print(f"Restored scheduler state (last_epoch={start_scheduler_state.get('last_epoch', 'N/A')})")
+    elif start_global_step > 0:
+        # No scheduler state in checkpoint — manually advance to global_step
+        for _ in range(start_global_step):
+            scheduler.step()
+        print(f"No scheduler state found, advanced scheduler to step {start_global_step}")
+    if start_optimizer_state is not None:
+        optimizer.load_state_dict(start_optimizer_state)
+        print(f"Restored optimizer state")
+
     # Baseline quality before SFT.
     if args.run_before_quality == 1:
         answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="BEFORE_SFT", step=0)
@@ -621,11 +698,14 @@ def main() -> None:
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    global_step = 0
-    micro_step = 0
-    tokens_seen = 0
+    global_step = start_global_step
+    tokens_seen = start_tokens_seen
     running_loss = 0.0
+    
+    if start_global_step > 0:
+        print(f"Resuming training from global_step={global_step}, tokens_seen={start_tokens_seen}")
 
+    micro_step = 0  # Track micro steps (batches before optimizer step)
     for epoch in range(EPOCHS):
         print(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", unit="batch")
@@ -673,12 +753,85 @@ def main() -> None:
                         tag="DURING_SFT",
                         step=global_step,
                     )
+
+                # Handle checkpoint saving
+                if args.save_strategy == "steps" and args.save_steps > 0 and global_step % args.save_steps == 0:
+                    if is_rank0:
+                        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        print(f"Saving checkpoint to {checkpoint_dir}")
+                        model.save_pretrained(checkpoint_dir)
+                        tokenizer.save_pretrained(checkpoint_dir)
+                        
+                        # Save training state
+                        state = {
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "tokens_seen": tokens_seen,
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                        }
+                        torch.save(state, os.path.join(checkpoint_dir, "training_state.bin"))
+                        
+                        # Handle save total limit
+                        if args.save_total_limit is not None:
+                            checkpoints = []
+                            for d in os.listdir(args.output_dir):
+                                if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d)):
+                                    try:
+                                        step = int(d.split("-")[1])
+                                        checkpoints.append((step, d))
+                                    except ValueError:
+                                        pass
+                            checkpoints.sort(key=lambda x: x[0])
+                            if len(checkpoints) > args.save_total_limit:
+                                for step, d in checkpoints[:-args.save_total_limit]:
+                                    shutil.rmtree(os.path.join(args.output_dir, d))
+                                    print(f"Removed old checkpoint: {d}")
+
+                        # Exit after checkpoint save for iterative training
+                        # (but don't exit if we've reached max_steps — let the final save happen)
+                        if args.exit_after_checkpoint_save and (args.max_steps <= 0 or global_step < args.max_steps):
+                            print(f"Checkpoint saved at step {global_step}. Exiting for iterative training.")
+                            sys.exit(0)
+
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
 
             pbar.set_postfix({"step": global_step, "loss": f"{loss.detach().item():.4f}"})
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
+
+    # Save final checkpoint when max_steps reached
+    if args.max_steps > 0 and global_step >= args.max_steps and global_step > 0:
+        if is_rank0:
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            print(f"Saving final checkpoint to {checkpoint_dir}")
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+            state = {
+                "epoch": EPOCHS - 1,
+                "global_step": global_step,
+                "tokens_seen": tokens_seen,
+                "scheduler_state_dict": scheduler.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            }
+            torch.save(state, os.path.join(checkpoint_dir, "training_state.bin"))
+            if args.save_total_limit is not None:
+                checkpoints = []
+                for d in os.listdir(args.output_dir):
+                    if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d)):
+                        try:
+                            step = int(d.split("-")[1])
+                            checkpoints.append((step, d))
+                        except ValueError:
+                            pass
+                checkpoints.sort(key=lambda x: x[0])
+                if len(checkpoints) > args.save_total_limit:
+                    for step, d in checkpoints[:-args.save_total_limit]:
+                        shutil.rmtree(os.path.join(args.output_dir, d))
+                        print(f"Removed old checkpoint: {d}")
 
     print("\nTraining finished.")
     print(f"Optimizer steps: {global_step:,}")
