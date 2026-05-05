@@ -47,8 +47,8 @@ Argonne 2.5 lives on the `llm.c` branch and was released as `PursuitOfDataScienc
 | Base context length | 1,024 tokens | 1,024 tokens |
 | Long-context stage | 13,568 tokens (dedicated `midtraining.py`) | Supported via continued pretraining |
 | Default LR (pretrain) | 3.0e-4 | 3.0e-4 |
-| Gradient clipping | 0.4 | 1.0 |
-| Effective batch size | ~1M tokens | ~245K tokens |
+| Gradient clipping | 1.0 | 1.0 |
+| Effective batch size | ~233K tokens | ~246K tokens |
 | torch.compile (default) | Enabled | Disabled |
 
 ## Training pipeline
