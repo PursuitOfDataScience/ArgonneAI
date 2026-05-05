@@ -49,7 +49,7 @@ Argonne 2.5 lives on the `llm.c` branch and was released as `PursuitOfDataScienc
 | Default LR (pretrain) | 3.0e-4 | 3.0e-4 |
 | Gradient clipping | 1.0 | 1.0 |
 | Effective batch size | ~233K tokens | ~246K tokens |
-| torch.compile (default) | Enabled | Disabled |
+| torch.compile | Enabled | Enabled |
 
 ## Training pipeline
 
