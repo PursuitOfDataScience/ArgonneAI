@@ -71,7 +71,7 @@ parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use g
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
 parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
-parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
+parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 5 min before this limit. 0 = disabled.")
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
 parser.add_argument("--seed", type=int, default=444, help="Base random seed")
@@ -114,8 +114,8 @@ assert GRAD_ACCUM_STEPS >= 1, (
 )
 ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-# Wall time: save 3 minutes before limit
-WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
+# Wall time: save 5 minutes before limit
+WALL_TIME_SAVE = args.wall_time - 300 if args.wall_time > 0 else 0
 
 # Autocast setup
 if args.precision == "bf16":
@@ -452,7 +452,7 @@ def main():
         if is_resumed:
             # Use token-based progress so resumed runs remain accurate even if batch config changed.
             initial_steps = min(estimated_steps, int(tokens_processed // ACTUAL_TOTAL_BATCH))
-        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step", disable=True)
+        pbar = tqdm(total=estimated_steps, initial=initial_steps, desc="Training", unit="step", disable=False)
 
     model.train()
 

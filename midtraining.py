@@ -672,7 +672,7 @@ def build_parser():
         choices=[0, 1],
         help="If 1, when loading init_checkpoint_path (non-resume), start fresh optimizer/scheduler at --lr",
     )
-    parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit.")
+    parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 5 min before this limit.")
     parser.add_argument(
         "--target_midtraining_tokens",
         type=int,
@@ -731,7 +731,7 @@ def main():
         f"{world_size} GPU(s) x batch_size {args.batch_size} x block_size {args.block_size}"
     )
     actual_total_batch = grad_accum_steps * tokens_per_micro
-    wall_time_save = args.wall_time - 180 if args.wall_time > 0 else 0
+    wall_time_save = args.wall_time - 300 if args.wall_time > 0 else 0
 
     if is_main:
         print("=" * 72)

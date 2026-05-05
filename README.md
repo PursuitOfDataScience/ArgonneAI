@@ -1,111 +1,99 @@
-# Argonne 2.5
+# Argonne 3
 
-## Repository layout (argonne3.0)
+This repository contains the full training and release pipeline for the Argonne causal LM family.
 
-`argonne3.0` is a branch in `ArgonneAI`, created from `main` on 2026-04-18, containing the production recipe selected from the round-1/2/3 search sequence ending at exp_317. Handoff and evidence artifacts live in:
-- `nextrun3/handoff.txt`
-- `nextrun3/final_report.txt`
-- `nextrun3/seed_variance.txt`
-- `nextrun3/batch_sizing.txt`
+## Current model architecture (Argonne 3)
 
-This branch was constructed via git plumbing (temporary index + commit-tree) without a working-tree checkout because `llm.c` jobs were active. There is no `ArgonneAI-argonne3.0/` directory; the branch exists in git object storage, and staging copies were written to `nextrun3/argonne3_staging/`.
+The active architecture in `argonne3.0` is defined by `model.py`, `pretrain.py`, and `continue_pretrain.py`:
 
-Inspect branch contents without checkout:
+| Component | Current setting |
+|---|---|
+| Parameters | 2,882,982,912 (~2.88B) |
+| Layers | 24 transformer blocks |
+| Hidden size | 3,072 |
+| Attention heads | 12 query / 4 key-value (GQA) |
+| Head dimension | 256 |
+| Feed-forward | SwiGLU MLP, 8,192 intermediate dim |
+| Normalization | RMSNorm + QK norm + V norm + sandwich norms |
+| Attention pattern | Interleaved local/global attention |
+| Local attention window | 256 |
+| Logit stabilization | Final logit softcap = 15.0 |
+| RoPE theta (pretrain/continue) | 1,000,000 |
+| Base context length | 1,024 tokens (default pretrain/continue block size) |
+| Long-context stage default | 13,568 tokens (`midtraining.sh`) |
+| Tokenizer/vocab | From `--tokenizer_path` (config default vocab size is 151,936) |
+| Multi-token prediction (MTP) | Configurable horizon & loss weight (disabled by default) |
+| Z-loss | Configurable weight (0.0 by default) |
+
+## Architecture comparison: Argonne 3 vs. Argonne 2.5
+
+Argonne 2.5 lives on the `llm.c` branch and was released as `PursuitOfDataScience/Argonne2.5-base` (~1.27B params).
+
+| Component | Argonne 3 (`argonne3.0`) | Argonne 2.5 (`llm.c`) |
+|---|---|---|
+| Parameters | ~2.88B | ~1.27B |
+| Layers | 24 | 28 |
+| Hidden size | 3,072 | 1,792 |
+| Attention heads | 12 query / 4 key-value (GQA) | 14 query / 7 key-value (GQA) |
+| Head dimension | 256 | 128 |
+| Feed-forward intermediate dim | 8,192 | 4,864 |
+| Normalization | RMSNorm + QK norm + V norm + sandwich norms | RMSNorm only |
+| Attention pattern | Interleaved local/global attention | Full global attention |
+| Local attention window | 256 | N/A |
+| Logit softcap | 15.0 | None |
+| RoPE theta | 1,000,000 | 10,000 |
+| MTP support | Yes (configurable) | No |
+| Z-loss support | Yes (configurable) | No |
+| Base context length | 1,024 tokens | 1,024 tokens |
+| Long-context stage | 13,568 tokens (dedicated `midtraining.py`) | Supported via continued pretraining |
+| Default LR (pretrain) | 6.0e-4 | 3.0e-4 |
+| Gradient clipping | 0.4 | 1.0 |
+| Effective batch size | ~1M tokens | ~245K tokens |
+| torch.compile (default) | Enabled | Disabled |
+
+## Training pipeline
+
+End-to-end stages and launch scripts:
+
+1. Data preprocessing: `preprocess_data.py` + `preprocess_job.sh`
+2. Pretraining: `pretrain.py` + `run_full_training.sh`
+3. Continued pretraining: `continue_pretrain.py` + `continue.sh`
+4. Long-context midtraining: `midtraining.py` + `midtraining.sh`
+5. SFT: `sft.py` + `sft.sh`
+6. CoT SFT: `cot-sft.py` + `cot-sft.sh`
+7. DPO: `dpo.py` + `dpo.sh`
+8. Publishing: `push_model_to_hf.py`
+
+## SLURM scripts
+
+All repository `.sh` SLURM launchers now include:
+
 ```bash
-git show argonne3.0:<file>
-git ls-tree -r argonne3.0
+#SBATCH --exclude=midway3-0423,midway3-[0298,0377-0378,0603-0606]
 ```
 
-Check out once `llm.c` work is done:
+## Quick usage
+
 ```bash
-cd /home/youzhi/ArgonneAI
-git checkout argonne3.0
+# preprocess parquet -> binary tokens
+sbatch preprocess_job.sh
+
+# base pretrain
+sbatch run_full_training.sh
+
+# continue on new data
+sbatch continue.sh
+
+# long-context midtraining
+sbatch midtraining.sh
+
+# SFT / CoT-SFT / DPO
+sbatch sft.sh
+sbatch cot-sft.sh
+sbatch dpo.sh
 ```
 
-Push after checkout:
-```bash
-git push -u origin argonne3.0
-```
-
-End-to-end workflow on this branch:
-1. `preprocess_data.py` / `preprocess_job.sh`
-2. `pretrain.py` / `run_full_training.sh`
-3. `continue_pretrain.py` / `continue.sh`
-4. `midtraining.py` / `midtraining.sh`
-5. `sft.py` / `sft.sh`
-6. `cot-sft.py` / `cot-sft.sh`
-7. `dpo.py` / `dpo.sh`
-8. `push_model_to_hf.py`
-
-Batch config was empirically probed on 1 H200 for the 2.88B exp_317 architecture with gradient checkpointing on and torch.compile on. Full measurements are in `nextrun3/probe_batch_v2/results.tsv`. Production config: micro-batch 19, grad_accum 26 per 2-GPU run (`run_full_training.sh`), effective batch 1,011,712 tokens; scaled settings are grad_accum 51 (1 GPU), 13 (4 GPU), and 6 (8 GPU).
-
-### argonne2.5 -> argonne3.0 changes
-
-| Area | argonne2.5 | argonne3.0 | Evidence |
-|---|---|---|---|
-| Core architecture | 1792 hidden, 28 layers, 14/7 heads | 3072 hidden, 24 layers, 12/4 heads, interleaved local/global window 256 | exp_244, exp_287, exp_293 |
-| Stability stack | Base RMSNorm/flash-attn recipe | QK-norm + V-norm + sandwich norms + RoPE theta 1e6 | exp_253, exp_257 |
-| Output stabilization | No final logit cap | Final-logit softcap, tightened to cap=15 | exp_300, exp_301, exp_314 |
-| Loss shaping | z-loss used in late 2.x stack | z-loss removed in final best | exp_317 |
-| Optimizer choice | AdamW baseline | AdamW retained; Muon deferred to larger-scale retry | exp_329, exp_330 |
-| Batch regime | smaller effective batch proxy | ~1M effective tokens via micro-batch=19, grad_accum=26 (2 GPU), checkpointing on | `nextrun3/probe_batch_v2/results.tsv`, `nextrun3/batch_sizing.txt` |
-
-Argonne 2.5 is the completed pretraining checkpoint for the Argonne causal LM, released as `PursuitOfDataScience/Argonne2.5-base`.
-
-Source code and release scripts live in the main branch of this repo: [GitHub main branch](https://github.com/PursuitOfDataScience/ArgonneAI/tree/main)
-
-## Training loss curve
-
-![Argonne 2.5 loss curve](plots/argonne2_5_loss_curve.png)
-
-## Model architecture
-
-| Component | Specification |
-|-----------|--------------|
-| **Parameters** | 1,273,807,360 (~1.27B) |
-| **Layers** | 28 transformer blocks |
-| **Hidden size** | 1,792 |
-| **Attention heads** | 14 query / 7 key-value (GQA) |
-| **Head dimension** | 128 |
-| **Feed-forward** | SwiGLU MLP, 4,864 intermediate dim |
-| **Context length** | 1,024 tokens |
-| **Vocabulary size** | 151,669 |
-| **Normalization** | RMSNorm (ε = 1e-6) |
-| **Position encoding** | RoPE (θ = 10,000) |
-
-## Training details
-
-| Item | Value |
-|------|-------|
-| **Total steps** | 425,975 |
-| **Tokens processed** | ~76.05B |
-| **Final train loss** | 2.6119 |
-| **Sequence length** | 1,024 |
-| **Batch size per GPU** | 20 |
-| **Gradient accumulation** | 4 |
-| **Effective batch** | 245,760 tokens |
-| **Learning rate** | 3e-4 |
-| **Min LR ratio** | 0.1 |
-| **Warmup** | 1,000 steps |
-| **Precision** | bf16 autocast |
-| **torch.compile** | Enabled |
-| **GPUs** | 3× H2000s (DDP) |
-
-## Training data
-
-- FineWeb
-- FineWeb-Edu
-- Final stage training shard: 55.2B tokens
-- Cumulative training across the full run: 76.05B tokens
-
-## Repository scripts
-
-- `inference.py` generates text from a local checkpoint or Hugging Face repo.
-- `push_model_to_hf.py` publishes Argonne 2.5 base or instruct checkpoints to Hugging Face.
-- `sft.py` and `sft.sh` run the UltraChat SFT stage.
-- `dpo.py` and `dpo.sh` run the chatbot_arena_binarized DPO stage.
-
-## Inference
+## Inference example
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -134,163 +122,3 @@ output_ids = model.generate(
 )
 print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 ```
-
----
-
-# Argonne LLM Training
-
-Distributed PyTorch training pipeline for the Argonne causal LM using Qwen-family tokenizers and llm.c-style binary token data.
-
-## Project Layout
-
-```text
-ArgonneAI/
-├── model.py                 # Argonne model + Hugging Face registration (model_type="argonne2")
-├── pretrain.py              # Main DDP pretraining script
-├── continue_pretrain.py     # Continued pretraining script (new-data continuation workflow)
-├── sft.py                   # Supervised fine-tuning script
-├── cot-sft.py               # Chain-of-thought SFT script
-├── preprocess_data.py       # Parquet -> train.bin converter
-└── test/                    # Experiment scripts/results
-```
-
-## Requirements
-
-- Python 3 with CUDA-enabled PyTorch
-- `transformers`
-- `numpy`
-- `pyarrow`
-- `tqdm`
-- Optional but recommended: `flash-attn` (falls back automatically when unavailable)
-
-## Quick Start
-
-### 1) Preprocess parquet data
-
-Creates `train.bin` with the expected magic/header format and saves a tokenizer copy in `<output_dir>/tokenizer`.
-
-```bash
-python3 preprocess_data.py \
-  --tokenizer_path /path/to/Qwen3-0.6B-Base \
-  --data_dir /path/to/parquet_dir \
-  --output_dir /path/to/output_dir \
-  --text_column text \
-  --workers 16
-```
-
-SLURM example:
-
-```bash
-sbatch preprocess_job.sh
-```
-
-### 2) Train (new run or resume)
-
-`pretrain.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
-
-```bash
-torchrun --nproc_per_node=2 pretrain.py \
-  --tokenizer_path /path/to/tokenizer \
-  --data_path /path/to/train.bin \
-  --checkpoint_dir /path/to/checkpoints \
-  --lr 3e-4 \
-  --batch_size 20 \
-  --total_batch_size 163840 \
-  --block_size 1024 \
-  --precision bf16 \
-  --flash_attention 1 \
-  --torch_compile 1 \
-  --gradient_checkpointing 1
-```
-
-SLURM example:
-
-```bash
-sbatch run_full_training.sh
-```
-
-### 3) Continue pretraining on new data
-
-`continue_pretrain.py` is intended for continued pretraining and is commonly used with `--reset_schedule 1`.
-
-```bash
-torchrun --nproc_per_node=2 continue_pretrain.py \
-  --tokenizer_path /path/to/tokenizer \
-  --data_path /path/to/new_train.bin \
-  --checkpoint_dir /path/to/checkpoints \
-  --lr 3e-4 \
-  --batch_size 16 \
-  --total_batch_size 131072 \
-  --block_size 1024 \
-  --reset_schedule 1
-```
-
-SLURM example:
-
-```bash
-sbatch continue.sh
-```
-
-## Common Training Arguments (`pretrain.py` and `continue_pretrain.py`)
-
-| Argument | Description | Default |
-|---|---|---|
-| `--tokenizer_path` | Path to tokenizer | Required |
-| `--data_path` | Path to training tokens (`.bin`) | Required |
-| `--checkpoint_dir` | Checkpoint/model output directory | Required |
-| `--lr` | Learning rate | Required |
-| `--batch_size` | Micro-batch size per GPU | Required |
-| `--total_batch_size` | Target total batch size in tokens | Required |
-| `--block_size` | Sequence length | Required |
-| `--min_lr_ratio` | Final/min LR as a ratio of `--lr` | `0.1` |
-| `--warmup_steps` | Warmup steps | `0` |
-| `--weight_decay` | AdamW weight decay | `0.1` |
-| `--adam_beta1` | AdamW beta1 | `0.9` |
-| `--adam_beta2` | AdamW beta2 | `0.95` |
-| `--schedule` | LR schedule (`cosine` or `wsd`) | `wsd` |
-| `--cooldown` | WSD cooldown steps at end | `0` |
-| `--grad_clip` | Gradient norm clipping | `1.0` |
-| `--precision` | Autocast precision (`fp32`, `fp16`, `bf16`) | `bf16` |
-| `--flash_attention` | Enable flash-attention paths (`0/1`) | `1` |
-| `--checkpoint_interval` | Periodic checkpoint interval (seconds) | `1800` |
-| `--max_epochs` | Stop after this many data epochs | `1` |
-| `--gradient_checkpointing` | Enable gradient checkpointing (`0/1`) | `1` |
-| `--torch_compile` | Enable `torch.compile` (`0/1`) | `0` |
-| `--torch_compile_mode` | Compile mode (`default`, `reduce-overhead`, `max-autotune`) | `default` |
-| `--resume_from` | Explicit checkpoint path | `None` |
-| `--wall_time` | If `>0`, save and exit ~3 minutes before limit (seconds) | `0` (disabled) |
-| `--reset_schedule` | Reset behavior on resume (see below) | `0` |
-| `--val_data_path` | Optional held-out validation `.bin` | `None` |
-
-### Important `--reset_schedule` difference
-
-- In `pretrain.py`, `--reset_schedule 1` resets LR schedule, step counter, token counter, and data position (fresh-run counters).
-- In `continue_pretrain.py`, `--reset_schedule 1` resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed` from the loaded checkpoint.
-
-## Checkpointing and Outputs
-
-- Checkpoints are written as `checkpoint_step_<N>.pt`.
-- Checkpoints include: model state, optimizer state, scheduler state, `global_step`, `tokens_processed`, and data position.
-- On periodic checkpoints, rank 0 also prints a sampled generation.
-- At end of run, scripts save:
-  - Final training checkpoint
-  - `final_model/` containing model weights, tokenizer, and config via `save_pretrained`.
-
-## Model Notes (`model.py`)
-
-- Hugging Face-compatible model/config (`ArgonneConfig`, `ArgonneModel`), registered for `AutoConfig`, `AutoModel`, and `AutoModelForCausalLM`.
-- Uses grouped-query attention (GQA), SwiGLU MLP, RMSNorm, RoPE.
-- Attention path selection: FlashAttention 2 (if available) -> PyTorch SDPA -> math fallback.
-- Includes numerical-stability guards for NaNs/Infs in logits/loss.
-
-### Training preset used by scripts
-
-`pretrain.py` and `continue_pretrain.py` instantiate the model with:
-
-- Hidden size: `1792`
-- Layers: `28`
-- Attention heads: `14`
-- KV heads: `7`
-- `max_position_embeddings = --block_size`
-
-The defaults inside `ArgonneConfig` are different and are mainly for config-level compatibility.
