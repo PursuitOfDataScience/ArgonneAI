@@ -64,35 +64,6 @@ End-to-end stages and launch scripts:
 7. DPO: `dpo.py` + `dpo.sh`
 8. Publishing: `push_model_to_hf.py`
 
-## SLURM scripts
-
-All repository `.sh` SLURM launchers now include:
-
-```bash
-#SBATCH --exclude=midway3-0423,midway3-[0298,0377-0378,0603-0606]
-```
-
-## Quick usage
-
-```bash
-# preprocess parquet -> binary tokens
-sbatch preprocess_job.sh
-
-# base pretrain
-sbatch run_full_training.sh
-
-# continue on new data
-sbatch continue.sh
-
-# long-context midtraining
-sbatch midtraining.sh
-
-# SFT / CoT-SFT / DPO
-sbatch sft.sh
-sbatch cot-sft.sh
-sbatch dpo.sh
-```
-
 ## Inference example
 
 ```python
