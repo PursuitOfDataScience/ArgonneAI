@@ -232,7 +232,17 @@ echo "cot-sft.py exited with status $train_status"
 # If the run succeeded with --exit_after_checkpoint_save, find the latest
 # intermediate checkpoint and resubmit with auto-resume.
 if [[ $train_status -eq 0 && "$EXIT_AFTER_CHECKPOINT_SAVE" == "1" ]]; then
+  # If the final model + completion marker already exist, training is done.
+  if [[ -f "$OUTPUT_DIR/.cot_sft_complete" && -f "$OUTPUT_DIR/config.json" && -f "$OUTPUT_DIR/model.safetensors" ]]; then
+    echo "Found $OUTPUT_DIR/.cot_sft_complete -- CoT SFT is finished. Not resubmitting."
+    exit 0
+  fi
   LATEST_CKPT=$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'checkpoint-*' -printf '%p\n' 2>/dev/null | sort -V | tail -n 1 || true)
+  # Detect "training complete" by checking if HF Trainer wrote the final
+  # model + tokenizer at the output root and the latest checkpoint is
+  # beyond the total expected steps. Without an explicit completion marker
+  # from cot-sft.py, the safest check is: the final save files exist AND
+  # there are no more pending steps to run.
   if [[ -n "$LATEST_CKPT" ]]; then
     CURRENT_STEP=$(basename "$LATEST_CKPT" | sed 's/checkpoint-//')
     echo "Latest checkpoint: $LATEST_CKPT (step $CURRENT_STEP of max $MAX_STEPS)"

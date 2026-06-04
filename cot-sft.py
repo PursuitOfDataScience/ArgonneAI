@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import time
 import random
 import re
 import sys
@@ -1938,6 +1939,22 @@ def main() -> None:
         tokenizer.save_pretrained(args.output_dir)
         trainer.save_state()
         print(f"Saved final model/tokenizer to: {args.output_dir}")
+        # Write a completion marker so wrapper scripts can detect end-of-training
+        # and avoid an infinite resubmit loop when the trainer exits with
+        # status 0 on a no-op resume.
+        completion_path = os.path.join(args.output_dir, ".cot_sft_complete")
+        try:
+            with open(completion_path, "w") as f:
+                json.dump(
+                    {
+                        "global_step": int(trainer.state.global_step),
+                        "finished_at_unix": time.time(),
+                    },
+                    f,
+                )
+            print(f"Wrote completion marker: {completion_path}")
+        except OSError as e:
+            print(f"  warn: could not write completion marker: {e}")
 
 
 if __name__ == "__main__":
