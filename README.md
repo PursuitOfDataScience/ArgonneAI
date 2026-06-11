@@ -61,43 +61,11 @@ Argonne 3.0-base is a 2.88B-parameter decoder-only transformer, released as [`Pu
 - Stage 2: FineWeb CC-MAIN-2025-21 dump (~55.21B tokens)
 - Tokenizer: [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base) (151,669-token vocab)
 
-## Inference
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-
-model_id = "PursuitOfDataScience/argonne-3.0-base"
-
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    trust_remote_code=True,
-    dtype=torch.bfloat16,
-)
-
-prompt = "Write a short paragraph about scientific computing at Argonne National Laboratory."
-inputs = tokenizer(prompt, return_tensors="pt")
-input_ids = inputs["input_ids"].to(model.device)
-
-output_ids = model.generate(
-    input_ids,
-    max_length=input_ids.shape[1] + 128,
-    temperature=0.8,
-    top_p=0.95,
-    top_k=50,
-    do_sample=True,
-)
-print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
-```
-
-Notes: this is a base model (no instruction tuning or alignment). The custom `generate` uses `max_length` (total length), not `max_new_tokens`. RoPE θ = 1,000,000 allows context extension in follow-on stages.
-
 ---
 
 # Argonne 2.5
 
-Argonne 2.5 is a 1.27B-parameter pretraining checkpoint, released as [`PursuitOfDataScience/Argonne2.5-base`](https://huggingface.co/PursuitOfDataScience/Argonne2.5-base). Inference follows the same pattern as Argonne 3.0 above with `model_id = "PursuitOfDataScience/Argonne2.5-base"`.
+Argonne 2.5 is a 1.27B-parameter pretraining checkpoint, released as [`PursuitOfDataScience/Argonne2.5-base`](https://huggingface.co/PursuitOfDataScience/Argonne2.5-base).
 
 ## Training loss curve
 
@@ -259,96 +227,6 @@ ArgonneAI/
 ├── push_model_to_hf.py      # Publish checkpoints to Hugging Face
 └── eval_sft_quality.py      # SFT quality probes
 ```
-
-## Requirements
-
-- Python 3 with CUDA-enabled PyTorch
-- `transformers`, `datasets`, `numpy`, `pyarrow`, `tqdm`
-- Optional: `flash-attn` (the model falls back to SDPA/math attention automatically)
-
-## Quick start
-
-### 1) Preprocess parquet data
-
-Creates `train.bin` with the expected magic/header format and saves a tokenizer copy in `<output_dir>/tokenizer`.
-
-```bash
-python3 preprocess_data.py \
-  --tokenizer_path /path/to/Qwen3-0.6B-Base \
-  --data_dir /path/to/parquet_dir \
-  --output_dir /path/to/output_dir \
-  --text_column text \
-  --workers 16
-```
-
-### 2) Pretrain (new run or resume)
-
-`pretrain.py` auto-resumes from the latest `checkpoint_step_*.pt` in `--checkpoint_dir` when `--resume_from` is not provided.
-
-```bash
-torchrun --nproc_per_node=3 pretrain.py \
-  --tokenizer_path /path/to/tokenizer \
-  --data_path /path/to/train.bin \
-  --checkpoint_dir /path/to/checkpoints \
-  --lr 3e-4 \
-  --batch_size 38 \
-  --total_batch_size 233472 \
-  --block_size 1024 \
-  --precision bf16 \
-  --flash_attention 1 \
-  --torch_compile 1 \
-  --gradient_checkpointing 1
-```
-
-### 3) Continue pretraining on new data
-
-`continue_pretrain.py` is commonly used with `--reset_schedule 1` (fresh optimizer/scheduler and data cursor, cumulative step/token counters preserved).
-
-```bash
-torchrun --nproc_per_node=3 continue_pretrain.py \
-  --tokenizer_path /path/to/tokenizer \
-  --data_path /path/to/new_train.bin \
-  --checkpoint_dir /path/to/checkpoints \
-  --lr 3e-4 \
-  --batch_size 38 \
-  --total_batch_size 233472 \
-  --block_size 1024 \
-  --reset_schedule 1
-```
-
-## Common training arguments (`pretrain.py` and `continue_pretrain.py`)
-
-| Argument | Description | Default |
-|---|---|---|
-| `--tokenizer_path` | Path to tokenizer | Required |
-| `--data_path` | Path to training tokens (`.bin`) | Required |
-| `--checkpoint_dir` | Checkpoint/model output directory | Required |
-| `--lr` | Learning rate | Required |
-| `--batch_size` | Micro-batch size per GPU | Required |
-| `--total_batch_size` | Target total batch size in tokens | Required |
-| `--block_size` | Sequence length | Required |
-| `--min_lr_ratio` | Final/min LR as a ratio of `--lr` | `0.1` |
-| `--warmup_steps` | Warmup steps | `0` |
-| `--weight_decay` | AdamW weight decay | `0.1` |
-| `--adam_beta1` / `--adam_beta2` | AdamW betas | `0.9` / `0.95` |
-| `--schedule` | LR schedule (`cosine` or `wsd`) | `wsd` |
-| `--cooldown` | WSD cooldown steps at end | `0` |
-| `--grad_clip` | Gradient norm clipping | `1.0` |
-| `--precision` | Autocast precision (`fp32`, `fp16`, `bf16`) | `bf16` |
-| `--flash_attention` | Enable flash-attention paths (`0/1`) | `1` |
-| `--checkpoint_interval` | Periodic checkpoint interval (seconds) | `1800` |
-| `--max_epochs` | Stop after this many data epochs | `1` |
-| `--gradient_checkpointing` | Enable gradient checkpointing (`0/1`) | `1` |
-| `--torch_compile` | Enable `torch.compile` (`0/1`) | `0` |
-| `--resume_from` | Explicit checkpoint path | `None` |
-| `--wall_time` | If `>0`, save and exit before the limit (seconds) | `0` (disabled) |
-| `--reset_schedule` | Reset behavior on resume (see below) | `0` |
-| `--val_data_path` | Optional held-out validation `.bin` | `None` |
-
-### `--reset_schedule` difference
-
-- `pretrain.py`: resets LR schedule, step counter, token counter, and data position (fresh-run counters).
-- `continue_pretrain.py`: resets optimizer/scheduler and data position, but preserves cumulative `global_step` and `tokens_processed`.
 
 ## Checkpointing and outputs
 
