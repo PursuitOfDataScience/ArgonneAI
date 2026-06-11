@@ -1,5 +1,6 @@
 import math
 import importlib.util
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -23,6 +24,11 @@ if importlib.util.find_spec("flash_attn") is not None:
         _flash_attn_available = True
     except ImportError:
         _flash_attn_available = False
+
+# One-time startup log of which attention kernel is in effect, because the
+# sliding-window local attention is only implemented on the flash-attn path
+# and silently degrades to full attention on the SDPA/math fallbacks.
+_attention_path_logged = False
 
 
 class ArgonneConfig(PretrainedConfig):
@@ -163,20 +169,24 @@ class RotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
 
+        # Always compute inv_freq on CPU to avoid meta-device issues during from_pretrained
+        # (low_cpu_mem_usage=True initializes model on meta device, which would give uninitialized values)
         inv_freq = 1.0 / (
             self.base
-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, device or inv_freq.device, torch.get_default_dtype())
+        self._set_cos_sin_cache(max_position_embeddings, torch.device("cpu"), torch.float32)
 
     def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        # Always store cache in float32 to avoid precision loss when model dtype is bfloat16
+        # (large freqs lose precision in bfloat16, corrupting cos/sin values)
+        self.register_buffer("cos_cached", emb.cos().to(torch.float32), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(torch.float32), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len > self.max_seq_len_cached:
@@ -184,6 +194,23 @@ class RotaryEmbedding(nn.Module):
         return (
             self.cos_cached[:seq_len].to(dtype=x.dtype, device=x.device),
             self.sin_cached[:seq_len].to(dtype=x.dtype, device=x.device),
+        )
+
+    def init_buffers(self) -> None:
+        """Re-initialize inv_freq, cos_cached, sin_cached. Call after from_pretrained
+        to fix meta-device corruption (low_cpu_mem_usage=True destroys buffer values)."""
+        device = self.inv_freq.device
+        if device.type == "meta":
+            device = torch.device("cpu")
+        inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device="cpu") / self.dim)
+        )
+        self.inv_freq = inv_freq.to(device)
+        self._set_cos_sin_cache(
+            self.max_position_embeddings,
+            device,
+            torch.float32,
         )
 
 
@@ -473,7 +500,35 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
+        self._nan_loss_count = 0
         self.post_init()
+
+        global _attention_path_logged
+        rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "0"
+        if not _attention_path_logged and rank == "0":
+            _attention_path_logged = True
+            window = (
+                config.local_attention_window if config.interleaved_local_attention else None
+            )
+            if _flash_attn_available and config.use_flash_attention:
+                note = (
+                    f"flash-attn-2; sliding window {window} active on odd layers"
+                    if window is not None
+                    else "flash-attn-2; full attention"
+                )
+            else:
+                reason = (
+                    "flash-attn unavailable"
+                    if config.use_flash_attention
+                    else "use_flash_attention=False"
+                )
+                note = f"SDPA/math ({reason}); full attention"
+                if window is not None:
+                    note += (
+                        f" — local_attention_window={window} is configured but"
+                        " IGNORED on this path"
+                    )
+            print(f"[ArgonneModel] attention path: {note}", flush=True)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -495,6 +550,24 @@ class ArgonneModel(PreTrainedModel):
     def tie_weights(self, **kwargs) -> None:
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Wrap PreTrainedModel.from_pretrained to self-heal after loading.
+
+        from_pretrained may materialize the model via the meta device
+        (low_cpu_mem_usage), which fills the rotary embedding's non-persistent
+        buffers with uninitialized memory and can drop the
+        embed_tokens/lm_head tie. Callers previously had to remember to call
+        init_buffers() and tie_weights() by hand; do it here so every loader
+        gets a working model.
+        """
+        model = super().from_pretrained(*args, **kwargs)
+        for module in model.modules():
+            if isinstance(module, RotaryEmbedding):
+                module.init_buffers()
+        model.tie_weights()
+        return model
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -554,9 +627,10 @@ class ArgonneModel(PreTrainedModel):
             cap = self.config.logit_softcap
             logits = torch.tanh(logits / cap) * cap
         
-        # Check for NaN in logits and handle gracefully
-        if torch.isnan(logits).any():
-            # Replace NaN with zeros to prevent cascading failures
+        # Sanitize logits only at inference. During training the full-tensor
+        # scan forces a GPU sync every step over [batch, seq, vocab]; a NaN
+        # would surface in the loss check below anyway.
+        if not self.training and torch.isnan(logits).any():
             logits = torch.nan_to_num(logits, nan=0.0, posinf=65504.0, neginf=-65504.0)
 
         loss = None
@@ -589,9 +663,25 @@ class ArgonneModel(PreTrainedModel):
                 z = torch.logsumexp(logits.float(), dim=-1)
                 loss = loss + (self.config.z_loss_weight * z.pow(2).mean()).to(loss.dtype)
 
-            # Handle NaN loss
+            # A NaN loss becomes a zero loss that is still connected to every
+            # parameter — but through the parameters directly, NOT through the
+            # network's (possibly NaN) activations. Backward then delivers an
+            # exact zero gradient to each parameter: DDP/FSDP gradient hooks
+            # all fire (no collective desync/hang) and the optimizer step is a
+            # true no-op. Warn (bounded) instead of hiding it.
             if torch.isnan(loss):
-                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
+                self._nan_loss_count += 1
+                if self._nan_loss_count <= 5 or self._nan_loss_count % 100 == 0:
+                    print(
+                        f"WARNING: NaN loss detected (occurrence {self._nan_loss_count}); "
+                        "zeroing this step's loss.",
+                        flush=True,
+                    )
+                zero = torch.zeros((), device=loss.device, dtype=torch.float32)
+                for p in self.parameters():
+                    if p.requires_grad:
+                        zero = zero + torch.nan_to_num(p).sum().float() * 0.0
+                loss = zero.to(loss.dtype)
 
         return CausalLMOutput(logits=logits, loss=loss)
 
