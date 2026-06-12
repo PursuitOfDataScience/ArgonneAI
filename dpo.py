@@ -23,7 +23,9 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1226,6 +1228,172 @@ def save_model_and_tokenizer(model, tokenizer, output_dir: str) -> None:
     print(f"Saved final DPO checkpoint to: {output_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint helpers (intermediate save / resume / rotate)
+# ---------------------------------------------------------------------------
+
+_CKPT_STEP_RE = re.compile(r"checkpoint-(\d+)$")
+
+
+def _ckpt_step(path: str) -> int:
+    m = _CKPT_STEP_RE.search(os.path.basename(os.path.normpath(path)))
+    return int(m.group(1)) if m else -1
+
+
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    if not os.path.isdir(output_dir):
+        return None
+    candidates: List[tuple] = []
+    for name in os.listdir(output_dir):
+        full = os.path.join(output_dir, name)
+        if not os.path.isdir(full):
+            continue
+        step = _ckpt_step(name)
+        if step >= 0:
+            candidates.append((step, full))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def save_checkpoint(
+    output_dir: str,
+    global_step: int,
+    tokens_seen: int,
+    epoch: int,
+    policy_model,
+    optimizer,
+    scheduler,
+    args,
+    last_save_time: float,
+) -> str:
+    """Save policy model + optimizer + scheduler + metadata to ``checkpoint-N``."""
+    ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    from safetensors.torch import save_file
+
+    state_dict = {k: v.detach().contiguous().cpu() for k, v in policy_model.state_dict().items()}
+    save_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
+
+    if hasattr(policy_model, "config"):
+        try:
+            policy_model.config.save_pretrained(ckpt_dir)
+        except Exception as e:
+            print(f"  warn: could not save policy_model.config: {e}")
+
+    torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+    torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
+
+    rng_state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    torch.save(rng_state, os.path.join(ckpt_dir, "rng_state.pt"))
+
+    metadata = {
+        "global_step": global_step,
+        "tokens_seen": tokens_seen,
+        "epoch": epoch,
+        "saved_at_unix": time.time(),
+        "saved_at_monotonic": time.monotonic(),
+        "wall_since_last_save_s": time.monotonic() - last_save_time if last_save_time > 0 else 0.0,
+        "args": {
+            k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+            for k, v in vars(args).items()
+        },
+    }
+    with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+    print(f"[ckpt] saved checkpoint-{global_step} -> {ckpt_dir}")
+    return ckpt_dir
+
+
+def rotate_checkpoints(output_dir: str, save_total_limit: int) -> None:
+    if save_total_limit <= 0:
+        return
+    candidates: List[tuple] = []
+    for name in os.listdir(output_dir):
+        full = os.path.join(output_dir, name)
+        if not os.path.isdir(full):
+            continue
+        step = _ckpt_step(name)
+        if step >= 0:
+            candidates.append((step, full))
+    candidates.sort(key=lambda x: x[0])
+    while len(candidates) > save_total_limit:
+        step, path = candidates.pop(0)
+        try:
+            shutil.rmtree(path)
+            print(f"[ckpt] rotated out checkpoint-{step} (limit={save_total_limit})")
+        except OSError as e:
+            print(f"  warn: could not remove {path}: {e}")
+
+
+def load_checkpoint(
+    ckpt_path: str,
+    model,
+    optimizer,
+    scheduler,
+    device: torch.device,
+) -> Dict[str, int]:
+    from safetensors.torch import load_file
+
+    model_path = os.path.join(ckpt_path, "model.safetensors")
+    opt_path = os.path.join(ckpt_path, "optimizer.pt")
+    sched_path = os.path.join(ckpt_path, "scheduler.pt")
+    rng_path = os.path.join(ckpt_path, "rng_state.pt")
+    meta_path = os.path.join(ckpt_path, "metadata.json")
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"model.safetensors missing in {ckpt_path}")
+
+    state_dict = load_file(model_path, device=str(device))
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(
+        f"[ckpt] loaded model from {model_path} "
+        f"(missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+
+    if os.path.isfile(opt_path):
+        optimizer.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=False))
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device, non_blocking=True)
+        print(f"[ckpt] loaded optimizer state from {opt_path}")
+
+    if os.path.isfile(sched_path):
+        scheduler.load_state_dict(torch.load(sched_path, map_location="cpu", weights_only=False))
+        print(f"[ckpt] loaded scheduler state from {sched_path}")
+
+    if os.path.isfile(rng_path):
+        rng_state = torch.load(rng_path, map_location="cpu", weights_only=False)
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch"].cpu())
+        if torch.cuda.is_available() and rng_state.get("torch_cuda") is not None:
+            torch.cuda.set_rng_state_all([s.cpu() for s in rng_state["torch_cuda"]])
+        print(f"[ckpt] loaded RNG state from {rng_path}")
+
+    metadata: Dict[str, int] = {"global_step": 0, "tokens_seen": 0, "epoch": 0}
+    if os.path.isfile(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        metadata["global_step"] = int(meta.get("global_step", 0))
+        metadata["tokens_seen"] = int(meta.get("tokens_seen", 0))
+        metadata["epoch"] = int(meta.get("epoch", 0))
+        print(
+            f"[ckpt] loaded metadata: step={metadata['global_step']} "
+            f"tokens={metadata['tokens_seen']:,} epoch={metadata['epoch']}"
+        )
+    return metadata
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DPO training on local preference dataset")
     parser.add_argument("--argonne_root", type=str, required=True, help="Path to ArgonneAI directory")
@@ -1299,6 +1467,23 @@ def main() -> None:
         help="Run quality generations every N optimizer steps",
     )
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
+
+    # Checkpointing + resume
+    parser.add_argument("--save_strategy", type=str, default="none",
+                        choices=["none", "steps", "time"],
+                        help="When to save intermediate checkpoints: 'steps', 'time' (wall clock), or 'none'.")
+    parser.add_argument("--save_steps", type=int, default=600,
+                        help="Save every N optimizer steps when save_strategy=steps.")
+    parser.add_argument("--save_seconds", type=int, default=0,
+                        help="Save every N wall-clock seconds when save_strategy=time. 0 disables.")
+    parser.add_argument("--save_total_limit", type=int, default=-1,
+                        help="Keep at most N most recent checkpoint directories (-1 = keep all).")
+    parser.add_argument("--resume_from_checkpoint", type=str, default="",
+                        help="Path to a checkpoint directory to resume from. Use 'auto' to pick the latest under --output_dir.")
+    parser.add_argument("--exit_after_checkpoint_save", action="store_true",
+                        help="Exit cleanly after the first save (used with SLURM auto-resubmit).")
+    parser.add_argument("--slice_time_limit", type=int, default=0,
+                        help="If > 0, save and exit before this many seconds of wall time elapse (best-effort).")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -1333,7 +1518,14 @@ def main() -> None:
         f"Dataset recipe: {args.dataset_recipe} | Save final: {int(save_final)} | "
         f"Locked eval probes: {len(QUALITY_QUESTIONS)}"
     )
-    print("Intermediate checkpoint saving: disabled")
+    print("Intermediate checkpoint saving: disabled" if args.save_strategy == "none" else (
+        f"Intermediate checkpoint saving: every {args.save_steps} steps" if args.save_strategy == "steps"
+        else f"Intermediate checkpoint saving: every {args.save_seconds}s wall clock"
+    ))
+    if args.save_strategy != "none":
+        print(f"  keep up to: {args.save_total_limit if args.save_total_limit > 0 else 'all'}")
+        print(f"  exit after first save: {'yes' if args.exit_after_checkpoint_save else 'no'}")
+        print(f"  resume from: {args.resume_from_checkpoint or '<none>'}")
     print(f"Final model save dir: {args.output_dir}")
 
     policy_model, tokenizer = build_model_and_tokenizer(
@@ -1428,6 +1620,23 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # Resume from checkpoint (if requested). Must happen after optimizer+scheduler
+    # are constructed so we can restore their state in-place.
+    resume_metadata = {"global_step": 0, "tokens_seen": 0, "epoch": 0}
+    if args.resume_from_checkpoint:
+        resume_path = args.resume_from_checkpoint
+        if resume_path == "auto":
+            latest = find_latest_checkpoint(args.output_dir)
+            if latest is None:
+                raise FileNotFoundError(
+                    f"--resume_from_checkpoint=auto but no checkpoints found under {args.output_dir}"
+                )
+            resume_path = latest
+            print(f"[resume] auto-selected latest checkpoint: {resume_path}")
+        if not os.path.isdir(resume_path):
+            raise FileNotFoundError(f"--resume_from_checkpoint path does not exist: {resume_path}")
+        resume_metadata = load_checkpoint(resume_path, policy_model, optimizer, scheduler, device)
+
     answer_questions(
         policy_model,
         tokenizer,
@@ -1438,8 +1647,9 @@ def main() -> None:
         max_seq_len=args.max_seq_length,
     )
 
-    global_step = 0
-    tokens_seen = 0
+    global_step = int(resume_metadata.get("global_step", 0))
+    tokens_seen = int(resume_metadata.get("tokens_seen", 0))
+    resume_epoch = int(resume_metadata.get("epoch", 0))
     running_loss = 0.0
     running_dpo_loss = 0.0
     running_chosen_sft_loss = 0.0
@@ -1447,11 +1657,22 @@ def main() -> None:
     running_reward_margin = 0.0
     log_updates = 0
 
+    if global_step > 0:
+        print(
+            f"[resume] starting from global_step={global_step} "
+            f"tokens_seen={tokens_seen:,} (resumed epoch index {resume_epoch})"
+        )
+
+    # Wall-time tracking for save cadence + slice time limit.
+    last_save_time = time.monotonic()
+    job_start_time = last_save_time
+    save_locked_out = False
+
     policy_model.train()
     optimizer.zero_grad(set_to_none=True)
 
     stop_training = False
-    for epoch in range(args.num_epochs):
+    for epoch in range(resume_epoch, args.num_epochs):
         if stop_training:
             break
 
@@ -1466,6 +1687,31 @@ def main() -> None:
 
         pbar = tqdm(total=epoch_step_budget, desc=f"Epoch {epoch + 1}/{args.num_epochs}", unit="step")
         for micro_step, batch in enumerate(train_loader, start=1):
+            # Slice time limit reached -> save and exit so SLURM can resubmit.
+            if (
+                args.slice_time_limit > 0
+                and (time.monotonic() - job_start_time) >= args.slice_time_limit
+            ):
+                print(
+                    f"[slice] wall time {args.slice_time_limit}s reached; "
+                    f"saving checkpoint and exiting."
+                )
+                save_checkpoint(
+                    args.output_dir,
+                    global_step=global_step,
+                    tokens_seen=tokens_seen,
+                    epoch=epoch,
+                    policy_model=policy_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    last_save_time=last_save_time,
+                )
+                rotate_checkpoints(args.output_dir, args.save_total_limit)
+                pbar.close()
+                print("Exiting cleanly due to --slice_time_limit.")
+                return
+
             chosen_input_ids = batch["chosen_input_ids"].to(device, non_blocking=True)
             chosen_labels = batch["chosen_labels"].to(device, non_blocking=True)
             rejected_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
@@ -1565,6 +1811,34 @@ def main() -> None:
                 torch.cuda.empty_cache()
                 policy_model.train()
 
+            # --- Intermediate checkpoint save (steps or wall-clock) ---
+            should_save = False
+            if not save_locked_out and args.save_strategy == "steps" and args.save_steps > 0:
+                if global_step % args.save_steps == 0:
+                    should_save = True
+            elif not save_locked_out and args.save_strategy == "time" and args.save_seconds > 0:
+                if (time.monotonic() - last_save_time) >= args.save_seconds:
+                    should_save = True
+
+            if should_save:
+                save_checkpoint(
+                    args.output_dir,
+                    global_step=global_step,
+                    tokens_seen=tokens_seen,
+                    epoch=epoch,
+                    policy_model=policy_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    last_save_time=last_save_time,
+                )
+                last_save_time = time.monotonic()
+                rotate_checkpoints(args.output_dir, args.save_total_limit)
+                if args.exit_after_checkpoint_save:
+                    print("[exit] --exit_after_checkpoint_save set; exiting after first save.")
+                    pbar.close()
+                    return
+
             if args.max_steps > 0 and global_step >= args.max_steps:
                 stop_training = True
                 break
@@ -1583,6 +1857,22 @@ def main() -> None:
 
     if save_final:
         save_model_and_tokenizer(policy_model, tokenizer, args.output_dir)
+
+    # Write completion marker so wrapper scripts can detect end-of-training.
+    completion_path = os.path.join(args.output_dir, ".dpo_complete")
+    try:
+        with open(completion_path, "w") as f:
+            json.dump(
+                {
+                    "global_step": global_step,
+                    "tokens_seen": tokens_seen,
+                    "finished_at_unix": time.time(),
+                },
+                f,
+            )
+        print(f"Wrote completion marker: {completion_path}")
+    except OSError as e:
+        print(f"  warn: could not write completion marker: {e}")
 
     print("Training complete.")
 

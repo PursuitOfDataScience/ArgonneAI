@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import time
 import random
 import re
 import sys
@@ -62,6 +63,7 @@ QUALITY_FORCE_NON_MCQ_POSTPROCESS = True
 QUALITY_LOG_RAW = False
 QUALITY_NO_REPEAT_NGRAM = 10
 QUALITY_REPETITION_PENALTY = 1.0
+NO_TEXT_GENERATION = True
 QUALITY_TOKENS_AFTER_ANSWER = 96
 QUALITY_LOOP_NGRAM = 12
 QUALITY_LOOP_REPEATS = 4
@@ -1442,10 +1444,123 @@ class QualityCallback(TrainerCallback):
         self.every_steps = every_steps
 
     def on_step_end(self, args, state, control, **kwargs):
+        if NO_TEXT_GENERATION:
+            return control
         if state.global_step > 0 and state.global_step % self.every_steps == 0:
             model = kwargs.get("model")
             if model is not None:
                 answer_questions(model, self.tokenizer, QUALITY_QUESTIONS, "DURING_SFT", state.global_step)
+        return control
+
+
+class WallClockCheckpointCallback(TrainerCallback):
+    """Time-based checkpointing for SLURM slice chains (weekend.sh-style).
+
+    Saves a checkpoint every `interval_seconds` of wall-clock time, and once
+    `wall_time_seconds` elapses it forces one final save and stops training
+    cleanly so the wrapper can resubmit the next slice without losing work.
+    Also reports HBM usage early (step 10) and at every save so utilization
+    can be verified from the logs.
+    """
+
+    def __init__(self, interval_seconds: int = 0, wall_time_seconds: int = 0) -> None:
+        self.interval_seconds = max(0, int(interval_seconds))
+        self.wall_time_seconds = max(0, int(wall_time_seconds))
+        self.start_time: Optional[float] = None
+        self.next_save_elapsed = (
+            float(self.interval_seconds) if self.interval_seconds > 0 else float("inf")
+        )
+        self.stopping = False
+
+    @staticmethod
+    def _report_hbm(step: int) -> None:
+        if not torch.cuda.is_available():
+            return
+        device = torch.cuda.current_device()
+        total = torch.cuda.get_device_properties(device).total_memory
+        allocated = torch.cuda.max_memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        print(
+            f"[HBM] step {step}: peak allocated {allocated / 2**30:.1f} GiB, "
+            f"reserved {reserved / 2**30:.1f} GiB, capacity {total / 2**30:.1f} GiB "
+            f"({100.0 * allocated / total:.1f}% peak alloc, "
+            f"{100.0 * reserved / total:.1f}% reserved)",
+            flush=True,
+        )
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 10:
+            self._report_hbm(state.global_step)
+        if self.start_time is None:
+            self.start_time = time.time()
+            return control
+        elapsed = time.time() - self.start_time
+        if (
+            self.wall_time_seconds > 0
+            and elapsed >= self.wall_time_seconds
+            and not self.stopping
+        ):
+            self.stopping = True
+            print(
+                f"Wall time limit reached ({elapsed:.0f}s >= {self.wall_time_seconds}s) "
+                f"at step {state.global_step}; saving final checkpoint and stopping this slice.",
+                flush=True,
+            )
+            control.should_save = True
+            control.should_training_stop = True
+        elif elapsed >= self.next_save_elapsed:
+            print(
+                f"Checkpoint interval reached ({elapsed:.0f}s) at step {state.global_step}; saving.",
+                flush=True,
+            )
+            control.should_save = True
+            self.next_save_elapsed = elapsed + self.interval_seconds
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        self._report_hbm(state.global_step)
+        return control
+
+
+class StopAfterCheckpointSaveCallback(TrainerCallback):
+    def __init__(self, enabled: bool = False, slice_steps: int = 0) -> None:
+        self.enabled = enabled
+        self.slice_steps = max(0, int(slice_steps))
+        self.start_step: Optional[int] = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_step = int(state.global_step)
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.enabled or self.slice_steps <= 0:
+            return control
+        if self.start_step is None:
+            self.start_step = max(0, int(state.global_step) - 1)
+        target_step = self.start_step + self.slice_steps
+        if int(state.global_step) >= target_step:
+            print(
+                f"Slice step target reached at step {state.global_step}; saving checkpoint.",
+                flush=True,
+            )
+            control.should_save = True
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self.enabled:
+            return control
+        max_steps = int(getattr(state, "max_steps", 0) or 0)
+        if max_steps > 0 and state.global_step >= max_steps:
+            return control
+        print(
+            f"Checkpoint saved at step {state.global_step}; stopping this training slice.",
+            flush=True,
+        )
+        control.should_training_stop = True
         return control
 
 
@@ -1460,6 +1575,20 @@ class QualityCallback(TrainerCallback):
 # This way logits[i] (predicted from token i) is trained against token i+1.
 
 class ShiftedLossTrainer(Trainer):
+    """Trainer with manual input/label shift and manual autocast.
+
+    Autocast is applied here instead of via TrainingArguments(bf16=True)
+    because Accelerate's mixed-precision forward wrapper converts ALL model
+    outputs to fp32 — including the full [batch, seq, vocab] logits tensor,
+    a ~2 GiB/sample allocation at vocab 151k that training never reads
+    (only the loss is used). That copy was the direct cause of step-1 OOMs
+    at large batch sizes. sft.py's manual loop autocasts the same way.
+    """
+
+    def __init__(self, *args, autocast_dtype: Optional[torch.dtype] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.autocast_dtype = autocast_dtype
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
@@ -1470,11 +1599,19 @@ class ShiftedLossTrainer(Trainer):
         if attention_mask is not None:
             attention_mask = attention_mask[:, :-1].contiguous()
 
-        outputs = model(
-            input_ids=x,
-            attention_mask=attention_mask,
-            labels=y,
-        )
+        if self.autocast_dtype is not None and torch.cuda.is_available():
+            with torch.autocast("cuda", dtype=self.autocast_dtype):
+                outputs = model(
+                    input_ids=x,
+                    attention_mask=attention_mask,
+                    labels=y,
+                )
+        else:
+            outputs = model(
+                input_ids=x,
+                attention_mask=attention_mask,
+                labels=y,
+            )
         loss = outputs.loss
         return (loss, outputs) if return_outputs else loss
 
@@ -1590,6 +1727,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quality_force_non_mcq_postprocess", type=int, default=1, choices=[0, 1])
     p.add_argument("--quality_log_raw", type=int, default=0, choices=[0, 1])
     p.add_argument(
+        "--no_text_generation",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Skip all sample-question text generation probes when set to 1",
+    )
+    p.add_argument(
         "--quality_questions_file",
         type=str,
         default="/home/youzhi/ArgonneAI/cot_experiments/root_cause/quality_questions_mcq.txt",
@@ -1604,6 +1748,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--skip_final_save", action="store_true", help="Skip final save_pretrained output")
     p.add_argument("--resume_from_checkpoint", default=None, help="HF checkpoint path to resume from")
+    p.add_argument(
+        "--exit_after_checkpoint_save",
+        action="store_true",
+        help="Stop the training process after the next checkpoint save so the job wrapper can resubmit",
+    )
+    p.add_argument(
+        "--slice_steps",
+        type=int,
+        default=0,
+        help="If > 0 with --exit_after_checkpoint_save, force a checkpoint after this many resumed training steps",
+    )
+    p.add_argument(
+        "--checkpoint_interval_seconds",
+        type=int,
+        default=0,
+        help="If > 0, save a checkpoint every N seconds of wall-clock training time",
+    )
+    p.add_argument(
+        "--wall_time_seconds",
+        type=int,
+        default=0,
+        help="If > 0, save a final checkpoint and stop training cleanly after N seconds so a wrapper can resubmit",
+    )
     return p.parse_args()
 
 
@@ -1635,13 +1802,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    global QUALITY_QUESTIONS
-    if args.quality_questions_file:
-        QUALITY_QUESTIONS = load_quality_questions_from_file(args.quality_questions_file)
-
     global MAX_NEW_TOKENS_QUALITY, QUALITY_DO_SAMPLE, QUALITY_TEMPERATURE, QUALITY_TOP_P, QUALITY_TOP_K
     global QUALITY_SEED_THINK, QUALITY_FORCE_MCQ_POSTPROCESS, QUALITY_FORCE_NON_MCQ_POSTPROCESS
-    global QUALITY_LOG_RAW
+    global QUALITY_LOG_RAW, NO_TEXT_GENERATION
     global QUALITY_NO_REPEAT_NGRAM, QUALITY_REPETITION_PENALTY
     MAX_NEW_TOKENS_QUALITY = args.max_new_tokens_quality
     QUALITY_DO_SAMPLE = args.quality_do_sample == 1
@@ -1652,8 +1815,13 @@ def main() -> None:
     QUALITY_FORCE_MCQ_POSTPROCESS = args.quality_force_mcq_postprocess == 1
     QUALITY_FORCE_NON_MCQ_POSTPROCESS = args.quality_force_non_mcq_postprocess == 1
     QUALITY_LOG_RAW = args.quality_log_raw == 1
+    NO_TEXT_GENERATION = args.no_text_generation == 1
     QUALITY_NO_REPEAT_NGRAM = max(0, args.quality_no_repeat_ngram)
     QUALITY_REPETITION_PENALTY = max(1.0, args.quality_repetition_penalty)
+
+    global QUALITY_QUESTIONS
+    if not NO_TEXT_GENERATION and args.quality_questions_file:
+        QUALITY_QUESTIONS = load_quality_questions_from_file(args.quality_questions_file)
     if args.preserve_raw_reasoning == 1 and args.max_think_tokens > 0:
         print(
             f"WARNING: preserve_raw_reasoning=1 but max_think_tokens={args.max_think_tokens}; "
@@ -1661,7 +1829,8 @@ def main() -> None:
             flush=True,
         )
     if (
-        args.quality_force_non_mcq_postprocess == 1
+        not NO_TEXT_GENERATION
+        and args.quality_force_non_mcq_postprocess == 1
         and args.quality_force_mcq_postprocess == 0
         and "mcq" in os.path.basename(args.quality_questions_file).lower()
     ):
@@ -1811,13 +1980,17 @@ def main() -> None:
         is_rank0 = torch.distributed.get_rank() == 0
     else:
         is_rank0 = True
-    if is_rank0 and args.run_before_quality == 1:
+    if is_rank0 and args.run_before_quality == 1 and not NO_TEXT_GENERATION:
         answer_questions(model, tokenizer, QUALITY_QUESTIONS, "BEFORE_SFT", 0)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     bf16 = args.precision == "bf16"
     fp16 = args.precision == "fp16"
+    # bf16 deliberately NOT passed to TrainingArguments: ShiftedLossTrainer
+    # autocasts manually so Accelerate never fp32-converts the returned
+    # logits (see ShiftedLossTrainer docstring). fp16 still goes through the
+    # Trainer for GradScaler support.
     train_args = TrainingArguments(
         output_dir=args.output_dir,
         learning_rate=args.lr,
@@ -1827,7 +2000,7 @@ def main() -> None:
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         logging_steps=10,
-        bf16=bf16,
+        bf16=False,
         fp16=fp16,
         save_strategy=args.save_strategy,
         save_steps=max(1, args.save_steps),
@@ -1844,9 +2017,20 @@ def main() -> None:
     trainer = ShiftedLossTrainer(
         model=model,
         args=train_args,
+        autocast_dtype=torch.bfloat16 if bf16 else None,
         train_dataset=train_dataset,
         data_collator=CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
-        callbacks=[QualityCallback(tokenizer=tokenizer, every_steps=args.quality_steps)],
+        callbacks=[
+            QualityCallback(tokenizer=tokenizer, every_steps=args.quality_steps),
+            StopAfterCheckpointSaveCallback(
+                enabled=args.exit_after_checkpoint_save,
+                slice_steps=args.slice_steps,
+            ),
+            WallClockCheckpointCallback(
+                interval_seconds=args.checkpoint_interval_seconds,
+                wall_time_seconds=args.wall_time_seconds,
+            ),
+        ],
     )
 
     if args.resume_from_checkpoint:
@@ -1854,14 +2038,39 @@ def main() -> None:
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     else:
         trainer.train()
-    if is_rank0 and args.run_after_quality == 1:
+    if is_rank0 and args.run_after_quality == 1 and not NO_TEXT_GENERATION:
         answer_questions(model, tokenizer, QUALITY_QUESTIONS, "AFTER_SFT", int(trainer.state.global_step))
-    if args.skip_final_save:
+    trainer_max_steps = int(getattr(trainer.state, "max_steps", 0) or 0)
+    stopped_for_next_slice = (
+        (args.exit_after_checkpoint_save or args.wall_time_seconds > 0)
+        and trainer_max_steps > 0
+        and int(trainer.state.global_step) < trainer_max_steps
+    )
+    if stopped_for_next_slice:
+        print("Skipping final model/tokenizer save for incomplete checkpoint slice.")
+    elif args.skip_final_save:
         print("Skipping final model/tokenizer save (--skip_final_save).")
     else:
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        trainer.save_state()
         print(f"Saved final model/tokenizer to: {args.output_dir}")
+        # Write a completion marker so wrapper scripts can detect end-of-training
+        # and avoid an infinite resubmit loop when the trainer exits with
+        # status 0 on a no-op resume.
+        completion_path = os.path.join(args.output_dir, ".cot_sft_complete")
+        try:
+            with open(completion_path, "w") as f:
+                json.dump(
+                    {
+                        "global_step": int(trainer.state.global_step),
+                        "finished_at_unix": time.time(),
+                    },
+                    f,
+                )
+            print(f"Wrote completion marker: {completion_path}")
+        except OSError as e:
+            print(f"  warn: could not write completion marker: {e}")
 
 
 if __name__ == "__main__":

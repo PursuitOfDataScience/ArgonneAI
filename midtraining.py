@@ -1066,6 +1066,8 @@ def main():
             f"{launch_midtraining_tokens:,} >= {target_midtraining_tokens:,}. Finalizing without extra training."
         )
 
+    exited_due_to_wall_time = False
+
     while True:
         if target_reached_at_launch:
             break
@@ -1248,6 +1250,7 @@ def main():
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
                 if world_size > 1:
                     dist.barrier()
+                exited_due_to_wall_time = True
                 break
 
         should_stop = torch.tensor([0], device=device)
@@ -1276,33 +1279,37 @@ def main():
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss_str}")
 
     if is_main:
-        print("\nSaving final checkpoint...")
-    data_position = train_loader.get_position()
-    checkpoint_path, _ = save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        global_step,
-        tokens_processed,
-        train_loss,
-        data_position,
-        args.checkpoint_dir,
-        train_loader.epoch,
-        dataset_base_global_step,
-        dataset_base_tokens_processed,
-        num_tokens,
-        args.data_path,
-        midtraining_base_global_step,
-        midtraining_base_tokens_processed,
-        distributed_strategy,
-        args.fsdp_sharding_strategy,
-        is_main,
-    )
-    if is_main:
-        print(f"Final checkpoint saved: {checkpoint_path}")
+        if exited_due_to_wall_time:
+            print("\nWall-time checkpoint already saved; skipping redundant final save so the next slice can resume cleanly.")
+        else:
+            print("\nSaving final checkpoint...")
+    if not exited_due_to_wall_time:
+        data_position = train_loader.get_position()
+        checkpoint_path, _ = save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            global_step,
+            tokens_processed,
+            train_loss,
+            data_position,
+            args.checkpoint_dir,
+            train_loader.epoch,
+            dataset_base_global_step,
+            dataset_base_tokens_processed,
+            num_tokens,
+            args.data_path,
+            midtraining_base_global_step,
+            midtraining_base_tokens_processed,
+            distributed_strategy,
+            args.fsdp_sharding_strategy,
+            is_main,
+        )
+        if is_main:
+            print(f"Final checkpoint saved: {checkpoint_path}")
 
-    final_model_dir = os.path.join(args.checkpoint_dir, args.final_model_dir_name)
-    save_final_model_artifacts(model, config, tokenizer, final_model_dir, is_main)
+        final_model_dir = os.path.join(args.checkpoint_dir, args.final_model_dir_name)
+        save_final_model_artifacts(model, config, tokenizer, final_model_dir, is_main)
 
     if is_main:
         midtraining_tokens_processed = max(0, tokens_processed - midtraining_base_tokens_processed)

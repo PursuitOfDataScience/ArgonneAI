@@ -22,21 +22,29 @@ if str(SCRIPT_DIR) not in sys.path:
 
 SOURCE_CODE_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/tree/main"
 MODEL_CODE_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/model.py"
+PRETRAIN_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/pretrain.py"
+CONTINUE_PRETRAIN_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/continue_pretrain.py"
 SFT_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/sft.py"
 DPO_SHELL_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/dpo.sh"
 SFT_SHELL_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/sft.sh"
 DPO_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/dpo.py"
 INFERENCE_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/inference.py"
 MIDTRAINING_SCRIPT_URL = "https://github.com/PursuitOfDataScience/ArgonneAI/blob/main/midtraining.py"
-BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne3.0-base"
+BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/argonne-3.0-base"
 CTX13568_BASE_MODEL_URL = "https://huggingface.co/PursuitOfDataScience/Argonne3.0-ctx13568"
+FINEWEB_DATASET_URL = "https://huggingface.co/datasets/HuggingFaceFW/fineweb"
 LONGMINO_DATASET_URL = "https://huggingface.co/datasets/allenai/dolma3_longmino_pool"
 ULTRACHAT_DATASET_URL = "https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k"
 CHATBOT_ARENA_DATASET_URL = "https://huggingface.co/datasets/KatoHF/chatbot_arena_binarized"
+QWEN3_TOKENIZER_URL = "https://huggingface.co/Qwen/Qwen3-0.6B-Base"
 CHECKPOINT_DTYPE = "bfloat16"
 DEFAULT_WEIGHT_SHARD_COUNT = 5
-TOKENIZER_NOTE = "This model uses the Qwen3 tokenizer family via the Qwen2Tokenizer compatibility class."
-DEFAULT_BASE_REPO_ID = "PursuitOfDataScience/Argonne3.0-base"
+TOKENIZER_NOTE = (
+    "This model reuses the Qwen3 tokenizer (vocabulary size 151,669) through the "
+    "`Qwen2Tokenizer` compatibility class. The tokenizer files are bundled with the "
+    "checkpoint so no extra download is required."
+)
+DEFAULT_BASE_REPO_ID = "PursuitOfDataScience/argonne-3.0-base"
 DEFAULT_INSTRUCT_REPO_ID = "PursuitOfDataScience/Argonne3.0-instruct"
 DEFAULT_MIDTRAINING_REPO_ID = "PursuitOfDataScience/Argonne3.0-ctx13568"
 DEFAULT_BASE_MODEL_NAME = "Argonne 3.0-base"
@@ -63,16 +71,20 @@ CTX13568_INSTRUCT_RECOMMENDED_ROWS = [
 ]
 
 ARCHITECTURE_ROWS = [
-    ("**Parameters**", "~2.88B"),
+    ("**Parameters**", "2,882,162,688 (~2.88B)"),
     ("**Layers**", "24 transformer blocks"),
     ("**Hidden size**", "3,072"),
     ("**Attention heads**", "12 query / 4 key-value (GQA)"),
     ("**Head dimension**", "256"),
     ("**Feed-forward**", "SwiGLU MLP, 8,192 intermediate dim"),
+    ("**Attention pattern**", "Interleaved local/global causal attention"),
+    ("**Local attention window**", "256 tokens (every other layer)"),
+    ("**Normalization**", "RMSNorm with QK / V / sandwich norms"),
+    ("**Position encoding**", "RoPE (\u03b8 = 1,000,000)"),
+    ("**Logit stabilization**", "Final logit softcap = 15.0"),
     ("**Context length**", "1,024 tokens"),
     ("**Vocabulary size**", "151,669"),
-    ("**Normalization**", "RMSNorm with QK/V/sandwich normalization"),
-    ("**Position encoding**", "RoPE (θ = 1,000,000)"),
+    ("**Tied embeddings**", "Yes (input \u2194 output)"),
 ]
 
 
@@ -203,38 +215,55 @@ print(reply)
 
 
 def build_base_model_card(repo_id, model_name, parameter_count, plot_repo_path, shard_count):
-    architecture_rows = [("**Parameters**", f"{parameter_count:,} (~1.27B)")] + ARCHITECTURE_ROWS[1:]
+    architecture_rows = [("**Parameters**", f"{parameter_count:,} (~2.88B)")] + ARCHITECTURE_ROWS[1:]
     training_rows = [
-        ("**Total steps**", "425,975"),
-        ("**Tokens processed**", "~76.05B"),
-        ("**Final train loss**", "2.6119"),
-        ("**Sequence length**", "1,024"),
-        ("**Batch size per GPU**", "20"),
-        ("**Gradient accumulation**", "4"),
-        ("**Effective batch**", "245,760 tokens"),
-        ("**Learning rate**", "3e-4"),
+        ("**Stages**", "Two-stage causal language modeling (pretrain \u2192 continued pretrain)"),
+        ("**Total optimizer steps**", "329,148"),
+        ("**Tokens processed (cumulative)**", "76,050,702,336 (~76.05B)"),
+        ("**Stage 1 tokens (pretrain)**", "20,839,021,454 (~20.84B, single epoch)"),
+        ("**Stage 2 tokens (continued pretrain)**", "55,211,688,156 (~55.21B, single epoch)"),
+        ("**Sequence length**", "1,024 tokens"),
+        ("**Batch size per GPU**", "38"),
+        ("**Gradient accumulation steps**", "2"),
+        ("**Data-parallel world size**", "3 GPUs"),
+        ("**Effective batch**", "233,472 tokens / step"),
+        ("**Optimizer**", "AdamW (\u03b2\u2081=0.9, \u03b2\u2082=0.95, weight decay 0.1)"),
+        ("**Peak learning rate**", "3.0e-4"),
         ("**Min LR ratio**", "0.1"),
-        ("**Warmup**", "1,000 steps"),
-        ("**Precision**", "bf16 autocast"),
-        ("**Checkpoint dtype**", CHECKPOINT_DTYPE),
-        ("**Weight format**", f"{shard_count} sharded safetensors"),
-        ("**torch.compile**", "Enabled"),
-        ("**GPUs**", "3x H2000s (DDP)"),
+        ("**Schedule**", "Warmup-Stable-Decay (WSD); 1,000 warmup steps, 0 cooldown (stable phase only)"),
+        ("**Gradient clipping**", "1.0"),
+        ("**Precision**", "bf16 autocast (weights in fp32, optimizer states in fp32)"),
+        ("**`torch.compile`**", "Enabled (default mode)"),
+        ("**Gradient checkpointing**", "Enabled"),
+        ("**Flash attention**", "Enabled (kernels fall back gracefully if unavailable)"),
+        ("**Final-slice average train loss**", "2.5168"),
+        ("**Checkpoint dtype on Hub**", CHECKPOINT_DTYPE),
+        ("**Weight format on Hub**", f"{shard_count} sharded safetensors + index"),
+        ("**Hardware**", "3\u00d7 NVIDIA H200 GPUs (DDP)"),
+        ("**Random seed**", "444"),
+    ]
+    data_rows = [
+        ("**Pretrain corpus**", f"FineWeb (tokenized with the Qwen3 tokenizer); see [HuggingFaceFW/fineweb]({FINEWEB_DATASET_URL})"),
+        ("**Continued-pretrain corpus**", f"FineWeb CC-MAIN-2025-21 dump (Qwen3 tokenizer); see [HuggingFaceFW/fineweb]({FINEWEB_DATASET_URL})"),
+        ("**Tokenizer source**", f"[Qwen/Qwen3-0.6B-Base]({QWEN3_TOKENIZER_URL}) (151,669-token vocab)"),
     ]
     source_section = f"""## Source code
 
-The release was built from the GitHub main branch codebase: {SOURCE_CODE_URL}
+Built from the GitHub main branch: {SOURCE_CODE_URL}
 
-Key scripts:
-- `pretrain.py`
-- `continue_pretrain.py`
-- `inference.py`
-- `push_model_to_hf.py`
+Key scripts used to produce this checkpoint:
+- [`model.py`]({MODEL_CODE_URL}) \u2014 the `ArgonneModel` / `ArgonneConfig` architecture (bundled here as `model.py`)
+- [`pretrain.py`]({PRETRAIN_SCRIPT_URL}) \u2014 stage 1 DDP pretraining loop
+- [`continue_pretrain.py`]({CONTINUE_PRETRAIN_SCRIPT_URL}) \u2014 stage 2 continued-pretraining loop
 
 """
-    loss_curve_section = f"""## Loss curve
+    loss_curve_section = f"""## Training loss curve
+
+The figure below tracks loss, perplexity, and learning rate against cumulative training tokens across both stages.
 
 ![Training loss curve]({plot_repo_path})
+
+The warmup-stable-decay schedule is visible in the LR panel: 1,000 linear warmup steps to 3.0e-4 followed by a flat stable phase (cooldown was set to 0 for this run).
 
 """ if plot_repo_path else ""
     return f"""---
@@ -248,12 +277,15 @@ tags:
 - transformer
 - argonne
 - pretrained
+- base-model
 pipeline_tag: text-generation
 ---
 
 # {model_name}
 
-{model_name} is a decoder-only transformer language model trained on a mixture of FineWeb and FineWeb-Edu data.
+{model_name} is a 2.88B-parameter decoder-only transformer language model from the Argonne 3.x family. It is a *base* (foundation) checkpoint trained from scratch on FineWeb-derived web text and is intended as a starting point for further continued pretraining, supervised fine-tuning, or preference optimization.
+
+The architecture combines grouped-query attention with several stability-oriented additions (QK-norm, V-norm, sandwich norms, interleaved local/global attention, and a final logit softcap). Weights are stored in bf16 and split across {shard_count} safetensor shards so the model can be loaded with `transformers` on commodity hardware.
 
 ## Model architecture
 
@@ -263,19 +295,25 @@ pipeline_tag: text-generation
 
 {markdown_table(training_rows)}
 
+### Stage 1 \u2014 pretrain (`pretrain.py`)
+- Cold-started randomly initialized weights.
+- One full epoch over the FineWeb pretraining shard (20.84B tokens).
+- 1,000-step linear warmup followed by the WSD stable phase at LR 3.0e-4.
+
+### Stage 2 \u2014 continued pretrain (`continue_pretrain.py`)
+- Resumed from the stage-1 checkpoint with a fresh optimizer / scheduler (data cursor reset to the new shard).
+- One full epoch over the FineWeb CC-MAIN-2025-21 shard (55.21B tokens).
+- Same hyperparameters as stage 1, no additional warmup.
+
 ## Training data
 
-- FineWeb
-- FineWeb-Edu
-- Final stage training shard: 55.2B tokens
-- Cumulative training across the full run: 76.05B tokens
+{markdown_table(data_rows)}
 
 ## Tokenizer
 
 {TOKENIZER_NOTE}
 
-{source_section}{loss_curve_section}
-## Inference
+{source_section}{loss_curve_section}## Inference
 
 ```python
 {build_inference_snippet(repo_id)}
@@ -283,15 +321,23 @@ pipeline_tag: text-generation
 
 ## Usage notes
 
-- Load with `trust_remote_code=True`.
-- The custom `generate` method uses `max_length` rather than `max_new_tokens`.
-- Weights are published as {shard_count} bf16 safetensor shards.
-- Switch to greedy decoding if you want deterministic output.
+- Load with `trust_remote_code=True` so the custom `ArgonneModel` / `ArgonneConfig` classes (`model.py`) are registered.
+- The custom `generate` method on `ArgonneModel` uses `max_length` (total sequence length) rather than `max_new_tokens`; see the snippet above for the recommended pattern.
+- This is a *base* model: no instruction tuning, alignment, or safety filtering has been applied. Outputs can include factually incorrect, biased, or unsafe text.
+- Weights are published as {shard_count} bf16 safetensor shards with a `model.safetensors.index.json` weight map for sharded loading.
+- The published context length is 1,024 tokens. RoPE uses \u03b8 = 1,000,000 so the same checkpoint can be extended to longer contexts in follow-on stages.
+- Switch to greedy decoding (`do_sample=False`) if you want deterministic output.
+
+## Limitations
+
+- Trained on web data only; no instruction following, dialogue, or tool use.
+- 1,024-token context limits multi-document or long-form tasks without further long-context training.
+- Loss plateaued around \u22482.5 (~12 PPL) on FineWeb \u2014 typical for a 2.88B model trained on ~76B tokens, but well above frontier-scale models.
 
 ## Citation
 
 ```bibtex
-@misc{{argonne25,
+@misc{{argonne30base,
   author = {{PursuitOfDataScience}},
   title = {{{model_name}}},
   year = {{2026}},
