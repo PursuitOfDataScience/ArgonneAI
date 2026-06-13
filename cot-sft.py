@@ -651,8 +651,14 @@ def build_masked_example(
     max_seq_len: int,
     max_think_tokens: int = 0,
     preserve_raw_reasoning: bool = False,
+    allow_non_reasoning: bool = False,
 ) -> Optional[Dict[str, List[int]]]:
-    """Build one supervised example with loss only on the final assistant turn."""
+    """Build one supervised example with loss only on the final assistant turn.
+
+    When allow_non_reasoning is set, targets WITHOUT a <think> block are kept
+    and trained on as plain SFT examples (used to teach the model when *not* to
+    think). Otherwise such targets are dropped, as before.
+    """
     if not messages:
         return None
     target_idx = find_last_assistant_turn(messages)
@@ -667,9 +673,12 @@ def build_masked_example(
     if last_user_idx is None:
         return None
     target_turn = dict(messages[target_idx])
-    if not assistant_has_reasoning_format([target_turn]):
+    has_reasoning = assistant_has_reasoning_format([target_turn])
+    if not has_reasoning and not allow_non_reasoning:
         return None
-    if preserve_raw_reasoning:
+    if preserve_raw_reasoning or not has_reasoning:
+        # Plain targets (and the preserve path) train on the stripped content
+        # as-is; only reasoning targets go through canonicalization.
         target_turn["content"] = target_turn["content"].strip()
     else:
         canonical_target = canonicalize_reasoning_turn(
@@ -740,12 +749,14 @@ class LazySFTDataset(TorchDataset):
         max_think_tokens: int = 0,
         max_reasoning_rows: int = 0,
         preserve_raw_reasoning: bool = False,
+        allow_non_reasoning: bool = False,
     ):
         self.ds = ds
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.max_think_tokens = max_think_tokens
         self.preserve_raw_reasoning = preserve_raw_reasoning
+        self.allow_non_reasoning = allow_non_reasoning
         self.rng = random.Random(20260330)
 
         candidate_indices = list(range(len(ds)))
@@ -780,7 +791,7 @@ class LazySFTDataset(TorchDataset):
         conv = clean_messages(msgs)
         if not conv:
             return None
-        if not assistant_has_reasoning_format(conv):
+        if not assistant_has_reasoning_format(conv) and not self.allow_non_reasoning:
             return None
         return build_masked_example(
             conv,
@@ -788,6 +799,7 @@ class LazySFTDataset(TorchDataset):
             self.max_seq_len,
             max_think_tokens=self.max_think_tokens,
             preserve_raw_reasoning=self.preserve_raw_reasoning,
+            allow_non_reasoning=self.allow_non_reasoning,
         )
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
@@ -1686,6 +1698,13 @@ def parse_args() -> argparse.Namespace:
         help="Use the original assistant <think>...</think> turn as-is instead of canonicalizing it",
     )
     p.add_argument(
+        "--allow_non_reasoning",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Keep+train on assistant turns WITHOUT a <think> block (direct/no-think targets) instead of dropping them",
+    )
+    p.add_argument(
         "--max_think_tokens",
         type=int,
         default=128,
@@ -1973,6 +1992,7 @@ def main() -> None:
         max_think_tokens=args.max_think_tokens,
         max_reasoning_rows=args.max_reasoning_rows,
         preserve_raw_reasoning=args.preserve_raw_reasoning == 1,
+        allow_non_reasoning=args.allow_non_reasoning == 1,
     )
     print(f"Reasoning rows after cheap filters: {len(train_dataset):,}")
 

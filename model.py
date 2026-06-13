@@ -13,7 +13,7 @@ from transformers import (
     PreTrainedModel,
     PretrainedConfig,
 )
-from transformers.modeling_outputs import CausalLMOutput
+from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 
 
 flash_attn_func = None
@@ -294,7 +294,9 @@ class GroupedQueryAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         bsz, seqlen, _ = hidden_states.shape
 
         query = self.q_proj(hidden_states)
@@ -313,11 +315,34 @@ class GroupedQueryAttention(nn.Module):
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
+        # ---- KV cache (inference only; training keeps past_kv=None/use_cache=False) ----
+        # Cache pre-repeat (num_kv_heads), post-rotary K/V. The SDPA/math path
+        # ignores the sliding window (full causal), so storing all keys and having
+        # the new query attend to everything reproduces the no-cache result.
+        is_decode = past_kv is not None
+        if is_decode:
+            past_k, past_v = past_kv
+            key = torch.cat([past_k, key], dim=2)
+            value = torch.cat([past_v, value], dim=2)
+        new_kv = (key, value) if use_cache else None
+        kv_len = key.shape[2]
+
+        # Additive mask used only when decoding with a cache: query at absolute
+        # position (kv_len - seqlen + i) attends to keys j <= that position.
+        decode_mask = None
+        if is_decode:
+            q_pos = torch.arange(kv_len - seqlen, kv_len, device=hidden_states.device)
+            k_pos = torch.arange(kv_len, device=hidden_states.device)
+            allowed = k_pos[None, :] <= q_pos[:, None]
+            decode_mask = torch.zeros(seqlen, kv_len, dtype=query.dtype, device=hidden_states.device)
+            decode_mask = decode_mask.masked_fill(~allowed, -65504.0)[None, None]
+
         key = self._repeat_kv(key)
         value = self._repeat_kv(value)
 
         use_flash_attn_2 = (
-            _flash_attn_available
+            not is_decode
+            and _flash_attn_available
             and self.use_flash_attention
             and attention_mask is None
             and query.dtype in (torch.float16, torch.bfloat16)
@@ -356,9 +381,13 @@ class GroupedQueryAttention(nn.Module):
 
         if attn_output is None and use_scaled_dot:
             try:
-                # Use is_causal=True when no attention_mask (faster Flash Attention path)
-                # When attention_mask is provided, we need to combine it with causal masking
-                if attention_mask is None:
+                if decode_mask is not None:
+                    attn_output = F.scaled_dot_product_attention(
+                        query, key, value, attn_mask=decode_mask,
+                        dropout_p=0.0, is_causal=False,
+                    )
+                elif attention_mask is None:
+                    # Prefill / training: fast causal path.
                     attn_output = F.scaled_dot_product_attention(
                         query,
                         key,
@@ -384,16 +413,18 @@ class GroupedQueryAttention(nn.Module):
 
         if attn_output is None:
             scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # Apply causal mask - use large negative instead of -inf for numerical stability
-            causal_mask = torch.triu(
-                torch.ones(seqlen, seqlen, dtype=torch.bool, device=hidden_states.device),
-                diagonal=1,
-            )
             mask_value = -65504.0  # Large negative instead of -inf
-            scores = scores.masked_fill(causal_mask, mask_value)
-            # Apply attention_mask if provided
-            if attention_mask is not None:
-                scores = scores + attention_mask
+            if decode_mask is not None:
+                scores = scores + decode_mask
+            else:
+                # Apply causal mask - use large negative instead of -inf for stability
+                causal_mask = torch.triu(
+                    torch.ones(seqlen, kv_len, dtype=torch.bool, device=hidden_states.device),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(causal_mask, mask_value)
+                if attention_mask is not None:
+                    scores = scores + attention_mask
             attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
@@ -403,7 +434,10 @@ class GroupedQueryAttention(nn.Module):
             .contiguous()
             .view(bsz, seqlen, self.num_heads * self.head_dim)
         )
-        return self.o_proj(attn_output)
+        out = self.o_proj(attn_output)
+        if use_cache:
+            return out, new_kv
+        return out
 
 
 class SwiGLUMLP(nn.Module):
@@ -456,10 +490,20 @@ class Block(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
-        hidden_states = self.attn(hidden_states, position_embeddings, attention_mask)
+        attn_out = self.attn(
+            hidden_states, position_embeddings, attention_mask,
+            past_kv=past_kv, use_cache=use_cache,
+        )
+        new_kv = None
+        if use_cache:
+            hidden_states, new_kv = attn_out
+        else:
+            hidden_states = attn_out
         if self.sandwich_norm:
             hidden_states = self.attn_out_norm(hidden_states)
         hidden_states = residual + hidden_states
@@ -470,6 +514,8 @@ class Block(nn.Module):
         if self.sandwich_norm:
             hidden_states = self.mlp_out_norm(hidden_states)
         hidden_states = residual + hidden_states
+        if use_cache:
+            return hidden_states, new_kv
 
         return hidden_states
 
@@ -595,6 +641,8 @@ class ArgonneModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
         _, seq_length = input_ids.shape
@@ -606,10 +654,16 @@ class ArgonneModel(PreTrainedModel):
 
         # The training path does not use attention masks.
         attention_mask = None
-        cos, sin = self.rotary_emb(hidden_states, seq_length)
-        rotary = (cos, sin)
 
-        for layer in self.blocks:
+        # RoPE positions are offset by the cached length so incremental decode
+        # uses the correct absolute positions.
+        past_len = past_key_values[0][0].shape[2] if past_key_values else 0
+        cos_full, sin_full = self.rotary_emb(hidden_states, past_len + seq_length)
+        rotary = (cos_full[past_len:past_len + seq_length],
+                  sin_full[past_len:past_len + seq_length])
+
+        new_cache = [] if use_cache else None
+        for i, layer in enumerate(self.blocks):
             if self.gradient_checkpointing and self.training:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     layer,
@@ -618,6 +672,13 @@ class ArgonneModel(PreTrainedModel):
                     attention_mask,
                     use_reentrant=False,
                 )
+            elif use_cache:
+                past_kv = past_key_values[i] if past_key_values else None
+                hidden_states, layer_kv = layer(
+                    hidden_states, rotary, attention_mask,
+                    past_kv=past_kv, use_cache=True,
+                )
+                new_cache.append(layer_kv)
             else:
                 hidden_states = layer(hidden_states, rotary, attention_mask)
 
@@ -683,6 +744,8 @@ class ArgonneModel(PreTrainedModel):
                         zero = zero + torch.nan_to_num(p).sum().float() * 0.0
                 loss = zero.to(loss.dtype)
 
+        if use_cache:
+            return CausalLMOutputWithPast(logits=logits, loss=loss, past_key_values=new_cache)
         return CausalLMOutput(logits=logits, loss=loss)
 
     @torch.no_grad()
