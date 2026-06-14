@@ -26,6 +26,44 @@ except ModuleNotFoundError:
     pass
 
 GSM8K = "/project/rcc/youzhi/data/gsm8k_main_curated/shards/shard_00000.jsonl"
+MATH = "/project/rcc/youzhi/data/nlile_hendrycks-MATH-benchmark"
+MATH_MAX_LEVEL = 3  # lvl 1-3 only: where the model has a non-trivial pass rate
+
+
+def load_problems(source, n_problems, seed=0):
+    """Return list of (question, gold, tier). source in {gsm8k, math, both}."""
+    import random as _r
+    probs = []
+    if source in ("gsm8k", "both"):
+        g = []
+        for ln in open(GSM8K):
+            o = json.loads(ln)
+            gold = extract_boxed(o["answer"])
+            if gold is not None:
+                g.append((o["question"], gold, "star_gsm8k"))
+        probs += g
+    if source in ("math", "both"):
+        from datasets import load_from_disk
+        ds = load_from_disk(MATH)["train"]
+        m = []
+        for r in ds:
+            if int(r.get("level", 9)) > MATH_MAX_LEVEL:
+                continue
+            # Keep ONLY purely-numeric answers. norm() extracts the *first*
+            # number, so symbolic answers ("-4x^4-7x+14", "3/2", "\frac12")
+            # would yield a bogus gold and poison verification. Require the
+            # whole cleaned answer to be a plain int/decimal.
+            cleaned = str(r["answer"]).strip().replace("$", "").replace(",", "").replace(" ", "")
+            if not re.fullmatch(r"-?\d+(\.\d+)?", cleaned):
+                continue
+            gold = norm(cleaned)
+            if gold is not None:
+                m.append((r["problem"], gold, "star_math"))
+        probs += m
+    _r.Random(seed).shuffle(probs)
+    if n_problems and n_problems > 0:
+        probs = probs[:n_problems]
+    return probs
 
 
 def norm(s):
@@ -95,7 +133,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="/project/rcc/youzhi/models/instruct/think_mix2_ckpts")
     ap.add_argument("--out", default="/project/rcc/youzhi/data/star_correct_v1")
+    ap.add_argument("--source", choices=["gsm8k", "math", "both"], default="gsm8k")
     ap.add_argument("--n-problems", type=int, default=1500)
+    ap.add_argument("--start", type=int, default=0,
+                    help="skip the first N problems (chunking / resume after a kill)")
     ap.add_argument("--k", type=int, default=6)
     ap.add_argument("--max-new-tokens", type=int, default=400)
     ap.add_argument("--temperature", type=float, default=0.8)
@@ -113,22 +154,20 @@ def main():
         args.model_path, trust_remote_code=True, dtype=dtype, low_cpu_mem_usage=True)
     model.to("cuda"); model.eval()
 
-    problems = []
-    for ln in open(GSM8K):
-        o = json.loads(ln)
-        gold = extract_boxed(o["answer"])
-        if gold is not None:
-            problems.append((o["question"], gold))
-        if len(problems) >= args.n_problems:
-            break
-    print(f"Loaded {len(problems)} gsm8k problems with gold. "
-          f"Sampling K={args.k} @ temp {args.temperature}.", flush=True)
+    problems = load_problems(args.source, args.n_problems)
+    if args.start:
+        problems = problems[args.start:]
+    from collections import Counter as _C
+    print(f"Loaded {len(problems)} problems (source={args.source}, start={args.start}) "
+          f"{dict(_C(t for _, _, t in problems))}. "
+          f"Sampling K={args.k} @ temp {args.temperature}, max_new={args.max_new_tokens}.",
+          flush=True)
 
     kept, solved, total_correct = [], 0, 0
     # failure-mode tally across all samples (diagnostic: truncation vs capability)
     fm = {"correct": 0, "wrong": 0, "unclosed": 0, "no_answer": 0}
     t0 = _dt.datetime.now()
-    for pi, (q, gold) in enumerate(problems):
+    for pi, (q, gold, tier) in enumerate(problems):
         enc = tok.apply_chat_template(
             [{"role": "user", "content": q}], tokenize=True,
             add_generation_prompt=True, enable_thinking=True, return_tensors="pt")
@@ -156,7 +195,7 @@ def main():
             for tr in good[:args.max_keep_per_problem]:
                 kept.append({"messages": [
                     {"role": "user", "content": q},
-                    {"role": "assistant", "content": tr}], "tier": "star_gsm8k"})
+                    {"role": "assistant", "content": tr}], "tier": tier})
             total_correct += len(good)
         if (pi + 1) % 50 == 0:
             el = (_dt.datetime.now() - t0).total_seconds()
