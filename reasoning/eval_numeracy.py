@@ -23,10 +23,16 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+# model.py lives at the repo ROOT (parent of reasoning/) and self-registers the
+# `argonne2` arch with AutoConfig/AutoModelForCausalLM at import time. Without
+# importing it, AutoModelForCausalLM.from_pretrained raises KeyError('argonne2').
+# Put BOTH reasoning/ and the repo root on the path so the import resolves
+# regardless of where the script is launched from.
+for _p in (SCRIPT_DIR, SCRIPT_DIR.parent):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 try:
-    from model import ArgonneConfig, ArgonneModel  # noqa: F401
+    from model import ArgonneConfig, ArgonneModel  # noqa: F401  (registers argonne2)
 except ModuleNotFoundError:
     pass
 

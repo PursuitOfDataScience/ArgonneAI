@@ -60,8 +60,8 @@ End-to-end stages and launch scripts:
 3. Continued pretraining: `continue_pretrain.py` + `continue.sh`
 4. Long-context midtraining: `midtraining.py` + `midtraining.sh`
 5. SFT: `sft.py` + `sft.sh`
-6. CoT SFT: `cot-sft.py` + `cot-sft.sh`
-7. DPO: `dpo.py` + `dpo.sh`
+6. DPO: `dpo.py` + `dpo.sh`
+7. Reasoning / CoT SFT, STaR, GRPO, evals: see `reasoning/` (start with `reasoning/thinking_training.md`)
 8. Publishing: `push_model_to_hf.py`
 
 ## Inference example

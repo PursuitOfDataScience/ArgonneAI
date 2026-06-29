@@ -41,12 +41,30 @@ except ModuleNotFoundError:
 from star_generate import norm, extract_boxed, load_problems, batched_sample
 
 
-def reward_of(text, gold):
-    """1.0 iff the trace closes </think> AND its final \\boxed answer == gold."""
-    if "</think>" not in text:
-        return 0.0
+def shaped_reward(text, gold, has_eos):
+    """Graded, verifiable reward. Returns (reward, is_correct).
+
+    Round-1 GRPO used a binary 0/1 reward; with group-normalized advantage that
+    gives ZERO gradient whenever a whole group is all-correct or all-wrong (only
+    ~3/8 groups carried signal). Grading the reward gives almost every group
+    variance -> non-zero advantage, and the ordering
+        correct > closed+wrong-answer > closed+no-answer > stopped-unclosed > looping
+    directly pressures the policy to CLOSE </think> and stop the enumeration
+    loops that ate the token budget, even before it can solve the problem.
+    is_correct is tracked separately so logged accuracy stays honest (the policy
+    can't game *that* — only the gold check counts).
+    """
+    closed = "</think>" in text
     pred = extract_boxed(text)
-    return 1.0 if (pred is not None and pred == gold) else 0.0
+    if closed and pred is not None and pred == gold:
+        return 1.0, True
+    if closed and pred is not None:
+        return 0.3, False          # right format, wrong answer
+    if closed:
+        return 0.15, False         # closed but no parseable \boxed
+    if not has_eos:
+        return -0.2, False         # never stopped -> truncated/looping
+    return 0.0, False              # stopped without closing
 
 
 def seq_token_logp(model, ids, temp):
@@ -65,12 +83,12 @@ def main():
     ap.add_argument("--out", default="/project/rcc/youzhi/models/instruct/think_grpo_ckpts")
     ap.add_argument("--source", choices=["gsm8k", "math", "both"], default="gsm8k")
     ap.add_argument("--n-problems", type=int, default=0, help="0 = all")
-    ap.add_argument("--steps", type=int, default=400)
-    ap.add_argument("--prompts-per-step", type=int, default=8)
+    ap.add_argument("--steps", type=int, default=2000, help="upper bound; usually wall-limited via --max-hours")
+    ap.add_argument("--prompts-per-step", type=int, default=12)
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--beta", type=float, default=0.04, help="KL coefficient")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--grad-clip", type=float, default=1.0)
@@ -116,7 +134,7 @@ def main():
     order = torch.randperm(len(problems), generator=torch.Generator().manual_seed(args.seed)).tolist()
     ptr = 0
     t_start = time.time()
-    run_reward, run_closed, run_n = 0.0, 0.0, 0
+    run_reward, run_closed, run_correct, run_n = 0.0, 0.0, 0, 0
 
     for step in range(args.steps):
         # ---- pull the next P problems (reshuffle on wrap) ----
@@ -141,14 +159,18 @@ def main():
                                       top_k=0, top_p=0)
             seqs, rews = [], []
             for g in gens:
+                has_eos = eos_id in g
                 # strip trailing tokens after the first eos (batched_sample appends until done)
-                if eos_id in g:
+                if has_eos:
                     g = g[:g.index(eos_id) + 1]
                 text = tok.decode(g, skip_special_tokens=True)
-                rews.append(reward_of(text, gold))
+                r, correct = shaped_reward(text, gold, has_eos)
+                rews.append(r)
                 seqs.append(pids + g)
+                run_correct += int(correct)
+                run_closed += int("</think>" in text)
             groups.append({"plen": len(pids), "seqs": seqs, "rews": rews})
-            run_reward += sum(rews); run_closed += sum("</think>" in tok.decode(s[len(pids):], skip_special_tokens=True) for s in seqs)
+            run_reward += sum(rews)
             run_n += len(rews)
 
         # ---- advantages (group-normalized) ----
@@ -199,12 +221,13 @@ def main():
             opt.step()
 
         el = time.time() - t_start
-        print(f"[{step+1}/{args.steps}] reward={run_reward/max(1,run_n):.3f} "
-              f"closed={run_closed/max(1,run_n):.2f} signal_groups={n_back}/{len(groups)} "
+        print(f"[{step+1}/{args.steps}] acc={run_correct/max(1,run_n):.3f} "
+              f"reward={run_reward/max(1,run_n):.3f} closed={run_closed/max(1,run_n):.2f} "
+              f"signal_groups={n_back}/{len(groups)} "
               f"kl={kl_acc/max(1,n_back):.4f} loss={loss_acc:.4f} gnorm={gnorm:.2f} "
               f"lr={lr_at(step):.2e} | {el/(step+1):.1f}s/step", flush=True)
-        # reset running stats each step for a per-step reward read
-        run_reward = run_closed = 0.0; run_n = 0
+        # reset running stats each step for a per-step read
+        run_reward = run_closed = 0.0; run_correct = run_n = 0
 
         # ---- checkpointing ----
         due = (step + 1) % args.save_steps == 0

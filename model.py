@@ -763,9 +763,20 @@ class ArgonneModel(PreTrainedModel):
         self.eval()
         device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
+        ctx = self.config.max_position_embeddings
+        # KV-cache decode: prefill the prompt once, then feed a single token per
+        # step reusing past_key_values. This yields identical logits to the
+        # recompute-the-whole-prefix path (gated by verify_cache.py) but turns the
+        # per-step cost from O(seq_len) down to O(1). When the running sequence
+        # would exceed the context window we rebuild the cache from the truncated
+        # window, matching the original chunk = input_ids[:, -ctx:] behavior.
+        past = None
+        outputs = None
         while input_ids.shape[1] < max_length:
-            chunk = input_ids[:, -self.config.max_position_embeddings :]
-            outputs = self.forward(chunk)
+            if past is None or past[0][0].shape[2] >= ctx:
+                chunk = input_ids[:, -ctx:]
+                outputs = self.forward(chunk, use_cache=True)
+                past = outputs.past_key_values
             logits = outputs.logits[:, -1, :] / temperature
 
             if repetition_penalty != 1.0:
@@ -812,9 +823,15 @@ class ArgonneModel(PreTrainedModel):
             else:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-            input_ids = torch.cat([input_ids, next_token.to(input_ids.device)], dim=-1)
+            next_token = next_token.to(input_ids.device)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
             if input_ids.shape[1] >= max_length:
                 break
+            # Advance the cache by one token unless we must rebuild it next loop
+            # (cache full); the top-of-loop guard re-prefills in that case.
+            if past[0][0].shape[2] < ctx:
+                outputs = self.forward(next_token, past_key_values=past, use_cache=True)
+                past = outputs.past_key_values
         return input_ids.to(device)
 
 

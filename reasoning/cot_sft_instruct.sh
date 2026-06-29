@@ -182,7 +182,7 @@ if [[ "${SLICE_STEPS:-0}" -gt 0 ]]; then
   SLICE_FLAG="--slice_steps $SLICE_STEPS"
 fi
 
-torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" /home/youzhi/ArgonneAI/cot-sft.py \
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" /home/youzhi/ArgonneAI/reasoning/cot-sft.py \
   --model_path "$MODEL_PATH" \
   --tokenizer_path "$TOKENIZER_PATH" \
   --model_def /home/youzhi/ArgonneAI/model.py \
