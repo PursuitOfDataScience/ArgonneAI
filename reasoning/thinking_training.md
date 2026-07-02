@@ -1133,6 +1133,39 @@ it was consciously skipped.)
 **Timeline math**: ~570M tokens per 8h night slice → the ~4B-token knee (≈2B math at
 50:50; a bit later at 60:40) is ~5–7 more night slices or ~2 days of a weekend chain.
 
+### Deep eval of ckpt 345108 (same day; `reasoning/eval_intermix_base.py`, `report/eval-intermix-345108.out`)
+
+Doubled the probe (fresh 20-math/15-general EXTENSION set) and added held-out NLL@1024
++ a position-bucketed long-context NLL curve at 13568, across the actual seed
+(pretrain `329148.pt` — verified bit-identical scores to the argonne-3.0-base dir),
+the pure-FineMath base, and intermix @644M tokens:
+
+| model | MATH std/ext | GEN std/ext | NLL FineWeb | NLL FineMath | ppl @ pos 8k-13.5k |
+|---|---|---|---|---|---|
+| seed 329148 / argonne-3.0-base | 3/20 · 2/20 | 14/15 · 15/15 | 2.572 | 3.322 | **803** (collapses past 1024) |
+| finemath 864124 | 18/20 · 17/20 | 6/15 · 9/15 | 4.215 | 1.408 | 71 |
+| **intermix 345108** | **12/20 · 11/20** | **11/15 · 14/15** | **3.006** | **1.601** | **17** (flat) |
+
+1. **The math gain replicates on never-seen items** (11/20 ext vs 12/20 std) — no
+   probe overfitting. Combined 23/40 vs the seed's 5/40.
+2. **General is healthier than the morning's 11/15 suggested**: 14/15 on the fresh
+   extension set, 25/30 combined vs the seed's 29/30 — mild erosion, nothing like
+   FineMath's collapse (15/30). Part of the FineWeb-NLL rise is distribution shift
+   (a 40%-math diet broadens the prior on generic web text), not pure fact loss —
+   the probe is the better forgetting metric.
+3. **The efficiency ratio is the headline**: at 644M tokens (4.5% of an epoch),
+   intermix has captured **~90% of the math-NLL gain** that 21B pure-FineMath tokens
+   bought (Δ1.72 of Δ1.91 nats) at **~26% of the general-NLL cost** (Δ0.43 vs Δ1.64).
+   Doc-level replay-mixing is doing exactly what §13 hoped.
+4. **Intermix is also the context extension** (it replaced longmino): the seed's ppl
+   explodes past position 1024 (15 → 390–800; raw θ=1e6 does NOT extrapolate), while
+   intermix is flat to 13.5k (ppl 12–25). One phase now does numeracy + general
+   retention + long context — longmino is fully obsolete.
+
+Remaining gap to the §15 bar (MATH ≥14/20, GEN ≥13/15): probe-accuracy math must
+still roughly double; NLL says the knowledge is arriving, accuracy follows tokens.
+Keep the nightly probe cadence and stop at the knee.
+
 ---
 
 ## The throughline (what this whole project teaches)
