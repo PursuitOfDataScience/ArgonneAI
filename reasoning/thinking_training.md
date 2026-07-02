@@ -5,7 +5,29 @@ A walkthrough of every stage we went through to turn a freshly-initialized
 learning. Each section says **what** we did, **why**, and **what we learned** —
 because most of the real lessons came from the things that *didn't* work.
 
-> ## ⭐ LATEST RESULT (2026-06-28): the FineMath base BREAKS the §10 ceiling
+> ## ⭐ LATEST RESULT (2026-07-02, §15): the recipe WORKS — it was always the base
+>
+> **One line:** running the *identical* reasoning recipe (intermix → SFT → DPO → CoT on the
+> same `cot_sft_mix_v3`) on two **off-the-shelf** bases produced reasoning models that
+> **pass all four quadrants** — something **no** Argonne from-scratch checkpoint ever did.
+>
+> | 4-quadrant (think) | **Qwen1.5-0.5B** | **Llama-3.2-1B** | best Argonne |
+> |---|---|---|---|
+> | MATH no-think / +CoT | **10 / 10** | **10 / 10** | ~1 / 5–7 |
+> | GENERAL no-think / +CoT | **8 / 8** | **9 / 8** | ~8 / good |
+>
+> Both solve the §10 residuals with clean traces AND keep general chat. The **0.46B** Qwen
+> matches the 1.24B Llama on math — so **base *quality* (numerate AND knowledgeable), not
+> size, was the ceiling**; a small balanced base beats the 2.88B lopsided one. This closes
+> the arc: throughline #1 ("capability is set upstream") proven in the affirmative — every
+> §5–§13 lever (STaR/GRPO/data-calibration/FineMath) was fighting an upstream deficit the
+> recipe never needed to fix given a healthy base. New base-agnostic harness:
+> `reasoning/reason_control/`. Intermix was mildly *negative* on these already-good bases
+> (it's a base-repair tool, not universal). Full details in **§15**.
+>
+> ---
+>
+> ## Earlier result (2026-06-28): the FineMath base BREAKS the §10 ceiling
 >
 > **The one-line takeaway:** the inherited-numeracy ceiling that blocked every
 > prior stage (§5–§10) is **gone on the FineMath-midtrained base**. A thinking
@@ -117,7 +139,9 @@ make it reason." It is the entry point you (future agent) will use after the
 **What midtraining leaves you.** When a midtraining phase reaches its token
 target, `midtraining.py:save_final_model_artifacts` writes a **plain HF model
 dir** — `config.json` + `model.safetensors` + tokenizer + `chat_template.jinja`:
-- Phase 1 (longmino): `/project/rcc/youzhi/models/midtrain/final_model_complete`
+- Phase 1 (longmino): `/project/rcc/youzhi/models/midtrain/final_model_complete_longmino`
+  (renamed in §16 — `models/midtrain` is now the live INTERMIX checkpoint dir, and a
+  dir literally named `final_model_complete` there acts as the phase-done marker)
 - Phase 2 (FineMath): `/project/rcc/youzhi/models/midtrain_finemath/final_model_complete`
 
 That dir is a **base LM, not a chat model**, and it has **no `auto_map`/modeling
@@ -635,6 +659,479 @@ general share per §1.5) to keep the math win *and* recover general/no-think. Us
 | `quick_base_probe.py` / `.sh` | Training-free few-shot numeracy probe across bases (the cheapest progress signal). |
 | `sft_finemath.sh`, `dpo_finemath.sh`, `cot_finemath.sh` | H100, continuous-run, FineMath-pathed copies of the SFT/DPO/CoT launchers (θ=1e4, batch 2, auto-chain SFT→DPO→CoT→eval). |
 | `eval_finemath.sh` | 4-quadrant eval of `think_finemath` vs `think_mix3/mix2/star2`. |
+
+---
+
+## 12. The balanced pipeline on the *latest* FineMath base (DONE — refutes §11's "use a later checkpoint" fix)
+
+§11 ended with a prescription: run the **proper balanced pipeline** (general
+SFT → DPO → CoT-SFT) on a **later FineMath checkpoint** to keep the math win *and*
+recover the general ability that the cheap §11 check had lost. This section runs
+exactly that experiment — and the answer is a clean, surprising **no**.
+
+**What we ran.** Full reasoning recipe on the **latest** FineMath midtraining
+checkpoint `checkpoint_step_833124.pt` (~20.5B midtraining tokens — an *order of
+magnitude more* FineMath than §11's pinned `768847`/~1.9B snapshot):
+```
+extract_finemath_test_base.py (ckpt 833124 → HF base, ctx 13568, θ=1e4)
+  └▶ sft_test.sh   (UltraChat general SFT)          -> midtrain_finemath_test/sft
+       └▶ dpo_test.sh  (KatoHF chatbot_arena, chat_refine_strict) -> …/dpo
+            └▶ cot_test.sh (cot_sft_mix_v3, θ=1e4)   -> …/think
+                 └▶ eval_test.sh (4-quadrant)        -> report/finemath_test_*.log
+```
+1× H100, job name `test`, 1-hour auto-resubmitting slices, all in a throwaway
+`midtrain_finemath_test/` dir. Reused **mix v3** (not the still-unbuilt mix v4) to
+keep the experiment one-variable against §11 (the base is the only change vs
+`think_mix3`; the SFT+DPO stages are the only change vs §11's `think_finemath`).
+
+> **Bug worth remembering (cost a stalled day).** SFT auto-chains to DPO via
+> `sbatch dpo_test.sh`, and SLURM's default `--export=ALL` **leaks the finished
+> stage's exported env into the next job**. SFT's exported `DATA_PATH=ultrachat`,
+> `OUTPUT_DIR=…/sft`, `DATASET_RECIPE=chat_refine_strict` clobbered DPO's
+> `${VAR:-default}`s → DPO tried to build preference pairs out of UltraChat →
+> "kept 0 unique rows" → `RuntimeError: Could not construct any valid DPO sample`
+> → crash in ~1m47s, whole chain dead. **Fix:** `unset` every config var at the top
+> of each chained launcher (done in `dpo_test.sh` and `cot_test.sh`), so the
+> correct defaults always win; keep only `RESUME_FROM_CHECKPOINT` for self-resume.
+> After the fix DPO read chatbot_arena / `…/dpo` and kept 204 valid pairs.
+
+**Result — a hard math↔general trade-off that the balanced pipeline could NOT undo**
+(`report/finemath_test_{math,gen}_{nt,th}.log`; NEW = `midtrain_finemath_test/think`):
+
+| quadrant | **NEW (latest FineMath, full SFT→DPO→CoT)** | think_mix3 (old base, same v3) | think_mix2 | think_star2 |
+|---|---|---|---|---|
+| MATH no-think (greedy) | **10/10** clean & terse | ~0/10 (degenerate boxed) | ~1/10 | ~1/10 |
+| MATH + CoT (sample) | **10/10** short correct traces | 5/10 | ~5/10 (loops) | ~5/10 (loops) |
+| GENERAL no-think (greedy) | **~0/11** | ~8/11 | ~8/11 | ~7/11 |
+| GENERAL + CoT (sample) | **~1/11** (only "Paris") | good | good | good |
+
+- **Math is the best of any model we've trained, in *both* modes.** 10/10 no-think
+  *and* 10/10 with-CoT, with short non-degenerate traces — it never falls into the
+  `x=2 x=2 x=2…` / `7+3=10 → 4+3=7 →…` repetition loops that swallow mix2/star2's
+  and even mix3's harder items. `think_mix3` (same v3 data, old base) still slips
+  `8+3=9`, `100/4=20`, `sum→90`, `perim→14`. **The numerate base is doing all of it.**
+- **General ability is catastrophically gone — worse than §11's savant, and the
+  full general SFT+DPO did NOT rescue it.** No-think, NEW answers "capital of France
+  is *France*", "the sun is a *planet*, not a star", "photosynthesis = breaking down
+  food into CO₂", and loops on Shakespeare / primary colors. With-CoT it usually
+  can't even *close* `</think>` on a general question (the trace loops until the
+  token budget runs out); it recovers only "Paris". The old-base baselines answer
+  all of these correctly.
+
+**Why this refutes §11's fix.** §11 blamed the lost general ability on *skipping*
+general SFT/DPO and guessed a *later* checkpoint + balanced pipeline would fix it.
+Both guesses are wrong here: we **did** the full general SFT (UltraChat) + DPO, on a
+**much later** checkpoint, and general got **worse**, not better. The culprit is the
+**FineMath base itself**: ~20.5B tokens of math-heavy midtraining **catastrophically
+forgot world/general knowledge** (§6's zero-sum diet, but on the *pretraining* side),
+and ~250M tokens of downstream SFT cannot re-teach facts the base no longer holds.
+More FineMath ⇒ better numeracy **and** deeper forgetting — the `768847`→`833124`
+step moved *both* dials the wrong way for general. This is a genuine
+**capability–capability trade-off in the base**, not a fine-tuning-recipe problem.
+
+**Corrected recommendation (supersedes §11's "use a later checkpoint").**
+1. **Use an *earlier* FineMath checkpoint**, not a later one — find the knee where
+   numeracy has lifted (§11's `768847` already probed **16/20**) but general
+   knowledge hasn't yet collapsed. Sweep a few early `checkpoint_step_*` with the
+   training-free `quick_base_probe.py` **plus** a general-knowledge probe.
+2. **Better: fix the midtraining recipe, not the checkpoint.** Interleave a general
+   web/chat replay share into FineMath midtraining (anti-forgetting) so the base
+   *keeps* Paris/Mars/oxygen while gaining arithmetic. Then the balanced pipeline
+   (+ mix v4 for the no-think/general share, §1.5) can win both quadrants. **mix v4
+   alone cannot save a base that has already forgotten the capital of France.**
+
+All `midtrain_finemath_test/` checkpoints were deleted after grading (throwaway
+A/B); the launchers `reasoning/{extract_finemath_test_base.py,sft_test,dpo_test,cot_test,eval_test}.sh`
+remain for re-running against an earlier/replayed base.
+
+---
+
+## 13. What to do about general ability — and should we keep midtraining math?
+
+Put §11 and §12 side by side and the shape of the problem is clear:
+
+| base | FineMath tokens | downstream MATH (CoT) | general chat |
+|---|---|---|---|
+| old `argonne-3.0-base` | 0 | 5–6/10 (residual slips) | **~8/11 ✅** |
+| FineMath `768847` (§11) | ~1.9B | **10/10 ✅** | broken (but skipped SFT/DPO) |
+| FineMath `833124` (§12) | ~20.5B | **10/10 ✅** | **~0/11 ❌ (full SFT/DPO couldn't save it)** |
+
+**The decisive observation: the math benefit saturated early, the forgetting did not.**
+Going from ~1.9B → ~20.5B FineMath tokens bought **~0 additional** elementary-numeracy
+(both bases already max our probe at 10/10) while turning a recoverable savant into a
+base that has *forgotten the capital of France* and can't be fine-tuned back. On this
+axis, every FineMath token past ~2B is nearly pure downside. *(Honest caveat: our math
+probe is 10 easy items and saturates trivially — this says nothing about hard/competition
+MATH, where more math tokens might still help. If hard math is a goal, measure it before
+concluding. But for a general assistant with solid numeracy, the diet has overshot.)*
+
+### Should we keep midtraining math?
+- **Continue the *current* pure-FineMath run? No.** It's already idle at step `864124`
+  and its elementary-numeracy gain saturated ~`768847`; more pure-math tokens only
+  deepen catastrophic forgetting (`768847`→`833124` made general *worse*).
+- **Keep injecting math at all? Yes — but never as a pure diet.** The right knob is a
+  **replay mix**, not more math-only tokens.
+
+### The plan for general ability, cheapest first
+1. **Confirm the diagnosis + find the knee (do this first, ~10 min).** `quick_base_probe.py`
+   is math-only; add a **general-knowledge base probe** (few-shot Paris/Mars/oxygen/…)
+   and run it on `old-base` vs pinned `768847` vs latest `864124`. This directly tests
+   the "the *base* forgot" claim (currently inferred from downstream, not measured on the
+   base) and locates where general collapses. *(Note: `midtrain_finemath/` keeps only the
+   latest `.pt`; the only early base we still have is the pinned `768847` — so the sweep
+   is effectively old-base / 768847 / latest, not a dense curve.)*
+2. **Balanced pipeline on the *earliest* good base (reuse §12 launchers).** Point
+   `extract_finemath_test_base.py` + `{sft,dpo,cot,eval}_test.sh` at pinned `768847`
+   instead of `833124`. If its base general-probe is healthier, the same SFT→DPO→CoT
+   should retain more general while keeping the 10/10 math. Cheap — launchers exist.
+3. **The durable fix — replay-mix midtraining (change the recipe, not the checkpoint).**
+   Edit `midtraining.py`'s Phase-2 data recipe to interleave **~40–60% general/longmino
+   replay** with FineMath (standard continued-pretraining anti-forgetting), and re-run.
+   A base that *keeps* world knowledge while gaining numeracy is the only thing that lets
+   the balanced pipeline (+ mix v4, §1.5) win **both** quadrants. Most compute, but it's
+   the principled answer and it's what §12 proved we can't skip.
+4. **Cheap side-experiment — model soup.** Weight-average the FineMath base ⊕ the old
+   general base and probe both quadrants. A fast read on whether the two capabilities are
+   even linearly reconcilable; if a merged base scores decently on both, it's a near-free
+   base for the pipeline.
+
+**Recommendation:** stop treating "more FineMath tokens" as progress (it saturated); do
+(1) now to measure the trade-off honestly, run (2) as the cheap near-term model, and plan
+(3) replay-mix midtraining as the real fix. Do **not** resume the pure-math run as-is.
+
+### Measured — base probe on BOTH axes (2026-07-01, `report/base-probe-general.out`)
+
+Step (1) above, run. `reasoning/base_probe_general.py` (few-shot greedy: 20 math +
+15 world-knowledge items) on the three raw bases. The result **overturns §12's
+"FineMath caused the forgetting" story and kills the intermix-from-longmino plan:**
+
+| base | MATH /20 | GENERAL /15 | character of outputs |
+|---|---|---|---|
+| `pretrain/argonne-3.0-base` | 3 | **13** | knowledgeable, innumerate — the proven-general base |
+| `midtrain/` longmino (Phase-1) | 2 | **5** | **degraded + degenerate** ("largest planet is the blue.krone", "opposite of hot is the red") |
+| `midtrain_finemath/864124` (Phase-2) | **18** | 6 | numerate but factually hollow ("capital of Japan is Japan", "first president: Kennedy") |
+
+- **Longmino — the proposed canvas — is NOT healthy.** It already fell 13→5 on general
+  knowledge (and generates degenerately) while gaining *nothing* on math (3→2). The
+  **Phase-1 context-extension midtraining did most of the world-knowledge damage —
+  before FineMath ran at all.** Its only real contribution was long context.
+- **FineMath is not the main culprit.** On top of longmino it went 5→6 general (flat)
+  while lifting math 2→18. §12 attributed the catastrophic forgetting to FineMath; the
+  base probe shows general was *already* destroyed at longmino.
+- **Destruction, not suppression.** Few-shot prompting could NOT surface
+  Tokyo/Washington/Portuguese from the FineMath base — consistent with §12's finding
+  that full SFT+DPO couldn't recover general. Fine-tuning can't rebuild lost facts.
+- *(Instrument caveat: 15-item keyword-matched general probe is rough, but the
+  qualitative outputs — "blue.krone", "capital of Japan is Japan" — corroborate the scores.)*
+
+**Corrected canvas + plan (supersedes the "intermix from longmino" idea above).**
+The only base with intact world knowledge is **`pretrain/argonne-3.0-base` (13/15)**. So:
+- **Do NOT intermix from longmino** (already forgotten), and do not treat longmino as a
+  required step: the old general-good models (mix2/mix3, ~8/11) were SFT'd **directly
+  from `argonne-3.0-base`**, getting long context via RoPE extrapolation at SFT time
+  (§11 note) — longmino was never on the general-good path.
+- **Intermix midtraining from `argonne-3.0-base`:** one balanced continued-pretraining
+  run mixing FineMath (numeracy) + general/web replay (hold general near 13), **skipping
+  longmino**. Target a base at ~13 general AND ~18 math. Smoke-test on a few-hundred-M
+  slice, re-probe both axes with `base_probe_general.py`, then scale. The few-shot probe
+  is cheap enough to tune the math:general ratio against directly before the full run.
+
+---
+
+## 14. Implementing the intermix fix — the midtraining launchers now do it (DONE 2026-07-01)
+
+§13's corrected plan is now **wired into the production launchers**. `weekend.sh`,
+`night.sh`, and `midtraining.sh` were switched from the old two-phase
+longmino→FineMath chain to a **single INTERMIX phase**: seed the healthy pretrain
+base and train it on a doc-shuffled FineWeb+FineMath mix, writing to `models/midtrain`.
+
+**What changed (minimal, backward-compatible).**
+- `midtraining.sh`: added a `DOC_SHUFFLE` knob (default 0) + `--doc_shuffle` on the
+  torchrun call. **This was the critical missing piece** — the trainer never passed
+  `--doc_shuffle`, so an intermix manifest would have been read in manifest order
+  (all FineWeb docs, then all FineMath docs) = *sequential* training = the exact
+  catastrophic forgetting we're fixing. `DOC_SHUFFLE=1` globally permutes docs each
+  epoch so the two sources truly interleave.
+- `weekend.sh` / `night.sh`: export `DATA_OVERRIDE=<intermix manifest>`,
+  `DOC_SHUFFLE_OVERRIDE=1`, `ROPE_THETA_OVERRIDE=1000000` (match the argonne-3.0-base
+  θ=1e6 regime, the proven-general path — NOT FineMath's θ=1e4), and `PHASE2_DATA=""`
+  (single phase). Seed (`pretrain/checkpoint_step_329148.pt`) and output
+  (`models/midtrain`) are the existing Phase-1 defaults, so nothing else moved. The
+  auto-resubmit chain / slices / FSDP / wall-time saves are all untouched.
+- Result: **`bash weekend.sh` (continuous chain) or `bash night.sh` (one 8h slice at
+  23:00)** now runs the intermix midtraining from the base. `midtrain/` had no loose
+  `.pt` checkpoints (only an old `final_model_complete`), so it seeds *fresh* from the
+  base rather than resuming longmino.
+
+**The intermix corpus (`reasoning/build_intermix.py`).** midtraining.py's
+`DocManifestDataLoader` takes ONE `block_size`-token window per doc per epoch, so the
+effective **token mix equals the DOC-count ratio**, not raw corpus size. The builder:
+- references all 64 FineMath doc-bin shards directly (absolute paths), and
+- carves a matching number of docs from **FineWeb** (`.../CC-MAIN-2025-21-binary/train.bin`
+  — the pretrain corpus, the source of the base's 13/15 general knowledge) into
+  `DOC_LEN`-token docs, writing one doc-bin shard + `.lengths.npy`, then
+- emits a merged manifest with `tokenized_dir="/"` and absolute paths (so it can draw
+  from two different tokenized_dirs). `GENERAL_RATIO` (default 1.0 = 50:50) tunes the
+  split; bump to 1.5 (60:40 general) to lean harder against forgetting.
+- **Gotchas:** `DOC_LEN` must be `> block_size` (13570 for the 13568 production block)
+  or the loader raises "Short doc window"; and the FineWeb `.bin` has a **1024-byte
+  header (256×int32)** before the uint32 tokens (see `pretrain.py: offset=256*4`) —
+  read from byte 0 and you get garbage token IDs. Production manifest lives at
+  `/project/rcc/youzhi/data/intermix/intermix_manifest.json` (28GB FineWeb slice +
+  64 FineMath shards, 520,066 docs each, 50:50).
+
+**Test-drive (validated it RUNS; NOT yet that the result is good).** Ran `weekend.sh`
+~32 min: it seeded argonne-3.0-base (step 329148, phase token counter reset to 0, data
+from the start), trained ~985 steps on the θ=1e6 doc-shuffled intermix, and saved
+`midtrain/checkpoint_step_330133.pt` — then we cancelled. So the end-to-end pipeline
+(seed→intermix data→train→checkpoint) is confirmed working. A real `weekend.sh` run
+**resumes from 330133** (the test-drive work continues, not wasted).
+
+**Still open (do this on the first real run).** We have NOT empirically confirmed the
+50:50 mix preserves general knowledge — the smoke validation was cancelled before its
+probe. On the first production checkpoint, probe both axes:
+`EXTRA_CKPT=<midtrain .pt> EXTRA_THETA=1000000 python reasoning/base_probe_general.py`,
+and if GENERAL slips below ~13/15, rebuild with `GENERAL_RATIO=1.5` and relaunch.
+> **UPDATE (2026-07-02, §16): measured.** At ~644M intermix tokens the probe read
+> MATH 12/20 / **GENERAL 11/15** — below the threshold, so the rule fired: the
+> manifest was rebuilt at `GENERAL_RATIO=1.5` (60:40). Details + a full pipeline
+> audit (several latent bugs found & fixed) in §16.
+
+**New files (this experiment).**
+| File | What |
+|---|---|
+| `reasoning/base_probe_general.py` / `.sh` | Few-shot BASE probe on BOTH axes (20 math + 15 world-knowledge); `EXTRA_CKPT`/`EXTRA_THETA` env add a checkpoint to compare. The §13 measurements + the intermix validator. |
+| `reasoning/build_intermix.py` | Builds the production intermix manifest (FineWeb + all FineMath, DOC_LEN/GENERAL_RATIO configurable). |
+| `reasoning/build_intermix_smoke.py`, `intermix_smoke.sh` | Small block-2048 smoke variant (build + short midtrain + auto-probe) for a fast read before the full run. |
+| `weekend.sh`, `night.sh`, `midtraining.sh` (edited) | Now default to single-phase intermix from the base → `midtrain` (doc_shuffle, θ=1e6). |
+
+---
+
+## 15. The decisive control — run the recipe on REAL bases (Qwen1.5-0.5B, Llama-3.2-1B) — DONE 2026-07-02
+
+Every section §1–§14 fought the same enemy: a *from-scratch* base whose capability was
+set upstream (throughline #1). §13's base probe made it quantitative — no Argonne base
+ever had numeracy AND world knowledge at once (argonne-3.0-base 3/20 math·13/15 gen;
+longmino 2/20·5/15; FineMath-864124 18/20·6/15). The obvious, never-run experiment:
+**take real, off-the-shelf, well-pretrained bases and run the IDENTICAL recipe.** If the
+recipe is sound and only the base was the bottleneck, a good base should yield a reasoning
+model that passes the 4-quadrant eval — which NO Argonne checkpoint ever did (each failed
+≥1 quadrant). We ran two bases, spanning the "quality" axis: **Llama-3.2-1B** (1.24B, a
+strong 1B base) and **Qwen1.5-0.5B** (0.46B — the "should be worse" base).
+
+### The base probe overturns the premise: BOTH real bases are strong on BOTH axes
+`reason_control/probe.py`, the same 20-math / 15-general few-shot probe as §13:
+
+| base | params | MATH /20 | GENERAL /15 | character |
+|---|---|---|---|---|
+| argonne-3.0-base | 2.88B | 3 | 13 | innumerate (from-scratch) |
+| longmino (Phase-1) | 2.88B | 2 | 5 | degraded both |
+| FineMath-864124 | 2.88B | 18 | 6 | numerate, amnesiac |
+| **Llama-3.2-1B** | 1.24B | **13–14** | **15** | strong both |
+| **Qwen1.5-0.5B** | 0.46B | **14** | **14** | strong both |
+
+**Even a 0.46B off-the-shelf base clears the numeracy ceiling that blocked the 2.88B
+from-scratch model AND keeps world knowledge** — the both-axes health no Argonne base ever
+had. Qwen's math-heavy pretraining shows even at 0.5B (it solved "divisors of 12 = 6" cold,
+which the Llama-1B base missed). The hypothesis that the 0.5B model "should perform worse"
+is already FALSE at the base-probe level. (Instrument caveat: greedy few-shot, single-fact;
+±1 run-to-run bf16 wobble on math.)
+
+### Method — a generic, base-agnostic recipe harness (`reasoning/reason_control/`)
+The Argonne scripts are welded to the custom ArgonneModel + Qwen-3 tokenizer + FSDP/doc-bin
+machinery. Rather than bend them, we re-implemented the SAME recipe as small, model-agnostic
+scripts (plain HF + hand-rolled training loops; both bases are standard HF Llama/Qwen2):
+1. **INTERMIX midtrain** (the §14 recipe, re-tokenized): the prebuilt intermix `.bin` is
+   Qwen-3-tokenized — incompatible with these bases' own tokenizers — so we re-stream the raw
+   FineWeb + FineMath parquet, tokenize with the *base's own* tokenizer, doc-shuffle 50:50,
+   pack to 1024, continued-pretrain **80M tokens at a gentle LR 5e-5** (a strong base needs a
+   light touch, not the from-scratch 1e-4).
+2. **SFT** on UltraChat, **DPO** on argilla/dpo-mix-7k (hand-rolled DPO loss + frozen ref),
+   **CoT-SFT** on the SAME `cot_sft_mix_v3` used for `think_mix3`/`think_finemath` — so the
+   only variables vs the Argonne runs are the base + tokenizer.
+3. **4-quadrant eval**: the exact §5 probes, {math,general}×{no-think greedy, with-CoT
+   sampled}, auto-graded + full dumps.
+
+Chat-family is auto-detected (ChatML for Qwen `<|im_start|>…<|im_end|>` vs Llama-3 headers);
+training-time label masking and eval-time `apply_chat_template` are verified token-identical
+per family. Runtime **HBM autotuner** sizes the batch for whatever H100 (80G/96G) SLURM gives.
+
+### Intermix effect on an already-strong base (base → after 80M-token intermix @5e-5)
+- Qwen1.5-0.5B: MATH 14→12   GENERAL 14→13   (mild drop both axes)
+- Llama-3.2-1B: MATH 13→12   GENERAL 15→15   (general fully preserved; math −1)
+
+CONFIRMS the expectation: on a base that's *already* numerate the intermix step is
+neutral-to-mildly-**negative** (a little forgetting), NOT the big lift it gave the deficient
+Argonne base (§14). The gentle 5e-5 LR kept the damage small (a 1e-4 smoke dropped Qwen math
+to 11/20); the larger Llama-1B was more robust on general. **The intermix phase is a
+base-repair tool, not a universal good — for a healthy base, skip it or keep the LR tiny.**
+
+### 4-quadrant eval — YES: the recipe yields a working reasoning model on BOTH bases
+| quadrant | **Qwen1.5-0.5B think** | **Llama-3.2-1B think** | best Argonne (think_*) |
+|---|---|---|---|
+| MATH no-think | **10/10** | **10/10** | ~0–1/10 (degenerate `\boxed`) |
+| MATH + CoT | **10/10** | **10/10** | 5–7/10 |
+| GENERAL no-think | **8/10** | **9/10** | ~8/11 |
+| GENERAL + CoT | **8/10** | **8/10** | good |
+
+**Both bases are a clean pass on all four quadrants — which NO Argonne checkpoint ever
+achieved.** Each Argonne best failed ≥1 quadrant: `think_finemath`/`think_test` hit 10/10 math
+but ~0/10 general (savant / catastrophic forgetting); `think_mix2/mix3` kept ~8/11 general but
+**failed math no-think** (degenerate `\boxed{first#}`) and only reached 5–7/10 math-CoT. Here
+the 0.46B Qwen MATCHES the 1.24B Llama on math (10/10 both modes) and trails by one on general
+no-think (8 vs 9, tracking the base-probe gap 14 vs 15). Both produce textbook with-CoT traces
+that solve all four §10 residuals: `2x = 17−5 = 12, x = 6`; `n(n+1)/2 = 10·11/2 = 55`;
+`2·(8+3) = 22`; `12 = 2²·3 → (2+1)(1+1) = 6`. General misses were minor phrasing/keyword slips,
+not the "capital of France is France" collapse of the FineMath base. Full runs finished in
+~1h42 (Qwen) / ~3h (Llama) on one H100 each.
+
+### What this control establishes
+1. **Throughline #1, proven in the affirmative — the recipe was never the problem, the base
+   was.** The exact pipeline that produced a quadrant-failing model on the 2.88B from-scratch
+   base produces a **clean four-quadrant pass** on two off-the-shelf bases, using the *same*
+   `cot_sft_mix_v3` data as `think_mix3`. All the §5–§13 heroics (STaR, GRPO, mix v1/v2/v3,
+   FineMath midtraining) were fighting an upstream deficit; give the recipe a base healthy on
+   **both** numeracy and world knowledge and it just works.
+2. **"Smaller should be worse" is refuted — base QUALITY, not size, was the lever here.** The
+   0.46B Qwen matched the 1.24B Llama on math and trailed by one on general, because it is
+   already strong on both axes. A small-but-balanced base beats a large-but-lopsided one (the
+   2.88B FineMath base was 18/20 math but amnesiac and unrecoverable). Capacity would likely
+   bite on *harder* competition math; on this grade-school→early-algebra bar it did not.
+3. **The intermix midtraining step is base-repair, not a universal good** (see above): mildly
+   negative on both already-strong bases; SFT→DPO→CoT recovered (final general 8–9/10).
+4. **Practical:** `reasoning/reason_control/` is a reusable, base-agnostic runner of the whole
+   recipe (probe → intermix → SFT → DPO → CoT → 4-quadrant eval) on any HF base, with a runtime
+   HBM autotuner for mixed 80G/96G H100s. Each full run fit in one H100 in <3.5h.
+
+### Operational lessons (so the next agent doesn't re-pay them)
+The model-agnostic re-implementation was easy; getting it to run *fast and full-HBM on a
+mixed cluster* was where all the time went:
+- **Memoize tokenizer family-detection.** `tok.get_vocab()` builds the full 128k–152k-entry
+  dict; calling it inside the per-example chat renderer (twice) cost ~75 ms/example and made a
+  data build *hang* ~50 min (looked like a training stall). Cache it once → ~80× faster (a
+  113k-row CoT build drops to ~1 min). Also load the HF column once and shuffle *indices in
+  memory* — `ds.shuffle()` + row iteration random-accesses the project FS and is pathological.
+- **HBM autotuner: measure sustained RESERVED, not single-step ALLOCATED.** A single
+  fwd+bwd+step on a fresh allocator reports `max_memory_allocated` ≈ 95% at a batch that then
+  OOMs; OOM tracks `max_memory_reserved` (incl. fragmentation), which stabilizes only after
+  ~10 steps. The LM-head **logits `(bs,seq,vocab)` upcast to fp32 for the loss** are the real
+  ceiling (tens of GB), not the transformer. Force **grad_accum=1** (accumulation keeps a
+  prior micro-step's param-sized `.grad` resident — memory the single-step measurement never
+  saw). A CUDA OOM's **traceback pins the failed tensors**, so a naive reduce-and-retry
+  *cascades* (28→10); null the step's locals + `gc.collect()` + `synchronize()` +
+  `empty_cache()` before backing off. Net: autotuner selects ~96%, sustained settles ~80–96%
+  after ≤1 clean backoff.
+
+### New files (this experiment) — `reasoning/reason_control/`
+| File | What |
+|---|---|
+| `common.py` | Chat-family autodetect + token-identical `render_chat`, HBM autotuner, time-boxed train loop, the §5 probe/eval question sets. |
+| `probe.py` | Both-axes few-shot base probe (== §13's 20-math/15-general). |
+| `midtrain.py` | Re-tokenized FineWeb+FineMath doc-shuffled intermix (base's own tokenizer). |
+| `sft.py` / `dpo.py` / `cot.py` | UltraChat SFT / argilla DPO (hand-rolled) / `cot_sft_mix_v3` CoT-SFT. |
+| `eval.py` | 4-quadrant auto-graded eval. |
+| `run_all.sh` | One continuous, resumable, time-boxed H100 job; `BASE_MODEL_PATH` picks the base. |
+
+**Bottom line:** stop trying to fix reasoning downstream. A good base + this modest recipe is
+a *0.5B reasoning model that passes every quadrant* — better all-around than anything built on
+the 2.88B from-scratch base. If a from-scratch Argonne base is still the goal, the target is
+explicit: get it to ~14/20 math AND ~14/15 general *simultaneously* (what Qwen-0.5B already
+has), then this recipe finishes the job.
+
+---
+
+## 16. First intermix probe + full pipeline audit (2026-07-02) — 50:50 → 60:40, five latent bugs fixed
+
+The §14 intermix run had its first real slices (test-drive to step 330133, then one
+8h night.sh slice to **345108** ≈ **644M intermix tokens**, ~78M tokens/h on 3×H200).
+Two things happened today: the §14-prescribed probe was run on the newest checkpoint,
+and the whole launcher/trainer/data pipeline got a line-by-line audit.
+
+### The probe (`report/base-probe-intermix-345108.out`) — the decision rule fired
+
+| base | MATH /20 | GENERAL /15 |
+|---|---|---|
+| argonne-3.0-base (seed) | 3 | 14 |
+| longmino (Phase-1) | 2 | 5 |
+| FineMath 864124 (Phase-2) | 18 | 6 |
+| **intermix @ 644M tok** | **12** | **11** |
+
+- **The intermix design works directionally**: math 3→12 with only ~322M math tokens
+  (pure FineMath needed ~1.9B for 16/20), while general held at 11 instead of
+  collapsing to 5–6 like both sequential phases. The training-log loss oscillation
+  (~1.1 on math docs ↔ ~2.9 on web docs) is the visible signature of real doc-level
+  interleaving.
+- **But GENERAL slipped below the §14 threshold (~13/15)** → per the pre-registered
+  rule, the manifest was **rebuilt with `GENERAL_RATIO=1.5` (60:40)**. Verified safe:
+  55.2B FineWeb tokens available vs 10.6B needed; and `midtraining.py`'s
+  metadata-mismatch resume branch handles an in-place manifest change cleanly (keeps
+  the doc cursor, resets epoch — a harmless random skip). Bonus: 60:40 raises epoch
+  capacity to ~17.6B tokens, so the 16B target is now reachable inside `max_epochs=1`
+  (at 50:50 one epoch was only 14.11B — see the zombie-chain bug below).
+  **Never rebuild while a slice is training** — `build_intermix.py` opens
+  `fineweb_slice.bin` with `"wb"`, truncating the file a live loader is memmapping.
+- Going forward: probe **every night slice** (`EXTRA_CKPT=<latest .pt>
+  EXTRA_THETA=1000000`, ~15 min on 1×H100). Stop rule: **MATH ≥14 with GENERAL ≥13**
+  (the §15 bar). If GENERAL <11 at 60:40, next levers: LR 3e-4 → 1e-4 (repair wants a
+  lighter touch; §15 used 5e-5 on healthy bases) or `GENERAL_RATIO=2.0`.
+
+### The audit — what was verified CORRECT
+- `doc_shuffle` is a **global, per-epoch-seeded permutation across all 65 shards**
+  (`midtraining.py:_refresh_doc_order`), and resume restores the exact permutation +
+  doc position — no repeats, no skips.
+- The data itself is clean: both sources decode to coherent text, uint32 dtype and the
+  FineWeb 1024-byte header handled correctly, and **every doc in all shards is
+  ≥13,570 tokens** (FineMath min 16,384) so the "Short doc window" crash can't fire.
+- Checkpoint saves are atomic (tmp + `os.replace`) with a truncated-checkpoint
+  fallback scan; θ=1e6 and all overrides survive every sbatch hop including
+  auto-resubmit and failure-retry chains; slice 134 resumed exactly where the
+  test-drive stopped.
+
+### Bugs found & FIXED (all latent — none tainted the checkpoints trained so far)
+1. **Zombie resubmit chain**: a finished single-phase run (token target or epoch end)
+   wrote `final_model_complete` but `midtraining.sh` only had a done-check for the
+   two-phase path — an AUTO_RESUBMIT=1 chain would launch 1-step slices forever, each
+   writing a 36 GB checkpoint. Fixed: single-phase completion gate at slice start + a
+   don't-resubmit guard when the marker was written this slice.
+2. **Stale `midtrain/final_model_complete` (the old longmino final)** was sitting in
+   the live intermix checkpoint dir. It (a) was the `PHASE1_DONE_MARKER` that would
+   flip a slice to sequential FineMath if `PHASE2_DATA` ever leaked in, (b) would be
+   silently overwritten when intermix finishes, (c) was the probes' longmino baseline
+   path. **Renamed to `final_model_complete_longmino`**; all script references updated
+   (`base_probe_general.py`, `quick_base_probe.py`, both extract scripts).
+3. **`night.sh` PHASE2_DATA leak**: unlike `weekend.sh`, night.sh didn't pin
+   `PHASE2_DATA=` (empty) in the GPU job's `--export` list, so a stale
+   `export PHASE2_DATA=…` in the submitting shell (the §12 `--export=ALL` leak class)
+   would silently re-enable the sequential FineMath phase. Fixed: appended
+   `PHASE2_DATA=` to the wrap's EXTRA_EXPORT.
+4. **`eos_token_id: null` written at the source**: the §5 eos bug was patched in
+   checkpoint dirs but `midtraining.py`'s config construction never set eos, so every
+   future `final_model_complete` would re-introduce it. Fixed: config now takes
+   eos/bos/pad from the tokenizer (also in `extract_finemath_base.py`).
+5. **`extract_finemath_base.py` hardcoded θ=1e4 + the FineMath ckpt path** — reusing
+   it on an intermix checkpoint would write a corrupt-config base (§11's gotcha,
+   reversed). Now env-parameterized (`CKPT`, `ROPE_THETA`, `OUT`, `TOKENIZER_SRC`),
+   with a guard refusing to create a `final_model_complete` marker next to live
+   checkpoints. This matters because stopping at the probe knee (~4B tokens) means no
+   final artifacts exist — the extract script IS the handoff path.
+6. **FSDP grad clipping** used the plain `torch.nn.utils.clip_grad_norm_`, which under
+   `shard_grad_op` clips each rank by its LOCAL shard norm (underestimated,
+   rank-inconsistent). Fixed to `FSDP.clip_grad_norm_`. (pretrain/continue_pretrain
+   are DDP — theirs was already correct. Mostly benign historically since clip=1.0
+   rarely binds.)
+7. **WSD cooldown/warmup used GLOBAL scheduler steps** while `estimated_steps` is
+   phase-local — on a seeded run (scheduler resumes at ~329k) setting
+   `COOLDOWN_OVERRIDE` would have collapsed LR instantly instead of annealing at the
+   end. Fixed: the schedule is now phase-local and anchored to
+   min(epoch-end, token-target). Side effect (intended): a **freshly seeded** phase
+   now actually performs its `--warmup_steps` warmup; the in-flight resumed run is
+   unaffected (its phase step is ~16k, past warmup).
+
+(Checkpoint pruning was flagged too — ~72 GB/h accumulation — but quota is ample, so
+it was consciously skipped.)
+
+**Timeline math**: ~570M tokens per 8h night slice → the ~4B-token knee (≈2B math at
+50:50; a bit later at 60:40) is ~5–7 more night slices or ~2 days of a weekend chain.
 
 ---
 

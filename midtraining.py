@@ -835,6 +835,11 @@ def main():
         intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=args.block_size,
         rope_theta=args.rope_theta,
+        # Without an explicit eos, save_final_model_artifacts writes
+        # eos_token_id=null and downstream generation never stops (the §5 bug).
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
         use_flash_attention=args.flash_attention == 1,
         qk_norm=ENABLE_QK_NORM,
         v_norm=ENABLE_V_NORM,
@@ -942,22 +947,31 @@ def main():
     min_lr = args.lr * args.min_lr_ratio
     min_lr_scale = min_lr / args.lr
 
+    # The scheduler's step counter is GLOBAL (a run seeded from the pretrain
+    # checkpoint resumes it at ~329k), but warmup/cosine/cooldown are meant in
+    # PHASE-local steps anchored to the phase's planned end. Filled in after
+    # checkpoint parsing, once the phase base step and token target are known;
+    # until then the defaults reproduce plain steady-state behavior.
+    schedule_ctx = {"phase_base_step": 0, "phase_total_steps": estimated_steps}
+
     def lr_lambda(step):
-        if step < args.warmup_steps:
-            return step / max(1, args.warmup_steps)
+        phase_step = max(0, step - schedule_ctx["phase_base_step"])
+        phase_total_steps = schedule_ctx["phase_total_steps"]
+        if phase_step < args.warmup_steps:
+            return phase_step / max(1, args.warmup_steps)
 
         if args.schedule == "cosine":
-            progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
-            return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * progress)))
+            progress = (phase_step - args.warmup_steps) / max(1, phase_total_steps - args.warmup_steps)
+            return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * min(1.0, progress))))
 
         if args.cooldown <= 0:
             return 1.0
 
-        cooldown_start = max(args.warmup_steps, estimated_steps - args.cooldown)
-        if step < cooldown_start:
+        cooldown_start = max(args.warmup_steps, phase_total_steps - args.cooldown)
+        if phase_step < cooldown_start:
             return 1.0
 
-        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, args.cooldown))
+        cooldown_progress = min(1.0, (phase_step - cooldown_start) / max(1, args.cooldown))
         return 1.0 - cooldown_progress * (1.0 - min_lr_scale)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -1093,11 +1107,23 @@ def main():
         remaining_midtraining_tokens = max(0, target_midtraining_tokens - launch_midtraining_tokens)
         target_steps = int((remaining_midtraining_tokens + actual_total_batch - 1) // actual_total_batch)
 
+    # Anchor the LR schedule to this phase: local step 0 = the phase's seed
+    # step, and the planned end = whichever comes first of the epoch cap and
+    # the token target (so COOLDOWN_OVERRIDE=N means "anneal the last N steps
+    # before the phase actually stops").
+    schedule_ctx["phase_base_step"] = midtraining_base_global_step
+    if target_midtraining_tokens > 0:
+        schedule_ctx["phase_total_steps"] = min(
+            estimated_steps,
+            int((target_midtraining_tokens + actual_total_batch - 1) // actual_total_batch),
+        )
+
     if delay_compile_until_after_optimizer_restore:
         if is_main:
             print("Compiling model with torch.compile...")
         model = torch.compile(model, mode=args.torch_compile_mode)
 
+    fsdp_wrapper_for_clip = get_fsdp_wrapper(model)
     last_checkpoint_time = time.time()
     training_start_time = time.time()
     train_losses = []
@@ -1203,7 +1229,14 @@ def main():
 
         step_loss = step_loss_total / grad_accum_steps
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # FSDP shards gradients across ranks (shard_grad_op reduce-scatters
+        # them), so the plain utility would clip each rank by its LOCAL shard
+        # norm -- an underestimated, rank-inconsistent global norm. FSDP's own
+        # method all-reduces the norm before scaling.
+        if fsdp_wrapper_for_clip is not None:
+            fsdp_wrapper_for_clip.clip_grad_norm_(args.grad_clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
         global_step += 1
