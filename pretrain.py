@@ -62,6 +62,12 @@ parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
 parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2")
 parser.add_argument("--schedule", type=str, default="wsd", choices=["cosine", "wsd"], help="LR schedule")
 parser.add_argument("--cooldown", type=int, default=4000, help="Cooldown steps at end of WSD schedule")
+# Argonne-3.5 recipe: express the WSD cooldown as a fraction of the estimated run instead of a
+# fixed step count. When >0 this OVERRIDES --cooldown and is recomputed from estimated_steps on
+# every resume, so the terminal LR anneal lands correctly regardless of corpus size or how the
+# run is sliced across wall-time-limited SLURM jobs. The launcher's old --cooldown 0 left the
+# WSD schedule with NO decay phase at all (LR flat at peak forever); 0.15 restores the anneal.
+parser.add_argument("--cooldown_frac", type=float, default=0.0, help="WSD cooldown as a fraction of estimated steps; if >0 overrides --cooldown. Argonne-3.5 recipe: 0.15.")
 parser.add_argument("--grad_clip", type=float, default=0.4, help="Gradient clipping")
 parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
@@ -366,6 +372,12 @@ def main():
     min_lr = args.lr * args.min_lr_ratio
     min_lr_scale = min_lr / args.lr
 
+    # Argonne-3.5: resolve the WSD cooldown length. A fraction (--cooldown_frac) is preferred
+    # because estimated_steps is recomputed identically on every resume, so cooldown_start below
+    # is stable across the wall-time-sliced training and the anneal always finishes at the run's
+    # true end. Falls back to the fixed --cooldown step count when the fraction is 0.
+    cooldown_steps = int(args.cooldown_frac * estimated_steps) if args.cooldown_frac > 0 else args.cooldown
+
     def lr_lambda(step):
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
@@ -374,14 +386,14 @@ def main():
             progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
             return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
-        if args.cooldown <= 0:
+        if cooldown_steps <= 0:
             return 1.0
 
-        cooldown_start = max(args.warmup_steps, estimated_steps - args.cooldown)
+        cooldown_start = max(args.warmup_steps, estimated_steps - cooldown_steps)
         if step < cooldown_start:
             return 1.0
 
-        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, args.cooldown))
+        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, cooldown_steps))
         return 1.0 - cooldown_progress * (1.0 - min_lr_scale)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -446,6 +458,7 @@ def main():
             f"logit_softcap: {LOGIT_SOFTCAP}"
         )
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
+        print(f"Schedule: {args.schedule}, Cooldown: {cooldown_steps} steps (frac={args.cooldown_frac}, ~{(cooldown_steps/max(1,estimated_steps)*100):.1f}% of run), Grad clip: {args.grad_clip}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
         if args.wall_time > 0:
