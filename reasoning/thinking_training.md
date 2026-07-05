@@ -1,118 +1,205 @@
 # Training a Reasoning Model from Scratch — Argonne 3.0
 
-A walkthrough of every stage we went through to turn a freshly-initialized
-2.88B transformer into a chain-of-thought ("thinking") model, written for
-learning. Each section says **what** we did, **why**, and **what we learned** —
-because most of the real lessons came from the things that *didn't* work.
+How we turned a freshly-initialized 2.88B transformer into a chain-of-thought
+("thinking") model, **`Argonne-3.0-think`** — published at
+[PursuitOfDataScience/Argonne-3.0-think](https://huggingface.co/PursuitOfDataScience/Argonne-3.0-think).
 
-> ## ⭐ LATEST (2026-07-05, §19): DONE — `soup_blend_a085` = 33/40, the best from-scratch Argonne reasoner (10/10 math BOTH modes + recovered general), built training-free
->
-> **One line:** we built the α=0.65 weight-soup base (§17, probe 15/13) and ran the
-> full Argonne recipe on it (`MODE=soup`). Result: **`think_soup` is the FIRST
-> from-scratch Argonne model to hit 10/10 in BOTH math modes and solve all four §10
-> residuals** (no prior approach ever did) — **but GENERAL chat regressed under
-> CoT-SFT** (loops + lost facts; 5/4 vs old-base ~8). The diagnostic proved
-> **`dpo_soup` was general-healthy pre-CoT → the CoT stage broke it, NOT the base**
-> (so more midtraining won't help). **mix v4** (rebalance CoT to 56% concise
-> no-think) → `think_soup_v4`: **9/9 math, 6/5 general = 29/40, a LATERAL trade —
-> did NOT fix general.** The from-scratch soup line plateaus strong-math/weak-general;
-> §15's real bases (~36/40) remain the only clean 4-quadrant pass.
->
-> **THE ANSWER (§19):** the reasoning line is **finished**. A *training-free* weight-soup
-> of the pre-CoT and post-CoT checkpoints — **`0.15·dpo_soup + 0.85·think_soup`** (both
-> same basin) — **surgically un-does the CoT stage's general regression while keeping its
-> math**. Result **`soup_blend_a085` = 33/40**: MATH **10/10 no-think + 10/10 with-CoT**
-> (perfect, = `think_soup`) AND GENERAL recovered (no-think **5→7**: grammar loop gone,
-> Mars fact restored). First from-scratch Argonne model that is both a perfect arithmetic
-> reasoner AND a loop-free generalist. **SHIP `models/instruct/soup_blend_a085` (greedy).**
-> Mechanism: lower α kills more loops but *breaks* `<think>` trace-closure (a050/a070
-> gen-with-CoT → 1/10), so α=0.85 is the knee. Residual misses (colors→green, transitivity)
-> are genuine **base gaps** (wrong in `dpo_soup` too) → only argonne3.5 base-quality fixes them.
->
-> **Prior levers, all inferior & closed:** decoding-fix REFUTED (§18f — rep-penalty
-> corrupts arithmetic, "80"→"8", math 10→4); CoT-data rebalance = lateral (§18d, mix-v4
-> 29/40); intermix midtraining = wrong stage (§18g). Do **not** revisit them.
-> Full saga in **§18/§19**.
->
-> ---
->
-> ## ⭐ Earlier result (2026-07-02, §15): the recipe WORKS — it was always the base
->
-> **One line:** running the *identical* reasoning recipe (intermix → SFT → DPO → CoT on the
-> same `cot_sft_mix_v3`) on two **off-the-shelf** bases produced reasoning models that
-> **pass all four quadrants** — something **no** Argonne from-scratch checkpoint ever did.
->
-> | 4-quadrant (think) | **Qwen1.5-0.5B** | **Llama-3.2-1B** | best Argonne |
-> |---|---|---|---|
-> | MATH no-think / +CoT | **10 / 10** | **10 / 10** | ~1 / 5–7 |
-> | GENERAL no-think / +CoT | **8 / 8** | **9 / 8** | ~8 / good |
->
-> Both solve the §10 residuals with clean traces AND keep general chat. The **0.46B** Qwen
-> matches the 1.24B Llama on math — so **base *quality* (numerate AND knowledgeable), not
-> size, was the ceiling**; a small balanced base beats the 2.88B lopsided one. This closes
-> the arc: throughline #1 ("capability is set upstream") proven in the affirmative — every
-> §5–§13 lever (STaR/GRPO/data-calibration/FineMath) was fighting an upstream deficit the
-> recipe never needed to fix given a healthy base. New base-agnostic harness:
-> `reasoning/reason_control/`. Intermix was mildly *negative* on these already-good bases
-> (it's a base-repair tool, not universal). Full details in **§15**.
->
-> ---
->
-> ## Earlier result (2026-06-28): the FineMath base BREAKS the §10 ceiling
->
-> **The one-line takeaway:** the inherited-numeracy ceiling that blocked every
-> prior stage (§5–§10) is **gone on the FineMath-midtrained base**. A thinking
-> model built on it scores **10/10 on math-with-CoT and solves all four §10
-> residual failures** (`2x+5=17`, `1+…+10=55`, perimeter, divisor-count) with
-> clean, concise, correct traces — something *no* prior checkpoint (mix2, star2,
-> grpo2, mix3) ever did. Data calibration / STaR / GRPO could never move these;
-> **a better base did, immediately.** Capability is set upstream (throughline #1),
-> now proven in the affirmative.
->
-> **What was run (a deliberately CHEAP check, not the full recipe — see §11):**
-> 1. **Few-shot base probe (no training, ~3 min):** raw bases on 20 arithmetic /
->    multi-step problems → `argonne-3.0-base` **3/20**, longmino Phase-1 **1/20**,
->    **FineMath Phase-2 16/20**. The math midtraining lifted base numeracy hugely;
->    residual misses were the §10 signature (right setup, one slipped step).
-> 2. **Short direct CoT-SFT from the FineMath base** (`cot_sft_mix_v3`, 2500 steps,
->    **skipping general SFT/DPO** to stay cheap) → `think_finemath`, then the
->    4-quadrant eval vs the old-base baselines.
->
-> **4-quadrant eval (`report/finemath_*.log`):**
->
-> | quadrant | think_finemath (NEW base) | think_mix3 (OLD base, *same* v3 data) | think_mix2 | think_star2 |
-> |---|---|---|---|---|
-> | **MATH + CoT** | **10/10** ✅ | 6/10 | ~4/10 | 6/10 |
-> | MATH no-think | ~7/10 | ~0/10 (degenerate `\boxed{first#}`) | ~4/10 | ~3/10 |
-> | GENERAL no-think | **~1–2/10** ❌ | ~7/10 | ~8/10 | ~7/10 |
-> | GENERAL + CoT | **~0/10** ❌ | ~6/10 | ~5/10 | ~5/10 |
->
-> **The catch (and it's an artifact of the shortcut, not the base):** the cheap
-> check skipped general SFT/DPO and trained only 2500 steps on a math-heavy mix,
-> so `think_finemath` is a **math savant that's broken on general chat** (loops:
-> "the capital of France is France itself…"). The old-base baselines went through
-> the full SFT→DPO and keep general ability. This is the **zero-sum-diet lesson**
-> (§6) in extreme form. The fix is known: run the **proper pipeline** on the
-> FineMath base (general SFT → DPO → CoT with a *balanced* mix v4 that restores
-> the no-think/general share) to keep the math win *and* recover general/no-think.
->
-> **Net:** the FineMath base is a real, large step up for reasoning; the next run
-> should do the full balanced pipeline on it (ideally on a *later*, more-trained
-> FineMath checkpoint — this was an early ~1.9B-token snapshot). Details in §11.
->
-> ---
->
-> TL;DR of the journey: pretrain → SFT → DPO → CoT-SFT gave us a model that
-> *formats* reasoning but can't reliably *reason*. We traced the failure to
-> weak pretraining numeracy (not model size), fixed format/fact errors with
-> calibrated CoT data, then hit a wall where supervised methods saturate. RLVR
-> (STaR, then GRPO) cleaned up behavior but did **not** lift held-out
-> multi-step reasoning. Targeted, verified multi-step data finally did — it's
-> the only lever that taught the multi-step *procedure* (solving `2x+5=17`,
-> counting divisors) — but it only **relocated** the ceiling: the model now
-> structures the solution correctly yet still slips on the elementary
-> *arithmetic* inside it. The bottleneck is now fact-execution (numeracy),
-> which traces straight back to pretraining.
+This document now **leads with the recipe that worked and the things to avoid**,
+then keeps the full chronological log (§0–§19) below as the evidence behind every
+claim. Most of the real lessons came from the things that *didn't* work — those
+are collected in **"Things to avoid."**
+
+**Bottom line:** the shipped model `models/instruct/soup_blend_a085` scores
+**33/40** on the internal 4-quadrant probe — **10/10 arithmetic in *both*
+no-think and with-CoT modes**, plus recovered general chat — the first from-scratch
+Argonne model that can reason *and* chat. The two highest-leverage moves were
+**calibrated, verified CoT data** and **two training-free weight-soups**.
+
+---
+
+## The success recipe (reproducible)
+
+The proven pipeline that produced `Argonne-3.0-think`, in order. **Every downstream
+stage runs at context 13,568 with RoPE θ = 1e6** (the base is RoPE-extrapolated from
+a 1,024-ctx pretraining run). Scripts are on `main`; the launcher `.sh` files that
+set these hyperparameters are untracked by repo policy, so the numbers are captured
+here and in §17–§19.
+
+```
+FineWeb ─▶ [from-scratch pretrain] ─▶ Argonne-3.0-base (seed 329148)
+                                          │
+   FineWeb + FineMath  ─▶ [intermix midtraining, θ=1e6] ─▶ intermix ckpt 363908
+                                          │
+        SOUP BASE (training-free) = 0.35·seed + 0.65·intermix   ◀── idea #1
+                                          │
+                    SFT (UltraChat) ─▶ DPO (Chatbot Arena) ─▶ dpo_soup ──┐  (keep!)
+                                          │                              │
+                CoT-SFT (cot_sft_mix_v3, θ=1e6) ─▶ think_soup            │
+                                          │                              │
+   FINAL SOUP (training-free) = 0.15·dpo_soup + 0.85·think_soup  ◀── idea #2
+                                          │
+                              soup_blend_a085  = Argonne-3.0-think (33/40)
+```
+
+### Step 0 — The base is the whole ballgame
+Argonne 3.0-base: 2.88B params, 24 layers, hidden 3072, **12 query / 4 KV heads**
+(GQA), SwiGLU (8192), RMSNorm + QK/V/sandwich norms, RoPE, vocab **151,669** (Qwen3
+tokenizer), tied embeddings. Pretrained from scratch on **~76B tokens of FineWeb**
+at 1,024 ctx. **The single biggest determinant of the final reasoning model is this
+base's quality** — specifically its numeracy and world-knowledge. Every downstream
+lever calibrates and unlocks what's here; almost none of them *create* it (§11, §15,
+and throughline #1). Scripts: `pretrain.py`, `model.py`.
+
+### Step 1 — Repair numeracy: intermix midtraining
+The pure-FineWeb base can't do grade-school arithmetic (3/20 on the probe). Fix it by
+continuing pretraining on a **50:50 → 60:40 (by document) mix of FineWeb
+(`CC-MAIN-2025-21`) + FineMath (`finemath-4plus`)** at LR 3e-4, θ=1e6 → intermix
+checkpoint 363908 (~1.41B intermix tokens; MATH 14/20 but general eroding). Scripts:
+`preprocess_finemath.py` → `reasoning/build_intermix.py` → `midtraining.py`.
+
+### Step 2 — Reconcile math ↔ knowledge: the SOUP BASE (training-free) — **idea #1**
+The 3e-4 intermix over-writes general knowledge faster than replay protects it, so the
+raw intermix checkpoint is lopsided. A **linear weight interpolation of the two
+same-lineage θ=1e6 checkpoints** reconciles them for free:
+`0.35 · seed(329148) + 0.65 · intermix(363908)`. This is the **first from-scratch
+Argonne base to clear both axes of the probe** (MATH 15/20 **and** GEN 13/15). Math and
+general knowledge are ~linearly reconcilable in weight space; the raw checkpoint is a
+mild WiSE-FT overshoot. Script: `reasoning/build_soup_base.py` (§17).
+
+### Step 3 — General instruction-following: SFT
+Full SFT on **UltraChat 200k** (`HuggingFaceH4/ultrachat_200k`, `train_sft`) from the
+soup base. LR **2e-5**, 1 epoch, effective batch 18, 1×H200. Script: `sft.py`.
+
+### Step 4 — Preference alignment: DPO → keep `dpo_soup`
+DPO on **Chatbot Arena** (`KatoHF/chatbot_arena_binarized`, `chat_refine_strict`,
+~204 pairs). LR **1e-6**, β **0.03**, effective batch 8, 1×H200 → `dpo_soup`.
+**Retain this checkpoint** — the final soup (Step 6) needs it. At this point the model
+is general-healthy (~7–8/10 general) but not yet a strong reasoner.
+
+### Step 5 — Teach chain-of-thought: CoT-SFT → `think_soup`
+CoT-SFT from `dpo_soup` on **`cot_sft_mix_v3`** (~113k rows), LR **1e-5**, 1 epoch,
+effective batch 12 (3×H200 DDP), **θ=1e6** (critical — not the FineMath θ=1e4).
+Scripts: `reasoning/build_sft_mix.py` + `reasoning/build_mix_v3.py` → `reasoning/cot-sft.py`.
+The mix is deliberately calibrated (data is the highest-leverage lever in the project):
+
+| tier | rows | source |
+|---|---:|---|
+| `direct_tulu` (no-think chat) | 34,000 | `allenai/tulu-3-sft-mixture` |
+| `synth_arith` | 15,000 | synthetic, correct-by-construction |
+| `gen_ultrachat` (CoT-augmented) | 15,000 | from `HuggingFaceH4/ultrachat_200k` |
+| `hard_strict` | 12,000 | `PursuitOfDataScience/MiniMax-M2.1-Mixture-of-Thoughts` |
+| `easy_gsm8k` | 8,402 | `openai/gsm8k` (`main`) + `<think>`/`\boxed{}` |
+| `med_math` | 5,729 | `nlile/hendrycks-MATH-benchmark` (L1–3) |
+| `ms_algebra`/`ms_series`/`ms_geometry`/`ms_divisors` | 16,290 | synthetic multi-step, Python-verified |
+| `med_openmath` | 4,620 | `nvidia/OpenMathReasoning` (solutions regenerated) |
+| `hq_opus` | 2,300 | `nohurry/Opus-4.6-Reasoning-3000x-filtered` |
+
+Result: `think_soup` = **10/10 both math modes** (first Argonne to solve all four §10
+residuals cleanly) — **but general chat regresses** (loops, lost facts), because the CoT
+diet is math-heavy (the zero-sum diet, §6/§18b).
+
+### Step 6 — Recover general without losing math: the FINAL SOUP (training-free) — **idea #2**
+`think_soup` is just `dpo_soup` + a CoT weight-delta Δ in the *same* optimization basin.
+So blend a fraction of the (general-healthy) pre-CoT weights back in:
+`soup_blend_a085 = 0.15 · dpo_soup + 0.85 · think_soup`. This **fractionally un-applies Δ** —
+enough to erase the loop/forgetting pathology (grammar loop gone; Mars fact restored)
+while **keeping the full 10/10 math**. Script: `reasoning/build_ckpt_soup.py` (§19).
+**α = 0.85 is a knee** (see Things to avoid): more general recovery below it, but the
+`<think>` trace-closure format lives in Δ and starts breaking.
+
+### The result (`report/recover_*.log`, greedy no-think / sampled with-CoT)
+
+| quadrant | soup_blend_a085 | think_soup (α=1) |
+|---|:---:|:---:|
+| MATH no-think | **10/10** | 10/10 |
+| MATH + CoT | **10/10** | 10/10 |
+| GENERAL no-think | **7/10** | 5/10 |
+| GENERAL + CoT | **6/10** | 6/10 |
+| **total** | **33/40** | 29–31/40 |
+
+**Two ideas carried the whole project:** (1) *calibrated, verified CoT data* — the only
+lever that ever moved the held-out number; and (2) *training-free weight-soups*, used
+twice — once to build a both-axes base (Step 2), once to reconcile reasoning with chat
+(Step 6). Both are free (CPU tensor-averaging, minutes) and clean because the checkpoints
+share a lineage/basin. **Ship with greedy decoding for math/no-think.** Eval:
+`reasoning/eval_numeracy.py` (downstream), `reasoning/eval_intermix_base.py` (base probe).
+
+---
+
+## Things to avoid (each cost real time or compute to learn)
+
+### Method / modeling dead-ends
+- **Don't expect fine-tuning to *create* a capability the base lacks.** Six months of
+  STaR/GRPO/data-calibration never gave a from-scratch Argonne base clean multi-step math;
+  a better base (FineMath, then Qwen/Llama) did it immediately (§11, §15). Capability is
+  set upstream — fix the base, don't paper over it downstream.
+- **Don't chase RLVR (STaR/GRPO) to add a missing skill.** STaR saturates (you can only
+  imitate successes you already produce). GRPO round 2 maximized its shaped reward on gsm8k
+  and moved the policy yet produced **zero held-out gain** — a reward-proxy / train-test gap.
+  RLVR amplifies existing capability; it doesn't manufacture it (§8, §9).
+- **Don't over-index the CoT mix on math.** Fine-tuning is a zero-sum diet: a math-heavy
+  CoT diet erases general chat and reintroduces loops (§6, §18b). Keep a large concise
+  no-think / general share.
+- **Don't try to fix CoT-induced general loops with DECODING.** *Refuted* (§18f):
+  `repetition_penalty=1.3 + no_repeat_ngram=3` **corrupts arithmetic** — it blocks the model
+  from re-emitting a digit it just used, turning `80/2` into `8/2`, collapsing math 10→4.
+  It "fixed" only one general cell and left the real content errors. **Best decoding is
+  plain greedy.** (The reference `argonne-3.0-instruct` card's rep-penalty settings are
+  actively harmful for this reasoning model.)
+- **Don't "rebalance the CoT data" as the cure for general regression.** Tried it (mix v4,
+  56% concise): a **lateral trade**, 29/40, general still looped (§18d).
+- **Don't resume intermix midtraining to fix general.** It's the wrong stage — the diagnostic
+  proved general was healthy *after* SFT+DPO and broke at the *CoT* step, and intermix math
+  saturates by ~2B tokens while general won't move at LR 3e-4 (§18c, §18g).
+- **Don't over-dilute the final soup.** α below ~0.85 recovers more no-think general but
+  **breaks `<think>` trace-closure** (the CoT format lives in the weight-delta): at α=0.5/0.7
+  the with-CoT quadrant collapses to 1/10 (§19). α=0.85 is the knee.
+- **Don't spend the last mile on the residual base gaps.** A few misses (naming all three
+  primary colors, a taller/shorter transitivity puzzle) are wrong in `dpo_soup` too — genuine
+  2.88B base-capability limits, unfixable by souping/decoding/data. That's argonne3.5 work.
+
+### Diagnosis / evaluation traps
+- **Don't trust training curves.** Low loss, a moving KL, a rising shaped reward all looked
+  healthy while the held-out number stayed flat. Synthetic/templated data fits to low loss
+  *by construction*. **The 4-quadrant held-out eval is the only honest judge** (throughline #8).
+- **Don't diagnose "broken model" before ruling out decoder/eval bugs.** Early "gibberish"
+  was a `from_pretrained` buffer bug + prompt-inclusive n-gram bans in the eval decoder, and
+  training loss looked ~4× inflated purely from grad-accum scaling — not the model (§5).
+- **Don't apply a repetition penalty over prompt tokens.** Penalize *generated* tokens only;
+  banning prompt tokens produces garbage (§5, and the guard now in `eval_numeracy.py`).
+- **Localize the regression before retraining.** Evaluating the *pre-CoT* checkpoint is what
+  proved the CoT stage (not the base) broke general and pointed straight at the free fix (§18c).
+
+### Operational / infra traps
+- **Don't fill HBM blindly on CoT-SFT.** The ceiling is the **fp32 loss-logits
+  `(batch × seq × vocab≈151k)`** materialized in the *backward* pass, not startup memory —
+  batch 12/16/18 OOM at seq≈4k on a 140 GiB H200; profile the backward (§18e). Filling HBM
+  also forces a bigger effective batch (quality tension).
+- **Don't rely on `--export=ALL` across chained sbatch stages.** A finished stage's exported
+  config leaks into the next and clobbers `:-` defaults (DPO once ran on the wrong dataset →
+  0 pairs → crash). `unset` config vars at the top of each chained launcher (§12).
+- **Don't run watchers with `nohup`/detached.** They die silently and miss failures — use
+  harness-tracked background tasks.
+- **Don't submit to the excluded SLURM nodes:** `midway3-0423,midway3-[0298,0377-0378,0603-0606]`
+  (and 0602 is ECC-flaky). Every `sbatch` must carry the `--exclude`.
+- **Never force-add a `.sh`.** Repo policy: all `.sh` are git-ignored (they carry
+  cluster-specific paths); the recipe they encode lives in this doc. `.py`/`.md` are force-added.
+- **Don't assume flash-attn / the sliding window is active.** The env has flash-attn-4, so
+  `model.py` silently runs **full causal attention** (the 256-token local window is ignored)
+  in all production runs; `qk_norm` is essential at high LR (§16 audit).
+- **Don't midtrain on FineMath without replaying general data.** The full pipeline on a
+  pure-FineMath base produced 10/10 math but **catastrophic** general ("the capital of France
+  is France") that SFT+DPO could not recover — the base forgot the world (§12). The intermix
+  + soup base (Steps 1–2) exists precisely to avoid this.
+
+---
+
+## Detailed chronological record
+
+Everything below is the full log (§0–§19) that produced the recipe above, followed by
+**"The throughline"** (the nine deeper principles) and the **script & file guide**. Read
+the recipe and avoid-list first; drop into a section when you need the evidence or the exact
+numbers behind a claim.
 
 ---
 
