@@ -108,6 +108,38 @@ def get_base_model(model):
     return model
 
 
+def apply_fp8_training(model, include_lm_head=True):
+    """Argonne-3.5 FP8 (torchao float8, tensorwise dynamic) on the Linear matmuls + tied lm_head.
+    Convert BEFORE DDP/compile; fp32 master weights; no persistent buffers so ckpt/resume are 1:1 with
+    nn.Linear. Skips Linears whose dims aren't /16. Returns (n_converted, n_skipped, lm_status)."""
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    try:
+        from torchao.float8 import Float8LinearRecipeName            # torchao >= ~0.10
+    except ImportError:
+        from torchao.float8.config import Float8LinearRecipeName     # older torchao
+    cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE)
+    stat = {"c": 0, "s": 0, "lm": "absent"}
+
+    def flt(mod, fqn):
+        is_lm = "lm_head" in fqn
+        if not isinstance(mod, nn.Linear):
+            return False
+        if is_lm and not include_lm_head:
+            stat["s"] += 1; stat["lm"] = "skipped(flag_off)"; return False
+        if (mod.in_features % 16) or (mod.out_features % 16):
+            stat["s"] += 1
+            if is_lm:
+                stat["lm"] = f"SKIPPED(dim_not_/16: out={mod.out_features}) -> NO fp8 lm_head speedup!"
+            return False
+        stat["c"] += 1
+        if is_lm:
+            stat["lm"] = "converted"
+        return True
+
+    convert_to_float8_training(model, module_filter_fn=flt, config=cfg)
+    return stat["c"], stat["s"], stat["lm"]
+
+
 def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new_tokens=100):
     model.eval()
     with torch.no_grad():
@@ -232,6 +264,13 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
+    if args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
+        # Pad vocab to a mult of 128 so the tied lm_head GEMM is FP8-eligible (see pretrain.py). Export
+        # trims back. Must match the pretrain-stage padded vocab so the resumed checkpoint shape agrees.
+        padded = ((VOCAB_SIZE + 127) // 128) * 128
+        if IS_MAIN:
+            print(f"FP8 lm_head: padding vocab {VOCAB_SIZE} -> {padded} (mult of 128; export trims back)")
+        VOCAB_SIZE = padded
     if IS_MAIN:
         print(f"Vocab size: {VOCAB_SIZE}, EOS token ID: {tokenizer.eos_token_id}")
 
@@ -267,6 +306,20 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+
+    # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
+    if args.fp8 == 1:
+        if args.torch_compile != 1 and IS_MAIN:
+            print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
+        embed_w = model.get_input_embeddings().weight
+        n_conv, n_skip, lm_status = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
+        assert model.get_output_embeddings().weight is embed_w, (
+            "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+        if args.fp8_lm_head == 1 and lm_status != "converted" and IS_MAIN:
+            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status} — expect ~1.18x not 1.25x.")
+        if IS_MAIN:
+            print(f"FP8 training ON (torchao tensorwise): converted {n_conv} Linear, skipped {n_skip}; "
+                  f"lm_head={lm_status}; embedding tie preserved.")
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
@@ -642,6 +695,18 @@ def main():
             final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
             os.makedirs(final_model_dir, exist_ok=True)
             save_model = get_base_model(model)
+            if args.fp8 == 1:
+                # Export a clean nn.Linear model (no torchao at inference). Dynamic tensorwise FP8 keeps
+                # weights in high precision -> state_dict loads 1:1; refuse to export if any weight missing.
+                clean = ArgonneModel(config)
+                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                assert not missing, (
+                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                if hasattr(clean, "tie_weights"):
+                    clean.tie_weights()
+                if IS_MAIN:
+                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
+                save_model = clean.to(DEVICE)
 
             actual_vocab = len(tokenizer)
             embed = save_model.get_input_embeddings()
@@ -698,6 +763,9 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=int, default=0, help="Cooldown steps at end of WSD schedule")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
+    # Argonne-3.5 FP8 (torchao float8, tensorwise) — same as pretrain.py. Requires --torch_compile 1.
+    parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8")
+    parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head")
     parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
     parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
     parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
