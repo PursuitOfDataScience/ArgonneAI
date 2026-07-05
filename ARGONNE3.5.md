@@ -68,36 +68,49 @@ literally omits WSD's decay phase), not on a proxy datapoint. The **LR direction
 
 ## 2. What changed (and what did NOT)
 
-The only **tracked** change is one small enabling addition to **`pretrain.py`** (`--cooldown_frac`);
-the rest of the recipe is a set of **launcher flags**. Per this repo's convention, shell scripts are
-git-ignored (`*.sh`) and kept local — so `run_full_training.sh` is **not committed on this branch**; the
-exact flags to set in your local copy are in §2.2 below, and this doc is their authoritative record.
-**The model architecture is byte-for-byte Argonne 3.0.**
+Tracked changes are in **`pretrain.py`** (`--cooldown_frac` and **FP8 training**); the rest is
+**launcher flags**. Per this repo's convention, shell scripts are git-ignored (`*.sh`) and kept local —
+so `run_full_training.sh` is **not committed on this branch**; the exact flags to set in your local copy
+are in §2.2 below, and this doc is their authoritative record. **The model architecture is byte-for-byte
+Argonne 3.0** (FP8 is a numerics/throughput change, not an architecture change).
 
 ### Changed — `pretrain.py`
 - Added `--cooldown_frac` (float, default 0.0). When > 0 it overrides `--cooldown` and sets the WSD
-  cooldown to `int(cooldown_frac × estimated_steps)`. Expressed as a fraction so the terminal anneal
-  lands at the run's true end regardless of corpus size or how the run is sliced across wall-time
-  SLURM jobs (`estimated_steps` is recomputed identically every resume). No other logic changed.
+  cooldown to `int(cooldown_frac × estimated_steps)`. Robust to corpus size / wall-time slicing.
+- Added **`--fp8` + `--fp8_lm_head`** (torchao float8, tensorwise dynamic scaling). When `--fp8 1`:
+  eligible `nn.Linear` (incl. the tied `lm_head`) are swapped to `Float8Linear` **before DDP/compile**;
+  master weights stay fp32; requires `--torch_compile 1` (FP8 scaling must fuse into the matmul or there
+  is NO speedup — eager is ~2.3× slower). **Recipe-search result** (`experiments/recipe35/`, verified on
+  the 12L proxy AND the full 24L/2.88B arch): **≈1.25× throughput, quality-neutral, 0 NaN → −0.135 to
+  −0.198 nats lower held-out CE per H200-hour** vs bf16. Two safety guards: (1) asserts the
+  embedding↔lm_head **tie survives** conversion (torchao reuses the weight Parameter); (2) the final HF
+  export **rebuilds a clean `nn.Linear` model** from the state_dict (so the shipped model needs no
+  torchao at inference) and asserts no weight is missing. Dynamic tensorwise scaling adds no persistent
+  state → checkpoints/resume are 1:1 with plain `nn.Linear`.
 
 ### 2.2 Changed — launcher flags (edit your local, untracked `run_full_training.sh`)
 | Flag | 3.0 | 3.5 | Confidence |
 |---|---|---|---|
+| `--fp8` / `--fp8_lm_head` | (none) | **`1` / `1`** | HIGH — 1.25× throughput, quality-neutral (recipe search) |
 | `--lr` | `3e-4` | `6e-4` | direction HIGH, magnitude MEDIUM (probe) |
 | `--grad_clip` | `1.0` | `0.4` | MEDIUM (safe — tightening a clip cannot destabilize) |
 | `--warmup_steps` (pretrain) | `1000` | `8000` | direction MEDIUM (co-tune with LR) |
 | `--cooldown` → `--cooldown_frac` (pretrain) | `0` (no decay) | `0.15` | HIGH that *some* decay helps; fraction MEDIUM |
+| `--torch_compile` | `1` | `1` (keep — REQUIRED for FP8 to fuse) | HIGH |
 
 Exact flags to set (everything else in `run_full_training.sh` is unchanged from 3.0):
 
 ```bash
 # --- pretrain.py torchrun block (exports the base model; gets the terminal WSD anneal) ---
+    --fp8 1 \
+    --fp8_lm_head 1 \
     --lr 6e-4 \
     --grad_clip 0.4 \
     --warmup_steps 8000 \
     --schedule wsd \
     --cooldown_frac 0.15 \      # replaces the old  --cooldown 0
     --min_lr_ratio 0.1 \
+    --torch_compile 1 \         # REQUIRED for FP8 (eager fp8 is ~2.3x slower)
 
 # --- continue_pretrain.py torchrun block (2nd stage; NO cooldown — see §5) ---
     --lr 6e-4 \
@@ -105,7 +118,13 @@ Exact flags to set (everything else in `run_full_training.sh` is unchanged from 
     --warmup_steps 0 \
     --schedule wsd \
     --cooldown 0 \
+    # (FP8 not wired into continue_pretrain.py yet — see §5; add the same apply_fp8_training call there)
 ```
+
+**Recommended pre-flight (do NOT skip for the full multi-day run):** (1) confirm the first ~50 steps
+train with finite loss and the log prints `FP8 training ON ... embedding tie preserved` (the tie assert
+fail-fasts if torchao ever changes behavior); (2) run a short at-scale **LR probe** {6e-4, 8e-4, 1e-3} —
+the proxy LR (1.6e-3) is short-horizon and must be re-tuned on the full 20.8B-token run.
 
 ### Deliberately NOT changed (kept at Argonne 3.0 defaults — validated or out-of-scope)
 - **Architecture** — `hidden 3072, 24 layers, 12Q/4KV, head_dim 256, SwiGLU 8192, tied embeddings,

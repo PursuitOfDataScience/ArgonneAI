@@ -70,6 +70,10 @@ parser.add_argument("--cooldown", type=int, default=4000, help="Cooldown steps a
 parser.add_argument("--cooldown_frac", type=float, default=0.0, help="WSD cooldown as a fraction of estimated steps; if >0 overrides --cooldown. Argonne-3.5 recipe: 0.15.")
 parser.add_argument("--grad_clip", type=float, default=0.4, help="Gradient clipping")
 parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
+# Argonne-3.5 FP8: torchao float8 (tensorwise dynamic) on the Linear matmuls + lm_head. Recipe-search
+# result: ~1.25x H200 throughput at neutral quality (needs torch_compile=1; master weights stay fp32).
+parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8 (requires torch_compile=1)")
+parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head — recipe default; tie is preserved")
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
@@ -199,6 +203,32 @@ def get_base_model(model):
     return model
 
 
+def apply_fp8_training(model, include_lm_head=True):
+    """Argonne-3.5: swap eligible nn.Linear -> torchao Float8Linear (tensorwise DYNAMIC scaling) so the
+    Linear matmuls run in FP8 on H200 tensor cores (~1.25x throughput, quality-neutral per the recipe
+    search). Dynamic scaling adds NO persistent params/buffers, so checkpoints + state_dict stay 1:1
+    with plain nn.Linear (resume/export work). Skips any Linear whose dims aren't /16 (scaled_mm req).
+    Call BEFORE DDP/compile, with master weights in fp32. Returns (n_converted, n_skipped)."""
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig, Float8LinearRecipeName
+    cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE)
+    stat = {"c": 0, "s": 0}
+
+    def flt(mod, fqn):
+        if not isinstance(mod, nn.Linear):
+            return False
+        if ("lm_head" in fqn) and not include_lm_head:
+            stat["s"] += 1
+            return False
+        if (mod.in_features % 16) or (mod.out_features % 16):
+            stat["s"] += 1
+            return False
+        stat["c"] += 1
+        return True
+
+    convert_to_float8_training(model, module_filter_fn=flt, config=cfg)
+    return stat["c"], stat["s"]
+
+
 def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new_tokens=100):
     model.eval()
     with torch.no_grad():
@@ -316,6 +346,19 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+
+    # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
+    if args.fp8 == 1:
+        if args.torch_compile != 1 and IS_MAIN:
+            print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
+        embed_w = model.get_input_embeddings().weight            # capture the tied weight pre-conversion
+        n_conv, n_skip = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
+        # The tie must survive (torchao reuses the weight Parameter). Fail loudly if it silently broke.
+        assert model.get_output_embeddings().weight is embed_w, (
+            "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+        if IS_MAIN:
+            print(f"FP8 training ON (torchao tensorwise, lm_head={args.fp8_lm_head}): "
+                  f"converted {n_conv} Linear, skipped {n_skip}; embedding tie preserved.")
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
@@ -641,6 +684,18 @@ def main():
             final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
             os.makedirs(final_model_dir, exist_ok=True)
             save_model = get_base_model(model)
+            if args.fp8 == 1:
+                # Export a clean nn.Linear model so the shipped HF checkpoint needs no torchao at
+                # inference. Dynamic tensorwise FP8 keeps weights in high precision → state_dict is 1:1.
+                clean = ArgonneModel(config)
+                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                assert not missing, (
+                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                if hasattr(clean, "tie_weights"):
+                    clean.tie_weights()
+                if IS_MAIN:
+                    print(f"FP8 export: rebuilt clean nn.Linear model (dropped {len(unexpected)} torchao keys)")
+                save_model = clean.to(DEVICE)
 
             actual_vocab = len(tokenizer)
             embed = save_model.get_input_embeddings()
