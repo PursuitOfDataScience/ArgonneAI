@@ -121,10 +121,25 @@ Exact flags to set (everything else in `run_full_training.sh` is unchanged from 
     # (FP8 not wired into continue_pretrain.py yet — see §5; add the same apply_fp8_training call there)
 ```
 
-**Recommended pre-flight (do NOT skip for the full multi-day run):** (1) confirm the first ~50 steps
-train with finite loss and the log prints `FP8 training ON ... embedding tie preserved` (the tie assert
-fail-fasts if torchao ever changes behavior); (2) run a short at-scale **LR probe** {6e-4, 8e-4, 1e-3} —
-the proxy LR (1.6e-3) is short-horizon and must be re-tuned on the full 20.8B-token run.
+**Pre-flight (do NOT skip for the full multi-day run) — from an adversarial code review of the FP8 port:**
+1. **Multi-GPU smoke FIRST** (review's one real residual): `torchrun --nproc_per_node=3 ... --fp8 1
+   --torch_compile 1 --gradient_checkpointing 1` for a few hundred steps. The DDP-then-compile path is
+   *unchanged from 3.0* (byte-identical order), but `torch.compile(DDP(Float8Linear))` invokes inductor's
+   DDPOptimizer graph-split over the fp8 subgraphs for the first time here — confirm it starts (no
+   DDPOptimizer/compile error), loss matches the 1-GPU fp8 run within noise, and tok/s shows the ~1.25×
+   (proving fp8 fused, not graph-broke). Failure would be LOUD (crash), not silent corruption.
+2. Confirm the log prints `lm_head=converted` (NOT `SKIPPED`) — the run auto-pads vocab
+   `151669→151680` (÷128) so the tied lm_head GEMM is FP8-eligible; without the pad it silently stays
+   bf16 (~1.18× not 1.25×). Padding rows are unused; the HF export trims back to 151669. **Note:** the
+   pad changes the embedding shape → fp8 checkpoints are NOT resume-compatible with unpadded (151669) ones.
+3. Short at-scale **LR probe** {6e-4, 8e-4, 1e-3} — the proxy LR (1.6e-3) is short-horizon; re-tune on
+   the full 20.8B-token run.
+
+**Verified safe by the review** (torch 2.9.1 / torchao 0.17.0): the tied weight is a single shared
+Parameter → all-reduced once under DDP (no double-reduce); dynamic tensorwise scaling has no persistent
+buffers → checkpoint/resume are 1:1 with nn.Linear; grad-checkpoint recompute derives identical fp8
+scales → exact gradients. (A "torchao 0.9.0 import breaks" finding was a FALSE POSITIVE — the AI env has
+0.17.0, confirmed; the import is also made version-robust.)
 
 ### Deliberately NOT changed (kept at Argonne 3.0 defaults — validated or out-of-scope)
 - **Architecture** — `hidden 3072, 24 layers, 12Q/4KV, head_dim 256, SwiGLU 8192, tied embeddings,

@@ -208,25 +208,33 @@ def apply_fp8_training(model, include_lm_head=True):
     Linear matmuls run in FP8 on H200 tensor cores (~1.25x throughput, quality-neutral per the recipe
     search). Dynamic scaling adds NO persistent params/buffers, so checkpoints + state_dict stay 1:1
     with plain nn.Linear (resume/export work). Skips any Linear whose dims aren't /16 (scaled_mm req).
-    Call BEFORE DDP/compile, with master weights in fp32. Returns (n_converted, n_skipped)."""
-    from torchao.float8 import convert_to_float8_training, Float8LinearConfig, Float8LinearRecipeName
+    Call BEFORE DDP/compile, with master weights in fp32. Returns (n_converted, n_skipped, lm_status)."""
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    try:
+        from torchao.float8 import Float8LinearRecipeName            # torchao >= ~0.10
+    except ImportError:
+        from torchao.float8.config import Float8LinearRecipeName     # older torchao
     cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE)
-    stat = {"c": 0, "s": 0}
+    stat = {"c": 0, "s": 0, "lm": "absent"}
 
     def flt(mod, fqn):
+        is_lm = "lm_head" in fqn
         if not isinstance(mod, nn.Linear):
             return False
-        if ("lm_head" in fqn) and not include_lm_head:
-            stat["s"] += 1
-            return False
+        if is_lm and not include_lm_head:
+            stat["s"] += 1; stat["lm"] = "skipped(flag_off)"; return False
         if (mod.in_features % 16) or (mod.out_features % 16):
             stat["s"] += 1
+            if is_lm:
+                stat["lm"] = f"SKIPPED(dim_not_/16: out={mod.out_features}) -> NO fp8 lm_head speedup!"
             return False
         stat["c"] += 1
+        if is_lm:
+            stat["lm"] = "converted"
         return True
 
     convert_to_float8_training(model, module_filter_fn=flt, config=cfg)
-    return stat["c"], stat["s"]
+    return stat["c"], stat["s"], stat["lm"]
 
 
 def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new_tokens=100):
@@ -310,6 +318,16 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
+    if args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
+        # torch._scaled_mm needs both GEMM dims %16; len(tokenizer)=151669 is not, so the tied lm_head
+        # would silently stay bf16 (only ~1.18x instead of the recipe's 1.25x). Pad vocab to a multiple
+        # of 128 (tensor-core aligned): padding rows are unused ids and the final HF export trims
+        # embeddings back to len(tokenizer). NOTE: this changes the embedding shape, so argonne3.5 fp8
+        # checkpoints are NOT resume-compatible with unpadded (len-151669) checkpoints — fresh run only.
+        padded = ((VOCAB_SIZE + 127) // 128) * 128
+        if IS_MAIN:
+            print(f"FP8 lm_head: padding vocab {VOCAB_SIZE} -> {padded} (mult of 128; export trims back)")
+        VOCAB_SIZE = padded
     if IS_MAIN:
         print(f"Vocab size: {VOCAB_SIZE}, EOS token ID: {tokenizer.eos_token_id}")
 
@@ -352,13 +370,16 @@ def main():
         if args.torch_compile != 1 and IS_MAIN:
             print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
         embed_w = model.get_input_embeddings().weight            # capture the tied weight pre-conversion
-        n_conv, n_skip = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
+        n_conv, n_skip, lm_status = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
         # The tie must survive (torchao reuses the weight Parameter). Fail loudly if it silently broke.
         assert model.get_output_embeddings().weight is embed_w, (
             "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+        if args.fp8_lm_head == 1 and lm_status != "converted" and IS_MAIN:
+            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status} — expect ~1.18x not 1.25x. "
+                  f"Pad vocab to a multiple of 16 to enable it.")
         if IS_MAIN:
-            print(f"FP8 training ON (torchao tensorwise, lm_head={args.fp8_lm_head}): "
-                  f"converted {n_conv} Linear, skipped {n_skip}; embedding tie preserved.")
+            print(f"FP8 training ON (torchao tensorwise): converted {n_conv} Linear, skipped {n_skip}; "
+                  f"lm_head={lm_status}; embedding tie preserved.")
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
@@ -694,7 +715,7 @@ def main():
                 if hasattr(clean, "tie_weights"):
                     clean.tie_weights()
                 if IS_MAIN:
-                    print(f"FP8 export: rebuilt clean nn.Linear model (dropped {len(unexpected)} torchao keys)")
+                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
                 save_model = clean.to(DEVICE)
 
             actual_vocab = len(tokenizer)
