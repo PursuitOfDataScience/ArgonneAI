@@ -914,7 +914,32 @@ def main():
     elif args.init_checkpoint_path and os.path.exists(args.init_checkpoint_path):
         checkpoint_path_used = args.init_checkpoint_path
         checkpoint = torch.load(args.init_checkpoint_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # The seed may be an FP8/torchao pretrain checkpoint whose embedding/lm_head are
+        # vocab-PADDED (e.g. 151680 -> the real 151669) and which may carry extra fp8
+        # buffers absent from this vanilla bf16 model. Map the seed onto THIS model's
+        # params by name: trim a padded leading dim, ignore non-model keys, and assert
+        # every model param is filled (loud failure beats a silent partial load).
+        _seed_sd = checkpoint["model_state_dict"]
+        _tgt_sd = model.state_dict()
+        _mapped, _trimmed, _missing = {}, [], []
+        for _k, _tgt in _tgt_sd.items():
+            _src = _seed_sd.get(_k)
+            if _src is None:
+                _missing.append(_k)
+                continue
+            if tuple(_src.shape) != tuple(_tgt.shape):
+                if _src.dim() == _tgt.dim() and _src.shape[0] > _tgt.shape[0] and _src.shape[1:] == _tgt.shape[1:]:
+                    _src = _src[: _tgt.shape[0]].contiguous()
+                    _trimmed.append(_k)
+                else:
+                    raise ValueError(f"midtrain seed shape mismatch for {_k}: seed {tuple(_src.shape)} vs model {tuple(_tgt.shape)}")
+            _mapped[_k] = _src
+        if _missing:
+            raise KeyError(f"midtrain seed is missing {len(_missing)} model params (e.g. {_missing[:8]}); seed/model arch mismatch")
+        model.load_state_dict(_mapped, strict=True)
+        if is_main:
+            _extra = [k for k in _seed_sd if k not in _tgt_sd]
+            print(f"[midtrain seed] loaded {len(_mapped)} params; vocab-trimmed {len(_trimmed)} (e.g. {_trimmed[:4]}); ignored {len(_extra)} non-model/fp8 seed keys", flush=True)
         checkpoint_optimizer_state = checkpoint["optimizer_state_dict"]
         if args.distributed_strategy == "fsdp" and world_size > 1 and not optimizer_state_uses_param_names(checkpoint_optimizer_state):
             checkpoint_optimizer_state = FSDP.rekey_optim_state_dict(
