@@ -19,7 +19,12 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+# model.py lives at the repo ROOT (parent of reasoning/) and self-registers the
+# `argonne2` arch. Put BOTH reasoning/ and root on the path so AutoModel can load
+# checkpoints that don't bundle model.py (e.g. soup_blend_a085; no auto_map).
+for _p in (SCRIPT_DIR, SCRIPT_DIR.parent):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 try:
     from model import ArgonneConfig, ArgonneModel  # noqa: F401
 except ModuleNotFoundError:
@@ -76,8 +81,14 @@ def norm(s):
     v = m.group(0)
     try:
         f = float(v)
+        # A model can emit an astronomically large number (runaway loop / huge product);
+        # float(v) then overflows to inf and int(inf) raises OverflowError. Guard both so a
+        # single pathological trace never crashes a grading/generation job (this norm is the
+        # shared primitive behind eval_math/clean_eval/vllm_bon/vllm_rollouts/grpo).
+        if f != f or f in (float("inf"), float("-inf")):
+            return None
         return str(int(f)) if f == int(f) else str(f)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -129,6 +140,43 @@ def batched_sample(model, input_ids, *, max_new_tokens, eos_id, temperature, top
     return gen
 
 
+def autofit_k(model, prompt_ids, *, eos_id, target_frac=0.85, max_k=512,
+              probe_tokens=64, temperature=0.8, top_k=50, top_p=0.95, verbose=True):
+    """Pick the largest generation group K (identical copies of ONE prompt) whose peak
+    HBM stays <= target_frac of the card. The model has no cross-prompt batching, so K is
+    the only knob to fill HBM during generation. Probes with a SHORT generation on the
+    given (ideally longest) prompt so the prefill logit spike is captured; OOM-safe.
+
+    Returns K>=1. Note: generation on a small model is HBM-light AND compute-scales with K,
+    so a high target may pick a K that is slow per problem — cap via max_k for time budgets.
+    """
+    total = torch.cuda.get_device_properties(0).total_memory
+    best = 1
+    for k in (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512):
+        if k > max_k:
+            break
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            batch = prompt_ids.repeat(k, 1)
+            batched_sample(model, batch, max_new_tokens=probe_tokens, eos_id=eos_id,
+                           temperature=temperature, top_k=top_k, top_p=top_p)
+            frac = torch.cuda.max_memory_allocated() / total
+            if verbose:
+                print(f"  [autofit] K={k:<4} probe peak {frac*100:.0f}% HBM", flush=True)
+            if frac <= target_frac:
+                best = k
+            if frac >= target_frac:
+                break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if verbose:
+                print(f"  [autofit] K={k:<4} OOM -> stop; using K={best}", flush=True)
+            break
+    torch.cuda.empty_cache()
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="/project/rcc/youzhi/models/instruct/think_mix2_ckpts")
@@ -143,6 +191,12 @@ def main():
     ap.add_argument("--top-k", type=int, default=50)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--max-keep-per-problem", type=int, default=2)
+    ap.add_argument("--all-out", default=None,
+                    help="ALSO persist EVERY rollout with its label {correct,wrong,unclosed,"
+                         "no_answer} + gold here (the corpus for RLVR-DPO / a verifier). Off if unset.")
+    ap.add_argument("--target-hbm", type=float, default=0.0,
+                    help="auto-fit K to this HBM fraction (0=off, use fixed --k); OOM-safe.")
+    ap.add_argument("--max-k", type=int, default=256, help="cap for --target-hbm auto-fit.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -157,39 +211,65 @@ def main():
     problems = load_problems(args.source, args.n_problems)
     if args.start:
         problems = problems[args.start:]
+
+    eff_k = args.k
+    if args.target_hbm > 0:
+        longest_q = max(problems, key=lambda p: len(p[0]))[0]
+        penc = tok.apply_chat_template(
+            [{"role": "user", "content": longest_q}], tokenize=True,
+            add_generation_prompt=True, enable_thinking=True, return_tensors="pt")
+        pid = penc["input_ids"] if hasattr(penc, "keys") else penc
+        eff_k = autofit_k(model, pid.to("cuda"), eos_id=eos_id, target_frac=args.target_hbm,
+                          max_k=args.max_k, temperature=args.temperature,
+                          top_k=args.top_k, top_p=args.top_p)
+
     from collections import Counter as _C
     print(f"Loaded {len(problems)} problems (source={args.source}, start={args.start}) "
           f"{dict(_C(t for _, _, t in problems))}. "
-          f"Sampling K={args.k} @ temp {args.temperature}, max_new={args.max_new_tokens}.",
-          flush=True)
+          f"Sampling K={eff_k} @ temp {args.temperature}, max_new={args.max_new_tokens}."
+          f"{' [+all-out]' if args.all_out else ''}", flush=True)
 
-    kept, solved, total_correct = [], 0, 0
+    kept, all_rows, solved, total_correct = [], [], 0, 0
     # failure-mode tally across all samples (diagnostic: truncation vs capability)
     fm = {"correct": 0, "wrong": 0, "unclosed": 0, "no_answer": 0}
     t0 = _dt.datetime.now()
     for pi, (q, gold, tier) in enumerate(problems):
+        torch.cuda.reset_peak_memory_stats()
         enc = tok.apply_chat_template(
             [{"role": "user", "content": q}], tokenize=True,
             add_generation_prompt=True, enable_thinking=True, return_tensors="pt")
         ids = enc["input_ids"] if hasattr(enc, "keys") else enc
-        batch = ids.repeat(args.k, 1)
-        gens = batched_sample(model, batch, max_new_tokens=args.max_new_tokens,
-                              eos_id=eos_id, temperature=args.temperature,
-                              top_k=args.top_k, top_p=args.top_p)
+        while True:
+            try:
+                batch = ids.repeat(eff_k, 1)
+                gens = batched_sample(model, batch, max_new_tokens=args.max_new_tokens,
+                                      eos_id=eos_id, temperature=args.temperature,
+                                      top_k=args.top_k, top_p=args.top_p)
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if eff_k <= 1:
+                    raise
+                eff_k = max(1, eff_k // 2)
+                print(f"  [oom] halved K -> {eff_k} at problem {pi}", flush=True)
         good = []
         for g in gens:
             text = tok.decode(g, skip_special_tokens=True)
             pred = extract_boxed(text)
             if "</think>" not in text:
-                fm["unclosed"] += 1
+                label = "unclosed"
             elif pred is None:
-                fm["no_answer"] += 1
+                label = "no_answer"
             elif pred == gold:
-                fm["correct"] += 1
+                label = "correct"
             else:
-                fm["wrong"] += 1
-            if pred == gold and "</think>" in text:
+                label = "wrong"
+            fm[label] += 1
+            if label == "correct":
                 good.append(text.strip())
+            if args.all_out:
+                all_rows.append({"question": q, "trace": text.strip(), "label": label,
+                                 "pred": pred if pred is not None else "", "gold": gold, "tier": tier})
         if good:
             solved += 1
             for tr in good[:args.max_keep_per_problem]:
@@ -197,19 +277,29 @@ def main():
                     {"role": "user", "content": q},
                     {"role": "assistant", "content": tr}], "tier": tier})
             total_correct += len(good)
-        if (pi + 1) % 50 == 0:
+        if pi == 0 or (pi + 1) % 25 == 0:
             el = (_dt.datetime.now() - t0).total_seconds()
+            _hbm = torch.cuda.max_memory_allocated() / torch.cuda.get_device_properties(0).total_memory
             print(f"  [{pi+1}/{len(problems)}] solved={solved} "
-                  f"({100*solved/(pi+1):.0f}% pass@{args.k}) kept={len(kept)} "
-                  f"| samples {fm} | {el/(pi+1):.2f}s/prob", flush=True)
+                  f"({100*solved/(pi+1):.0f}% pass@{eff_k}) kept={len(kept)} "
+                  f"| samples {fm} | {el/(pi+1):.2f}s/prob "
+                  f"hbm={_hbm*100:.0f}% ({torch.cuda.max_memory_allocated()/1e9:.1f}/{torch.cuda.get_device_properties(0).total_memory/1e9:.0f}GB)",
+                  flush=True)
         # Incremental save so a wall-time kill doesn't lose everything.
-        if (pi + 1) % 200 == 0 and kept:
-            _save(kept, args.out)
+        if (pi + 1) % 200 == 0:
+            if kept:
+                _save(kept, args.out)
+            if args.all_out and all_rows:
+                _save(all_rows, args.all_out)
 
-    print(f"\nDONE: {solved}/{len(problems)} solved (pass@{args.k}={100*solved/len(problems):.1f}%), "
+    print(f"\nDONE: {solved}/{len(problems)} solved (pass@{eff_k}={100*solved/len(problems):.1f}%), "
           f"{len(kept)} correct traces kept", flush=True)
-    _save(kept, args.out)
-    print(f"saved -> {args.out}", flush=True)
+    if kept:
+        _save(kept, args.out)
+        print(f"saved -> {args.out}", flush=True)
+    if args.all_out and all_rows:
+        _save(all_rows, args.all_out)
+        print(f"saved ALL {len(all_rows)} labeled rollouts -> {args.all_out}", flush=True)
 
 
 def _save(rows, out):

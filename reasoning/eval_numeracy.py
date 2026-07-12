@@ -69,13 +69,26 @@ PROBE_SETS = {"math": MATH_PROBES, "general": GENERAL_PROBES}
 
 @torch.inference_mode()
 def decode_loop(model, input_ids, *, max_new_tokens, eos_id,
-                do_sample=False, temperature=0.7, top_k=50, top_p=0.95):
+                do_sample=False, temperature=0.7, top_k=50, top_p=0.95,
+                repetition_penalty=1.0, no_repeat_ngram=0):
     device = model.embed_tokens.weight.device
     ctx = model.config.max_position_embeddings
     cur = input_ids.to(device)
     out = []
     for _ in range(max_new_tokens):
         logits = model.forward(cur[:, -ctx:]).logits[:, -1, :].float()
+        # Repetition penalty + no-repeat-ngram over GENERATED tokens only (never
+        # the prompt -- §5's prompt-inclusive-ban bug). Defaults (1.0 / 0) are no-ops.
+        if repetition_penalty != 1.0 and out:
+            for t in set(out):
+                v = logits[0, t]
+                logits[0, t] = v / repetition_penalty if v > 0 else v * repetition_penalty
+        if no_repeat_ngram > 0 and len(out) >= no_repeat_ngram:
+            n = no_repeat_ngram
+            prefix = tuple(out[-(n - 1):]) if n > 1 else ()
+            for i in range(len(out) - n + 1):
+                if tuple(out[i:i + n - 1]) == prefix:
+                    logits[0, out[i + n - 1]] = float("-inf")
         if do_sample:
             logits = logits / max(temperature, 1e-6)
             if top_k:
@@ -108,6 +121,10 @@ def parse_args():
                    help="Prompt with think mode on (default off).")
     p.add_argument("--sample", action="store_true",
                    help="Sample (temp 0.7) instead of greedy.")
+    p.add_argument("--repetition-penalty", type=float, default=1.0,
+                   help="Penalize already-generated tokens (1.0 = off). 1.3 anti-loop.")
+    p.add_argument("--no-repeat-ngram", type=int, default=0,
+                   help="Ban repeated generated n-grams of this size (0 = off).")
     p.add_argument("--log", default=None)
     return p.parse_args()
 
@@ -158,7 +175,9 @@ def main():
             with torch.autocast("cuda", dtype=dtype):
                 gen = decode_loop(model, input_ids,
                                   max_new_tokens=args.max_new_tokens, eos_id=eos_id,
-                                  do_sample=args.sample)
+                                  do_sample=args.sample,
+                                  repetition_penalty=args.repetition_penalty,
+                                  no_repeat_ngram=args.no_repeat_ngram)
             text = tok.decode(gen, skip_special_tokens=False).strip()
             # When thinking, show the final answer after </think>.
             final = text.split("</think>", 1)[1].strip() if "</think>" in text else ""
