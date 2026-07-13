@@ -1636,6 +1636,65 @@ forward moves are serving-system (reranker §25 / tool-exec loop §27) or a bett
 
 ---
 
+## 29. v8 — diversity-preserving teacher distillation: mechanism WORKS, ship gate NULL (keep v4) (2026-07-12/13)
+
+The §26 v7 pilot proved external-teacher distillation lands a real greedy gain but collapses
+self-consistency. An adversarial design panel diagnosed the cause as **short-only SFT sharpening the
+student's sampling distribution + teacher-share homogenization** (not the teacher's decode), and
+prescribed a **self-anchor tier** (v3's OWN verified-correct traces, keeping its basin) + modest teacher
+share + no upsampling, **gated behind a cheap STOP-GATE probe.** Executed in full:
+
+### 29a. Phase-A STOP-GATE (probe, ~16k mixes, n=400) — the mechanism is REAL
+Arm 0 (v7-replica: teacher greedy, ~10%) vs Arm 1 (teacher-M2 **+ self_anchor**), cross-souped into v3 @α=0.3:
+- **Arm 0 reproduced v7's collapse** (self-cons −6.0 vs v3); **Arm 1 HELD self-cons** (−0.75) with greedy +5.0.
+- At matched α, Arm 1 beat Arm 0 by **+5.25 self-cons** → the self-anchor tier is the fix. STOP-GATE PASSED → Phase B.
+
+### 29b. Phase-B build (`gen_traces.py` → `build_mix_v8.py` → `cot_v8.sh`)
+- Teacher: **Qwen3-4B** (non-thinking, M≤2 distinct/problem) on **gsm8k-train + MATH-L1-3** → 14.6k verified
+  traces. Self-anchor: **v3's own** verified `<think>` traces on gsm8k-train → 2.4k. `cot_sft_mix_v8` = 28.9k,
+  ALL ≤640 tok: teacher_math 16% / self_anchor 8% / direct_tulu 26% / diversity tiers ~34% (NO code/tool, §26).
+- CoT-SFT `dpo_soup`→`think_v8`, θ=1e6, **HBM-aware micro-batch** (card-adaptive: 94 GiB→micro-28, eff-28,
+  LR √-scaled to 1.53e-5, filled **90%**; auto-scales down on 80 GiB cards). Cross-soup `think_v8 × v3`,
+  α-select knee = **0.30** (`xv8_30`), exactly as Phase A predicted.
+
+### 29c. Ship gate (n=1000, Wilson CIs; svamp/asdiv/mawps clean + gsmplus) — NULL vs the incumbent
+| model | Σgreedy (clean) | Σself-cons (clean) |
+|---|---:|---:|
+| v3 `x_v6v2_040` | 71.2 | **131.7** |
+| **v4 `x_v7v3_300` (shipped)** | 76.7 | 123.3 |
+| **v8 `xv8_30`** | **77.9** | 124.7 |
+
+- **v8 ≈ v4 (within noise):** Δgreedy **+1.2**, Δself-cons **+1.4** — both inside the ~±3–4% n=1000 CIs
+  (svamp greedy even −0.4). NOT a clear improvement over the live model.
+- **v8 fails the strict gate vs v3:** self-cons **−7.0** (greedy +6.7). The self-anchor held self-cons on
+  SVAMP/ASDiv (in-distribution to its gsm8k basin) but **NOT on MAWPS** (v3 43.3 → v8 39.2) — the fix is
+  **distribution-limited**; at the broad gate v8 is the same greedy↔self-cons trade v4 was, just marginally
+  less-regressed. General no-think held (Paris/Shakespeare/Mars/photosynthesis ✓; only the pre-existing
+  colors/transitivity base-gaps, same as v3/v4).
+- **DECISION: KEEP v4.** No single-card v8 variant achieves a *clear both-axes win over v3*; v8 vs the
+  incumbent v4 is within noise. Shipping it would churn the public card for a non-significant gain
+  (throughline #8). `think_v8` + `xv8_30` + the verified corpus are retained for **Tier 3 transfer**.
+
+### 29d. The thrice-confirmed conclusion
+Three independent measurements now agree — Phase-A greedy control, v7 (§26), v8 (§29): **single-card weight
+edits on this 2.88B base convert into a greedy↔self-consistency TRADE, never a clean both-axes win over v3.**
+The wall is base capability (throughline #1; pass@32 ~77% unmoved throughout). The two real forward moves
+stand: **(a) a better BASE** — argonne3.5, to which the v8 recipe (short-trace termination + diversity-
+preserving teacher distillation + self-anchor + cross-soup) transfers directly (§15: ~36/40 on
+Qwen/Llama-grade bases); **(b) serving-system** wins (external reranker §25, tool-exec loop §27). Single-card
+distillation is now **exhausted** — do not re-pay it.
+
+### New files this section
+| File | What |
+|---|---|
+| `gen_traces.py` | Model-agnostic diversity-preserving trace generator (teacher OR v3-self-anchor; multi-sample, keep-M-distinct by step-signature, canonicalize). |
+| `build_mix_v8.py` | `cot_sft_mix_v8` (teacher-math + self_anchor + v6 backbone, ≤640 tok, teacher ~15%). |
+| `cot_v8.sh` | HBM-aware CoT-SFT (micro-batch auto-sized to the live card → ~90% on 80/94 GiB; eff-batch fixed via grad_accum; LR √-scaled). |
+| `build_mix_v8_probe.py`, `phaseA_v8.sh`, `eval_phaseA.sh` | Phase-A STOP-GATE probe (Arm0 vs Arm1) + answer-entropy metric in `clean_eval`. |
+| `post_v8.sh`, `gate_v8.sh` | Cross-soup α-select + the n≥1000 4-source ship gate (Wilson CIs) vs v3 and v4. |
+
+---
+
 ## The throughline (what this whole project teaches)
 
 1. **Capability is set upstream.** Pretraining quality (here: numeracy) is the

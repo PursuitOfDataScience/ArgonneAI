@@ -159,10 +159,12 @@ def budget_forced_generate(llm, tok, prompt_ids, budget, tail, temperature=0.0):
 
 def grade(texts_per_problem, golds, think=True):
     """Return metrics dict over per-problem lists of generations."""
+    import math as _math
     n = len(golds)
     fm = Counter()
     n_first = n_pass = n_maj = 0
     tot = corr = 0
+    ent_sum = ent_n = 0.0   # mean distinct-answer entropy over closed+boxed samples (diversity metric)
     for texts, gold in zip(texts_per_problem, golds):
         votes = Counter()
         any_c = False
@@ -188,11 +190,16 @@ def grade(texts_per_problem, golds, think=True):
             n_pass += 1
         if votes and votes.most_common(1)[0][0] == gold:
             n_maj += 1
+        tv = sum(votes.values())
+        if tv > 0:
+            ent_sum += -sum((c / tv) * _math.log2(c / tv) for c in votes.values())
+            ent_n += 1
     k = len(texts_per_problem[0]) if texts_per_problem else 0
     return {"n": n, "k": k, "single_acc": 100 * corr / max(tot, 1),
             "pass1": 100 * n_first / n, "passk": 100 * n_pass / n,
             "majority": 100 * n_maj / n, "fm": dict(fm),
-            "n_first": n_first, "n_pass": n_pass, "n_maj": n_maj}
+            "n_first": n_first, "n_pass": n_pass, "n_maj": n_maj,
+            "answer_entropy": ent_sum / max(ent_n, 1)}
 
 
 def wilson_ci(k, n, z=1.96):
@@ -281,6 +288,7 @@ def main():
         out(f"    single-sample acc (T={args.temperature}) : {m_s['single_acc']:.2f}%")
         out(f"    self-consistency (K={args.k}) : {m_s['majority']:.2f}% {wilson_ci(m_s['n_maj'], nn)}")
         out(f"    pass@{args.k:<3}(latent ceiling) : {m_s['passk']:.2f}% {wilson_ci(m_s['n_pass'], nn)}")
+        out(f"    answer-entropy@K (diversity) : {m_s['answer_entropy']:.3f} bits")
         summary.append((src, tag, m_greedy['pass1'], m_bf['pass1'], m_s['majority'], m_s['passk']))
 
     out("\n" + "=" * 78)
