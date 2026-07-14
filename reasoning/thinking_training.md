@@ -9,6 +9,16 @@ then keeps the full chronological log (§0–§21) below as the evidence behind 
 claim. Most of the real lessons came from the things that *didn't* work — those
 are collected in **"Things to avoid."**
 
+> ## ⚠ SCOPE DISCIPLINE — DO NOT DRIFT (user directive, 2026-07-13)
+> **When the task is "improve Argonne-3.0-think," stay ENTIRELY within the 3.0-think lineage** (the 2.88B
+> soup/CoT family: `dpo_soup → think_* → the v1–v5 soups`, models under `models/instruct/`). **Do NOT look at,
+> probe, propose, or pivot to any other pretraining model — in particular NOT `argonne3.5` / the
+> `/home/youzhi/ArgonneAI-3.5` worktree / `models/pretrain/`.** argonne3.5 is a SEPARATE from-scratch base line;
+> it is never the answer to a 3.0-think request. Even when single-card weight edits look "exhausted," keep
+> finding levers ON 3.0-think: weight-soup frontier points, broader/better CoT data, and serving-system wins
+> (external-verifier reranker §25, tool-execution loop §27). ("Downstream exhausted → wait for 3.5" is a drift
+> the user has now corrected TWICE — §29 pivot was wrong.) See [[argonne3-think-push-not-35]].
+
 **Bottom line:** the shipped model scores **33/40** on the internal 4-quadrant probe —
 strong arithmetic in *both* no-think and with-CoT modes, plus recovered general chat — the
 first from-scratch Argonne model that can reason *and* chat. The two highest-leverage moves were
@@ -1633,6 +1643,141 @@ reasoning-focused, mixed update**, not a clean dominance:
 **Version lineage:** v1 `soup_blend_a085` → v2 `blend_star_a06` → v3 `x_v6v2_040` → **v4 `x_v7v3_300`**.
 The honest verdict stands (§26/§27): this is the ceiling of single-card weight edits; the real
 forward moves are serving-system (reranker §25 / tool-exec loop §27) or a better base (Tier 3).
+
+---
+
+## 29. v8 — diversity-preserving teacher distillation: mechanism WORKS, ship gate NULL (keep v4) (2026-07-12/13)
+
+The §26 v7 pilot proved external-teacher distillation lands a real greedy gain but collapses
+self-consistency. An adversarial design panel diagnosed the cause as **short-only SFT sharpening the
+student's sampling distribution + teacher-share homogenization** (not the teacher's decode), and
+prescribed a **self-anchor tier** (v3's OWN verified-correct traces, keeping its basin) + modest teacher
+share + no upsampling, **gated behind a cheap STOP-GATE probe.** Executed in full:
+
+### 29a. Phase-A STOP-GATE (probe, ~16k mixes, n=400) — the mechanism is REAL
+Arm 0 (v7-replica: teacher greedy, ~10%) vs Arm 1 (teacher-M2 **+ self_anchor**), cross-souped into v3 @α=0.3:
+- **Arm 0 reproduced v7's collapse** (self-cons −6.0 vs v3); **Arm 1 HELD self-cons** (−0.75) with greedy +5.0.
+- At matched α, Arm 1 beat Arm 0 by **+5.25 self-cons** → the self-anchor tier is the fix. STOP-GATE PASSED → Phase B.
+
+### 29b. Phase-B build (`gen_traces.py` → `build_mix_v8.py` → `cot_v8.sh`)
+- Teacher: **Qwen3-4B** (non-thinking, M≤2 distinct/problem) on **gsm8k-train + MATH-L1-3** → 14.6k verified
+  traces. Self-anchor: **v3's own** verified `<think>` traces on gsm8k-train → 2.4k. `cot_sft_mix_v8` = 28.9k,
+  ALL ≤640 tok: teacher_math 16% / self_anchor 8% / direct_tulu 26% / diversity tiers ~34% (NO code/tool, §26).
+- CoT-SFT `dpo_soup`→`think_v8`, θ=1e6, **HBM-aware micro-batch** (card-adaptive: 94 GiB→micro-28, eff-28,
+  LR √-scaled to 1.53e-5, filled **90%**; auto-scales down on 80 GiB cards). Cross-soup `think_v8 × v3`,
+  α-select knee = **0.30** (`xv8_30`), exactly as Phase A predicted.
+
+### 29c. Ship gate (n=1000, Wilson CIs; svamp/asdiv/mawps clean + gsmplus) — NULL vs the incumbent
+| model | Σgreedy (clean) | Σself-cons (clean) |
+|---|---:|---:|
+| v3 `x_v6v2_040` | 71.2 | **131.7** |
+| **v4 `x_v7v3_300` (shipped)** | 76.7 | 123.3 |
+| **v8 `xv8_30`** | **77.9** | 124.7 |
+
+- **v8 ≈ v4 (within noise):** Δgreedy **+1.2**, Δself-cons **+1.4** — both inside the ~±3–4% n=1000 CIs
+  (svamp greedy even −0.4). NOT a clear improvement over the live model.
+- **v8 fails the strict gate vs v3:** self-cons **−7.0** (greedy +6.7). The self-anchor held self-cons on
+  SVAMP/ASDiv (in-distribution to its gsm8k basin) but **NOT on MAWPS** (v3 43.3 → v8 39.2) — the fix is
+  **distribution-limited**; at the broad gate v8 is the same greedy↔self-cons trade v4 was, just marginally
+  less-regressed. General no-think held (Paris/Shakespeare/Mars/photosynthesis ✓; only the pre-existing
+  colors/transitivity base-gaps, same as v3/v4).
+- **DECISION: KEEP v4.** No single-card v8 variant achieves a *clear both-axes win over v3*; v8 vs the
+  incumbent v4 is within noise. Shipping it would churn the public card for a non-significant gain
+  (throughline #8). `think_v8` + `xv8_30` + the verified corpus are retained for **Tier 3 transfer**.
+
+### 29d. The thrice-confirmed conclusion
+Three independent measurements now agree — Phase-A greedy control, v7 (§26), v8 (§29): **single-card weight
+edits on this 2.88B base convert into a greedy↔self-consistency TRADE, never a clean both-axes win over v3.**
+The wall is base capability (throughline #1; pass@32 ~77% unmoved throughout). The two real forward moves
+stand: **(a) a better BASE** — argonne3.5, to which the v8 recipe (short-trace termination + diversity-
+preserving teacher distillation + self-anchor + cross-soup) transfers directly (§15: ~36/40 on
+Qwen/Llama-grade bases); **(b) serving-system** wins (external reranker §25, tool-exec loop §27). Single-card
+distillation is now **exhausted** — do not re-pay it.
+
+### New files this section
+| File | What |
+|---|---|
+| `gen_traces.py` | Model-agnostic diversity-preserving trace generator (teacher OR v3-self-anchor; multi-sample, keep-M-distinct by step-signature, canonicalize). |
+| `build_mix_v8.py` | `cot_sft_mix_v8` (teacher-math + self_anchor + v6 backbone, ≤640 tok, teacher ~15%). |
+| `cot_v8.sh` | HBM-aware CoT-SFT (micro-batch auto-sized to the live card → ~90% on 80/94 GiB; eff-batch fixed via grad_accum; LR √-scaled). |
+| `build_mix_v8_probe.py`, `phaseA_v8.sh`, `eval_phaseA.sh` | Phase-A STOP-GATE probe (Arm0 vs Arm1) + answer-entropy metric in `clean_eval`. |
+| `post_v8.sh`, `gate_v8.sh` | Cross-soup α-select + the n≥1000 4-source ship gate (Wilson CIs) vs v3 and v4. |
+
+---
+
+## §30 — "improve 3.0-think, don't drift, thoroughly evaluate everything, then update" (2026-07-13/14)
+
+Directive: push the **3.0-think card itself** (NOT argonne3.5 — see the SCOPE-DISCIPLINE banner up top and
+[[argonne3-think-push-not-35]]); evaluate exhaustively before shipping. Two new card levers were run to
+convergence, plus the definitive n=1000 characterization of the whole frontier.
+
+### 30a. v3↔think_v8 soup frontier, densely sampled (n=500, 6 models) — FLAT
+`soup_v8v3.sh` built `xv8_10/15/20` (+ existing `xv8_30`) and evaluated them with v3 & v4 on clean
+SVAMP/ASDiv/MAWPS. Every point is within ~±1.5pt (means) of every other; per-source Wilson CIs overlap
+heavily. `xv8_15` is the best-balanced (greedy 25.9 ≥ v4 25.5, self-cons 42.1 > v4 40.9 — both nominal,
+< CI). No point dominates v4. **Confirmation #4.**
+
+### 30b. v9 — BREVITY self-distillation (attack the unclosed greedy loss) — NULL/REGRESSION
+Audit of the greedy failure modes: the dominant single-shot loss is **unclosed/no-answer** (15–30% of greedy
+attempts never emit an answer — thinking loops past the 512 plain-greedy limit; asdiv n=1000 v3: 192 unclosed
++ 105 no_answer of 1000). Hypothesis: CoT-SFT on v3's **own** verified traces that CLOSE within budget →
+teach concise termination while own-traces preserve the answer distribution (low homogenization risk).
+`gen_v9.sh` (`gen_traces --think 1 --max-tokens 400` over gsm8k_train+MATH-L1-3 → **6394** distinct traces,
+median 495 chars) → `build_mix_v9.py` (short-self-anchor **25%**, direct_tulu 29% general anchor, **NO
+teacher**) → `cot_v9.sh` (dpo_soup→`think_v9`, HBM-aware micro-28 @90.9% reserved) → soups `xv9_30/50/70`.
+**Result (`screen_v9.sh`, n=500):** `think_v9` is **worse on every axis** (greedy 23.3 vs v4 25.5, self-cons
+38.0 vs v3 43.3, mawps greedy collapsed 22→17; answer-entropy 2.70). SFT on the model's own short traces
+**homogenized** it without adding accuracy; soups just interpolate back toward v3. **Confirmation #5.**
+
+### 30c. The definitive n=1000 frontier (`gate_v8.sh`, v3/v4/xv8_15, 4 sources + guardrail) — FLAT PARETO
+| model | Σgreedy | +budget | **Σself-cons** | pass@32 | Σ(greedy+self-cons) |
+|---|---:|---:|---:|---:|---:|
+| v3 `x_v6v2_040` | 71.2 | 77.4 | **131.7** | ~77.7 | **202.8** |
+| **v4 `x_v7v3_300` (shipped)** | **76.7** | **80.6** | 123.3 | ~78.3 | 200.0 |
+| `xv8_15` (0.85·v3+0.15·v8) | 74.5 | 79.2 | 126.4 | ~77.1 | 200.9 |
+*(Σ = sum over the 3 clean sources svamp/asdiv/mawps; per-source in `report/gatev8_math_*_52093640.log`.)*
+
+- **The three points are one flat Pareto line:** identical pass@32 (~78% — the *capability* ceiling is fixed),
+  Σ(greedy+self-cons) tied to within 1.4/200 (0.7%). v3 = self-cons corner (Σ +8.4 over v4, real & consistent
+  across all 4 sources incl. gsmplus; mawps +5.0), v4 = greedy corner (asdiv-driven, +5.7). **`xv8_15` is the
+  midpoint — it does NOT dominate v4** (self-cons +3.1 / greedy −2.2 vs v4, a milder version of the same trade).
+- Guardrail: general/math no-think **identical** across v3/v4/xv8_15 — same successes, same pre-existing
+  base-gaps (grammar "She don't", divisors-of-12→12, primary-colors→green, sun-is-a-planet). No new regressions.
+- **6th independent confirmation** (Phase-A control, v7, v8, soup frontier, v9, this gate): **no single-card
+  weight edit on this 2.88B base wins both greedy and self-consistency.** Even a hypothetical perfect
+  selection-DPO caps at pass@32 ≈ 78 (fixed), and §22i shows SFT/DPO can't reach external-reasoner selection
+  on this base → at best a marginal self-cons gain for a greedy cost, i.e. another trade. **Weights are done.**
+
+### 30d. DECISION & the real lever
+**KEEP v4 weights** — shipping any frontier point over another is an *operating-point* choice, not a benchmark
+improvement (composite tied; would churn the public card for < CI, throughline #8). v3 remains the self-cons
+alternative retained upstream. **The one genuine benchmark lift on this card is the serving reranker (§25):**
+it cashes the fixed ~78% pass@32 ceiling, taking the deployable metric from self-cons ~41 → ~75 (+34pt).
+Re-validated on the **shipped v4 base + MAWPS** (`ext_verify.sh`, job 52116464, n=500, McNemar vs v4's vote):
+
+| set | v4 self-cons (vote) | **reasoned-rerank** | solver | pass@32 |
+|---|---:|---:|---:|---:|
+| svamp | 36.4 | **74.8** (+38.4, p<.001) | 73.8 | 77.0 |
+| asdiv | 49.0 | **76.0** (+27.0, p<.001) | 77.4 | 79.2 |
+| mawps | 38.4 | **58.0** (+19.6, p<.001) | 60.4 | 77.2 |
+
+- **The reranker recovers the exact self-cons v4 traded away** (mawps 38.4→58.0) and reaches ~97% of pass@32
+  on svamp/asdiv. Mean deployable accuracy **41 → 70 (+28pt)**, every source significant. `yesno` (1-token
+  judge) still *hurts*; `solver`≈`reasoned` ⇒ the capture is Qwen's competence applied to Argonne's candidate
+  set — a 2-model serving win, honestly framed, NOT the 2.88B card unlocked. This is now the headline
+  "best accuracy" recipe on the HF card; `ext_verify.py` (two-phase generate→rerank) is the runnable form.
+
+### §30 conclusion
+Weights are done (6 confirmations); the real lever is serving. Shipped: **KEEP v4 weights**, HF README updated
+with the n=1000 frontier + this validated reranker recipe, campaign scripts committed to main. Optional next
+card lever (documented, NOT run — near-certain 7th null since pass@32 is pinned): selection-DPO on
+reranker/ground-truth preference pairs.
+
+### New files this section
+| File | What |
+|---|---|
+| `soup_v8v3.sh` | Dense v3↔think_v8 frontier (α 0.10–0.30) build + n=500 eval. |
+| `gen_v9.sh`, `build_mix_v9.py`, `cot_v9.sh`, `screen_v9.sh` | v9 brevity self-distillation pipeline (gen concise own-traces → short-anchor-dominant mix, no teacher → CoT-SFT → soups → screen). NULL. |
 
 ---
 
