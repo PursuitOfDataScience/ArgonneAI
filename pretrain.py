@@ -9,7 +9,9 @@ import sys
 import glob
 import time
 import argparse
+import json
 import random
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,7 +40,9 @@ LOGIT_SOFTCAP = 15.0
 parser = argparse.ArgumentParser()
 # Paths
 parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
-parser.add_argument("--data_path", type=str, required=True, help="Path to training data (.bin)")
+parser.add_argument("--data_path", type=str, required=True, help="Path to training data: a flat llm.c .bin OR a doc-manifest .json (fineweb+finemath docbin, doc-aware)")
+parser.add_argument("--doc_shuffle", type=int, default=0, choices=[0, 1], help="If 1 and --data_path is a doc-manifest .json, globally shuffle document order each epoch (REQUIRED for an intermix manifest so fineweb+finemath are interleaved, not trained sequentially)")
+parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling")
 parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
 # Training hyperparameters
 # Production LR: 6e-4
@@ -188,6 +192,206 @@ class DataLoader:
 
     def set_position(self, position):
         self.current_position = position
+
+
+# ---------------------------------------------------------------------------
+# Doc-aware manifest loader (ported verbatim from midtraining.py): reads a
+# fineweb+finemath docbin manifest (.json), samples ONE block_size window per
+# doc per epoch, and (with doc_shuffle) interleaves the sources. build_train_loader
+# dispatches to the flat llm.c DataLoader for a .bin and to this for a .json.
+# ---------------------------------------------------------------------------
+class DocManifestDataLoader:
+    def __init__(
+        self,
+        manifest_path,
+        B,
+        T,
+        rank=0,
+        world_size=1,
+        cache_size=4,
+        shuffle_docs=False,
+        shuffle_seed=1337,
+    ):
+        self.B = B
+        self.T = T
+        self.rank = rank
+        self.world_size = world_size
+        self.manifest_path = os.path.abspath(manifest_path)
+        self.epoch = 0
+        self.shuffle_docs = bool(shuffle_docs)
+        self.shuffle_seed = int(shuffle_seed)
+        self._cache_size = max(1, cache_size)
+        self._shard_cache = OrderedDict()
+
+        with open(self.manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        tokenized_dir = manifest["tokenized_dir"]
+        files = [item for item in manifest["files"] if int(item["docs_kept"]) > 0]
+        if not files:
+            raise ValueError(f"No kept documents found in manifest: {self.manifest_path}")
+
+        self.shards = []
+        doc_offsets = [0]
+        total_docs = 0
+        for item in files:
+            bin_path = os.path.join(tokenized_dir, item["bin_path"])
+            lengths_path = os.path.join(tokenized_dir, item["lengths_path"])
+            docs_kept = int(item["docs_kept"])
+            self.shards.append(
+                {
+                    "bin_path": bin_path,
+                    "lengths_path": lengths_path,
+                    "docs_kept": docs_kept,
+                    "source_relpath": item["source_relpath"],
+                }
+            )
+            total_docs += docs_kept
+            doc_offsets.append(total_docs)
+
+        self.doc_offsets = np.asarray(doc_offsets, dtype=np.int64)
+        self.total_docs = total_docs
+        self.total_tokens = int(manifest["qwen_tokens_kept"])
+        self.docs_per_global_step = self.B * self.world_size
+        self.usable_docs = (self.total_docs // self.docs_per_global_step) * self.docs_per_global_step
+        if self.usable_docs <= 0:
+            raise ValueError(
+                f"Doc-aware dataset is too small for B={self.B}, world_size={self.world_size}: "
+                f"total_docs={self.total_docs}"
+            )
+
+        self.num_tokens = self.usable_docs * self.T
+        self.current_position = self.rank * self.B
+        self.doc_order = np.arange(self.usable_docs, dtype=np.int64)
+        self._refresh_doc_order()
+
+        if self.rank == 0:
+            print(f"DocManifestDataLoader: {self.total_docs:,} docs, {self.total_tokens:,} raw kept tokens")
+            print(
+                f"DocManifestDataLoader effective epoch: {self.usable_docs:,} docs -> "
+                f"{self.num_tokens:,} training tokens"
+            )
+            print(f"DocManifestDataLoader manifest: {self.manifest_path}")
+            if self.shuffle_docs:
+                print(f"DocManifestDataLoader doc shuffling: enabled (seed={self.shuffle_seed})")
+
+    def _load_shard(self, shard_idx):
+        cached = self._shard_cache.get(shard_idx)
+        if cached is not None:
+            self._shard_cache.move_to_end(shard_idx)
+            return cached
+
+        shard = self.shards[shard_idx]
+        lengths = np.load(shard["lengths_path"], mmap_mode="r")
+        offsets = np.zeros(len(lengths), dtype=np.uint64)
+        if len(lengths) > 1:
+            np.cumsum(lengths[:-1], dtype=np.uint64, out=offsets[1:])
+        tokens = np.memmap(shard["bin_path"], dtype=np.uint32, mode="r")
+        cached = (tokens, lengths, offsets)
+        self._shard_cache[shard_idx] = cached
+        if len(self._shard_cache) > self._cache_size:
+            self._shard_cache.popitem(last=False)
+        return cached
+
+    def _locate_doc(self, global_doc_idx):
+        shard_idx = int(np.searchsorted(self.doc_offsets, global_doc_idx, side="right") - 1)
+        local_doc_idx = int(global_doc_idx - self.doc_offsets[shard_idx])
+        return shard_idx, local_doc_idx
+
+    def _span_start(self, global_doc_idx, doc_len):
+        max_start = doc_len - (self.T + 1)
+        if max_start <= 0:
+            return 0
+        mixed = (
+            (int(global_doc_idx) + 1) * 0x9E3779B185EBCA87
+            + (int(self.epoch) + 1) * 0xC2B2AE3D27D4EB4F
+        ) & 0xFFFFFFFFFFFFFFFF
+        return mixed % (max_start + 1)
+
+    def _refresh_doc_order(self):
+        if not self.shuffle_docs:
+            return
+        rng = np.random.default_rng(self.shuffle_seed + int(self.epoch))
+        self.doc_order = rng.permutation(self.usable_docs).astype(np.int64)
+
+    def _doc_window(self, global_doc_idx):
+        shard_idx, local_doc_idx = self._locate_doc(global_doc_idx)
+        tokens, lengths, offsets = self._load_shard(shard_idx)
+        doc_len = int(lengths[local_doc_idx])
+        start = self._span_start(global_doc_idx, doc_len)
+        doc_offset = int(offsets[local_doc_idx])
+        buf = tokens[doc_offset + start:doc_offset + start + self.T + 1]
+        if len(buf) != self.T + 1:
+            raise RuntimeError(
+                f"Short doc window for global_doc_idx={global_doc_idx}: "
+                f"doc_len={doc_len}, start={start}, got={len(buf)}"
+            )
+        return np.asarray(buf, dtype=np.int64)
+
+    def next_batch(self):
+        batch_docs = []
+        for i in range(self.B):
+            doc_idx = self.current_position + i
+            if self.shuffle_docs:
+                doc_idx = int(self.doc_order[doc_idx])
+            batch_docs.append(self._doc_window(doc_idx))
+
+        buf = torch.from_numpy(np.stack(batch_docs, axis=0))
+        if torch.cuda.is_available():
+            buf = buf.pin_memory()
+        x = buf[:, :-1]
+        y = buf[:, 1:]
+
+        self.current_position += self.docs_per_global_step
+        if self.current_position + self.B > self.usable_docs:
+            self.current_position = self.rank * self.B
+            self.epoch += 1
+            self._refresh_doc_order()
+            if self.rank == 0:
+                print(f"\n*** Epoch {self.epoch} completed ***\n")
+        return x, y
+
+    def get_position(self):
+        return int(self.current_position)
+
+    def set_position(self, position):
+        self.current_position = int(position)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        self._refresh_doc_order()
+
+    def start_from_beginning(self):
+        self.current_position = self.rank * self.B
+
+    def resume_from_checkpoint_position(self, position):
+        self.current_position = int(position) + self.rank * self.B
+
+    def steps_from_position(self, position):
+        return int(max(0, position) // self.docs_per_global_step)
+
+
+def build_train_loader(
+    data_path,
+    batch_size,
+    block_size,
+    rank,
+    world_size,
+    doc_shuffle=0,
+    doc_shuffle_seed=1337,
+):
+    if data_path.endswith(".json"):
+        return DocManifestDataLoader(
+            data_path,
+            batch_size,
+            block_size,
+            rank,
+            world_size,
+            shuffle_docs=bool(doc_shuffle),
+            shuffle_seed=int(doc_shuffle_seed),
+        )
+    return DataLoader(data_path, batch_size, block_size, rank, world_size)
+
 
 # Import model
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -383,7 +587,7 @@ def main():
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
-        model = DDP(model, device_ids=[LOCAL_RANK])
+        model = DDP(model, device_ids=[LOCAL_RANK], gradient_as_bucket_view=True)
         if IS_MAIN:
             print(f"Using {WORLD_SIZE} GPUs with DistributedDataParallel")
 
@@ -398,17 +602,20 @@ def main():
         print(f"Model parameters: {total_params:,}")
         print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
 
-    # Create data loader
-    train_loader = DataLoader(
+    # Create data loader (flat llm.c .bin OR doc-manifest .json, chosen by extension)
+    train_loader = build_train_loader(
         args.data_path,
         args.batch_size,
         args.block_size,
         RANK,
         WORLD_SIZE,
-        start_token_offset=0,
+        doc_shuffle=args.doc_shuffle,
+        doc_shuffle_seed=args.doc_shuffle_seed,
     )
     val_loader = None
     if IS_MAIN and args.val_data_path:
+        # Validation is always a flat held-out llm.c .bin (the val loop below reads
+        # a contiguous slice via .tokens / .current_position); manifests are train-only.
         val_loader = DataLoader(
             args.val_data_path,
             args.batch_size,
@@ -418,18 +625,23 @@ def main():
             start_token_offset=0,
         )
 
-    # Estimate steps for scheduler
-    num_tokens = len(train_loader.tokens)
+    # Estimate steps for scheduler. The doc-manifest loader exposes .num_tokens (one
+    # T-window per doc per epoch = usable_docs*T); the flat loader exposes .tokens.
+    num_tokens = train_loader.num_tokens if hasattr(train_loader, "num_tokens") else len(train_loader.tokens)
     estimated_steps = int((num_tokens * args.max_epochs) / ACTUAL_TOTAL_BATCH)
     if IS_MAIN:
         print(f"Training for {args.max_epochs} epoch(s) ~= {estimated_steps} steps ({num_tokens * args.max_epochs:,} tokens)")
 
-    # Create optimizer
+    # Create optimizer. fused=True -> single fused CUDA kernel for the AdamW update over the
+    # fp32 master params (same math as the default foreach path; numerically-equivalent), fewer
+    # kernel launches / less memory traffic. Master weights are plain fp32 CUDA Parameters even
+    # under torchao tensorwise fp8, so fused AdamW is supported.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
+        fused=True,
     )
 
     # Scheduler with warmup (cosine or WSD)
@@ -481,6 +693,7 @@ def main():
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 weight_decay=args.weight_decay,
+                fused=True,
             )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             global_step = 0
@@ -497,8 +710,17 @@ def main():
             global_step = checkpoint['global_step']
             tokens_processed = checkpoint['tokens_processed']
             data_position = checkpoint.get('data_position', 0)
-            train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
-            train_loader.epoch = tokens_processed // num_tokens
+            resumed_epoch = int(tokens_processed // num_tokens) if num_tokens > 0 else 0
+            if hasattr(train_loader, "resume_from_checkpoint_position"):
+                # Doc-manifest loader: data_position is a DOC index (rank-0's cursor).
+                # Restore the per-epoch shuffle order first (so the resumed doc order
+                # reproduces the original epoch) then place the per-rank cursor.
+                if hasattr(train_loader, "set_epoch"):
+                    train_loader.set_epoch(resumed_epoch)
+                train_loader.resume_from_checkpoint_position(data_position)
+            else:
+                train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
+                train_loader.epoch = resumed_epoch
             if IS_MAIN:
                 print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}, LR: {scheduler.get_last_lr()[0]:.2e}")
             is_resumed = True
@@ -591,6 +813,11 @@ def main():
             pbar.update(1)
 
         current_lr = optimizer.param_groups[0]['lr']
+
+        if IS_MAIN and (global_step in (1, 2, 3, 5, 10, 20, 50) or global_step % 200 == 0):
+            _mem_res = torch.cuda.max_memory_reserved() / 1e9
+            _mem_tot = torch.cuda.get_device_properties(LOCAL_RANK).total_memory / 1e9
+            print(f"  [HBM] step {global_step}: peak reserved {_mem_res:.1f}/{_mem_tot:.1f} GB ({100*_mem_res/_mem_tot:.1f}%) | micro_batch={args.batch_size} block={args.block_size} grad_ckpt={args.gradient_checkpointing} fp8={args.fp8}", flush=True)
 
         if IS_MAIN and global_step % 50 == 0:
             perplexity = np.exp(step_loss)
