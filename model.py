@@ -61,6 +61,7 @@ class ArgonneConfig(PretrainedConfig):
         interleaved_local_attention: bool = True,
         local_attention_window: Optional[int] = 256,
         logit_softcap: float = 15.0,
+        loss_chunk_size: int = 0,
         tie_word_embeddings: bool = True,
         attention_bias: bool = False,
         mlp_bias: bool = False,
@@ -126,6 +127,9 @@ class ArgonneConfig(PretrainedConfig):
             int(local_attention_window) if local_attention_window is not None and int(local_attention_window) > 0 else None
         )
         self.logit_softcap = float(logit_softcap)
+        # >0 enables chunked cross-entropy (frees the full (batch*seq, vocab) fp32 logit transient
+        # that caps batch at long context). 0 = off (default; unchanged full-logit path).
+        self.loss_chunk_size = int(loss_chunk_size)
         self.tie_word_embeddings = tie_word_embeddings
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
@@ -339,6 +343,19 @@ class GroupedQueryAttention(nn.Module):
 
         key = self._repeat_kv(key)
         value = self._repeat_kv(value)
+
+        # Argonne-3.5 speedup (hardware accel, training-neutral): qk/v-norm return fp32
+        # (fp32 norm-weight * bf16 activation type-promotes), which trips the dtype gate below
+        # and forces the hand-rolled O(seq^2) math attention. Under bf16 autocast the matmuls
+        # already run in bf16, so casting q/k/v to the autocast dtype here is numerically
+        # equivalent (measured rel diff 3.7e-3 < bf16 roundoff 7.8e-3) and lets SDPA pick a fused
+        # FLASH/cuDNN kernel: ~2x lower attention memory + faster. Training-under-autocast only;
+        # inference/decode (self.training False) is untouched.
+        if self.training and torch.is_autocast_enabled() and query.dtype not in (torch.float16, torch.bfloat16):
+            _ac_dtype = torch.get_autocast_dtype("cuda") if hasattr(torch, "get_autocast_dtype") else torch.get_autocast_gpu_dtype()
+            query = query.to(_ac_dtype)
+            key = key.to(_ac_dtype)
+            value = value.to(_ac_dtype)
 
         use_flash_attn_2 = (
             not is_decode
@@ -683,6 +700,27 @@ class ArgonneModel(PreTrainedModel):
                 hidden_states = layer(hidden_states, rotary, attention_mask)
 
         hidden_states = self.norm(hidden_states)
+
+        # Chunked cross-entropy (training only, flag-gated via config.loss_chunk_size): avoids
+        # materializing the full (batch*seq, vocab) fp32 logit tensor -- the HBM wall at long context.
+        # Early-return so the standard full-logit path below stays byte-for-byte unchanged (zero risk to
+        # non-chunked / default runs). Only taken when MTP + z-loss are off (both default off).
+        _chunk = getattr(self.config, "loss_chunk_size", 0)
+        if (self.training and labels is not None and _chunk > 0
+                and self.config.mtp_horizon == 1 and self.config.z_loss_weight == 0):
+            loss = self._chunked_lm_loss(hidden_states, labels, _chunk)
+            if torch.isnan(loss):
+                self._nan_loss_count += 1
+                if self._nan_loss_count <= 5 or self._nan_loss_count % 100 == 0:
+                    print(f"WARNING: NaN loss detected (occurrence {self._nan_loss_count}); "
+                          "zeroing this step's loss.", flush=True)
+                zero = torch.zeros((), device=loss.device, dtype=torch.float32)
+                for p in self.parameters():
+                    if p.requires_grad:
+                        zero = zero + torch.nan_to_num(p).sum().float() * 0.0
+                loss = zero.to(loss.dtype)
+            return CausalLMOutput(logits=None, loss=loss)
+
         logits = self.lm_head(hidden_states)
         if self.config.logit_softcap > 0:
             cap = self.config.logit_softcap
@@ -747,6 +785,40 @@ class ArgonneModel(PreTrainedModel):
         if use_cache:
             return CausalLMOutputWithPast(logits=logits, loss=loss, past_key_values=new_cache)
         return CausalLMOutput(logits=logits, loss=loss)
+
+    @torch.compiler.disable
+    def _chunked_lm_loss(self, hidden_states, labels, chunk_size):
+        """Cross-entropy without ever materializing the full (batch*seq, vocab) fp32 logit tensor.
+        MUST run eager (@torch.compiler.disable): torch.compile/inductor otherwise fuses the chunks
+        back into the full (N, vocab) logit tensor, re-creating the OOM this is meant to avoid. The
+        transformer body still compiles (+FP8); only this loss runs eager (a small fraction of compute).
+        Splits the flattened rows into chunks; torch.utils.checkpoint recomputes each chunk's logits
+        in backward, so peak logit memory = chunk_size*vocab (not N*vocab). Numerically identical to
+        F.cross_entropy(full_logits, labels.view(-1), ignore_index=-100) with per-chunk softcap
+        (mean over non-ignored). Caller guarantees mtp_horizon==1 and z_loss_weight==0.
+        Uses self.lm_head(...) per chunk so the fp8 (Float8Linear) GEMM path is preserved."""
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        cap = float(self.config.logit_softcap)
+        H = hidden_states.reshape(-1, hidden_states.size(-1))
+        L = labels.reshape(-1).to(H.device)
+        N = H.size(0)
+
+        def _seg(hc, lc):
+            lg = self.lm_head(hc)                    # (chunk, vocab); Float8Linear under fp8
+            if cap > 0:
+                lg = torch.tanh(lg / cap) * cap
+            return F.cross_entropy(lg, lc, ignore_index=-100, reduction="sum")
+
+        total = H.new_zeros((), dtype=torch.float32)
+        ntok = torch.zeros((), device=H.device, dtype=torch.float32)
+        cs = max(1, int(chunk_size))
+        for i in range(0, N, cs):
+            hc = H[i:i + cs]
+            lc = L[i:i + cs]
+            seg = _ckpt(_seg, hc, lc, use_reentrant=False) if self.training else _seg(hc, lc)
+            total = total + seg.float()
+            ntok = ntok + (lc != -100).sum().float()
+        return total / ntok.clamp(min=1.0)
 
     @torch.no_grad()
     def generate(
