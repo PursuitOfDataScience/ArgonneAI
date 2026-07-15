@@ -396,13 +396,6 @@ def main():
         checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler_state = checkpoint.get('scheduler_state_dict')
-        if scheduler_state:
-            scheduler.load_state_dict(scheduler_state)
-        else:
-            for _ in range(checkpoint['global_step']):
-                scheduler.step()
         global_step = checkpoint['global_step']
         tokens_processed = checkpoint['tokens_processed']
         data_position = checkpoint.get('data_position', 0)
@@ -413,17 +406,28 @@ def main():
         checkpoint_dataset_base_tokens = checkpoint.get('dataset_base_tokens_processed')
 
         if args.reset_schedule == 1:
-            # Continued pretraining on new data:
-            # keep model, optimizer, and scheduler state; restart the data cursor.
+            # NEW PHASE on new data (continued-pretrain / midtrain seed): keep MODEL weights only, and
+            # start a FRESH optimizer + WSD schedule at --lr; restart the data cursor. Do NOT inherit the
+            # seed's optimizer/scheduler -- otherwise the seed's (post-cooldown, ~min) LR carries over via
+            # the scheduler and the new phase trains far too gently to LEARN the new data. Fresh AdamW
+            # moments are also correct for a new-data phase. (2026-07-14: fixes the scheduler-carryover
+            # caveat that made --lr a no-op; validated the seed loss starts low, LR now honors --lr.)
             if IS_MAIN:
-                print("Reset schedule mode: preserving optimizer/scheduler state and restarting the data position")
-                print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
+                print(f"Reset-schedule (NEW PHASE): model weights seeded; FRESH optimizer + WSD @ lr={args.lr}; data cursor restarted")
+                print(f"Seed had {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
             train_loader.set_position(RANK * args.batch_size * args.block_size)
             train_loader.epoch = 0
             dataset_base_global_step = global_step
             dataset_base_tokens_processed = tokens_processed
             is_resumed = False
         else:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler_state = checkpoint.get('scheduler_state_dict')
+            if scheduler_state:
+                scheduler.load_state_dict(scheduler_state)
+            else:
+                for _ in range(checkpoint['global_step']):
+                    scheduler.step()
             train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
             metadata_matches = (
                 checkpoint_dataset_base_step is not None

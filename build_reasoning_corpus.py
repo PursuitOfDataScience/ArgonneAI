@@ -375,7 +375,7 @@ def iter_records(path, fmt, columns=None):
         pf = pq.ParquetFile(path)
         # Stream in bounded row batches (NOT whole row groups) so 16 workers x a large
         # code row group don't OOM -- keeps peak host RAM at the tokenizer+decontam floor.
-        for batch in pf.iter_batches(batch_size=1024, columns=columns):
+        for batch in pf.iter_batches(batch_size=256, columns=columns):  # 256 (not 1024): bounds the
             for row in batch.to_pylist():
                 yield row
     elif fmt == "arrow":
