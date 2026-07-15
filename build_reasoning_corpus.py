@@ -698,9 +698,10 @@ def cmd_flatten(args):
     for name, cfg in SOURCES.items():
         if not cfg.get("enabled", True) and name not in (args.include or []):
             continue
-        bins = sorted(b for b in glob.glob(os.path.join(source_outdir(name), "*.bin")) if not b.endswith(".tmp"))
+        bins = sorted(b for b in glob.glob(os.path.join(source_outdir(name), "*.bin"))
+                      if not b.endswith(".tmp") and os.path.getsize(b) >= 4)  # skip 0-token (empty) shards
         if not bins:
-            print(f"[flatten] SKIP {name}: no .bin (not tokenized yet)")
+            print(f"[flatten] SKIP {name}: no non-empty .bin (not tokenized yet)")
             continue
         mms = [np.memmap(b, dtype=np.uint32, mode="r") for b in bins]
         avail = int(sum(len(m) for m in mms))
