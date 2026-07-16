@@ -107,7 +107,7 @@ def batched_sample(model, input_ids, *, max_new_tokens, eos_id, temperature, top
     Uses the model's KV cache: prefill the prompt once, then feed one token per
     step. ~100x+ faster than recomputing the full sequence each step.
     """
-    device = model.embed_tokens.weight.device
+    device = next(model.parameters()).device   # arch-agnostic (argonne + Qwen2/Llama)
     cur = input_ids.to(device)
     B = cur.shape[0]
     done = torch.zeros(B, dtype=torch.bool, device=device)

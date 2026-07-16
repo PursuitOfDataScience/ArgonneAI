@@ -301,7 +301,12 @@ def run_rerank(args):
         r["_boxed_closed"] = [p for p, cl in boxed_all if p is not None and cl]
         r["_votes"] = Counter(r["_boxed"])
         r["_votes_closed"] = Counter(r["_boxed_closed"])
-        r["_answers"] = sorted(r["_votes"])
+        # rerank only the top-M distinct answers by vote (the right answer is almost always among
+        # them when pass@K is high); caps verifier cost at high K + focuses on plausible candidates.
+        if args.rerank_topm and args.rerank_topm > 0:
+            r["_answers"] = [a for a, _ in r["_votes"].most_common(args.rerank_topm)]
+        else:
+            r["_answers"] = sorted(r["_votes"])
 
     vscore = {k: {} for k in kinds}
     solo = {}
@@ -421,6 +426,8 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--gpu-util", type=float, default=0.90)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rerank-topm", type=int, default=0,
+                    help="rerank only the top-M distinct answers by vote (0=all); caps cost at high K")
     ap.add_argument("--log", default=None)
     args = ap.parse_args()
     if args.mode == "generate":
