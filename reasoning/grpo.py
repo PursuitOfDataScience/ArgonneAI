@@ -82,6 +82,46 @@ def seq_token_logp(model, ids, temp):
     return logp.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
 
+def hf_batched_rollout(policy, tok, batch, G, *, max_new_tokens, temperature, eos_id, pad_id, dev):
+    """FAST rollout for padding-capable archs (Qwen/Llama): LEFT-pad all P prompts and do ONE batched
+    policy.generate(num_return_sequences=G) instead of P sequential per-prompt decodes. PURE temperature
+    sampling (top_k=0, top_p=1.0) to keep the GRPO gradient unbiased. Returns (groups, counters) in the
+    exact format the per-prompt path produces (seqs = prompt_ids + gen_ids, plen = prompt len).
+    (The argonne arch ignores attention_mask, so it must use the per-prompt batched_sample path instead.)
+    """
+    prompts = []
+    for (q, _gold, _t) in batch:
+        enc = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=True,
+                                      add_generation_prompt=True, enable_thinking=True, return_tensors="pt")
+        prompts.append((enc["input_ids"] if hasattr(enc, "keys") else enc)[0].tolist())
+    P = len(prompts); maxlen = max(len(p) for p in prompts)
+    input_ids = torch.full((P, maxlen), pad_id, dtype=torch.long, device=dev)
+    attn = torch.zeros((P, maxlen), dtype=torch.long, device=dev)
+    for i, p in enumerate(prompts):
+        input_ids[i, maxlen - len(p):] = torch.tensor(p, device=dev)   # LEFT-pad
+        attn[i, maxlen - len(p):] = 1
+    with torch.inference_mode():
+        out = policy.generate(input_ids=input_ids, attention_mask=attn, do_sample=True,
+                              temperature=temperature, top_k=0, top_p=1.0,
+                              num_return_sequences=G, max_new_tokens=max_new_tokens,
+                              eos_token_id=eos_id, pad_token_id=pad_id)
+    gen = out[:, maxlen:]  # every prompt left-padded to maxlen -> generation starts at maxlen
+    groups, C = [], {"correct": 0, "closed": 0, "reward": 0.0, "n": 0}
+    for p in range(P):
+        gold, pids, seqs, rews = batch[p][1], prompts[p], [], []
+        for k in range(G):
+            g = gen[p * G + k].tolist()
+            if eos_id in g:
+                g = g[:g.index(eos_id) + 1]
+            text = tok.decode(g, skip_special_tokens=True)
+            r, correct = shaped_reward(text, gold, eos_id in g)
+            rews.append(r); seqs.append(pids + g)
+            C["correct"] += int(correct); C["closed"] += int("</think>" in text)
+        groups.append({"plen": len(pids), "seqs": seqs, "rews": rews})
+        C["reward"] += sum(rews); C["n"] += len(rews)
+    return groups, C
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="/project/rcc/youzhi/models/instruct/think_star2_ckpts")
@@ -105,6 +145,9 @@ def main():
                          "ceiling). 0 = whole group. Grads accumulate across chunks -> identical update.")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--fast-rollout", action="store_true",
+                    help="batched left-pad policy.generate rollout (padding-capable archs: Qwen/Llama); "
+                         "~10x faster + fills HBM vs the per-prompt custom decode (argonne-only path)")
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--beta", type=float, default=0.04, help="KL coefficient")
     ap.add_argument("--warmup", type=int, default=10)
@@ -183,7 +226,14 @@ def main():
         # ---- sample G rollouts per problem (cached, raw temp-T) ----
         groups = []  # each: dict(prompt_len, seqs[list of full id-lists], rewards, advs)
         policy.eval()
-        for (q, gold, _tier) in batch:
+        if args.fast_rollout:
+            _pad = tok.pad_token_id if tok.pad_token_id is not None else eos_id
+            groups, _C = hf_batched_rollout(policy, tok, batch, G, max_new_tokens=args.max_new_tokens,
+                                            temperature=args.temperature, eos_id=eos_id, pad_id=_pad, dev=dev)
+            run_correct += _C["correct"]; run_closed += _C["closed"]
+            run_reward += _C["reward"]; run_n += _C["n"]
+        else:
+          for (q, gold, _tier) in batch:
             enc = tok.apply_chat_template(
                 [{"role": "user", "content": q}], tokenize=True,
                 add_generation_prompt=True, enable_thinking=True, return_tensors="pt")

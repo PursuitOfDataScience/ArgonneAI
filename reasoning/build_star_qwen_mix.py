@@ -8,10 +8,10 @@ import random
 from datasets import Dataset, load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer
 
-STAR = "/project/rcc/youzhi/data/star_qwen05b_r2"
+STAR = os.environ.get("STAR_IN", "/project/rcc/youzhi/data/star_qwen05b_r2")
 V3 = "/project/rcc/youzhi/data/cot_sft_mix_v3"
-TOK = "/project/rcc/youzhi/models/reason_Qwen1.5-0.5B/think"
-OUT = "/project/rcc/youzhi/data/cot_sft_mix_qwen_star_r2"
+TOK = os.environ.get("TOK_IN", "/project/rcc/youzhi/models/reason_Qwen1.5-0.5B/think")
+OUT = os.environ.get("MIX_OUT", "/project/rcc/youzhi/data/cot_sft_mix_qwen_star_r2")
 V3_KEEP = int(os.environ.get("V3_KEEP", "18000"))
 SEED = 20260714
 
