@@ -350,9 +350,13 @@ def main():
         # ---- checkpointing ----
         due = (step + 1) % args.save_steps == 0
         time_up = el > args.max_hours * 3600
-        if due or time_up or step == args.steps - 1:
-            policy.save_pretrained(args.out); tok.save_pretrained(args.out)
-            print(f"saved -> {args.out} (step {step+1})", flush=True)
+        last = time_up or step == args.steps - 1
+        if due or last:
+            # periodic snapshots go to DISTINCT dirs (GRPO can over-optimize past an early peak;
+            # keep every snapshot so the best step can be picked). final/wall-limit -> args.out.
+            dest = args.out if last else f"{args.out}_step{step+1}"
+            policy.save_pretrained(dest); tok.save_pretrained(dest)
+            print(f"saved -> {dest} (step {step+1})", flush=True)
             if time_up:
                 print("WALL LIMIT reached; exiting after save.", flush=True)
                 break

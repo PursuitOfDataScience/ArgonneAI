@@ -26,8 +26,15 @@ RDIR = str(Path(__file__).resolve().parent)
 for _p in (RDIR, REPO):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-from star_generate import extract_boxed  # noqa: E402
+from star_generate import extract_boxed, norm  # noqa: E402
 from tool_eval import SYS, gen_problems, parse_tool_call, safe_eval  # noqa: E402
+from clean_eval import load_clean  # noqa: E402  clean SVAMP/ASDiv/MAWPS/GSM-Plus loaders
+
+
+def _match(text, gold):
+    """Robust numeric match (norm both sides), so clean-set golds and boxed answers compare fairly."""
+    b = extract_boxed(text)
+    return b is not None and norm(str(b)) == norm(str(gold))
 
 
 def execute_tool(name, payload):
@@ -41,6 +48,9 @@ def execute_tool(name, payload):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/project/rcc/youzhi/models/instruct/think_v7")
+    ap.add_argument("--source", default=None,
+                    help="clean set (svamp/asdiv/mawps/gsmplus) for MULTI-STEP word problems; "
+                         "default None = synthesized single-op arithmetic (gen_problems, §27)")
     ap.add_argument("--n-problems", type=int, default=150)
     ap.add_argument("--max-turns", type=int, default=4)      # max tool calls per problem
     ap.add_argument("--seg-tokens", type=int, default=256)   # tokens per generation segment
@@ -66,7 +76,12 @@ def main():
     from vllm.inputs import TokensPrompt
     from transformers import AutoTokenizer
 
-    probs = gen_problems(args.n_problems, args.seed)
+    if args.source:
+        probs = load_clean(args.source, args.n_problems, seed=args.seed)
+        out(f"[tool_decode] source={args.source} (clean multi-step)  n={len(probs)}")
+    else:
+        probs = gen_problems(args.n_problems, args.seed)
+        out(f"[tool_decode] source=single-op-synth (§27)  n={len(probs)}")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
               gpu_memory_utilization=args.gpu_util, max_model_len=args.max_model_len,
@@ -127,8 +142,8 @@ def main():
 
     # -------- grade + report --------
     n = len(probs)
-    base_ok = sum(1 for (q, g), t in zip(probs, base_texts) if extract_boxed(t) == g)
-    tool_ok = sum(1 for (q, g), t in zip(probs, texts) if extract_boxed(t) == g)
+    base_ok = sum(1 for (q, g), t in zip(probs, base_texts) if _match(t, g))
+    tool_ok = sum(1 for (q, g), t in zip(probs, texts) if _match(t, g))
     avg_exec = sum(n_exec) / n
     out("=" * 70)
     out(f"TOOL-EXECUTION decode  model={Path(args.model).name}  n={n}")
