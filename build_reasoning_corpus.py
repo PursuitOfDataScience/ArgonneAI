@@ -707,8 +707,32 @@ def cmd_flatten(args):
         avail = int(sum(len(m) for m in mms))
         budget = int(cfg["budget_tokens"] * args.scale)
         use = min(avail, budget) if budget > 0 else avail
-        srcs.append(dict(name=name, tier=cfg["tier"], mms=mms, use=use, emitted=0, idx=0, off=0))
-        print(f"[flatten] {name:22} tier={cfg['tier']:11} avail={avail/1e9:6.3f}B use={use/1e9:6.3f}B ({len(bins)} bins)")
+        frac = max(0.0, min(1.0, args.holdout_frac))
+        split = int(round((1.0 - frac) * use))            # main=[0,split)  holdout=[split,use)  (DISJOINT)
+        if args.part == "main":
+            start, end = 0, split
+        elif args.part == "holdout":
+            start, end = split, use
+        else:
+            start, end = 0, use
+        srcs.append(dict(name=name, tier=cfg["tier"], mms=mms, use=(end - start),
+                         emitted=0, idx=0, off=0, start=start))
+        print(f"[flatten] {name:22} tier={cfg['tier']:11} avail={avail/1e9:6.3f}B "
+              f"part={args.part} window=[{start/1e9:.3f}B,{end/1e9:.3f}B) emit={(end - start)/1e9:6.3f}B ({len(bins)} bins)")
+
+    # Pre-skip each source to the start of its window (the holdout part starts mid-stream). This is
+    # what makes main/holdout share NO source tokens -> genuinely DISJOINT, same-composite slices.
+    def _skip(s, n):
+        while n > 0 and s["idx"] < len(s["mms"]):
+            m = s["mms"][s["idx"]]
+            t = min(len(m) - s["off"], n)
+            s["off"] += t; n -= t
+            if s["off"] >= len(m):
+                s["idx"] += 1; s["off"] = 0
+    for s in srcs:
+        if s.get("start", 0) > 0:
+            _skip(s, s["start"])
+
     total = sum(s["use"] for s in srcs)
     if total <= 0:
         raise SystemExit("[flatten] no tokens to flatten")
@@ -780,9 +804,15 @@ def main():
     p.add_argument("--scale", type=float, default=1.0); p.add_argument("--no_decontam", action="store_true")
     p = sub.add_parser("finalize")
     p.add_argument("--scale", type=float, default=1.0); p.add_argument("--include", nargs="*", default=[])
-    p = sub.add_parser("flatten")   # -> ONE dense flat llm.c .bin for the pretraining-phase continue_pretrain
+    p = sub.add_parser("flatten")   # -> dense flat llm.c .bin(s); --holdout_frac/--part carve DISJOINT slices
     p.add_argument("--scale", type=float, default=1.0); p.add_argument("--chunk", type=int, default=262144)
     p.add_argument("--out_bin", default=""); p.add_argument("--include", nargs="*", default=[])
+    p.add_argument("--holdout_frac", type=float, default=0.0,
+                   help="Reserve this fraction of EACH source's used tokens for a disjoint held-out slice "
+                        "(e.g. 0.25 -> main=first 75%%, holdout=last 25%% of every source; same composite).")
+    p.add_argument("--part", choices=["all", "main", "holdout"], default="all",
+                   help="all=whole corpus (default); main=first (1-holdout_frac) of each source; "
+                        "holdout=last holdout_frac. main+holdout are DISJOINT + same-composite.")
     args = ap.parse_args()
     {"list": cmd_list, "inspect": cmd_inspect, "tokenize": cmd_tokenize,
      "finalize": cmd_finalize, "flatten": cmd_flatten}[args.cmd](args)

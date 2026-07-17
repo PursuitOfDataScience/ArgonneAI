@@ -78,6 +78,7 @@ parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "f
 # result: ~1.25x H200 throughput at neutral quality (needs torch_compile=1; master weights stay fp32).
 parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8 (requires torch_compile=1)")
 parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head — recipe default; tie is preserved")
+parser.add_argument("--loss_chunk_size", type=int, default=0, help="If >0, chunked cross-entropy over this many (batch*seq) rows/chunk — frees the full-logit fp32 transient so batch can grow (fill HBM higher). 0 = off. NOTE: raising batch mid-run shifts the WSD cooldown (cooldown_frac × estimated_steps); use only on a FRESH run with LR/cooldown set for the bigger batch.")
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
@@ -554,6 +555,7 @@ def main():
         interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
         local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
         logit_softcap=LOGIT_SOFTCAP,
+        loss_chunk_size=args.loss_chunk_size,
         tie_word_embeddings=True,
     )
     config._keep_in_fp32_modules = []
