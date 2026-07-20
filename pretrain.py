@@ -19,11 +19,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-# Model architecture
-HIDDEN_SIZE = 3072
-NUM_LAYERS = 24
-NUM_HEADS = 12
-NUM_KV_HEADS = 4  # GQA
+# Model architecture -- argonne4.0: the argonne3.5 arch SCALED TO ~1.04B (the
+# data-efficiency campaign's fixed "3.5-at-1B" shape; see ARGONNE4.0.md). Only the
+# four width/depth constants change from 3.5's 2.88B; head_dim is DERIVED
+# (hidden_size // num_heads = 1536 // 6 = 256) and every fp8 GEMM dim stays
+# /16-divisible (1536, 6*256, 2*256, 4096), so fp8 + lm_head remain eligible.
+HIDDEN_SIZE = 1536
+NUM_LAYERS = 32
+NUM_HEADS = 6
+NUM_KV_HEADS = 2  # GQA (num_heads % num_kv_heads == 0 required)
+INTERMEDIATE_SIZE = 4096  # 3.5 lets this fall to the model.py default (8192); argonne4.0 PINS 4096
 ENABLE_QK_NORM = True
 ENABLE_V_NORM = True
 Z_LOSS_WEIGHT = 0.0
@@ -40,9 +45,11 @@ LOGIT_SOFTCAP = 15.0
 parser = argparse.ArgumentParser()
 # Paths
 parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
-parser.add_argument("--data_path", type=str, required=True, help="Path to training data: a flat llm.c .bin OR a doc-manifest .json (fineweb+finemath docbin, doc-aware)")
+parser.add_argument("--data_path", type=str, required=False, default=None, help="Single training source: a flat llm.c .bin OR a doc-manifest .json. Mutually exclusive with --train_sources; exactly one is required.")
+parser.add_argument("--train_sources", type=str, default=None, help="argonne4.0 weighted data mixture: 'PATH:WEIGHT,PATH:WEIGHT' (e.g. edu.bin:50,math.bin:30,code.bin:20). Samples ONE source per micro-batch by weight (DDP-synced across ranks, resumable). Overrides --data_path.")
+parser.add_argument("--train_tokens", type=int, default=0, help="Total training-token budget defining the WSD schedule length when --train_sources is used (estimated_steps = train_tokens / effective_batch, so the cooldown lands at the run's true end). 0 = default to the combined source size (~one weighted pass).")
 parser.add_argument("--doc_shuffle", type=int, default=0, choices=[0, 1], help="If 1 and --data_path is a doc-manifest .json, globally shuffle document order each epoch (REQUIRED for an intermix manifest so fineweb+finemath are interleaved, not trained sequentially)")
-parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling")
+parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling; ALSO seeds the --train_sources source sampler (identical on every rank so source picks stay in lockstep)")
 parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
 # Training hyperparameters
 # Production LR: 6e-4
@@ -93,6 +100,7 @@ parser.add_argument("--final_model_dir", type=str, default=None, help="Optional 
 parser.add_argument("--completion_marker", type=str, default=None, help="Optional marker file written only after max_epochs is completed and the final model export succeeds.")
 parser.add_argument("--seed", type=int, default=444, help="Base random seed")
 args = parser.parse_args()
+assert args.data_path or args.train_sources, "provide exactly one of --data_path or --train_sources"
 
 # Distributed setup
 def setup_distributed():
@@ -131,8 +139,10 @@ assert GRAD_ACCUM_STEPS >= 1, (
 )
 ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-# Wall time: save 5 minutes before limit
-WALL_TIME_SAVE = args.wall_time - 300 if args.wall_time > 0 else 0
+# Wall time: save the checkpoint before the hard kill. argonne4.0 is ~1.04B (checkpoint
+# ~11 GB vs argonne3.5's ~32 GiB), so the flush is ~3x faster -> a 150s margin (down from
+# 3.5's 300s) is ample and hands ~150s/slice back to training (owner directive 2026-07-20).
+WALL_TIME_SAVE = args.wall_time - 150 if args.wall_time > 0 else 0
 
 # Autocast setup
 if args.precision == "bf16":
@@ -193,6 +203,114 @@ class DataLoader:
 
     def set_position(self, position):
         self.current_position = position
+
+
+# ---------------------------------------------------------------------------
+# Weighted multi-source loader (argonne4.0): realize a train-data mixture at an
+# EXACT ratio by sampling a SOURCE per micro-batch by weight, without pre-building a
+# blend .bin per ratio. Ported from the validated data-efficiency probe
+# (argonne4_probe.py) and made DDP-aware + resumable for the wall-time-sliced run.
+#   DDP correctness: the source-selection RNG is seeded IDENTICALLY on every rank
+#     (seed carries no rank term), so at each draw all ranks pick the SAME source and
+#     stay in lockstep; within a source the per-rank DataLoader shards disjointly
+#     (offset rank*B*T, stride B*T*world_size) => no token is seen by two ranks.
+#   Resume: get_position() (called on rank 0) returns the shared rng state + each
+#     source's rank-0 cursor; on resume every rank restores the rng and sets each
+#     source cursor to rank0_cursor + rank*B*T (the per-source analogue of the flat
+#     loader's resume math). Because it is a RANDOM sampler over corpora far larger
+#     than any single slice, an imperfect resume only re-samples a little data (no
+#     contiguous skip/repeat) -- strictly more robust than a single-pass flat bin.
+def parse_train_sources(spec):
+    """'PATH:WEIGHT,PATH:WEIGHT' -> [(path, weight)] (rsplit on ':' so paths keep slashes)."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        path, w = part.rsplit(":", 1)
+        out.append((path.strip(), float(w)))
+    return out
+
+
+class WeightedMultiLoader:
+    def __init__(self, sources, B, T, rank=0, world_size=1, seed=1337, train_tokens=0):
+        # sources: list of (path, weight); reuse the DDP-aware flat DataLoader per source
+        self.B, self.T = B, T
+        self.rank, self.world_size = rank, world_size
+        self.paths = [p for p, _ in sources]
+        self.loaders = [DataLoader(p, B, T, rank, world_size) for p, _ in sources]
+        w = np.array([wt for _, wt in sources], dtype=np.float64)
+        assert (w > 0).all() and w.sum() > 0, "source weights must be positive"
+        self.p = w / w.sum()
+        self.n = len(self.loaders)
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+        self.counts = [0] * self.n
+        self.epoch = 0
+        total = sum(len(l.tokens) for l in self.loaders)
+        # num_tokens sets the WSD schedule length (estimated_steps = num_tokens/eff_batch).
+        # Default = combined corpus size (~one weighted pass); override with --train_tokens.
+        self.num_tokens = int(train_tokens) if train_tokens and int(train_tokens) > 0 else int(total)
+        if rank == 0:
+            frac = ", ".join(f"{os.path.basename(p)}:{self.p[i]:.3f}" for i, p in enumerate(self.paths))
+            print(f"WeightedMultiLoader: {self.n} sources [{frac}] combined={total:,} tok; "
+                  f"schedule num_tokens={self.num_tokens:,} (seed={self.seed})")
+
+    def next_batch(self):
+        i = int(self.rng.choice(self.n, p=self.p)) if self.n > 1 else 0
+        self.counts[i] += 1
+        xy = self.loaders[i].next_batch()
+        # Define an "epoch" as one full pass over the token BUDGET (num_tokens): total tokens
+        # drawn across all ranks = (per-rank draws) * B * T * world_size. This makes
+        # `train_loader.epoch >= max_epochs` fire in pretrain.py's stop check so the pretrain
+        # stage TERMINATES at the budget and writes .pretrain_complete -- WITHOUT this an
+        # infinite sampler never triggers the epoch-completion transition to continue_pretrain.
+        drawn = sum(self.counts) * self.B * self.T * self.world_size
+        self.epoch = int(drawn // self.num_tokens)
+        return xy
+
+    def get_position(self):
+        # rank-0 aggregate state (save_checkpoint calls this on IS_MAIN only). Picklable
+        # -> stored verbatim as checkpoint['data_position'].
+        return {
+            "wml": True,
+            "rng": self.rng.bit_generator.state,
+            "positions": [int(l.current_position) for l in self.loaders],
+            "counts": list(self.counts),
+            "epoch": int(self.epoch),
+        }
+
+    def resume_from_checkpoint_position(self, state):
+        # Presence of this method routes the loader through the manifest-style resume
+        # branch (pretrain.py passes the raw data_position, no external rank offset).
+        if not isinstance(state, dict) or not state.get("wml"):
+            if self.rank == 0:
+                print("WeightedMultiLoader: no compatible resume state; starting sampler fresh")
+            return
+        try:
+            self.rng.bit_generator.state = state["rng"]
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"WeightedMultiLoader: rng restore failed ({e}); reseeding {self.seed}")
+            self.rng = np.random.default_rng(self.seed)
+        off = self.rank * self.B * self.T
+        for l, pos0 in zip(self.loaders, state.get("positions", [])):
+            newpos = int(pos0) + off
+            if newpos + (self.B * self.T + 1) > len(l.tokens):  # wrap safety
+                newpos = l.start_token_offset + self.rank * self.B * self.T
+            l.current_position = newpos
+        self.counts = list(state.get("counts", self.counts))
+        self.epoch = int(state.get("epoch", 0))
+        if self.rank == 0:
+            print(f"WeightedMultiLoader: resumed {self.n} source cursors + rng (epoch {self.epoch})")
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def set_position(self, position):
+        # Compat shim: pretrain.py's flat-loader reset path may hand back an int; a
+        # random sampler has nothing contiguous to seek, so only a dict state is honored.
+        if isinstance(position, dict):
+            self.resume_from_checkpoint_position(position)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +498,15 @@ def build_train_loader(
     world_size,
     doc_shuffle=0,
     doc_shuffle_seed=1337,
+    train_sources=None,
+    train_tokens=0,
 ):
+    if train_sources:
+        srcs = parse_train_sources(train_sources)
+        return WeightedMultiLoader(
+            srcs, batch_size, block_size, rank, world_size,
+            seed=int(doc_shuffle_seed), train_tokens=train_tokens,
+        )
     if data_path.endswith(".json"):
         return DocManifestDataLoader(
             data_path,
@@ -543,6 +669,7 @@ def main():
         num_hidden_layers=NUM_LAYERS,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_KV_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=args.block_size,
         rope_theta=ROPE_THETA,
         use_flash_attention=args.flash_attention == 1,
@@ -613,6 +740,8 @@ def main():
         WORLD_SIZE,
         doc_shuffle=args.doc_shuffle,
         doc_shuffle_seed=args.doc_shuffle_seed,
+        train_sources=args.train_sources,
+        train_tokens=args.train_tokens,
     )
     val_loader = None
     if IS_MAIN and args.val_data_path:

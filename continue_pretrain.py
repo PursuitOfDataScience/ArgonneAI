@@ -20,12 +20,14 @@ from tqdm import tqdm
 AUTOCAST_DTYPE = None
 USE_AUTOCAST = False
 
-# Model architecture
-HIDDEN_SIZE = 3072
-NUM_LAYERS = 24
-NUM_HEADS = 12
-NUM_KV_HEADS = 4  # GQA
-INTERMEDIATE_SIZE = 8192
+# Model architecture -- argonne4.0: argonne3.5 arch SCALED TO ~1.04B (must MATCH
+# pretrain.py's constants so the pretrain->continue->midtrain checkpoint resume shapes
+# agree). head_dim is derived (1536//6 = 256).
+HIDDEN_SIZE = 1536
+NUM_LAYERS = 32
+NUM_HEADS = 6
+NUM_KV_HEADS = 2  # GQA
+INTERMEDIATE_SIZE = 4096
 ROPE_THETA = 1000000.0
 ENABLE_QK_NORM = True
 ENABLE_V_NORM = True
@@ -799,6 +801,8 @@ if __name__ == "__main__":
     )
     ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-    WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
+    # argonne4.0: ~1.04B checkpoint (~11 GB) flushes fast, so 150s margin (up-time for
+    # training) is ample; matches pretrain.py's argonne4.0 margin (owner directive 2026-07-20).
+    WALL_TIME_SAVE = args.wall_time - 150 if args.wall_time > 0 else 0
 
     main()
