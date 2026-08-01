@@ -16,6 +16,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -41,10 +42,18 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from continue_pretrain import (
+    ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+    ENABLE_QK_NORM,
+    ENABLE_SANDWICH_NORM,
+    ENABLE_V_NORM,
     HIDDEN_SIZE,
+    INTERMEDIATE_SIZE,
+    LOCAL_ATTENTION_WINDOW,
+    LOGIT_SOFTCAP,
     NUM_HEADS,
     NUM_KV_HEADS,
     NUM_LAYERS,
+    Z_LOSS_WEIGHT,
     DataLoader,
     cleanup_distributed,
     setup_distributed,
@@ -383,6 +392,50 @@ def get_latest_checkpoint_path(checkpoint_dir):
     return latest_step_path
 
 
+def list_checkpoints_newest_first(checkpoint_dir):
+    """Return checkpoint_step_*.pt paths sorted by step descending."""
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return []
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt"))
+    steps_and_paths = []
+    for f in checkpoints:
+        match = re.search(r"checkpoint_step_(\d+)\.pt$", f)
+        if match:
+            steps_and_paths.append((int(match.group(1)), f))
+    steps_and_paths.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in steps_and_paths]
+
+
+def load_checkpoint_with_fallback(preferred_path, checkpoint_dir, is_main):
+    """Load the newest readable checkpoint.
+
+    Tries ``preferred_path`` first, then every checkpoint_step_*.pt (newest
+    first). A checkpoint truncated by an interrupted save raises
+    RuntimeError("PytorchStreamReader failed reading zip archive ...") from
+    torch.load; we skip those rather than aborting the whole run. Returns
+    ``(checkpoint_dict, path)`` or ``(None, None)`` if nothing loads.
+    """
+    candidates = []
+    if preferred_path:
+        candidates.append(os.path.realpath(preferred_path))
+    for path in list_checkpoints_newest_first(checkpoint_dir):
+        real = os.path.realpath(path)
+        if real not in candidates:
+            candidates.append(real)
+
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            if is_main:
+                print(f"WARNING: skipping unreadable checkpoint {path}: {exc}")
+            continue
+        return checkpoint, path
+    return None, None
+
+
 def is_fsdp_model(model):
     return get_fsdp_wrapper(model) is not None
 
@@ -526,6 +579,7 @@ def save_checkpoint(
     distributed_strategy,
     fsdp_sharding_strategy,
     is_main,
+    midtraining_tokens_prior_phases=0,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
@@ -542,6 +596,10 @@ def save_checkpoint(
         "global_step": global_step,
         "tokens_processed": tokens_processed,
         "midtraining_tokens_processed": max(0, tokens_processed - midtraining_base_tokens_processed),
+        # Midtraining tokens completed in earlier phases (before this one's seed).
+        # Persisted so the displayed cumulative count survives the phase switch and
+        # every resume within this phase; the target-stop check stays per-phase.
+        "midtraining_tokens_prior_phases": int(midtraining_tokens_prior_phases),
         "loss": loss,
         "data_position": data_position,
         "dataset_epoch": dataset_epoch,
@@ -559,7 +617,14 @@ def save_checkpoint(
     }
 
     if is_main:
-        torch.save(checkpoint, checkpoint_path)
+        # Write atomically: torch.save streams a zip and only writes the central
+        # directory at the very end, so a process killed mid-write (e.g. SLURM
+        # EndTime on a sliced run) leaves a truncated, unreadable .pt. Writing to
+        # a temp file and os.replace()'ing guarantees checkpoint_step_*.pt is
+        # either the previous good copy or the new complete one -- never partial.
+        checkpoint_tmp_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint, checkpoint_tmp_path)
+        os.replace(checkpoint_tmp_path, checkpoint_path)
         latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
         latest_tmp_path = latest_path + ".tmp"
         try:
@@ -664,7 +729,7 @@ def build_parser():
         choices=[0, 1],
         help="If 1, when loading init_checkpoint_path (non-resume), start fresh optimizer/scheduler at --lr",
     )
-    parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit.")
+    parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 10 min before this limit.")
     parser.add_argument(
         "--target_midtraining_tokens",
         type=int,
@@ -673,7 +738,7 @@ def build_parser():
     )
     parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
     parser.add_argument("--sample_prompt", type=str, default="Long long time ago", help="Prompt used for periodic generation")
-    parser.add_argument("--sample_max_new_tokens", type=int, default=4096, help="Number of new tokens to generate at checkpoints")
+    parser.add_argument("--sample_max_new_tokens", type=int, default=1024, help="Number of new tokens to generate at checkpoints")
     parser.add_argument("--sample_do_sample", type=int, default=1, choices=[0, 1], help="Use stochastic sampling for periodic generation")
     parser.add_argument("--sample_temperature", type=float, default=0.8, help="Sampling temperature for periodic generation")
     parser.add_argument(
@@ -723,7 +788,10 @@ def main():
         f"{world_size} GPU(s) x batch_size {args.batch_size} x block_size {args.block_size}"
     )
     actual_total_batch = grad_accum_steps * tokens_per_micro
-    wall_time_save = args.wall_time - 180 if args.wall_time > 0 else 0
+    # Leave a 10-minute margin: a full ~36 GB checkpoint to the shared filesystem
+    # takes well over 5 min, so a smaller margin risks SLURM killing the save
+    # mid-write at the hard EndTime (see the truncated-checkpoint incident).
+    wall_time_save = args.wall_time - 600 if args.wall_time > 0 else 0
 
     if is_main:
         print("=" * 72)
@@ -764,9 +832,22 @@ def main():
         num_hidden_layers=NUM_LAYERS,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_KV_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=args.block_size,
         rope_theta=args.rope_theta,
+        # Without an explicit eos, save_final_model_artifacts writes
+        # eos_token_id=null and downstream generation never stops (the §5 bug).
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
         use_flash_attention=args.flash_attention == 1,
+        qk_norm=ENABLE_QK_NORM,
+        v_norm=ENABLE_V_NORM,
+        sandwich_norm=ENABLE_SANDWICH_NORM,
+        z_loss_weight=Z_LOSS_WEIGHT,
+        interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+        local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
+        logit_softcap=LOGIT_SOFTCAP,
         tie_word_embeddings=True,
     )
     config.block_size = args.block_size
@@ -795,6 +876,10 @@ def main():
     dataset_base_tokens_processed = 0
     midtraining_base_global_step = 0
     midtraining_base_tokens_processed = 0
+    # Cumulative midtraining tokens completed in PRIOR phases (e.g. Phase 1 before
+    # the Phase 2 seed). Added to the per-phase count only for display/reporting;
+    # the per-phase count alone drives the token-target stop.
+    midtraining_tokens_prior_phases = 0
     initial_steps = 0
     is_resumed = False
 
@@ -806,9 +891,16 @@ def main():
     checkpoint_path_used = None
     checkpoint_optimizer_state = None
 
-    if resume_from and os.path.exists(resume_from):
-        checkpoint_path_used = resume_from
-        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+    resume_checkpoint, resume_path = load_checkpoint_with_fallback(
+        resume_from if (resume_from and os.path.exists(resume_from)) else None,
+        args.checkpoint_dir,
+        is_main,
+    )
+
+    if resume_checkpoint is not None:
+        resume_from = resume_path
+        checkpoint_path_used = resume_path
+        checkpoint = resume_checkpoint
         model.load_state_dict(checkpoint["model_state_dict"])
         checkpoint_optimizer_state = checkpoint["optimizer_state_dict"]
         if args.distributed_strategy == "fsdp" and world_size > 1 and not optimizer_state_uses_param_names(checkpoint_optimizer_state):
@@ -818,11 +910,36 @@ def main():
                 model,
             )
         if is_main:
-            print(f"\n=== Resuming midtraining from checkpoint: {resume_from} ===")
+            print(f"\n=== Resuming midtraining from checkpoint: {resume_path} ===")
     elif args.init_checkpoint_path and os.path.exists(args.init_checkpoint_path):
         checkpoint_path_used = args.init_checkpoint_path
         checkpoint = torch.load(args.init_checkpoint_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # The seed may be an FP8/torchao pretrain checkpoint whose embedding/lm_head are
+        # vocab-PADDED (e.g. 151680 -> the real 151669) and which may carry extra fp8
+        # buffers absent from this vanilla bf16 model. Map the seed onto THIS model's
+        # params by name: trim a padded leading dim, ignore non-model keys, and assert
+        # every model param is filled (loud failure beats a silent partial load).
+        _seed_sd = checkpoint["model_state_dict"]
+        _tgt_sd = model.state_dict()
+        _mapped, _trimmed, _missing = {}, [], []
+        for _k, _tgt in _tgt_sd.items():
+            _src = _seed_sd.get(_k)
+            if _src is None:
+                _missing.append(_k)
+                continue
+            if tuple(_src.shape) != tuple(_tgt.shape):
+                if _src.dim() == _tgt.dim() and _src.shape[0] > _tgt.shape[0] and _src.shape[1:] == _tgt.shape[1:]:
+                    _src = _src[: _tgt.shape[0]].contiguous()
+                    _trimmed.append(_k)
+                else:
+                    raise ValueError(f"midtrain seed shape mismatch for {_k}: seed {tuple(_src.shape)} vs model {tuple(_tgt.shape)}")
+            _mapped[_k] = _src
+        if _missing:
+            raise KeyError(f"midtrain seed is missing {len(_missing)} model params (e.g. {_missing[:8]}); seed/model arch mismatch")
+        model.load_state_dict(_mapped, strict=True)
+        if is_main:
+            _extra = [k for k in _seed_sd if k not in _tgt_sd]
+            print(f"[midtrain seed] loaded {len(_mapped)} params; vocab-trimmed {len(_trimmed)} (e.g. {_trimmed[:4]}); ignored {len(_extra)} non-model/fp8 seed keys", flush=True)
         checkpoint_optimizer_state = checkpoint["optimizer_state_dict"]
         if args.distributed_strategy == "fsdp" and world_size > 1 and not optimizer_state_uses_param_names(checkpoint_optimizer_state):
             checkpoint_optimizer_state = FSDP.rekey_optim_state_dict(
@@ -855,22 +972,31 @@ def main():
     min_lr = args.lr * args.min_lr_ratio
     min_lr_scale = min_lr / args.lr
 
+    # The scheduler's step counter is GLOBAL (a run seeded from the pretrain
+    # checkpoint resumes it at ~329k), but warmup/cosine/cooldown are meant in
+    # PHASE-local steps anchored to the phase's planned end. Filled in after
+    # checkpoint parsing, once the phase base step and token target are known;
+    # until then the defaults reproduce plain steady-state behavior.
+    schedule_ctx = {"phase_base_step": 0, "phase_total_steps": estimated_steps}
+
     def lr_lambda(step):
-        if step < args.warmup_steps:
-            return step / max(1, args.warmup_steps)
+        phase_step = max(0, step - schedule_ctx["phase_base_step"])
+        phase_total_steps = schedule_ctx["phase_total_steps"]
+        if phase_step < args.warmup_steps:
+            return phase_step / max(1, args.warmup_steps)
 
         if args.schedule == "cosine":
-            progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
-            return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * progress)))
+            progress = (phase_step - args.warmup_steps) / max(1, phase_total_steps - args.warmup_steps)
+            return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * min(1.0, progress))))
 
         if args.cooldown <= 0:
             return 1.0
 
-        cooldown_start = max(args.warmup_steps, estimated_steps - args.cooldown)
-        if step < cooldown_start:
+        cooldown_start = max(args.warmup_steps, phase_total_steps - args.cooldown)
+        if phase_step < cooldown_start:
             return 1.0
 
-        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, args.cooldown))
+        cooldown_progress = min(1.0, (phase_step - cooldown_start) / max(1, args.cooldown))
         return 1.0 - cooldown_progress * (1.0 - min_lr_scale)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -915,6 +1041,8 @@ def main():
             checkpoint_dataset_base_tokens = checkpoint.get("dataset_base_tokens_processed")
             midtraining_base_global_step = int(checkpoint.get("midtraining_base_global_step", global_step))
             midtraining_base_tokens_processed = int(checkpoint.get("midtraining_base_tokens_processed", tokens_processed))
+            # Same phase: keep the prior-phases offset recorded when this phase began.
+            midtraining_tokens_prior_phases = int(checkpoint.get("midtraining_tokens_prior_phases", 0))
 
             if hasattr(train_loader, "resume_from_checkpoint_position"):
                 train_loader.resume_from_checkpoint_position(data_position)
@@ -952,9 +1080,11 @@ def main():
             is_resumed = True
             if is_main:
                 midtraining_tokens_processed = max(0, tokens_processed - midtraining_base_tokens_processed)
+                midtraining_tokens_cumulative = midtraining_tokens_prior_phases + midtraining_tokens_processed
                 print(
                     f"Resumed from step {global_step}, cumulative tokens: {tokens_processed:,}, "
-                    f"midtraining tokens: {midtraining_tokens_processed:,}, dataset epoch: {train_loader.epoch}, "
+                    f"midtraining tokens: {midtraining_tokens_cumulative:,} (this phase: {midtraining_tokens_processed:,}), "
+                    f"dataset epoch: {train_loader.epoch}, "
                     f"dataset progress: {dataset_progress_steps}/{estimated_steps} step(s), "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
                 )
@@ -963,6 +1093,20 @@ def main():
             dataset_base_tokens_processed = tokens_processed
             midtraining_base_global_step = global_step
             midtraining_base_tokens_processed = tokens_processed
+            # New phase seeded from a prior phase's checkpoint: the prior phases'
+            # cumulative midtraining tokens = that checkpoint's own prior offset
+            # plus the per-phase tokens it had completed. This keeps the displayed
+            # count continuous across the phase switch while the per-phase target
+            # restarts from 0 here.
+            seed_prior = int(checkpoint.get("midtraining_tokens_prior_phases", 0))
+            seed_base = int(checkpoint.get("midtraining_base_tokens_processed", checkpoint.get("tokens_processed", 0)))
+            seed_per_phase = int(
+                checkpoint.get(
+                    "midtraining_tokens_processed",
+                    max(0, int(checkpoint.get("tokens_processed", 0)) - seed_base),
+                )
+            )
+            midtraining_tokens_prior_phases = seed_prior + seed_per_phase
             if hasattr(train_loader, "start_from_beginning"):
                 train_loader.start_from_beginning()
             else:
@@ -970,8 +1114,9 @@ def main():
             set_loader_epoch(train_loader, 0)
             if is_main:
                 print(
-                    f"Seed checkpoint loaded at step {global_step}, cumulative tokens: {tokens_processed:,}. "
-                    "Starting the long-context data cursor from the beginning."
+                    f"Seed checkpoint loaded at step {global_step}, cumulative tokens: {tokens_processed:,}, "
+                    f"prior-phase midtraining tokens: {midtraining_tokens_prior_phases:,}. "
+                    "Starting this phase's token counter at 0 and the data cursor from the beginning."
                 )
                 optimizer_state_label = "Loaded" if loaded_optimizer_state else "Fresh"
                 print(f"{optimizer_state_label} optimizer LR: {optimizer.param_groups[0]['lr']:.2e}")
@@ -987,11 +1132,23 @@ def main():
         remaining_midtraining_tokens = max(0, target_midtraining_tokens - launch_midtraining_tokens)
         target_steps = int((remaining_midtraining_tokens + actual_total_batch - 1) // actual_total_batch)
 
+    # Anchor the LR schedule to this phase: local step 0 = the phase's seed
+    # step, and the planned end = whichever comes first of the epoch cap and
+    # the token target (so COOLDOWN_OVERRIDE=N means "anneal the last N steps
+    # before the phase actually stops").
+    schedule_ctx["phase_base_step"] = midtraining_base_global_step
+    if target_midtraining_tokens > 0:
+        schedule_ctx["phase_total_steps"] = min(
+            estimated_steps,
+            int((target_midtraining_tokens + actual_total_batch - 1) // actual_total_batch),
+        )
+
     if delay_compile_until_after_optimizer_restore:
         if is_main:
             print("Compiling model with torch.compile...")
         model = torch.compile(model, mode=args.torch_compile_mode)
 
+    fsdp_wrapper_for_clip = get_fsdp_wrapper(model)
     last_checkpoint_time = time.time()
     training_start_time = time.time()
     train_losses = []
@@ -1011,7 +1168,10 @@ def main():
         print(f"Distributed strategy in use: {distributed_strategy}")
         print(f"Cumulative step at launch: {global_step}")
         print(f"Cumulative tokens at launch: {tokens_processed:,}")
-        print(f"Midtraining tokens at launch: {launch_midtraining_tokens:,}")
+        print(
+            f"Midtraining tokens at launch: {midtraining_tokens_prior_phases + launch_midtraining_tokens:,} "
+            f"(this phase: {launch_midtraining_tokens:,})"
+        )
         print(f"Dataset-local progress at launch: {initial_steps}/{estimated_steps} step(s), dataset epoch {train_loader.epoch}")
         print(
             f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, "
@@ -1049,6 +1209,8 @@ def main():
             f"Target midtraining tokens already reached at launch: "
             f"{launch_midtraining_tokens:,} >= {target_midtraining_tokens:,}. Finalizing without extra training."
         )
+
+    exited_due_to_wall_time = False
 
     while True:
         if target_reached_at_launch:
@@ -1092,7 +1254,14 @@ def main():
 
         step_loss = step_loss_total / grad_accum_steps
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # FSDP shards gradients across ranks (shard_grad_op reduce-scatters
+        # them), so the plain utility would clip each rank by its LOCAL shard
+        # norm -- an underestimated, rank-inconsistent global norm. FSDP's own
+        # method all-reduces the norm before scaling.
+        if fsdp_wrapper_for_clip is not None:
+            fsdp_wrapper_for_clip.clip_grad_norm_(args.grad_clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
         global_step += 1
@@ -1102,12 +1271,13 @@ def main():
 
         current_lr = optimizer.param_groups[0]["lr"]
         midtraining_tokens_processed = max(0, tokens_processed - midtraining_base_tokens_processed)
+        midtraining_tokens_cumulative = midtraining_tokens_prior_phases + midtraining_tokens_processed
 
         if is_main and global_step % 10 == 0:
             perplexity = np.exp(step_loss)
             print(
                 f"Step {global_step} | Loss: {step_loss:.4f} | PPL: {perplexity:.2f} | "
-                f"Tokens: {tokens_processed:,} | Midtraining Tokens: {midtraining_tokens_processed:,} | "
+                f"Tokens: {tokens_processed:,} | Midtraining Tokens: {midtraining_tokens_cumulative:,} | "
                 f"LR: {current_lr:.2e}"
             )
             if pbar:
@@ -1116,7 +1286,7 @@ def main():
                         "loss": f"{step_loss:.4f}",
                         "lr": f"{current_lr:.2e}",
                         "tok": f"{tokens_processed/1e6:.2f}M",
-                        "midtok": f"{midtraining_tokens_processed/1e6:.2f}M",
+                        "midtok": f"{midtraining_tokens_cumulative/1e6:.2f}M",
                     }
                 )
 
@@ -1129,8 +1299,9 @@ def main():
         if should_token_target_stop[0] == 1:
             if is_main:
                 print(
-                    f"\nReached midtraining token target at step {global_step}: "
-                    f"{midtraining_tokens_processed:,}/{target_midtraining_tokens:,}. Finalizing..."
+                    f"\nReached midtraining token target at step {global_step} (this phase): "
+                    f"{midtraining_tokens_processed:,}/{target_midtraining_tokens:,} "
+                    f"(cumulative midtraining: {midtraining_tokens_cumulative:,}). Finalizing..."
                 )
             break
 
@@ -1165,6 +1336,7 @@ def main():
                 distributed_strategy,
                 args.fsdp_sharding_strategy,
                 is_main,
+                midtraining_tokens_prior_phases=midtraining_tokens_prior_phases,
             )
             if is_main:
                 print(f"Checkpoint saved: {checkpoint_path}")
@@ -1227,11 +1399,13 @@ def main():
                     distributed_strategy,
                     args.fsdp_sharding_strategy,
                     is_main,
+                    midtraining_tokens_prior_phases=midtraining_tokens_prior_phases,
                 )
                 if is_main:
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
                 if world_size > 1:
                     dist.barrier()
+                exited_due_to_wall_time = True
                 break
 
         should_stop = torch.tensor([0], device=device)
@@ -1260,41 +1434,48 @@ def main():
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss_str}")
 
     if is_main:
-        print("\nSaving final checkpoint...")
-    data_position = train_loader.get_position()
-    checkpoint_path, _ = save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        global_step,
-        tokens_processed,
-        train_loss,
-        data_position,
-        args.checkpoint_dir,
-        train_loader.epoch,
-        dataset_base_global_step,
-        dataset_base_tokens_processed,
-        num_tokens,
-        args.data_path,
-        midtraining_base_global_step,
-        midtraining_base_tokens_processed,
-        distributed_strategy,
-        args.fsdp_sharding_strategy,
-        is_main,
-    )
-    if is_main:
-        print(f"Final checkpoint saved: {checkpoint_path}")
+        if exited_due_to_wall_time:
+            print("\nWall-time checkpoint already saved; skipping redundant final save so the next slice can resume cleanly.")
+        else:
+            print("\nSaving final checkpoint...")
+    if not exited_due_to_wall_time:
+        data_position = train_loader.get_position()
+        checkpoint_path, _ = save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            global_step,
+            tokens_processed,
+            train_loss,
+            data_position,
+            args.checkpoint_dir,
+            train_loader.epoch,
+            dataset_base_global_step,
+            dataset_base_tokens_processed,
+            num_tokens,
+            args.data_path,
+            midtraining_base_global_step,
+            midtraining_base_tokens_processed,
+            distributed_strategy,
+            args.fsdp_sharding_strategy,
+            is_main,
+            midtraining_tokens_prior_phases=midtraining_tokens_prior_phases,
+        )
+        if is_main:
+            print(f"Final checkpoint saved: {checkpoint_path}")
 
-    final_model_dir = os.path.join(args.checkpoint_dir, args.final_model_dir_name)
-    save_final_model_artifacts(model, config, tokenizer, final_model_dir, is_main)
+        final_model_dir = os.path.join(args.checkpoint_dir, args.final_model_dir_name)
+        save_final_model_artifacts(model, config, tokenizer, final_model_dir, is_main)
 
     if is_main:
         midtraining_tokens_processed = max(0, tokens_processed - midtraining_base_tokens_processed)
+        midtraining_tokens_cumulative = midtraining_tokens_prior_phases + midtraining_tokens_processed
         print("\n" + "=" * 60)
         print(
             f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} "
             f"tokens_per_sec={tokens_processed/elapsed_time:.2f} "
-            f"midtraining_tokens={midtraining_tokens_processed:,} steps={global_step}"
+            f"midtraining_tokens={midtraining_tokens_cumulative:,} (this phase: {midtraining_tokens_processed:,}) "
+            f"steps={global_step}"
         )
         print("=" * 60)
 

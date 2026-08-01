@@ -13,7 +13,7 @@ from transformers import (
     PreTrainedModel,
     PretrainedConfig,
 )
-from transformers.modeling_outputs import CausalLMOutput
+from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 
 
 flash_attn_func = None
@@ -61,6 +61,7 @@ class ArgonneConfig(PretrainedConfig):
         interleaved_local_attention: bool = True,
         local_attention_window: Optional[int] = 256,
         logit_softcap: float = 15.0,
+        loss_chunk_size: int = 0,
         tie_word_embeddings: bool = True,
         attention_bias: bool = False,
         mlp_bias: bool = False,
@@ -126,6 +127,9 @@ class ArgonneConfig(PretrainedConfig):
             int(local_attention_window) if local_attention_window is not None and int(local_attention_window) > 0 else None
         )
         self.logit_softcap = float(logit_softcap)
+        # >0 enables chunked cross-entropy (frees the full (batch*seq, vocab) fp32 logit transient
+        # that caps batch at long context). 0 = off (default; unchanged full-logit path).
+        self.loss_chunk_size = int(loss_chunk_size)
         self.tie_word_embeddings = tie_word_embeddings
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
@@ -294,7 +298,9 @@ class GroupedQueryAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         bsz, seqlen, _ = hidden_states.shape
 
         query = self.q_proj(hidden_states)
@@ -313,11 +319,47 @@ class GroupedQueryAttention(nn.Module):
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
+        # ---- KV cache (inference only; training keeps past_kv=None/use_cache=False) ----
+        # Cache pre-repeat (num_kv_heads), post-rotary K/V. The SDPA/math path
+        # ignores the sliding window (full causal), so storing all keys and having
+        # the new query attend to everything reproduces the no-cache result.
+        is_decode = past_kv is not None
+        if is_decode:
+            past_k, past_v = past_kv
+            key = torch.cat([past_k, key], dim=2)
+            value = torch.cat([past_v, value], dim=2)
+        new_kv = (key, value) if use_cache else None
+        kv_len = key.shape[2]
+
+        # Additive mask used only when decoding with a cache: query at absolute
+        # position (kv_len - seqlen + i) attends to keys j <= that position.
+        decode_mask = None
+        if is_decode:
+            q_pos = torch.arange(kv_len - seqlen, kv_len, device=hidden_states.device)
+            k_pos = torch.arange(kv_len, device=hidden_states.device)
+            allowed = k_pos[None, :] <= q_pos[:, None]
+            decode_mask = torch.zeros(seqlen, kv_len, dtype=query.dtype, device=hidden_states.device)
+            decode_mask = decode_mask.masked_fill(~allowed, -65504.0)[None, None]
+
         key = self._repeat_kv(key)
         value = self._repeat_kv(value)
 
+        # Argonne-3.5 speedup (hardware accel, training-neutral): qk/v-norm return fp32
+        # (fp32 norm-weight * bf16 activation type-promotes), which trips the dtype gate below
+        # and forces the hand-rolled O(seq^2) math attention. Under bf16 autocast the matmuls
+        # already run in bf16, so casting q/k/v to the autocast dtype here is numerically
+        # equivalent (measured rel diff 3.7e-3 < bf16 roundoff 7.8e-3) and lets SDPA pick a fused
+        # FLASH/cuDNN kernel: ~2x lower attention memory + faster. Training-under-autocast only;
+        # inference/decode (self.training False) is untouched.
+        if self.training and torch.is_autocast_enabled() and query.dtype not in (torch.float16, torch.bfloat16):
+            _ac_dtype = torch.get_autocast_dtype("cuda") if hasattr(torch, "get_autocast_dtype") else torch.get_autocast_gpu_dtype()
+            query = query.to(_ac_dtype)
+            key = key.to(_ac_dtype)
+            value = value.to(_ac_dtype)
+
         use_flash_attn_2 = (
-            _flash_attn_available
+            not is_decode
+            and _flash_attn_available
             and self.use_flash_attention
             and attention_mask is None
             and query.dtype in (torch.float16, torch.bfloat16)
@@ -356,9 +398,13 @@ class GroupedQueryAttention(nn.Module):
 
         if attn_output is None and use_scaled_dot:
             try:
-                # Use is_causal=True when no attention_mask (faster Flash Attention path)
-                # When attention_mask is provided, we need to combine it with causal masking
-                if attention_mask is None:
+                if decode_mask is not None:
+                    attn_output = F.scaled_dot_product_attention(
+                        query, key, value, attn_mask=decode_mask,
+                        dropout_p=0.0, is_causal=False,
+                    )
+                elif attention_mask is None:
+                    # Prefill / training: fast causal path.
                     attn_output = F.scaled_dot_product_attention(
                         query,
                         key,
@@ -384,16 +430,18 @@ class GroupedQueryAttention(nn.Module):
 
         if attn_output is None:
             scores = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # Apply causal mask - use large negative instead of -inf for numerical stability
-            causal_mask = torch.triu(
-                torch.ones(seqlen, seqlen, dtype=torch.bool, device=hidden_states.device),
-                diagonal=1,
-            )
             mask_value = -65504.0  # Large negative instead of -inf
-            scores = scores.masked_fill(causal_mask, mask_value)
-            # Apply attention_mask if provided
-            if attention_mask is not None:
-                scores = scores + attention_mask
+            if decode_mask is not None:
+                scores = scores + decode_mask
+            else:
+                # Apply causal mask - use large negative instead of -inf for stability
+                causal_mask = torch.triu(
+                    torch.ones(seqlen, kv_len, dtype=torch.bool, device=hidden_states.device),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(causal_mask, mask_value)
+                if attention_mask is not None:
+                    scores = scores + attention_mask
             attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
@@ -403,7 +451,10 @@ class GroupedQueryAttention(nn.Module):
             .contiguous()
             .view(bsz, seqlen, self.num_heads * self.head_dim)
         )
-        return self.o_proj(attn_output)
+        out = self.o_proj(attn_output)
+        if use_cache:
+            return out, new_kv
+        return out
 
 
 class SwiGLUMLP(nn.Module):
@@ -456,10 +507,20 @@ class Block(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
-        hidden_states = self.attn(hidden_states, position_embeddings, attention_mask)
+        attn_out = self.attn(
+            hidden_states, position_embeddings, attention_mask,
+            past_kv=past_kv, use_cache=use_cache,
+        )
+        new_kv = None
+        if use_cache:
+            hidden_states, new_kv = attn_out
+        else:
+            hidden_states = attn_out
         if self.sandwich_norm:
             hidden_states = self.attn_out_norm(hidden_states)
         hidden_states = residual + hidden_states
@@ -470,6 +531,8 @@ class Block(nn.Module):
         if self.sandwich_norm:
             hidden_states = self.mlp_out_norm(hidden_states)
         hidden_states = residual + hidden_states
+        if use_cache:
+            return hidden_states, new_kv
 
         return hidden_states
 
@@ -500,6 +563,15 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
+        # Selective activation checkpointing (ported from argonne4.0). Runtime-only --
+        # NOT part of config or state_dict, so checkpoint/resume compatibility with every
+        # existing argonne3.5 checkpoint is unaffected. checkpoint_stride S:
+        #   S == 1 : checkpoint ALL layers (default; identical to prior behavior).
+        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer
+        #            -> store ceil(n_layers/S), recompute the rest. Smaller S stores MORE
+        #            (more HBM, less recompute, faster); too-small S OOMs.
+        # Numerically identical either way: it only chooses store-vs-recompute.
+        self.checkpoint_stride = 1
         self._nan_loss_count = 0
         self.post_init()
 
@@ -595,6 +667,8 @@ class ArgonneModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
         _, seq_length = input_ids.shape
@@ -606,11 +680,18 @@ class ArgonneModel(PreTrainedModel):
 
         # The training path does not use attention masks.
         attention_mask = None
-        cos, sin = self.rotary_emb(hidden_states, seq_length)
-        rotary = (cos, sin)
 
-        for layer in self.blocks:
-            if self.gradient_checkpointing and self.training:
+        # RoPE positions are offset by the cached length so incremental decode
+        # uses the correct absolute positions.
+        past_len = past_key_values[0][0].shape[2] if past_key_values else 0
+        cos_full, sin_full = self.rotary_emb(hidden_states, past_len + seq_length)
+        rotary = (cos_full[past_len:past_len + seq_length],
+                  sin_full[past_len:past_len + seq_length])
+
+        new_cache = [] if use_cache else None
+        for i, layer in enumerate(self.blocks):
+            _skip_ckpt = (self.checkpoint_stride >= 2) and (i % self.checkpoint_stride == 0)
+            if self.gradient_checkpointing and self.training and not _skip_ckpt:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
@@ -618,10 +699,38 @@ class ArgonneModel(PreTrainedModel):
                     attention_mask,
                     use_reentrant=False,
                 )
+            elif use_cache:
+                past_kv = past_key_values[i] if past_key_values else None
+                hidden_states, layer_kv = layer(
+                    hidden_states, rotary, attention_mask,
+                    past_kv=past_kv, use_cache=True,
+                )
+                new_cache.append(layer_kv)
             else:
                 hidden_states = layer(hidden_states, rotary, attention_mask)
 
         hidden_states = self.norm(hidden_states)
+
+        # Chunked cross-entropy (training only, flag-gated via config.loss_chunk_size): avoids
+        # materializing the full (batch*seq, vocab) fp32 logit tensor -- the HBM wall at long context.
+        # Early-return so the standard full-logit path below stays byte-for-byte unchanged (zero risk to
+        # non-chunked / default runs). Only taken when MTP + z-loss are off (both default off).
+        _chunk = getattr(self.config, "loss_chunk_size", 0)
+        if (self.training and labels is not None and _chunk > 0
+                and self.config.mtp_horizon == 1 and self.config.z_loss_weight == 0):
+            loss = self._chunked_lm_loss(hidden_states, labels, _chunk)
+            if torch.isnan(loss):
+                self._nan_loss_count += 1
+                if self._nan_loss_count <= 5 or self._nan_loss_count % 100 == 0:
+                    print(f"WARNING: NaN loss detected (occurrence {self._nan_loss_count}); "
+                          "zeroing this step's loss.", flush=True)
+                zero = torch.zeros((), device=loss.device, dtype=torch.float32)
+                for p in self.parameters():
+                    if p.requires_grad:
+                        zero = zero + torch.nan_to_num(p).sum().float() * 0.0
+                loss = zero.to(loss.dtype)
+            return CausalLMOutput(logits=None, loss=loss)
+
         logits = self.lm_head(hidden_states)
         if self.config.logit_softcap > 0:
             cap = self.config.logit_softcap
@@ -683,7 +792,43 @@ class ArgonneModel(PreTrainedModel):
                         zero = zero + torch.nan_to_num(p).sum().float() * 0.0
                 loss = zero.to(loss.dtype)
 
+        if use_cache:
+            return CausalLMOutputWithPast(logits=logits, loss=loss, past_key_values=new_cache)
         return CausalLMOutput(logits=logits, loss=loss)
+
+    @torch.compiler.disable
+    def _chunked_lm_loss(self, hidden_states, labels, chunk_size):
+        """Cross-entropy without ever materializing the full (batch*seq, vocab) fp32 logit tensor.
+        MUST run eager (@torch.compiler.disable): torch.compile/inductor otherwise fuses the chunks
+        back into the full (N, vocab) logit tensor, re-creating the OOM this is meant to avoid. The
+        transformer body still compiles (+FP8); only this loss runs eager (a small fraction of compute).
+        Splits the flattened rows into chunks; torch.utils.checkpoint recomputes each chunk's logits
+        in backward, so peak logit memory = chunk_size*vocab (not N*vocab). Numerically identical to
+        F.cross_entropy(full_logits, labels.view(-1), ignore_index=-100) with per-chunk softcap
+        (mean over non-ignored). Caller guarantees mtp_horizon==1 and z_loss_weight==0.
+        Uses self.lm_head(...) per chunk so the fp8 (Float8Linear) GEMM path is preserved."""
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        cap = float(self.config.logit_softcap)
+        H = hidden_states.reshape(-1, hidden_states.size(-1))
+        L = labels.reshape(-1).to(H.device)
+        N = H.size(0)
+
+        def _seg(hc, lc):
+            lg = self.lm_head(hc)                    # (chunk, vocab); Float8Linear under fp8
+            if cap > 0:
+                lg = torch.tanh(lg / cap) * cap
+            return F.cross_entropy(lg, lc, ignore_index=-100, reduction="sum")
+
+        total = H.new_zeros((), dtype=torch.float32)
+        ntok = torch.zeros((), device=H.device, dtype=torch.float32)
+        cs = max(1, int(chunk_size))
+        for i in range(0, N, cs):
+            hc = H[i:i + cs]
+            lc = L[i:i + cs]
+            seg = _ckpt(_seg, hc, lc, use_reentrant=False) if self.training else _seg(hc, lc)
+            total = total + seg.float()
+            ntok = ntok + (lc != -100).sum().float()
+        return total / ntok.clamp(min=1.0)
 
     @torch.no_grad()
     def generate(
@@ -700,9 +845,20 @@ class ArgonneModel(PreTrainedModel):
         self.eval()
         device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
+        ctx = self.config.max_position_embeddings
+        # KV-cache decode: prefill the prompt once, then feed a single token per
+        # step reusing past_key_values. This yields identical logits to the
+        # recompute-the-whole-prefix path (gated by verify_cache.py) but turns the
+        # per-step cost from O(seq_len) down to O(1). When the running sequence
+        # would exceed the context window we rebuild the cache from the truncated
+        # window, matching the original chunk = input_ids[:, -ctx:] behavior.
+        past = None
+        outputs = None
         while input_ids.shape[1] < max_length:
-            chunk = input_ids[:, -self.config.max_position_embeddings :]
-            outputs = self.forward(chunk)
+            if past is None or past[0][0].shape[2] >= ctx:
+                chunk = input_ids[:, -ctx:]
+                outputs = self.forward(chunk, use_cache=True)
+                past = outputs.past_key_values
             logits = outputs.logits[:, -1, :] / temperature
 
             if repetition_penalty != 1.0:
@@ -749,9 +905,15 @@ class ArgonneModel(PreTrainedModel):
             else:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-            input_ids = torch.cat([input_ids, next_token.to(input_ids.device)], dim=-1)
+            next_token = next_token.to(input_ids.device)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
             if input_ids.shape[1] >= max_length:
                 break
+            # Advance the cache by one token unless we must rebuild it next loop
+            # (cache full); the top-of-loop guard re-prefills in that case.
+            if past[0][0].shape[2] < ctx:
+                outputs = self.forward(next_token, past_key_values=past, use_cache=True)
+                past = outputs.past_key_values
         return input_ids.to(device)
 
 

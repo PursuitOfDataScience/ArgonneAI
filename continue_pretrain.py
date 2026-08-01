@@ -108,6 +108,38 @@ def get_base_model(model):
     return model
 
 
+def apply_fp8_training(model, include_lm_head=True):
+    """Argonne-3.5 FP8 (torchao float8, tensorwise dynamic) on the Linear matmuls + tied lm_head.
+    Convert BEFORE DDP/compile; fp32 master weights; no persistent buffers so ckpt/resume are 1:1 with
+    nn.Linear. Skips Linears whose dims aren't /16. Returns (n_converted, n_skipped, lm_status)."""
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    try:
+        from torchao.float8 import Float8LinearRecipeName            # torchao >= ~0.10
+    except ImportError:
+        from torchao.float8.config import Float8LinearRecipeName     # older torchao
+    cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE)
+    stat = {"c": 0, "s": 0, "lm": "absent"}
+
+    def flt(mod, fqn):
+        is_lm = "lm_head" in fqn
+        if not isinstance(mod, nn.Linear):
+            return False
+        if is_lm and not include_lm_head:
+            stat["s"] += 1; stat["lm"] = "skipped(flag_off)"; return False
+        if (mod.in_features % 16) or (mod.out_features % 16):
+            stat["s"] += 1
+            if is_lm:
+                stat["lm"] = f"SKIPPED(dim_not_/16: out={mod.out_features}) -> NO fp8 lm_head speedup!"
+            return False
+        stat["c"] += 1
+        if is_lm:
+            stat["lm"] = "converted"
+        return True
+
+    convert_to_float8_training(model, module_filter_fn=flt, config=cfg)
+    return stat["c"], stat["s"], stat["lm"]
+
+
 def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new_tokens=100):
     model.eval()
     with torch.no_grad():
@@ -163,6 +195,9 @@ def save_checkpoint(
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+    # NOTE (2026-07-29, owner directive): this function must NEVER delete checkpoints. A keep-last-N
+    # prune was added here on 2026-07-28 and removed the next day -- checkpoint retention is the
+    # owner's call, made by hand, not something training code does on its own. Do not re-add it.
     return checkpoint_path
 
 
@@ -232,6 +267,13 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
+    if args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
+        # Pad vocab to a mult of 128 so the tied lm_head GEMM is FP8-eligible (see pretrain.py). Export
+        # trims back. Must match the pretrain-stage padded vocab so the resumed checkpoint shape agrees.
+        padded = ((VOCAB_SIZE + 127) // 128) * 128
+        if IS_MAIN:
+            print(f"FP8 lm_head: padding vocab {VOCAB_SIZE} -> {padded} (mult of 128; export trims back)")
+        VOCAB_SIZE = padded
     if IS_MAIN:
         print(f"Vocab size: {VOCAB_SIZE}, EOS token ID: {tokenizer.eos_token_id}")
 
@@ -253,6 +295,7 @@ def main():
         interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
         local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
         logit_softcap=LOGIT_SOFTCAP,
+        loss_chunk_size=args.loss_chunk_size,
         tie_word_embeddings=True,
     )
     config._keep_in_fp32_modules = []
@@ -267,6 +310,25 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
+            model.checkpoint_stride = int(args.checkpoint_stride)
+            if IS_MAIN:
+                print(f"Selective activation checkpointing: stride={args.checkpoint_stride} "
+                      f"(checkpoint all EXCEPT store every {args.checkpoint_stride}th layer)")
+
+    # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
+    if args.fp8 == 1:
+        if args.torch_compile != 1 and IS_MAIN:
+            print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
+        embed_w = model.get_input_embeddings().weight
+        n_conv, n_skip, lm_status = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
+        assert model.get_output_embeddings().weight is embed_w, (
+            "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+        if args.fp8_lm_head == 1 and lm_status != "converted" and IS_MAIN:
+            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status} — expect ~1.18x not 1.25x.")
+        if IS_MAIN:
+            print(f"FP8 training ON (torchao tensorwise): converted {n_conv} Linear, skipped {n_skip}; "
+                  f"lm_head={lm_status}; embedding tie preserved.")
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
@@ -342,13 +404,6 @@ def main():
         checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler_state = checkpoint.get('scheduler_state_dict')
-        if scheduler_state:
-            scheduler.load_state_dict(scheduler_state)
-        else:
-            for _ in range(checkpoint['global_step']):
-                scheduler.step()
         global_step = checkpoint['global_step']
         tokens_processed = checkpoint['tokens_processed']
         data_position = checkpoint.get('data_position', 0)
@@ -359,17 +414,28 @@ def main():
         checkpoint_dataset_base_tokens = checkpoint.get('dataset_base_tokens_processed')
 
         if args.reset_schedule == 1:
-            # Continued pretraining on new data:
-            # keep model, optimizer, and scheduler state; restart the data cursor.
+            # NEW PHASE on new data (continued-pretrain / midtrain seed): keep MODEL weights only, and
+            # start a FRESH optimizer + WSD schedule at --lr; restart the data cursor. Do NOT inherit the
+            # seed's optimizer/scheduler -- otherwise the seed's (post-cooldown, ~min) LR carries over via
+            # the scheduler and the new phase trains far too gently to LEARN the new data. Fresh AdamW
+            # moments are also correct for a new-data phase. (2026-07-14: fixes the scheduler-carryover
+            # caveat that made --lr a no-op; validated the seed loss starts low, LR now honors --lr.)
             if IS_MAIN:
-                print("Reset schedule mode: preserving optimizer/scheduler state and restarting the data position")
-                print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
+                print(f"Reset-schedule (NEW PHASE): model weights seeded; FRESH optimizer + WSD @ lr={args.lr}; data cursor restarted")
+                print(f"Seed had {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
             train_loader.set_position(RANK * args.batch_size * args.block_size)
             train_loader.epoch = 0
             dataset_base_global_step = global_step
             dataset_base_tokens_processed = tokens_processed
             is_resumed = False
         else:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler_state = checkpoint.get('scheduler_state_dict')
+            if scheduler_state:
+                scheduler.load_state_dict(scheduler_state)
+            else:
+                for _ in range(checkpoint['global_step']):
+                    scheduler.step()
             train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
             metadata_matches = (
                 checkpoint_dataset_base_step is not None
@@ -642,6 +708,18 @@ def main():
             final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
             os.makedirs(final_model_dir, exist_ok=True)
             save_model = get_base_model(model)
+            if args.fp8 == 1:
+                # Export a clean nn.Linear model (no torchao at inference). Dynamic tensorwise FP8 keeps
+                # weights in high precision -> state_dict loads 1:1; refuse to export if any weight missing.
+                clean = ArgonneModel(config)
+                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                assert not missing, (
+                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                if hasattr(clean, "tie_weights"):
+                    clean.tie_weights()
+                if IS_MAIN:
+                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
+                save_model = clean.to(DEVICE)
 
             actual_vocab = len(tokenizer)
             embed = save_model.get_input_embeddings()
@@ -698,10 +776,15 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=int, default=0, help="Cooldown steps at end of WSD schedule")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
+    # Argonne-3.5 FP8 (torchao float8, tensorwise) — same as pretrain.py. Requires --torch_compile 1.
+    parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8")
+    parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head")
+    parser.add_argument("--loss_chunk_size", type=int, default=0, help="If >0, chunked cross-entropy over this many (batch*seq) rows/chunk -- frees the full-logit fp32 transient so batch can grow at long context. 0 = off.")
     parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
     parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
     parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
     parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+    parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (ported from argonne4.0). 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Numerically identical; requires --gradient_checkpointing 1.")
     parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help="Use torch.compile for speedup")
     parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")

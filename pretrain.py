@@ -9,7 +9,9 @@ import sys
 import glob
 import time
 import argparse
+import json
 import random
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,7 +40,9 @@ LOGIT_SOFTCAP = 15.0
 parser = argparse.ArgumentParser()
 # Paths
 parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
-parser.add_argument("--data_path", type=str, required=True, help="Path to training data (.bin)")
+parser.add_argument("--data_path", type=str, required=True, help="Path to training data: a flat llm.c .bin OR a doc-manifest .json (fineweb+finemath docbin, doc-aware)")
+parser.add_argument("--doc_shuffle", type=int, default=0, choices=[0, 1], help="If 1 and --data_path is a doc-manifest .json, globally shuffle document order each epoch (REQUIRED for an intermix manifest so fineweb+finemath are interleaved, not trained sequentially)")
+parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling")
 parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
 # Training hyperparameters
 # Production LR: 6e-4
@@ -62,12 +66,24 @@ parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
 parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2")
 parser.add_argument("--schedule", type=str, default="wsd", choices=["cosine", "wsd"], help="LR schedule")
 parser.add_argument("--cooldown", type=int, default=4000, help="Cooldown steps at end of WSD schedule")
+# Argonne-3.5 recipe: express the WSD cooldown as a fraction of the estimated run instead of a
+# fixed step count. When >0 this OVERRIDES --cooldown and is recomputed from estimated_steps on
+# every resume, so the terminal LR anneal lands correctly regardless of corpus size or how the
+# run is sliced across wall-time-limited SLURM jobs. The launcher's old --cooldown 0 left the
+# WSD schedule with NO decay phase at all (LR flat at peak forever); 0.15 restores the anneal.
+parser.add_argument("--cooldown_frac", type=float, default=0.0, help="WSD cooldown as a fraction of estimated steps; if >0 overrides --cooldown. Argonne-3.5 recipe: 0.15.")
 parser.add_argument("--grad_clip", type=float, default=0.4, help="Gradient clipping")
 parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
+# Argonne-3.5 FP8: torchao float8 (tensorwise dynamic) on the Linear matmuls + lm_head. Recipe-search
+# result: ~1.25x H200 throughput at neutral quality (needs torch_compile=1; master weights stay fp32).
+parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8 (requires torch_compile=1)")
+parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head — recipe default; tie is preserved")
+parser.add_argument("--loss_chunk_size", type=int, default=0, help="If >0, chunked cross-entropy over this many (batch*seq) rows/chunk — frees the full-logit fp32 transient so batch can grow (fill HBM higher). 0 = off. NOTE: raising batch mid-run shifts the WSD cooldown (cooldown_frac × estimated_steps); use only on a FRESH run with LR/cooldown set for the bigger batch.")
 parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
 parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (ported from argonne4.0). 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Numerically identical; requires --gradient_checkpointing 1.")
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
 parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
@@ -179,6 +195,206 @@ class DataLoader:
     def set_position(self, position):
         self.current_position = position
 
+
+# ---------------------------------------------------------------------------
+# Doc-aware manifest loader (ported verbatim from midtraining.py): reads a
+# fineweb+finemath docbin manifest (.json), samples ONE block_size window per
+# doc per epoch, and (with doc_shuffle) interleaves the sources. build_train_loader
+# dispatches to the flat llm.c DataLoader for a .bin and to this for a .json.
+# ---------------------------------------------------------------------------
+class DocManifestDataLoader:
+    def __init__(
+        self,
+        manifest_path,
+        B,
+        T,
+        rank=0,
+        world_size=1,
+        cache_size=4,
+        shuffle_docs=False,
+        shuffle_seed=1337,
+    ):
+        self.B = B
+        self.T = T
+        self.rank = rank
+        self.world_size = world_size
+        self.manifest_path = os.path.abspath(manifest_path)
+        self.epoch = 0
+        self.shuffle_docs = bool(shuffle_docs)
+        self.shuffle_seed = int(shuffle_seed)
+        self._cache_size = max(1, cache_size)
+        self._shard_cache = OrderedDict()
+
+        with open(self.manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        tokenized_dir = manifest["tokenized_dir"]
+        files = [item for item in manifest["files"] if int(item["docs_kept"]) > 0]
+        if not files:
+            raise ValueError(f"No kept documents found in manifest: {self.manifest_path}")
+
+        self.shards = []
+        doc_offsets = [0]
+        total_docs = 0
+        for item in files:
+            bin_path = os.path.join(tokenized_dir, item["bin_path"])
+            lengths_path = os.path.join(tokenized_dir, item["lengths_path"])
+            docs_kept = int(item["docs_kept"])
+            self.shards.append(
+                {
+                    "bin_path": bin_path,
+                    "lengths_path": lengths_path,
+                    "docs_kept": docs_kept,
+                    "source_relpath": item["source_relpath"],
+                }
+            )
+            total_docs += docs_kept
+            doc_offsets.append(total_docs)
+
+        self.doc_offsets = np.asarray(doc_offsets, dtype=np.int64)
+        self.total_docs = total_docs
+        self.total_tokens = int(manifest["qwen_tokens_kept"])
+        self.docs_per_global_step = self.B * self.world_size
+        self.usable_docs = (self.total_docs // self.docs_per_global_step) * self.docs_per_global_step
+        if self.usable_docs <= 0:
+            raise ValueError(
+                f"Doc-aware dataset is too small for B={self.B}, world_size={self.world_size}: "
+                f"total_docs={self.total_docs}"
+            )
+
+        self.num_tokens = self.usable_docs * self.T
+        self.current_position = self.rank * self.B
+        self.doc_order = np.arange(self.usable_docs, dtype=np.int64)
+        self._refresh_doc_order()
+
+        if self.rank == 0:
+            print(f"DocManifestDataLoader: {self.total_docs:,} docs, {self.total_tokens:,} raw kept tokens")
+            print(
+                f"DocManifestDataLoader effective epoch: {self.usable_docs:,} docs -> "
+                f"{self.num_tokens:,} training tokens"
+            )
+            print(f"DocManifestDataLoader manifest: {self.manifest_path}")
+            if self.shuffle_docs:
+                print(f"DocManifestDataLoader doc shuffling: enabled (seed={self.shuffle_seed})")
+
+    def _load_shard(self, shard_idx):
+        cached = self._shard_cache.get(shard_idx)
+        if cached is not None:
+            self._shard_cache.move_to_end(shard_idx)
+            return cached
+
+        shard = self.shards[shard_idx]
+        lengths = np.load(shard["lengths_path"], mmap_mode="r")
+        offsets = np.zeros(len(lengths), dtype=np.uint64)
+        if len(lengths) > 1:
+            np.cumsum(lengths[:-1], dtype=np.uint64, out=offsets[1:])
+        tokens = np.memmap(shard["bin_path"], dtype=np.uint32, mode="r")
+        cached = (tokens, lengths, offsets)
+        self._shard_cache[shard_idx] = cached
+        if len(self._shard_cache) > self._cache_size:
+            self._shard_cache.popitem(last=False)
+        return cached
+
+    def _locate_doc(self, global_doc_idx):
+        shard_idx = int(np.searchsorted(self.doc_offsets, global_doc_idx, side="right") - 1)
+        local_doc_idx = int(global_doc_idx - self.doc_offsets[shard_idx])
+        return shard_idx, local_doc_idx
+
+    def _span_start(self, global_doc_idx, doc_len):
+        max_start = doc_len - (self.T + 1)
+        if max_start <= 0:
+            return 0
+        mixed = (
+            (int(global_doc_idx) + 1) * 0x9E3779B185EBCA87
+            + (int(self.epoch) + 1) * 0xC2B2AE3D27D4EB4F
+        ) & 0xFFFFFFFFFFFFFFFF
+        return mixed % (max_start + 1)
+
+    def _refresh_doc_order(self):
+        if not self.shuffle_docs:
+            return
+        rng = np.random.default_rng(self.shuffle_seed + int(self.epoch))
+        self.doc_order = rng.permutation(self.usable_docs).astype(np.int64)
+
+    def _doc_window(self, global_doc_idx):
+        shard_idx, local_doc_idx = self._locate_doc(global_doc_idx)
+        tokens, lengths, offsets = self._load_shard(shard_idx)
+        doc_len = int(lengths[local_doc_idx])
+        start = self._span_start(global_doc_idx, doc_len)
+        doc_offset = int(offsets[local_doc_idx])
+        buf = tokens[doc_offset + start:doc_offset + start + self.T + 1]
+        if len(buf) != self.T + 1:
+            raise RuntimeError(
+                f"Short doc window for global_doc_idx={global_doc_idx}: "
+                f"doc_len={doc_len}, start={start}, got={len(buf)}"
+            )
+        return np.asarray(buf, dtype=np.int64)
+
+    def next_batch(self):
+        batch_docs = []
+        for i in range(self.B):
+            doc_idx = self.current_position + i
+            if self.shuffle_docs:
+                doc_idx = int(self.doc_order[doc_idx])
+            batch_docs.append(self._doc_window(doc_idx))
+
+        buf = torch.from_numpy(np.stack(batch_docs, axis=0))
+        if torch.cuda.is_available():
+            buf = buf.pin_memory()
+        x = buf[:, :-1]
+        y = buf[:, 1:]
+
+        self.current_position += self.docs_per_global_step
+        if self.current_position + self.B > self.usable_docs:
+            self.current_position = self.rank * self.B
+            self.epoch += 1
+            self._refresh_doc_order()
+            if self.rank == 0:
+                print(f"\n*** Epoch {self.epoch} completed ***\n")
+        return x, y
+
+    def get_position(self):
+        return int(self.current_position)
+
+    def set_position(self, position):
+        self.current_position = int(position)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        self._refresh_doc_order()
+
+    def start_from_beginning(self):
+        self.current_position = self.rank * self.B
+
+    def resume_from_checkpoint_position(self, position):
+        self.current_position = int(position) + self.rank * self.B
+
+    def steps_from_position(self, position):
+        return int(max(0, position) // self.docs_per_global_step)
+
+
+def build_train_loader(
+    data_path,
+    batch_size,
+    block_size,
+    rank,
+    world_size,
+    doc_shuffle=0,
+    doc_shuffle_seed=1337,
+):
+    if data_path.endswith(".json"):
+        return DocManifestDataLoader(
+            data_path,
+            batch_size,
+            block_size,
+            rank,
+            world_size,
+            shuffle_docs=bool(doc_shuffle),
+            shuffle_seed=int(doc_shuffle_seed),
+        )
+    return DataLoader(data_path, batch_size, block_size, rank, world_size)
+
+
 # Import model
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import ArgonneConfig, ArgonneModel
@@ -191,6 +407,40 @@ def get_base_model(model):
     if hasattr(model, '_orig_mod'):
         model = model._orig_mod
     return model
+
+
+def apply_fp8_training(model, include_lm_head=True):
+    """Argonne-3.5: swap eligible nn.Linear -> torchao Float8Linear (tensorwise DYNAMIC scaling) so the
+    Linear matmuls run in FP8 on H200 tensor cores (~1.25x throughput, quality-neutral per the recipe
+    search). Dynamic scaling adds NO persistent params/buffers, so checkpoints + state_dict stay 1:1
+    with plain nn.Linear (resume/export work). Skips any Linear whose dims aren't /16 (scaled_mm req).
+    Call BEFORE DDP/compile, with master weights in fp32. Returns (n_converted, n_skipped, lm_status)."""
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    try:
+        from torchao.float8 import Float8LinearRecipeName            # torchao >= ~0.10
+    except ImportError:
+        from torchao.float8.config import Float8LinearRecipeName     # older torchao
+    cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE)
+    stat = {"c": 0, "s": 0, "lm": "absent"}
+
+    def flt(mod, fqn):
+        is_lm = "lm_head" in fqn
+        if not isinstance(mod, nn.Linear):
+            return False
+        if is_lm and not include_lm_head:
+            stat["s"] += 1; stat["lm"] = "skipped(flag_off)"; return False
+        if (mod.in_features % 16) or (mod.out_features % 16):
+            stat["s"] += 1
+            if is_lm:
+                stat["lm"] = f"SKIPPED(dim_not_/16: out={mod.out_features}) -> NO fp8 lm_head speedup!"
+            return False
+        stat["c"] += 1
+        if is_lm:
+            stat["lm"] = "converted"
+        return True
+
+    convert_to_float8_training(model, module_filter_fn=flt, config=cfg)
+    return stat["c"], stat["s"], stat["lm"]
 
 
 def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new_tokens=100):
@@ -274,6 +524,16 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
+    if args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
+        # torch._scaled_mm needs both GEMM dims %16; len(tokenizer)=151669 is not, so the tied lm_head
+        # would silently stay bf16 (only ~1.18x instead of the recipe's 1.25x). Pad vocab to a multiple
+        # of 128 (tensor-core aligned): padding rows are unused ids and the final HF export trims
+        # embeddings back to len(tokenizer). NOTE: this changes the embedding shape, so argonne3.5 fp8
+        # checkpoints are NOT resume-compatible with unpadded (len-151669) checkpoints — fresh run only.
+        padded = ((VOCAB_SIZE + 127) // 128) * 128
+        if IS_MAIN:
+            print(f"FP8 lm_head: padding vocab {VOCAB_SIZE} -> {padded} (mult of 128; export trims back)")
+        VOCAB_SIZE = padded
     if IS_MAIN:
         print(f"Vocab size: {VOCAB_SIZE}, EOS token ID: {tokenizer.eos_token_id}")
 
@@ -296,6 +556,7 @@ def main():
         interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
         local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
         logit_softcap=LOGIT_SOFTCAP,
+        loss_chunk_size=args.loss_chunk_size,
         tie_word_embeddings=True,
     )
     config._keep_in_fp32_modules = []
@@ -310,10 +571,31 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
+            model.checkpoint_stride = int(args.checkpoint_stride)
+            if IS_MAIN:
+                print(f"Selective activation checkpointing: stride={args.checkpoint_stride} "
+                      f"(checkpoint all EXCEPT store every {args.checkpoint_stride}th layer)")
+
+    # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
+    if args.fp8 == 1:
+        if args.torch_compile != 1 and IS_MAIN:
+            print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
+        embed_w = model.get_input_embeddings().weight            # capture the tied weight pre-conversion
+        n_conv, n_skip, lm_status = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
+        # The tie must survive (torchao reuses the weight Parameter). Fail loudly if it silently broke.
+        assert model.get_output_embeddings().weight is embed_w, (
+            "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+        if args.fp8_lm_head == 1 and lm_status != "converted" and IS_MAIN:
+            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status} — expect ~1.18x not 1.25x. "
+                  f"Pad vocab to a multiple of 16 to enable it.")
+        if IS_MAIN:
+            print(f"FP8 training ON (torchao tensorwise): converted {n_conv} Linear, skipped {n_skip}; "
+                  f"lm_head={lm_status}; embedding tie preserved.")
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
-        model = DDP(model, device_ids=[LOCAL_RANK])
+        model = DDP(model, device_ids=[LOCAL_RANK], gradient_as_bucket_view=True)
         if IS_MAIN:
             print(f"Using {WORLD_SIZE} GPUs with DistributedDataParallel")
 
@@ -328,17 +610,20 @@ def main():
         print(f"Model parameters: {total_params:,}")
         print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
 
-    # Create data loader
-    train_loader = DataLoader(
+    # Create data loader (flat llm.c .bin OR doc-manifest .json, chosen by extension)
+    train_loader = build_train_loader(
         args.data_path,
         args.batch_size,
         args.block_size,
         RANK,
         WORLD_SIZE,
-        start_token_offset=0,
+        doc_shuffle=args.doc_shuffle,
+        doc_shuffle_seed=args.doc_shuffle_seed,
     )
     val_loader = None
     if IS_MAIN and args.val_data_path:
+        # Validation is always a flat held-out llm.c .bin (the val loop below reads
+        # a contiguous slice via .tokens / .current_position); manifests are train-only.
         val_loader = DataLoader(
             args.val_data_path,
             args.batch_size,
@@ -348,23 +633,34 @@ def main():
             start_token_offset=0,
         )
 
-    # Estimate steps for scheduler
-    num_tokens = len(train_loader.tokens)
+    # Estimate steps for scheduler. The doc-manifest loader exposes .num_tokens (one
+    # T-window per doc per epoch = usable_docs*T); the flat loader exposes .tokens.
+    num_tokens = train_loader.num_tokens if hasattr(train_loader, "num_tokens") else len(train_loader.tokens)
     estimated_steps = int((num_tokens * args.max_epochs) / ACTUAL_TOTAL_BATCH)
     if IS_MAIN:
         print(f"Training for {args.max_epochs} epoch(s) ~= {estimated_steps} steps ({num_tokens * args.max_epochs:,} tokens)")
 
-    # Create optimizer
+    # Create optimizer. fused=True -> single fused CUDA kernel for the AdamW update over the
+    # fp32 master params (same math as the default foreach path; numerically-equivalent), fewer
+    # kernel launches / less memory traffic. Master weights are plain fp32 CUDA Parameters even
+    # under torchao tensorwise fp8, so fused AdamW is supported.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
+        fused=True,
     )
 
     # Scheduler with warmup (cosine or WSD)
     min_lr = args.lr * args.min_lr_ratio
     min_lr_scale = min_lr / args.lr
+
+    # Argonne-3.5: resolve the WSD cooldown length. A fraction (--cooldown_frac) is preferred
+    # because estimated_steps is recomputed identically on every resume, so cooldown_start below
+    # is stable across the wall-time-sliced training and the anneal always finishes at the run's
+    # true end. Falls back to the fixed --cooldown step count when the fraction is 0.
+    cooldown_steps = int(args.cooldown_frac * estimated_steps) if args.cooldown_frac > 0 else args.cooldown
 
     def lr_lambda(step):
         if step < args.warmup_steps:
@@ -374,14 +670,14 @@ def main():
             progress = (step - args.warmup_steps) / max(1, estimated_steps - args.warmup_steps)
             return max(min_lr_scale, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
-        if args.cooldown <= 0:
+        if cooldown_steps <= 0:
             return 1.0
 
-        cooldown_start = max(args.warmup_steps, estimated_steps - args.cooldown)
+        cooldown_start = max(args.warmup_steps, estimated_steps - cooldown_steps)
         if step < cooldown_start:
             return 1.0
 
-        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, args.cooldown))
+        cooldown_progress = min(1.0, (step - cooldown_start) / max(1, cooldown_steps))
         return 1.0 - cooldown_progress * (1.0 - min_lr_scale)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -405,6 +701,7 @@ def main():
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 weight_decay=args.weight_decay,
+                fused=True,
             )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             global_step = 0
@@ -421,8 +718,17 @@ def main():
             global_step = checkpoint['global_step']
             tokens_processed = checkpoint['tokens_processed']
             data_position = checkpoint.get('data_position', 0)
-            train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
-            train_loader.epoch = tokens_processed // num_tokens
+            resumed_epoch = int(tokens_processed // num_tokens) if num_tokens > 0 else 0
+            if hasattr(train_loader, "resume_from_checkpoint_position"):
+                # Doc-manifest loader: data_position is a DOC index (rank-0's cursor).
+                # Restore the per-epoch shuffle order first (so the resumed doc order
+                # reproduces the original epoch) then place the per-rank cursor.
+                if hasattr(train_loader, "set_epoch"):
+                    train_loader.set_epoch(resumed_epoch)
+                train_loader.resume_from_checkpoint_position(data_position)
+            else:
+                train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
+                train_loader.epoch = resumed_epoch
             if IS_MAIN:
                 print(f"Resumed from step {global_step}, tokens: {tokens_processed:,}, epoch: {train_loader.epoch}, LR: {scheduler.get_last_lr()[0]:.2e}")
             is_resumed = True
@@ -446,6 +752,7 @@ def main():
             f"logit_softcap: {LOGIT_SOFTCAP}"
         )
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
+        print(f"Schedule: {args.schedule}, Cooldown: {cooldown_steps} steps (frac={args.cooldown_frac}, ~{(cooldown_steps/max(1,estimated_steps)*100):.1f}% of run), Grad clip: {args.grad_clip}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
         if args.wall_time > 0:
@@ -514,6 +821,11 @@ def main():
             pbar.update(1)
 
         current_lr = optimizer.param_groups[0]['lr']
+
+        if IS_MAIN and (global_step in (1, 2, 3, 5, 10, 20, 50) or global_step % 200 == 0):
+            _mem_res = torch.cuda.max_memory_reserved() / 1e9
+            _mem_tot = torch.cuda.get_device_properties(LOCAL_RANK).total_memory / 1e9
+            print(f"  [HBM] step {global_step}: peak reserved {_mem_res:.1f}/{_mem_tot:.1f} GB ({100*_mem_res/_mem_tot:.1f}%) | micro_batch={args.batch_size} block={args.block_size} grad_ckpt={args.gradient_checkpointing} fp8={args.fp8}", flush=True)
 
         if IS_MAIN and global_step % 50 == 0:
             perplexity = np.exp(step_loss)
@@ -628,6 +940,18 @@ def main():
             final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
             os.makedirs(final_model_dir, exist_ok=True)
             save_model = get_base_model(model)
+            if args.fp8 == 1:
+                # Export a clean nn.Linear model so the shipped HF checkpoint needs no torchao at
+                # inference. Dynamic tensorwise FP8 keeps weights in high precision → state_dict is 1:1.
+                clean = ArgonneModel(config)
+                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                assert not missing, (
+                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                if hasattr(clean, "tie_weights"):
+                    clean.tie_weights()
+                if IS_MAIN:
+                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
+                save_model = clean.to(DEVICE)
 
             actual_vocab = len(tokenizer)
             embed = save_model.get_input_embeddings()

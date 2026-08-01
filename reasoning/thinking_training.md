@@ -1781,6 +1781,45 @@ reranker/ground-truth preference pairs.
 
 ---
 
+## §31 — Base-quality evaluation for argonne3.5: the toy probe is a GATE, not a capability measure; add a HARD tier (2026-07-20)
+
+Evaluating "how good is the argonne3.5 base *really*" ([[argonne35-pretrain-kickoff]]; probed at step 211234,
+~56.4B tok, in the WSD cooldown tail) surfaced that our instruments span **three tiers**, and the cheap one
+is far too easy to support any capability claim. This generalizes the §13 lesson ("the 10-item easy probe
+saturates trivially — says nothing about hard/competition math").
+
+- **Tier 0 — the two-axis GATE probe** (`reasoning/probe_pretrain_ckpt.py`, 20 math / 15 general, greedy
+  few-shot, ~3 GPU-min). Purpose: a cheap **read-only steering signal** for the live pretrain — watch
+  numeracy+knowledge climb and extrapolate the ≥14/20-math ∧ ≥14/15-general gate. It **saturates** and is
+  **noisy** at n=20/15: e.g. the general axis read 14/15 @step140319 but **12/15 @step211234** (oxygen→"air",
+  first-US-president→"Jefferson", 7→"5" continents) — a 2-item wobble **within probe noise**, NOT a
+  regression. Use it ONLY as a gate/steering signal, never as a capability number.
+- **Tier 1 — the standard held-out suite** (vLLM lm-eval, `reasoning/run_lmeval_vllm.py`, base few-shot):
+  arc_challenge(25) · hellaswag(10) · mmlu(5) · truthfulqa_mc2(0) · winogrande(5) · gsm8k(5) ·
+  minerva_math(4) · arc_easy/piqa/openbookqa/commonsense_qa/sciq/boolq/lambada_openai/gpqa_main(0). The real
+  base read + the **A/B vs `argonne-3.0-base`** (the doc's base-quality thesis, controlled: same probe/arch/tokenizer).
+- **Tier 2 — the HARD tier** (discriminating read + a baseline the reasoning recipe can later move):
+  **mmlu_pro**(5, 10-option reasoning-MMLU) · **bbh_fewshot**(3, BIG-Bench-Hard multi-step) · **gsm_plus**(5,
+  GSM8K robustness perturbations — the honest-math instrument, cf. `clean_eval`) · **drop**(3, discrete
+  reading-comprehension reasoning) · **agieval_en**(0, human-exam). All present in lm-eval 0.4.11.
+
+**CAVEAT — floor effect.** This is a *base* model: pre-cooldown-complete, pre-reasoning-anneal, pre-instruct.
+On competition MATH / GPQA / BBH a 2.88B base reads at/near the floor, so those matter mainly as a
+**baseline to measure the post-recipe delta against**, not a current-capability verdict. gsm_plus / mmlu_pro /
+drop do give above-floor, discriminating signal now.
+
+**Tooling** (both use the vLLM fast path per CLAUDE.local.md; 1×H100 @~90% HBM): `reasoning/eval35_thorough.sh`
+(Tier0 + extract + Tier1 A/B) and `reasoning/eval35_hard.sh` (Tier2). They extract the raw fp8 `.pt` → an HF dir
+by building at the **padded vocab 151680**, stripping compile/DDP key prefixes, then **trimming to 151669** —
+`extract_finemath_base.py` cannot (it assumes ckpt-vocab == tokenizer-vocab → `size mismatch` on the fp8 pad).
+Both bases are **ctx-1024 / θ=1e6**, so few-shot prompts >1024 use RoPE extrapolation
+(`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`) — applied **equally** to 3.5 and 3.0-base, so the A/B stays fair; absolute
+long-prompt numbers carry an "extrapolated beyond trained ctx" asterisk.
+
+**Results:** _[PENDING — Tier1 job 52414755 + Tier2 follow-up; append the 3.5-vs-3.0 table when complete.]_
+
+---
+
 ## The throughline (what this whole project teaches)
 
 1. **Capability is set upstream.** Pretraining quality (here: numeracy) is the

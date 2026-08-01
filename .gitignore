@@ -2,11 +2,13 @@ data/*
 processed_data/*
 pretrain/*
 logs/*
+*/*
 all_text_for_tokenizer.txt
 processed_data/*
 instruct_data/*
 *.sh
 report/
+cot_experiments/
 plot_loss.py
 Argonne_LLM/*
 argonne_instruct_finetuned/*

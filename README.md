@@ -6,11 +6,76 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 | Model | Params | Context | Training tokens | Hugging Face |
 |-------|--------|---------|-----------------|--------------|
+| [Argonne 3.5](#argonne-35) | 2.88B | **13,568** (trained) | ~88.84B | [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base) |
 | [Argonne 3.0](#argonne-30) | 2.88B | 1,024 (RoPE θ=1e6) | ~76.05B | [argonne-3.0-base](https://huggingface.co/PursuitOfDataScience/argonne-3.0-base) |
 | [Argonne 2.5](#argonne-25) | 1.27B | 1,024 | ~76.05B | [Argonne2.5-base](https://huggingface.co/PursuitOfDataScience/Argonne2.5-base) |
 | [Argonne 2.0](#argonne-20) | 4.9B | 4,096 | ~21.9B | — (not released) |
 | [Argonne 1.5](#argonne-15) | 357M | 2,048 | ~15.45B | [Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5) |
 | [Argonne 1.0](#argonne-10) | 276M | 2,048 | FineWeb-Edu | [Argonne-1.0](https://huggingface.co/PursuitOfDataScience/Argonne-1.0) |
+
+---
+
+# Argonne 3.5
+
+Argonne 3.5-base is a 2.88B-parameter decoder-only transformer, released as [`PursuitOfDataScience/argonne-3.5-base`](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base). Same architecture as Argonne 3.0; what changed is the training recipe and a three-stage data curriculum that ends in a **trained** 13,568-token context.
+
+## Training loss curve
+
+![Argonne 3.5 loss curve](plots/argonne3_5_loss_plot.png)
+
+Loss, perplexity, and LR against cumulative tokens across all three stages. The step down at each stage boundary is a change of data mixture, not a capability jump — the anneal and context-extension corpora are intrinsically lower-entropy than FineWeb, so cross-stage loss values are not comparable.
+
+## Training details
+
+| Item | Value |
+|------|-------|
+| **Stages** | Pretrain (`pretrain.py`) → reasoning anneal (`continue_pretrain.py`) → context extension (`continue_pretrain.py`) |
+| **Total optimizer steps** | 321,062 |
+| **Tokens processed** | ~88.84B (65.30B pretrain + 17.50B anneal + 6.02B context extension) |
+| **Sequence length** | 1,024 (stages 1–2) → **13,568** (stage 3) |
+| **Effective batch** | 233,472 → 270,336 tokens/step (stages 1–2); 488,448 tokens/step (stage 3) |
+| **Peak learning rate** | 6e-4 pretrain / 2e-4 anneal / 1e-4 context extension; WSD, 8,000 warmup steps, cooldown to 0.1× in every stage |
+| **Optimizer** | AdamW (β₁=0.9, β₂=0.95, weight decay 0.1), grad clip 0.4 |
+| **Precision** | FP8 (torchao tensorwise, incl. `lm_head`) under bf16 autocast, `torch.compile`, gradient checkpointing |
+| **Final train loss** | 0.8923 (stage-3 slice average) |
+| **Hardware** | 3× NVIDIA H100/H200 (DDP) |
+
+Recipe changes vs 3.0: a real LR cooldown in every stage (3.0 ran the WSD stable phase with `cooldown = 0`), a higher peak LR (6e-4 vs 3e-4), a longer warmup (8,000 vs 1,000), tighter gradient clipping (0.4 vs 1.0), and FP8 matmuls. The tighter clip plus QK-norm are what make the higher LR stable.
+
+## Training data
+
+- Stage 1 — [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) + [FineMath](https://huggingface.co/datasets/HuggingFaceTB/finemath), 85/15 (~65.30B tokens)
+- Stage 2 — code / math / reasoning / tool anneal with a FineWeb-Edu general-replay tier, built by [`build_reasoning_corpus.py`](build_reasoning_corpus.py) (~17.50B tokens)
+- Stage 3 — a **disjoint** slice of the same composite, read at 13,568 tokens (~6.02B tokens)
+- Tokenizer: [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base) (151,669-token vocab)
+
+## Context extension is trained, not extrapolated
+
+RoPE θ=1e6 does **not** extrapolate unaided on this architecture. Position-bucketed NLL on held-out arXiv, comparing the stage-2 checkpoint against the final weights it seeded (lower is better):
+
+| Token position | Stage 2 (ctx 1,024) | Argonne 3.5-base (ctx 13,568) |
+|---|---|---|
+| 0 – 1,024 | 2.194 | **2.161** |
+| 1,024 – 2,048 | 5.536 | **1.860** |
+| 4,096 – 8,192 | 5.895 | **1.320** |
+| 8,192 – 13,568 | 5.961 | **1.207** |
+| 13,568 – 20,480 | 5.965 | **1.122** |
+| 20,480 – 24,576 | 5.938 | **1.096** |
+
+The stage-2 model is coherent inside its 1,024-token window and effectively blind past it. The final model improves monotonically with position, keeps improving *beyond* its own 13,568 training length, and pays no short-context tax (the 0–1,024 control bucket is better than stage 2). Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
+
+## Base gate
+
+A 35-item greedy few-shot probe (20 math, 15 world-knowledge) used as a go/no-go gate on whether a base is worth a reasoning recipe — **not** a capability benchmark (n is small, it saturates, and it has a measured ±2-item noise floor).
+
+| Checkpoint | Math /20 | General /15 |
+|---|---|---|
+| Stage 2 (step 308,733) | 18 | 15 |
+| step 320,885 | 18 | 15 |
+| step 321,054 | 17 | 15 |
+| step 321,062 (released) | 18 | 15 |
+
+Both axes clear the ≥14/20 ∧ ≥14/15 gate, and context extension cost nothing on either. Reproduce with [`reasoning/probe_pretrain_ckpt.py`](reasoning/probe_pretrain_ckpt.py). No standard held-out benchmark suite has been run on this checkpoint yet.
 
 ---
 
