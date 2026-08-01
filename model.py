@@ -563,6 +563,15 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
+        # Selective activation checkpointing (ported from argonne4.0). Runtime-only --
+        # NOT part of config or state_dict, so checkpoint/resume compatibility with every
+        # existing argonne3.5 checkpoint is unaffected. checkpoint_stride S:
+        #   S == 1 : checkpoint ALL layers (default; identical to prior behavior).
+        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer
+        #            -> store ceil(n_layers/S), recompute the rest. Smaller S stores MORE
+        #            (more HBM, less recompute, faster); too-small S OOMs.
+        # Numerically identical either way: it only chooses store-vs-recompute.
+        self.checkpoint_stride = 1
         self._nan_loss_count = 0
         self.post_init()
 
@@ -681,7 +690,8 @@ class ArgonneModel(PreTrainedModel):
 
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.blocks):
-            if self.gradient_checkpointing and self.training:
+            _skip_ckpt = (self.checkpoint_stride >= 2) and (i % self.checkpoint_stride == 0)
+            if self.gradient_checkpointing and self.training and not _skip_ckpt:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,

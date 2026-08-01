@@ -161,6 +161,25 @@ SOURCES = {
         require_think_closure=False, decontam=False,  # general web; keep it fast
         dedup_key=None,
     ),
+    # ---- The BIG general-replay pool (added 2026-07-25) --------------------------------
+    # `fineweb_edu` above capped itself at n_shards=24 -> only 2.201B tokens, i.e. 9% of the
+    # anneal mix. That proved far too little replay: at 18% into the anneal the held-out
+    # FineWeb-Edu CE had risen +0.2457 nats and argonne3.5 was measurably WORSE on general
+    # text than argonne-3.0-base (2.6060 vs 2.4850) -- the §12 forgetting mode reproducing.
+    # build_a4_data.py had meanwhile tokenized ALL 218 FineWeb-Edu shards for argonne4 into
+    # OUT_ROOT/fineweb_edu_a4 (20.606B tok, same Qwen3 tokenizer, same uint32 .bin layout) --
+    # five days AFTER the anneal flatten was built, which is the only reason it was missed.
+    # flatten only needs `tier` + `budget_tokens` (it globs the already-tokenized .bin files),
+    # so no re-tokenization is required.
+    "fineweb_edu_a4": dict(
+        tier="general", fmt="arrow", renderer="text",
+        files=lambda: _g("/project/rcc/youzhi/data/fineweb-edu", "fineweb-edu-train-*-of-00218.arrow"),
+        columns=None, renderer_args=dict(text_col="text"),
+        budget_tokens=20_000_000_000, n_shards=218,
+        min_doc_tokens=32, max_doc_tokens=32768,
+        require_think_closure=False, decontam=False,
+        dedup_key=None,
+    ),
     # ---- Defined but OFF by default (medium quality, chatty; tangential to anneal) ---
     "instruct_chat": dict(
         tier="instruction", fmt="jsonl", renderer="chat", enabled=False,
@@ -694,10 +713,19 @@ def cmd_flatten(args):
     MAGIC, HDR = 20240801, 256
     out_bin = args.out_bin or os.path.join(OUT_ROOT, "reasoning_anneal_flat.bin")
     os.makedirs(os.path.dirname(out_bin), exist_ok=True)
+    overrides = {}
+    for kv in (getattr(args, "budgets", "") or "").split(","):
+        if kv.strip():
+            k, v = kv.split("=", 1)
+            overrides[k.strip()] = int(float(v))
+    if overrides:
+        print(f"[flatten] budget overrides: {overrides}")
     srcs = []
     for name, cfg in SOURCES.items():
         if not cfg.get("enabled", True) and name not in (args.include or []):
             continue
+        if overrides and name not in overrides:
+            continue          # an explicit --budgets list is also the source whitelist
         bins = sorted(b for b in glob.glob(os.path.join(source_outdir(name), "*.bin"))
                       if not b.endswith(".tmp") and os.path.getsize(b) >= 4)  # skip 0-token (empty) shards
         if not bins:
@@ -705,7 +733,7 @@ def cmd_flatten(args):
             continue
         mms = [np.memmap(b, dtype=np.uint32, mode="r") for b in bins]
         avail = int(sum(len(m) for m in mms))
-        budget = int(cfg["budget_tokens"] * args.scale)
+        budget = int(overrides.get(name, cfg["budget_tokens"]) * args.scale)
         use = min(avail, budget) if budget > 0 else avail
         frac = max(0.0, min(1.0, args.holdout_frac))
         split = int(round((1.0 - frac) * use))            # main=[0,split)  holdout=[split,use)  (DISJOINT)
@@ -715,6 +743,10 @@ def cmd_flatten(args):
             start, end = split, use
         else:
             start, end = 0, use
+        # Drop the already-consumed front of the window (see --skip_frac).
+        skip = max(0.0, min(1.0, getattr(args, "skip_frac", 0.0)))
+        if skip > 0:
+            start += int(round(skip * (end - start)))
         srcs.append(dict(name=name, tier=cfg["tier"], mms=mms, use=(end - start),
                          emitted=0, idx=0, off=0, start=start))
         print(f"[flatten] {name:22} tier={cfg['tier']:11} avail={avail/1e9:6.3f}B "
@@ -813,6 +845,16 @@ def main():
     p.add_argument("--part", choices=["all", "main", "holdout"], default="all",
                    help="all=whole corpus (default); main=first (1-holdout_frac) of each source; "
                         "holdout=last holdout_frac. main+holdout are DISJOINT + same-composite.")
+    p.add_argument("--skip_frac", type=float, default=0.0,
+                   help="Drop this fraction from the FRONT of each source's selected window. Used to "
+                        "re-flatten the UNCONSUMED remainder of a partially-trained anneal: the "
+                        "interleave is budget-proportional, so at fraction f through the flat bin every "
+                        "source has emitted ~f of its window, and --skip_frac f reproduces that cut so "
+                        "no token is served twice. Bias it HIGH -- over-skipping just leaves a few "
+                        "unseen tokens, under-skipping duplicates them.")
+    p.add_argument("--budgets", default="",
+                   help="Per-source budget override, 'name=tokens,name=tokens'. Sets the mix without "
+                        "editing SOURCES (emitted ~= budget * (1-holdout_frac) * (1-skip_frac)).")
     args = ap.parse_args()
     {"list": cmd_list, "inspect": cmd_inspect, "tokenize": cmd_tokenize,
      "finalize": cmd_finalize, "flatten": cmd_flatten}[args.cmd](args)

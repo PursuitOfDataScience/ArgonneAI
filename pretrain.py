@@ -83,6 +83,7 @@ parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], he
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
 parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (ported from argonne4.0). 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Numerically identical; requires --gradient_checkpointing 1.")
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
 parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
@@ -570,6 +571,11 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
+            model.checkpoint_stride = int(args.checkpoint_stride)
+            if IS_MAIN:
+                print(f"Selective activation checkpointing: stride={args.checkpoint_stride} "
+                      f"(checkpoint all EXCEPT store every {args.checkpoint_stride}th layer)")
 
     # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
     if args.fp8 == 1:
