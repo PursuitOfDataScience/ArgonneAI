@@ -2025,3 +2025,504 @@ REFUSE to run on a wrong split), `a35_v6_probe.sh` / `a35_v6x2.sh` (data ablatio
 (heartbeat: step-delta + GPU throttle probe), `stage_a35_base_hf.py`, `plot_a35_loss.py`.
 **`sft.py` now has opt-in DDP** (inert at WORLD_SIZE=1), verified 2-GPU vs 1-GPU at identical
 effective batch; it cut stage A from a projected 12.4h to 7:57.
+
+---
+
+## §33 — Reasoning EFFORT on the released argonne-3.5-think: the knob was negative, and the fix is data (2026-08-02)
+
+Directive: "thoroughly investigate and experiment if we can improve the reasoning effort of
+argonne3.5-think, which was just released to HF." Scope: the shipped model
+`models/a35_reason/blend_a085`. Budget: 3× H200 (midway3-0601) for 20h, one persistent SLURM job
+(`exp-a35-effort`) draining a task queue, so a ~20-min CoT-SFT round never waits in a queue.
+
+**The one-paragraph answer.** The released model had *no* reasoning-effort knob, and not merely a
+missing one — a **negative** one: forcing it to think longer made it monotonically worse
+(n=1000 clean, greedy + s1-style forced continuation: SVAMP 65.7→61.8, ASDiv 71.6→66.6; net flip
+−39 / −50). Two things fixed it. (1) A **self-verification data tier** built from the model's own
+rollouts flips the sign of that response (+0.1 / +1.3, net flip +1 / +13) — the model can now spend
+2.7× the tokens and get *better* instead of worse. (2) At a **higher dose** of the same tier the
+verification migrates out of the continuation and into the default trace, giving the best greedy of
+the campaign (68.3 / 74.3 at n=300 vs 65.0 / 73.0 shipped) with the knob going flat. Meanwhile the
+two obvious levers both failed, for reasons worth recording: additive on-policy **RFT was null**,
+and **RLVR-DPO at β=0.05 was destructive** (greedy 65→50) via likelihood collapse, which β=0.4
+repairs.
+
+### 33a. Phase 0 — the effort profile nobody had measured (`reasoning/effort_probe.py`)
+
+Four modes, all on the validated vLLM path, all pools contamination-audited via `clean_eval.load_clean`
+plus TRAIN-only pools added for fuel.
+
+**The model is not length-limited; long traces are a symptom of failure.** Greedy accuracy vs token
+budget saturates by 384 tokens and think-length p50 is only ~110–122 tokens. Binned by trace length
+(budget 512, n=300):
+
+| think-len | SVAMP acc | ASDiv acc |
+|---|---|---|
+| 60–100 | **88%** | **93%** |
+| 100–150 | 57% | 64% |
+| 250–400 | 25% | 0% |
+| 400+ | **0%** | **0%** |
+
+**Forced continuation is net-destructive, at n=1000.** Suppress the first `</think>`, inject
+"Wait, let me double-check that.", regenerate, repeat, then force-close:
+
+| arm | x0 | x1 | x2 | x3 | x6 | net flip @x6 | decoded @x6 |
+|---|---|---|---|---|---|---|---|
+| shipped, SVAMP | 65.7 | 64.8 | 63.4 | 62.8 | **61.8** | **−39** | 603 |
+| shipped, ASDiv | 71.6 | 68.6 | 68.4 | 67.0 | **66.6** | **−50** | 581 |
+
+`net flip` = (wrong→correct) − (correct→wrong) vs x0. The scalar hides the mechanism: on ASDiv at
+x3 the shipped model repaired 9 answers and broke 22.
+
+**Reward density is no longer the blocker.** §9/§20 killed GRPO because a binary reward at ~2.6%
+solve-rate left most groups with zero gradient. Measured on argonne-3.5-think, K=16, T=0.8/top_p .95:
+
+| pool | single-sample | signal groups (0<c<K) | dead (c=0) | mean √(p(1−p)) | pass@16 |
+|---|---|---|---|---|---|
+| gsm8k_train | 34.7% | **75.0%** | 21.2% | 0.308 | 78.8% |
+| math_train_easy (L1–3) | 29.3% | **79.8%** | 20.0% | 0.324 | 80.0% |
+| math_train_hard (L4–5) | 7.8% | 30.0% | 70.0% | 0.119 | 30.0% |
+| svamp (reference) | 56.5% | 84.3% | 5.3% | 0.341 | 94.7% |
+
+Also measured: **T=1.0 is strictly worse than T=0.8 for fuel** (gsm8k_train 18.7% vs 34.7%
+single-sample, `no_answer` 36% vs 17%, and *lower* group signal 71.0% vs 75.0%) — hotter sampling
+buys unusable samples, not diversity. MATH L4–5 is out of the usable band and was excluded.
+
+**Where the headroom is.** T=0.8, K=32, n=300: SVAMP pass@32 **98.3%** / majority@32 78.0% / greedy
+65.0; ASDiv pass@32 **97.0%** / majority@32 85.0% / greedy 73.0. Only 5/300 and 9/300 problems are
+never solved. Majority voting saturates early (SVAMP k8 75.2 → k32 78.0) while pass@k keeps
+climbing, so **vote quality, not vote count, is binding** — i.e. the model's *mode* is wrong on
+~28% of solvable problems, and greedy returns the mode.
+
+### 33b. Eval integrity — two things to know before quoting any number here
+- **`max_model_len` is inert; the kernel path is not.** Same model, same 300 seed-0 problems, T=0:
+  `max_model_len` ∈ {1024,1536,2048} gives byte-identical generations (0/300 differ), but
+  eager vs compiled+CUDA-graph **rewrites ~30% of greedy traces** (88–89/300), changes the final
+  answer on 22–24, and flips correctness on 12–17 — for a *net* accuracy change of only ~1pt,
+  because the flips cancel. Consequence: greedy pass@1 at n=300 cannot separate arms at the ±2pt
+  level, which is where most of this campaign's deltas live. Every arm here is judged with
+  `enforce_eager=True` to match `clean_eval.py`, and the finalists are re-judged **paired at
+  n=1000 with McNemar** (`reasoning/effort_gate.py`).
+- **`no_answer` is mostly real error, not a format artifact.** 11.6% of T=0.8 rollouts close
+  `</think>` and emit no `\boxed{}`; of those only **27%** hold the right answer in another
+  convention (`#### 35`, a trailing number). So repairing answer formatting is worth ~3pt of
+  *sample* accuracy, not the ~12pt the raw `no_answer` rate suggests. Not pursued.
+
+### 33c. What failed, and why it is worth recording
+**Arm A — additive on-policy RFT/STaR: NULL.** 130,192 labeled rollouts from the shipped model over
+8,137 TRAIN problems (11 min on 3 H200s), filtered to 8,821 gold-verified + step-verified +
+non-degenerate traces, difficulty-weighted, added at 20% of the v6 mix (33,035 rows, 1 epoch from
+`dpo`, effective batch 12 — §32's recipe with one variable moved):
+
+| | SVAMP greedy | self-cons | ASDiv greedy | self-cons |
+|---|---|---|---|---|
+| shipped | 65.00 | 74.00 | 73.00 | 82.67 |
+| +RFT @20% (α=.85) | 63.00 | 76.00 | 73.67 | 80.33 |
+
+Sum greedy −1.33, sum self-cons −0.34: no consistent sign, all inside the noise floor. The
+mechanism reading: the model already samples the correct trace often (pass@32 97–98%), so raising
+its *likelihood* a little does not change the **argmax**, and greedy returns the argmax. A
+likelihood objective is the wrong tool for a mode problem.
+
+⚠️**The near-miss that makes this arm worth reading twice.** The first selection pass kept, as a
+*top pick*, `<think>\n</think>\n\nThe answer is $\boxed{50}$.` — an EMPTY think block on a problem
+the model solved 2/16 times. Shortest-first selection actively seeks these out, since an empty-think
+lucky guess is always the shortest "correct" candidate. Training on them teaches the model to skip
+reasoning and guess, and it would have looked like a data win (loss falls fast on 14-token rows).
+Fixed by `is_degenerate()`: minimum think length **and the gold value must appear inside `<think>`**.
+That single filter dropped 3,315 too-short + 1,938 gold-not-derived traces out of ~14k candidates.
+**Any self-training selection on this line must carry this filter.**
+
+**Arm C — RLVR-DPO at β=0.05: DESTRUCTIVE.** §23d lists weight-space RLVR-DPO as killed on
+2026-07-10, but that verdict rested on **321 pairs** from a model solving ~2.6% of problems. The
+same construction here yields 3,040 mode-targeted pairs (negatives drawn *majority-answer-first*, so
+the trace being pushed down is the one greedy emits) or 16,877 broad pairs. It still failed, for a
+different reason:
+
+| arm (from shipped) | β | lr | d_chosen | d_rejected | SVAMP greedy | ASDiv greedy |
+|---|---|---|---|---|---|---|
+| mode-wrong, 2 ep | 0.05 | 5e-7 | **−13.0** | −52.1 | **50.33** | **58.67** |
+| mode-wrong, 2 ep | 0.05 | 2e-6 | **−51.4** | −200.5 | — | — |
+| all-pairs, 1 ep | 0.05 | 2e-6 | **−74.6** | −155.3 | — | — |
+| mode-wrong, 1 ep | **0.40** | 5e-7 | **+3.2** | −2.3 | (see 33e) | |
+
+β=0.05 learned the *preference* (margin_acc 0.98–1.00) by collapsing **both** sequences' likelihood
+— textbook DPO degeneration. Budget-forcing recovered +9.7/+6.7 of the damage, which localises much
+of it to lost `</think>` **termination**, precisely the property §23e/v6 was built to install.
+**β=0.40 fixes the dynamics completely** (d_chosen +3.2 instead of −13.0). So the honest verdict is
+not "RLVR-DPO is dead" but "**RLVR-DPO on this model needs a tight leash; at β=0.05 it eats v6's
+termination before it reshapes the mode**".
+
+### 33d. What worked — a self-verification tier makes test-time compute usable
+`reasoning/build_verify_tier.py` builds three flavours from the same 130k-rollout corpus, all keyed
+on the exact cue string the probe injects, and all correct-by-construction:
+
+| tier | shape | teaches |
+|---|---|---|
+| `verify_confirm` | correct trace → cue → python-verified recheck of every `a op b = c` → answer | extra tokens are for re-checking |
+| `verify_rederive` | correct trace A → cue → *step-signature-distinct* correct trace B → answer | derive it a second way and commit when they agree — self-consistency in ONE pass |
+| `verify_fix` | wrong rollout → cue → honest transition → the model's own correct rollout → answer | when the check fails, re-derive instead of committing |
+
+**HONESTY RULE, which cost a redesign.** The first build clipped each wrong trace to its leading 60%
+and appended "That line of reasoning does not hold up" — for 3,054 of 3,500 rows, i.e. wherever no
+arithmetic error could be *located*. But a wrong trace's prefix is frequently correct (the error
+comes later), so those rows were teaching the model to abandon sound reasoning — plausibly the very
+behaviour that makes the shipped model's continuations lose 2–3 correct answers for each one they
+gain. A row may now only assert what was verified in python: `verify_fix` either NAMES a step it
+re-evaluated as wrong, or keeps the whole wrong attempt (which demonstrably reached a wrong answer)
+behind a neutral "let me recompute this independently".
+
+**Result (n=1000, greedy + forced continuation, 20% dose, α=0.85):**
+
+| arm | SVAMP x0→x6 | net flip | ASDiv x0→x6 | net flip | decoded @x6 |
+|---|---|---|---|---|---|
+| shipped | 65.7 → **61.8** | −39 | 71.6 → **66.6** | −50 | 581–603 |
+| **verify @20%** | 64.8 → **64.9** (peak 65.6 @x1) | **+1** | 73.3 → **74.6** (peak 74.9 @x2) | **+13** | **291–297** |
+| verify @20%, untrained cue | 64.8 → 61.9 | −29 | 73.3 → 71.6 | −17 | 457–461 |
+
+Three things in that table matter beyond the accuracy. The **flip matrix inverted** (ASDiv C→X 22 /
+X→C 9 → C→X 4 / X→C 14). The verify arm **decodes half as many tokens** at x6 (291 vs 603) because
+it emits a short recheck and closes, where the shipped model rambles. And the third row is the
+**specificity control**: with an untrained neutral cue the same weights degrade again past x3, so
+the trained cue is doing real work — though it only buys ~1pt over the neutral cue at x1–x3, so the
+honest claim is "the tier makes continuation non-destructive" first, "the cue is special" second.
+
+**Termination got better, not worse** (n=300 greedy): SVAMP `unclosed` **14 → 1**, `no_answer`
+3 → 0; ASDiv `unclosed` 6 → 2, `no_answer` 12 → 6.
+
+### 33e. Dose vs α — and a correction to how the two arms differ
+
+⚠️**CORRECTION, recorded because the naive reading is wrong.** The second arm was requested at
+`--rft-share 0.40`, but the verify pool only holds 7,800 rows, so the share was **capped by
+available data**. The two arms' REALIZED verify shares are **20.00%** (6,607/33,035) and **22.79%**
+(7,800/34,228) — an 18% difference in tier size, not 2×. They also differ in α (0.85 vs 1.00).
+So "the 40% arm" is mislabelled shorthand: most of its gain is **α=1.00**, not dose. Do not cite
+this pair as a dose-response. The 2×2 (tier size × α) is completed in 33h.
+
+Same tier, larger by 18%, at two α (n=300):
+
+| arm | SVAMP greedy | self-cons | ASDiv greedy | self-cons | knob (x0→x4) |
+|---|---|---|---|---|---|
+| shipped | 65.00 | 74.00 | 73.00 | 82.67 | negative |
+| verify @20%, α=.85 | 64.67 | 77.33 | 71.33 | 81.00 | **positive** |
+| verify @40%, α=.85 | 67.00 | 74.33 | 71.00 | 81.67 | flat |
+| **verify @40%, α=1.00** | **68.33** | 75.67 | **74.33** | 82.33 | flat |
+
+The dose **trades the knob for x0**: at 40% the forced continuation adds ~0.0–0.3 while plain greedy
+rises to the campaign's best (+3.33 / +1.33 vs shipped, +4.7 aggregate). The candidate explanation —
+that verification moved *out* of the continuation and *into* the default pass — is checked directly
+in `095_alpha` by counting recheck vocabulary in plain greedy traces.
+
+**Mechanism CONFIRMED (asdiv, n=300, plain greedy — no continuation involved).** Counting recheck
+vocabulary in the *default* trace:
+
+| model | ASDiv greedy | think-len | contains "wait" | "check/verif" | "recompute/redo/second way" |
+|---|---|---|---|---|---|
+| shipped | 72.33% | 108.9 | **2.3%** | 11.0% | 1.0% |
+| verify @20% | 71.00% | 108.1 | **51.3%** | 54.7% | 8.7% |
+| verify @40%, α=1.00 | **74.33%** | **102.0** | **59.0%** | 59.0% | 10.0% |
+
+The tier does not make the model think *longer* — think-length actually falls 108.9 → 102.0 — it
+makes the model **spend its existing budget on self-checking**. That is why the 40% dose buys
++2.0 greedy at *fewer* tokens, and why its external continuation knob goes flat: the work has
+already been done inside the first pass.
+
+**The α knee moved to 1.00** (40% dose, n=300). §32's knee was 0.85 and §32b warns never to assume
+the soup is inert — it moved again:
+
+| α | SVAMP greedy / +budget / self-cons | ASDiv greedy / +budget / self-cons |
+|---|---|---|
+| 0.70 | 67.33 / 69.67 / 73.67 | 68.00 / 72.00 / 80.00 |
+| 0.85 | 67.00 / 67.00 / 74.33 | 71.00 / 71.67 / 81.67 |
+| 0.925 | 66.00 / 66.00 / 74.67 | 72.67 / 72.67 / 83.33 |
+| **1.00** | **68.33** / 68.33 / **75.67** | **74.33** / 74.33 / 82.33 |
+
+α=0.70 reproduces §19/§32's non-termination signature (budget-forcing recovers +2.33/+4.00);
+higher α is monotonically better on greedy. Because α=1.00 means *no SFT soup partner*, the
+general-capability probe is not optional for this arm — §32's 0.15 partner is what fixed the
+instruction-following probe.
+
+**RLVR-DPO at a tight leash is a different, complementary win (n=300).**
+
+| arm | SVAMP greedy / +budget / self-cons / pass@8 | ASDiv greedy / +budget / self-cons / pass@8 |
+|---|---|---|
+| shipped | 65.00 / 66.00 / 74.00 / 90.67 | 73.00 / 73.67 / 82.67 / 92.33 |
+| β=0.40 lr5e-7 | 62.33 / 65.67 / **77.67** / **91.33** | 67.33 / 74.67 / **84.00** / **94.33** |
+| β=0.10 lr1e-7 | 63.67 / **66.67** / 76.33 / 90.67 | 71.67 / **76.00** / 83.67 / 93.00 |
+
+DPO costs native `</think>` closure (the greedy→+budget gap widens from ~1pt to 3.3–7.3pt) but
+**improves the sampled distribution**: aggregate self-consistency +5.0 (β=0.40) and +3.3 (β=0.10),
+aggregate +budget +3.0 (β=0.10). Its deployable cell is therefore `+budget`, not `greedy`. This is
+the opposite trade from the verify tier, which improves `greedy` and *tightens* termination —
+so the two are candidates to compose.
+
+### 33f. THE GATE — paired, n=1000/pool, McNemar (`reasoning/effort_gate.py`)
+
+Six arms × four deployable single-pass configs + self-consistency, same problems, one model per GPU
+in its own process. Aggregate = sum of the two pools' accuracy.
+
+| arm | greedy | best single-pass | self-cons@8 |
+|---|---:|---:|---:|
+| **shipped `blend_a085`** | 134.40 | 137.10 | 152.90 |
+| verify @20%, α=.85 (`vfy`) | 137.10 | 140.50 | 155.20 |
+| verify @40%, α=.85 | 138.00 | 140.10 | 155.20 |
+| **verify @40%, α=1.00 (`vfy40think`)** | **139.80** | 140.10 | 156.20 |
+| RLVR-DPO β=.10 lr1e-7 | 130.00 | 141.00 | 156.30 |
+| **RLVR-DPO β=.40 lr5e-7** | 127.70 | **141.60** | **157.00** |
+
+**Significant paired comparisons (exact McNemar):**
+
+| comparison | Δ | p |
+|---|---:|---:|
+| ASDiv, shipped greedy → `vfy40think` greedy | **+3.60** | **0.013** |
+| ASDiv, shipped best → `vfy` extend×2 | **+3.30** | **0.020** |
+| SVAMP, shipped best → DPO β=.40 +budget | **+2.90** | **0.033** |
+| ASDiv, shipped greedy → DPO β=.40 greedy | **−4.90** | **0.00096** |
+| **[`vfy`] its own greedy → extend×2, ASDiv** | **+2.30** | **0.00061** |
+| **[`vfy`] its own greedy → extend×1, SVAMP** | **+1.10** | **0.035** |
+| [`vfy40`] its own greedy → extend×3, ASDiv | +1.40 | 0.076 |
+| [`vfy40think`] its own greedy → extend×1, ASDiv | +0.30 | 0.70 |
+| [shipped] its own greedy → +budget, ASDiv | +1.70 | 0.00091 |
+
+**The three conclusions this supports, and their limits.**
+1. **The effort knob is real and it is trained, not decoded.** `vfy` improves *on itself* by spending
+   more sequential tokens: ASDiv +2.30 (p=0.0006), SVAMP +1.10 (p=0.035). The shipped model does the
+   opposite (ASDiv extend×3 67.10 vs greedy 69.90). Confirmed at n=1000 on two independent sets.
+2. **For a single-model card with no serving change, `vfy40think` is the winner**: aggregate greedy
+   **+5.4** (139.80 vs 134.40), significant on ASDiv (+3.60, p=0.013), at ~the same token cost
+   (146/150 → 123/131 decoded). The dose trade is now measured on both sides: 40% internalises the
+   verification (knob p=0.70, i.e. gone) while 20% keeps it external (knob p=0.0006).
+3. **RLVR-DPO is a *serving-dependent* win, and must be labelled that way.** β=.40 posts the best
+   best-single-pass (141.60) and best self-consistency (157.00), but only because budget-forcing
+   repairs it: its own greedy→+budget delta is **+5.7 / +8.2 (p≈1e-16)** versus +1.0/+1.7 for the
+   shipped model, and its plain greedy is significantly *worse* than shipped (ASDiv −4.90,
+   p=0.001). A stack that does not force-close would be downgrading.
+
+**Compute accounting** (mean decoded tokens/problem, shipped model): greedy 146/150 · +budget
+181/183 · extend×3 400/395 · self-cons@8 **1118/1220**. So self-consistency buys ~+18 aggregate for
+~8× the tokens, while `vfy`'s extend×2 buys ASDiv +2.30 for ~1.5× and `vfy40think` buys +5.4
+aggregate for **1×**. On tokens-per-point, the internalised route dominates everything else here.
+
+### 33g. The two scaling axes do NOT compose (n=500, `--sc-extensions 2`)
+
+Sequential effort helps the greedy path. Applied to *sampled* candidates and re-voted, it makes
+self-consistency **worse**, for every model:
+
+| model | SVAMP self-cons@8 → +ext×2 | ASDiv self-cons@8 → +ext×2 |
+|---|---|---|
+| shipped | 73.20 → **69.80** | 77.40 → **69.80** |
+| verify @20% (`vfy`) | 75.40 → 73.40 | 78.80 → 72.60 |
+| verify @29%·α=1 (`vfy40think`) | 75.20 → 74.00 | 81.60 → **78.40** |
+
+The verify arms lose less than the shipped model does (−1.2/−3.2 vs −3.4/−7.6), but the sign is
+negative everywhere, and it costs 2× the tokens (2237/2379 vs 1103/1227) to get there. Mechanism:
+the trained continuation is a *greedy re-derivation*; run it on K sampled traces and it pulls them
+toward a common attractor, destroying the very disagreement majority voting feeds on.
+
+**Consequence for the claim.** The effort knob repairs the **mode**, not the **distribution**. So the
+honest statement is "argonne-3.5-think can now be given more *sequential* compute on its greedy path
+and get better", not "more reasoning effort helps in general". Anyone deploying self-consistency
+should NOT add extensions on top.
+
+### 33h. Composition attempts — both fail, and one of them fails informatively
+
+**verify + mode-wrong RFT** (`vfymw`, verify tier + the 1,672 traces whose sampling mode is wrong,
+n=300): SVAMP 63.33 greedy / 75.33 self-cons, ASDiv **73.67** / **84.00**. Best non-DPO
+self-consistency of the campaign on ASDiv, and it keeps the knob — but SVAMP greedy is −1.67 and the
+aggregate does not beat `vfy40think`.
+
+**RLVR-DPO on top of the verify arm** — this one is worth reading. β=.40 and β=.10, 1 epoch, from
+`vfy40_think` (n=300):
+
+| arm | SVAMP greedy / +budget / self-cons | ASDiv greedy / +budget / self-cons |
+|---|---|---|
+| `vfy40_think` (the starting point) | **68.33** / 68.33 / 75.67 | **74.33** / 74.33 / 82.33 |
+| + DPO β=.40 | 63.67 / 63.67 / 74.33 | 72.67 / 72.67 / 80.67 |
+| + DPO β=.10 | 67.33 / 67.33 / 76.33 | 72.00 / 71.67 / 81.33 |
+
+Both **subtract**. But note `greedy == +budget` exactly for both, versus a +5.7/+8.2 budget-forcing
+gap when DPO ran on the shipped model: **the verify tier's termination is robust to DPO where v6's
+was not.** So DPO's earlier damage was specifically to a fragile termination behaviour, and the
+verify tier hardens it — while DPO still costs accuracy. RLVR-DPO does not compose here.
+
+### 33i. General-capability gate — flat (this is what makes the winner shippable)
+
+The 10-item 4-quadrant probe put `vfy40think` at **9/10** on general/no-think (it misses "list three
+primary colors") against 10/10 for the shipped model, which on this line's history (§12 general
+collapse, §18 zero-sum trade, §32's soup partner) is exactly the alarm you must not wave through —
+especially for an α=1.00 arm that has *no* SFT soup partner. lm-eval via the vLLM backend, 6 tasks:
+
+| model | arc_challenge | arc_easy | hellaswag | openbookqa | piqa | winogrande | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 42.92 | 59.60 | 59.91 | 37.00 | 72.80 | 59.04 | **55.21** |
+| `vfy40_a0925` | 42.49 | 59.13 | 59.74 | 37.20 | 72.69 | 58.88 | 55.02 |
+| `vfy40_think` (α=1.00) | 42.49 | 59.47 | 59.65 | 36.80 | 72.85 | 58.88 | 55.02 |
+
+**−0.19pt mean, no task moving more than 0.43pt** — flat. The 4-quadrant miss is a 10-item probe
+artifact, not a general regression, and α=1.00 does not cost broad capability *on this data*. Also
+flat on the other three quadrants (general/think 10/10, math/think 10/10 for both candidates);
+`dpo2_b10lo` is the only arm that regressed a quadrant (math/think 8/10), consistent with its
+termination damage.
+
+### 33j. FINAL GATE — 12 arms, n=1000/pool, paired
+
+| arm | what it is | greedy | best single-pass | self-cons@8 |
+|---|---|---:|---:|---:|
+| `base` | **shipped `blend_a085`** | 134.40 | 137.10 | 152.90 |
+| **`vfymw`** | **verify tier + mode-wrong RFT, α=.85** | **141.20** | **141.30** | 156.10 |
+| `vfy40think` | verify 22.8%, α=1.00 | 139.80 | 140.10 | 156.20 |
+| `vfybiga0925` | verify 29.1%, α=.925 | 139.50 | 140.40 | 153.80 |
+| `dpo3v40b10` | DPO β=.10 on `vfy40think` | 138.50 | 138.80 | 154.70 |
+| `vfy40` | verify 22.8%, α=.85 | 138.00 | 140.10 | 155.20 |
+| `vfy` | verify 20.0%, α=.85 | 137.10 | 140.50 | 155.20 |
+| `dpo3v40b40` | DPO β=.40 on `vfy40think` | 137.10 | 137.10 | 156.00 |
+| `vfybigthink` | verify 29.1%, α=1.00 | 136.90 | 139.00 | 154.40 |
+| `vfythink` | verify 20.0%, α=1.00 | 135.10 | 135.40 | 152.50 |
+| `dpo2b10lo` | RLVR-DPO β=.10 from shipped | 130.00 | 141.00 | 156.30 |
+| `dpo2b40` | RLVR-DPO β=.40 from shipped | 127.70 | **141.60** | **157.00** |
+
+**Winner: `vfymw_a085` — aggregate greedy +6.8 over the shipped model at the same token cost.**
+ASDiv **+4.80, p=0.00053** (and +3.10, p=0.022 against the shipped model's *best* config); SVAMP
++2.00, p=0.20. Self-consistency +3.2.
+
+**The pattern across every arm is the same and must be stated: ASDiv moves, SVAMP does not.**
+ASDiv gains are +3.6 to +4.8 with p between 0.0005 and 0.013 for five independent arms; SVAMP gains
+range 0.0 to +2.7 and **not one reaches p<0.05**. So the honest claim is "a significant improvement
+on ASDiv, replicated across arms, with SVAMP flat" — not a uniform gain.
+
+**Only `vfy` (20.0%, α=.85) owns the effort knob at n=1000:** its own greedy → extend×2 is
+ASDiv **+2.30 (p=0.0006)** and SVAMP **+1.10 (p=0.035)**. Every higher-accuracy arm has p>0.4 on the
+knob. **The knob and the accuracy are alternatives, not additives**: whatever raises x0 does so by
+internalising the verification, which is then no longer available to buy externally.
+
+**⚠️Within the verify family, dose and α differences are NOT resolvable at this n — do not tell a
+dose story.** The α=1.00 series across realized shares reads 135.10 (20.0%) → **139.80** (22.8%) →
+135.34 (25.40%, flavours held equal) → 136.90 (29.1%). Arm G (`vfyeq`) was built to separate dose
+from flavour balance and it does: an equal-flavour 25.40% arm is just as weak as the `fix`-heavy
+29.1% one, so the regression is **dose, not composition**. But a 4.7-point spike at 22.8% flanked by
+two ~135 points is a suspiciously sharp "optimum" for an 18%-of-tier change, and the same is true of
+the α grid (soup helps at 20.0%, hurts at 22.8%, helps at 29.1%). The defensible reading is that
+**one-epoch CoT-SFT run-to-run variation on this recipe is of order ±2-4 aggregate points**, which
+swamps every within-family contrast here. Two consequences: (i) §32b's "always sweep α" stands, but
+as a *search* instruction, not because a knee has been located; (ii) an earlier draft of this section
+claimed a dose optimum near 23% — that claim is withdrawn.
+
+**WHAT SURVIVES, and it is the replication rather than any single arm.** ASDiv improves
+significantly in **five independent arms** built from different data mixes and different α (+3.60 to
++4.80, p between 0.0005 and 0.013). SVAMP moves 0.0 to +2.7 and **never reaches p<0.05** in any arm.
+Five independent replications of a same-signed, same-magnitude ASDiv gain is a real effect; the
+ordering *among* those five is not.
+
+### 33k. The winner, fully gated — `vfymw_a085`
+
+`/project/rcc/youzhi/models/a35_effort/vfymw_a085` = CoT-SFT from `dpo`, 1 epoch, effective batch 12,
+on `cot_mix_v6_vfymw` (v6 + the 3-flavour verify tier + the 1,672-trace mode-wrong RFT slice;
+35,900 rows, 26.4% realized new-tier share), souped with `dpo` at **α=0.85** (swept: α=0.925 gives
+139.40 and α=1.00 gives 135.10 aggregate greedy, so 0.85 is the knee *for this arm*).
+
+| axis | shipped `blend_a085` | `vfymw_a085` | note |
+|---|---|---|---|
+| aggregate greedy (n=1000×2) | 134.40 | **141.20** | **+6.8** |
+| ASDiv greedy | 69.90 | **74.70** | **+4.80, p=0.00053** |
+| ASDiv vs shipped's BEST config | 71.60 | 74.70 | **+3.10, p=0.022** |
+| SVAMP greedy | 64.50 | 66.50 | +2.00, p=0.20 (**not significant**) |
+| self-consistency@8 | 152.90 | 156.10 | +3.2 |
+| decoded tokens (greedy) | 146 / 150 | ~same | no extra serving cost |
+| lm-eval mean (6 tasks) | 55.21% | 55.07% | flat (−0.14) |
+| 4-quadrant probe | 10/10 · 9/10 · 7/10 · 10/10 | **10/10 · 10/10 · 7/10 · 10/10** | ≥ shipped on every quadrant |
+
+(math/no-think 7/10 for *both* models is a 200-token probe truncation artifact — the model explains
+the method and runs out before emitting the number — not a regression.)
+
+**Honest characterisation.** This is a **modest, replicated, ASDiv-driven single-model gain at zero
+serving cost**, not a uniform improvement: SVAMP does not move significantly in this or any other
+arm. It is NOT published — publishing requires explicit per-action approval.
+
+### 33l. Throughlines
+1. **A likelihood objective cannot move an argmax.** Greedy returns the mode; the mode is wrong on
+   ~28% of solvable problems; adding more correct traces (RFT) raises their likelihood a little and
+   changes nothing. This is why §32's v6 worked (it changed the *diet*, restructuring what a trace
+   looks like) and why an additive tier of the same kind of trace does not.
+2. **"More reasoning effort" is a trained capability, not a decode-time option.** The shipped model
+   had a negative response to sequential compute. A tier that shows it what to *do* with extra
+   tokens flips the sign — and at higher dose it stops needing the extra tokens at all, because the
+   verification moves inside the first pass (think-length actually *falls*).
+3. **The knob and the accuracy are alternatives.** Every arm that raised x0 lost the external knob;
+   the only arm with a significant knob (`vfy`, 20.0%) has a lower x0. There is no arm with both.
+4. **DPO's failure mode here is a leash, not a signal.** §20 killed GRPO for signal starvation; that
+   is gone (75-82% signal groups). RLVR-DPO instead fails by likelihood collapse, and β fixes it.
+   Diagnose *which* failure you have before declaring a lever dead.
+5. **Self-training selection will hunt degenerate traces if you let it.** Shortest-first + "correct"
+   = empty-think lucky guesses. The filter is not optional and its absence looks like a data win.
+6. **Report the replication, not the ranking.** Five arms agree on ASDiv (p=0.0005-0.013); their
+   ordering, and every dose/α contrast between them, is inside one-epoch run-to-run variation.
+
+### 33m. Files added
+| file | what |
+|---|---|
+| `reasoning/effort_probe.py` | the effort profiler: `budget` / `extend` / `density` / `passk` / `greedy` modes |
+| `reasoning/effort_gate.py` | paired n=1000 gate over deployable configs + exact McNemar (+ `--report-from` merge, `--sc-extensions` for the composition test) |
+| `reasoning/rft_generate.py` | K-sample labeled-rollout generator + `is_degenerate` (the mandatory filter) |
+| `reasoning/rft_select.py` | OFFLINE selection from a rollout corpus (`--target mode_wrong`) — keeps a policy bug from costing a regeneration |
+| `reasoning/build_verify_tier.py` | the self-verification tier (confirm / rederive / fix), correct-by-construction |
+| `reasoning/build_mix_rft.py` | merge a tier into a CoT mix (`--rft-share`, `--balance-tiers`, `--drop-tiers`) |
+| `reasoning/build_rlvr_pairs.py` | RLVR-DPO pairs with MODE-FIRST negatives |
+
+Campaign root `/project/rcc/youzhi/a35_effort/` (worker.sh, env.sh, run_arm.sh, st.sh, queue/, report/).
+### 33n. BREADTH — five held-out sets, and two corrections to the claims above
+
+SVAMP/ASDiv are both 1-2-step word problems, i.e. the *same family*, and the verify tier was built
+from gsm8k-train + MATH-L1-3 rollouts. So the gate above could not tell a capability gain from a
+family-specific one. Three further sets settle it: **MAWPS** (520, clean, classic word problems),
+**GSM-Plus** (adversarial perturbations of GSM8K test — semi-clean, a robustness set), **math500**
+(MATH test, numeric-only, harder).
+
+**Greedy, paired against the shipped model, exact McNemar:**
+
+| pool | n | shipped | `vfy` | p | `vfymw` | p |
+|---|---:|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 64.50 | 1.0 | 66.50 | 0.20 |
+| ASDiv | 1000 | 69.90 | 72.60 | 0.057 | **74.70** | **0.00053** |
+| MAWPS | 500 | 56.80 | 55.80 | 0.58 | 56.60 | 1.0 |
+| **GSM-Plus** | 500 | 27.80 | **33.00** | **0.017** | 31.80 | 0.054 |
+| math500 | 319 | 29.78 | 31.03 | 0.69 | 31.03 | 0.71 |
+| *unweighted mean* | | *49.76* | *51.39* | | ***52.13*** | |
+
+Self-consistency@8 tracks it: SVAMP 74.20→76.20, ASDiv 78.70→79.90, **GSM-Plus 39.60→42.60**,
+MAWPS 60.60→59.20, math500 31.03→30.72.
+
+**CORRECTION 1 — the accuracy gain is set-dependent, not general.** Two of five sets move
+significantly (ASDiv p=0.0005, GSM-Plus p=0.017 for `vfy`); three do not (SVAMP, MAWPS, math500).
+The defensible statement is **+2.4pt unweighted mean over five held-out sets, carried by ASDiv and
+by the adversarial GSM-Plus**. Anything stronger is over-claiming. The GSM-Plus result is arguably
+the more interesting of the two, since GSM-Plus exists to break memorised procedure and the shipped
+model scores only 27.8% there.
+
+**CORRECTION 2 — "the released model cannot use more thinking" is TRUE ONLY on easy word problems.**
+Best-extension minus greedy, per set:
+
+| pool | shipped | p | `vfy` | p |
+|---|---:|---:|---:|---:|
+| SVAMP | +0.10 | 1.0 | **+1.10** | **0.035** |
+| ASDiv | −1.30 (−2.80 at x3) | — | **+2.30** | **0.0006** |
+| MAWPS | +0.00 | 1.0 | +0.80 | 0.34 |
+| **GSM-Plus** | **+6.20** | **0.00064** | −0.40 | 0.88 |
+| math500 | +1.57 | 0.58 | +2.51 | 0.12 |
+
+On **GSM-Plus the shipped model has a large, highly significant effort knob of its own** (+6.20,
+p=0.00064) — and the verify arm does not. The earlier sections' framing ("the effort knob is
+negative") holds for SVAMP/ASDiv/MAWPS and is **wrong for GSM-Plus and math500**, where the shipped
+model does benefit from extra thinking. The coherent reading: forced continuation helps when the
+first pass is genuinely unfinished (hard/adversarial items) and hurts when it is finished and
+correct (easy items, where continuing talks the model out of a right answer). The verify tier
+**flattens** that response — it removes the downside on the easy sets and, on GSM-Plus, also removes
+the upside, because it has already banked most of that gain in the first pass (greedy 27.8→33.0).
+
+**So the campaign's defensible bottom line is narrower than §33d suggests and still real:**
+- On easy word problems the shipped model *loses* accuracy to extra sequential compute and the
+  verify tier converts that into a small significant *gain* (SVAMP +1.10 p=0.035, ASDiv +2.30
+  p=0.0006). That is a genuine new capability.
+- At *fixed* compute the verify tier buys +2.4pt mean over five sets, significant on two of them.
+- It does **not** create a general-purpose "think harder" dial: on the one set where the shipped
+  model already had one, the tier replaces it rather than adding to it.
+
