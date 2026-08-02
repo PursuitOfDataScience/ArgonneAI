@@ -2526,3 +2526,148 @@ the upside, because it has already banked most of that gain in the first pass (g
 - It does **not** create a general-purpose "think harder" dial: on the one set where the shipped
   model already had one, the tier replaces it rather than adding to it.
 
+### 33o. TARGETED FOLLOW-UP and the final candidate — `robust_a085`
+
+§33n located the headroom: GSM-Plus, where the shipped model scores 27.8% greedy against a ~59%
+pass@8, and where the verify tier already produced its largest gain. The tier's fuel had been
+rollouts on *clean* phrasings only, so a distractor-robustness pool was built
+(`reasoning/build_perturb_pool.py`: 2,421 gsm8k-**TRAIN** problems with one irrelevant sentence about
+a different subject spliced in before the question; gold provably unchanged; GSM-Plus derives from
+gsm8k **test**, so disjoint items with a similar perturbation style — ordinary methodology, not
+leakage). Rollouts from `vfymw_a085` on that pool → a `pert_verify_*` tier (~2.5k rows, ~6.5% share)
+added to the winner's mix; everything else held.
+
+**Final candidate `robust_a085` — five held-out sets, greedy, paired vs the shipped model:**
+
+| pool | n | shipped | `vfymw` | **`robust`** | p (shipped→robust) |
+|---|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 66.50 | 66.40 | 0.228 |
+| ASDiv | 1000 | 69.90 | 74.70 | **73.80** | **0.0053** |
+| MAWPS | 500 | 56.80 | 56.60 | 56.80 | 1.0 |
+| **GSM-Plus** | 500 | 27.80 | 31.80 | **34.20** | **0.0018** |
+| math500 | 319 | 29.78 | 31.03 | 31.97 | 0.435 |
+| **unweighted mean** | | **49.76** | 52.13 | **52.63** | |
+
+General capability unchanged: lm-eval 6-task mean **54.97 vs 55.21** shipped (−0.24, no task moving
+>1.3pt); 4-quadrant **10/10 · 10/10 · 8/10 · 10/10** versus the shipped model's 10/10 · 10/10 · 7/10
+· 10/10 — i.e. ≥ shipped on all four.
+
+The targeted round did what it was designed to do (GSM-Plus 31.80 → 34.20, and the shipped-model
+comparison moved from p=0.054 to **p=0.0018**) while holding ASDiv and SVAMP. **But `robust` vs
+`vfymw` is not significant on any single set** (best p=0.21), so the honest ordering is
+"`robust` ≥ `vfymw` > shipped", with only the comparison against *shipped* established.
+
+**FINAL ANSWER TO THE QUESTION ASKED.** Yes, the reasoning effort of the released
+argonne-3.5-think can be improved, in two distinct senses, both measured paired at n≥319 per set:
+1. **Effort it can actually spend.** On easy word problems the released model *loses* accuracy to
+   forced extra thinking (ASDiv −2.8 over 3 extensions, net flip −50 at x6). The verify tier turns
+   that into a significant gain (`vfy`: ASDiv +2.30 p=0.0006, SVAMP +1.10 p=0.035). Caveat from
+   §33n: on GSM-Plus the released model already had a knob of its own (+6.20 p=0.00064), so this is
+   not a universal new dial.
+2. **Effort it doesn't have to spend.** `robust_a085` gains **+2.9pt unweighted mean across five
+   held-out sets at the same token cost** (significant on ASDiv and adversarial GSM-Plus, flat on
+   the other three), with general capability unchanged — because the verification is *internalised*
+   into the first pass rather than bolted on at decode time.
+
+Candidate on disk at `/project/rcc/youzhi/models/a35_effort/robust_a085`. **Not published** — an HF
+push needs explicit per-action approval, and the README rule (every published model linked from the
+repo README, both directions) applies if it ever ships.
+### 33p. ⚠️SEED REPLICATION — the headline discounted, and what actually survives
+
+Nothing above tested run-to-run variation directly, and §33j warned it might swamp every
+within-family contrast. So the winning recipe was retrained end-to-end with a different data-shuffle
+seed and a different trainer seed (`robust2`, otherwise identical), and gated on the same five sets.
+
+| pool | n | shipped | run 1 | p | run 2 | p | mean Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 66.40 | 0.228 | 66.00 | 0.357 | +1.70 |
+| ASDiv | 1000 | 69.90 | 73.80 | **0.0053** | 72.50 | 0.078 | +3.25 |
+| MAWPS | 500 | 56.80 | 56.80 | 1.0 | 55.80 | 0.603 | −0.50 |
+| **GSM-Plus** | 500 | 27.80 | 34.20 | **0.0018** | 32.60 | **0.025** | **+5.60** |
+| math500 | 319 | 29.78 | 31.97 | 0.435 | 27.90 | 0.532 | +0.16 |
+| **5-set mean** | | **49.76** | **52.63** | | **50.96** | | **+2.04** |
+
+**Two runs of an identical recipe differ by 1.68pt on the 5-set mean** (and by 4.07pt on math500
+alone). That is the empirical noise scale for one-epoch CoT-SFT here, and it retro-justifies §33j:
+every dose and α contrast in this campaign was inside it.
+
+**Consequences, applied honestly:**
+- **The "+2.9pt" for `robust_a085` is a single draw and is discounted to ≈+2.0pt**, the mean of two
+  independent runs. Report the recipe, not the checkpoint.
+- **What REPLICATES (same sign, both runs): SVAMP (+1.9/+1.5), ASDiv (+3.9/+2.6), GSM-Plus
+  (+6.4/+4.8).** GSM-Plus is individually significant in *both* runs (p=0.0018 and p=0.025) — the
+  single most solid accuracy result of the campaign, and it is the adversarial-robustness set.
+- **What does NOT replicate: MAWPS (0.0 / −1.0) and math500 (+2.2 / −1.9).** Both are flat-to-negative
+  once averaged; the first run's math500 number was noise.
+- Therefore the defensible accuracy claim is: **≈+2pt unweighted mean over five held-out sets, driven
+  by a replicated +5.6pt on adversarial GSM-Plus and +3.3pt on ASDiv, with MAWPS and math500 flat.**
+- Anyone selecting between the arms in §33f/§33j should treat their ordering as unresolved and pick
+  on the *mechanism* they want (knob → `vfy`; internalised verification → `robust`/`vfymw`), not on
+  an aggregate difference of 1-3 points.
+
+**This is the section to read first if you are tempted to run one arm and ship it.**
+### 33q. The distractor-perturb tier is NULL once seed-averaged
+
+§33o credited the targeted robustness round with GSM-Plus 31.80 → 34.20. With a second seed of
+*each* recipe (2-vs-2, greedy):
+
+| pool | shipped | `vfymw` mean of 2 | `robust` mean of 2 | Δ (perturb tier) |
+|---|---:|---:|---:|---:|
+| SVAMP | 64.50 | 65.20 | 66.20 | +1.00 |
+| ASDiv | 69.90 | 74.00 | 73.15 | **−0.85** |
+| GSM-Plus | 27.80 | 32.50 | 33.40 | +0.90 |
+
+**The perturb tier adds nothing measurable** — +1.0 / −0.85 / +0.9 is noise, and it changes sign
+across sets. The GSM-Plus gain belongs to the **base verify tier**, which reaches 32.50 on its own
+against the shipped model's 27.80. So §33o's "the targeted round did what it was designed to do" was
+a single-seed artifact and is **withdrawn**; `vfymw` (verify tier + mode-wrong slice) is sufficient,
+and the perturbation round was unnecessary work.
+
+What survives seed-averaging on these three sets, for BOTH verify recipes: **ASDiv +3.3 to +4.1,
+GSM-Plus +4.7 to +5.6, SVAMP +0.7 to +1.7.** That is the result.
+### 33r. FINAL, 3 SEEDS PER RECIPE — the number to quote
+
+Every recipe retrained end-to-end at three seeds (different data shuffle + trainer seed), each
+gated paired on the held-out sets. `reasoning/../a35_effort/aggregate.py` produces this table.
+
+| recipe | SVAMP | ASDiv | MAWPS | GSM-Plus | math500 | **5-set mean** | seeds |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 64.50 | 69.90 | 56.80 | 27.80 | 29.78 | **49.76** | 1 |
+| verify @20% (`vfy`) | 64.77 | 72.53 | 55.80 | 31.27 | 31.03 | **51.08** | 3 |
+| verify+modewrong (`vfymw`) | 65.57 | 73.47 | 56.60 | 32.07 | 31.03 | **51.75** | 3 |
+| + distractor tier (`robust`) | 66.50 | 73.57 | 56.30 | 32.80 | 29.94 | **51.82** | 3 |
+
+Δ vs shipped, 3-seed means: `vfy` **+1.3**, `vfymw` **+2.0**, `robust` **+2.1**.
+(MAWPS/math500 are 1-seed for `vfy`/`vfymw` and 2-seed for `robust`; SVAMP/ASDiv/GSM-Plus are 3-seed
+for all three.)
+
+**Per-set seed spread — the reason this section exists:**
+
+| set | spread across 3 seeds |
+|---|---|
+| ASDiv | 0.20–2.30pt |
+| SVAMP | 0.80–2.60pt |
+| GSM-Plus | 2.00–3.80pt |
+| math500 | **4.08pt** (2 seeds) |
+
+**Conclusions that survive 3 seeds:**
+1. **ASDiv +2.6 to +3.7 and GSM-Plus +3.5 to +5.0** — both consistent in sign across every seed of
+   every recipe. These are the campaign's real accuracy gains.
+2. **SVAMP is weakly positive (+0.3 to +2.0), MAWPS is flat-to-negative (−1.0 to −0.2), math500 is
+   flat** (+1.25 on one seed, −1.9 on another). Not gains.
+3. **`vfymw` ≈ `robust` (51.75 vs 51.82).** The distractor-perturb tier contributes nothing; §33o's
+   apparent +2.4 on GSM-Plus was a single-seed artifact, already withdrawn in §33q and now confirmed
+   dead at 3 seeds. **The simpler recipe is the recommendation.**
+4. **The whole verify family lands at +1.3 to +2.1pt mean.** Whatever the differences between arms in
+   §33f/§33j looked like, at 3 seeds they compress into a ~1pt band. Ship the recipe, not a
+   checkpoint picked from a leaderboard of one-seed runs.
+
+**FINAL ANSWER, in one line:** the reasoning effort of argonne-3.5-think can be improved —
+**+2.0pt unweighted mean over five held-out sets at unchanged token cost and unchanged general
+capability, carried by ASDiv (+3.6) and adversarial GSM-Plus (+4.3)** — and separately, the model can
+be given a *working* sequential-effort knob where it previously had a harmful one (ASDiv +2.30
+p=0.0006, SVAMP +1.10 p=0.035), though not on the harder sets where it already had one.
+
+**Recommended recipe if this is ever shipped:** `cot_mix_v6_vfymw` (v6 + the 3-flavour verify tier +
+the mode-wrong RFT slice), 1 epoch from `dpo`, effective batch 12, soup α=0.85 — averaged over ≥3
+seeds, picking the median run, not the best one.
