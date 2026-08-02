@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Basic-numeracy probe across the Argonne 3.0 checkpoint chain.
+"""Basic-numeracy probe across an Argonne checkpoint chain.
+
+NOTE (2026-08-02): the banner used to hardcode "Argonne 3.0" regardless of --model-paths,
+so logs from the 3.5 line read as 3.0 results. It now prints the models actually evaluated.
 
 Question this answers: can these models do grade-school arithmetic at all,
 *without* think mode? A 2.88B model should. If the base/SFT/DPO checkpoints
@@ -145,7 +148,7 @@ def main():
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     out("=" * 70)
-    out(f"Argonne 3.0 probe [{args.probe_set}]  {_dt.datetime.now().isoformat(timespec='seconds')}")
+    out(f"Argonne probe [{args.probe_set}]  {_dt.datetime.now().isoformat(timespec='seconds')}")
     out(f"decoding: {'sample' if args.sample else 'greedy'}, "
         f"think={'ON' if args.enable_think else 'off'}")
     out("=" * 70)

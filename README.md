@@ -6,7 +6,8 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 | Model | Params | Context | Training tokens | Hugging Face |
 |-------|--------|---------|-----------------|--------------|
-| [Argonne 3.5](#argonne-35) | 2.88B | **13,568** (trained) | ~88.84B | [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base) |
+| [Argonne 3.5-think](#argonne-35-think) | 2.88B | 13,568 | ~88.84B + post-training | [Argonne-3.5-think](https://huggingface.co/PursuitOfDataScience/Argonne-3.5-think) |
+| [Argonne 3.5-base](#argonne-35-base) | 2.88B | **13,568** (trained) | ~88.84B | [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base) |
 | [Argonne 3.0](#argonne-30) | 2.88B | 1,024 (RoPE θ=1e6) | ~76.05B | [argonne-3.0-base](https://huggingface.co/PursuitOfDataScience/argonne-3.0-base) |
 | [Argonne 2.5](#argonne-25) | 1.27B | 1,024 | ~76.05B | [Argonne2.5-base](https://huggingface.co/PursuitOfDataScience/Argonne2.5-base) |
 | [Argonne 2.0](#argonne-20) | 4.9B | 4,096 | ~21.9B | — (not released) |
@@ -15,7 +16,53 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 ---
 
-# Argonne 3.5
+# Argonne 3.5-think
+
+The reasoning model of the 3.5 line, released as [`PursuitOfDataScience/Argonne-3.5-think`](https://huggingface.co/PursuitOfDataScience/Argonne-3.5-think). Built on [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base); emits an explicit `<think>…</think>` trace then a `\boxed{}` answer.
+
+## vs Argonne 3.0-think
+
+![3.5-think vs 3.0-think](plots/a35think_vs_3p0.png)
+
+Both models measured in a **single job**, same grader, same n=300 / K=8 / seed — not compared against previously-recorded numbers.
+
+| clean, n=300, K=8 | Argonne 3.0-think | **Argonne 3.5-think** | delta |
+|---|---|---|---|
+| SVAMP greedy | 22.00 | **65.00** | **+43.0** |
+| SVAMP self-consistency | 30.00 | **74.00** | **+44.0** |
+| SVAMP pass@8 | 51.33 | **90.67** | +39.3 |
+| ASDiv greedy | 32.33 | **73.00** | **+40.7** |
+| ASDiv self-consistency | 39.33 | **82.67** | **+43.3** |
+| ASDiv pass@8 | 60.00 | **92.33** | +32.3 |
+
+Judged on **SVAMP/ASDiv**, which appear in no training stage of this line. **GSM8K is contaminated** for Argonne reasoning models and is never reported.
+
+## The mechanism: termination
+
+![termination](plots/a35think_termination.png)
+
+The defining failure of the 3.0 line was non-termination — traces that never closed `</think>`, so no answer was emitted. Training only on short, closed, correct traces makes termination a property of the weights: `no_answer` falls 53.7% → 1.3% (SVAMP) and 59.7% → 2.0% (ASDiv), and budget-forcing — previously the only thing that helped — now adds ~1 point.
+
+## What actually moved the number
+
+![attribution](plots/a35think_attribution.png)
+
+The base raises the **ceiling** (pass@8 58.7 → 74.0) while greedy stays flat; the short-trace mix converts that ceiling into a **floor** (+36.7 greedy); SFT breadth via the weight soup adds the last ~2 points. No RL, no distillation from a stronger teacher.
+
+## Recipe
+
+| stage | data | detail |
+|---|---|---|
+| 1 — SFT | UltraChat 200k | 207,865 rows, 1 epoch, effective batch 20 |
+| 2 — DPO | argilla/dpo-mix-7k | 6,750 pairs, LR 1e-6, β=0.03 |
+| 3 — CoT-SFT | short-trace mix, 26,428 rows all ≤768 tokens | 1 epoch, effective batch 12 |
+| 4 — weight soup | — | 0.85 × CoT + 0.15 × DPO |
+
+α = 0.85 is a measured knee, not a default: α = 0.70 reintroduces non-termination. Full build log, including the ablations that failed and two predictions that turned out wrong, is in [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §32.
+
+---
+
+# Argonne 3.5-base
 
 Argonne 3.5-base is a 2.88B-parameter decoder-only transformer, released as [`PursuitOfDataScience/argonne-3.5-base`](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base). Same architecture as Argonne 3.0; what changed is the training recipe and a three-stage data curriculum that ends in a **trained** 13,568-token context.
 
