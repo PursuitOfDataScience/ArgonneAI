@@ -1958,3 +1958,70 @@ reasoning/: build_*_mix.py ─▶ cot_sft_instruct.sh (cot-sft.py) ─▶ think_
                 ▼
       every checkpoint is graded by reasoning/star_eval.sh (eval_numeracy.py, 4-quadrant)
 ```
+
+---
+
+## §32 — argonne3.5 reasoning line: the base finally meets the mix (2026-08-01/02)
+
+§24 Tier 3 said the only real ceiling-raiser left was **a better base**, and that "the v3 recipe
+transfers directly to a stronger base." This section is that prediction being tested. It held,
+and by more than expected.
+
+**Result — final model `models/a35_reason/blend_a085` (= 0.85·think_v6 + 0.15·dpo):**
+
+| judge (clean, n=300, K=8) | 3.0 shipped v3/v4 | **argonne3.5 blend_a085** |
+|---|---|---|
+| SVAMP greedy / self-cons | ~23–27 / ~40–53 | **65.00 / 74.00** |
+| ASDiv greedy / self-cons | ~23–27 / ~40–53 | **73.00 / 82.67** |
+| general 10-item, no-think | (soup-recovered to ~7-8) | **10/10** |
+| `</think>` closure, 20 probes | — | **20/20** |
+
+Roughly 2.5–3× the deployable accuracy of the model this project shipped after STaR, GRPO,
+external-teacher distillation and two soup generations.
+
+### 32a. What actually did the work, in order
+1. **The base raised the ceiling.** Same recipe (`cot_ab_40k`), only the base swapped from
+   `a35_anneal_256082` to the finished midtrained base: self-cons 43.00→62.33, pass@8
+   58.67→74.00 (CIs disjoint). Greedy moved +1.67 — i.e. **flat**. Third replication of the 3.5
+   signature: the ceiling rises, the floor does not.
+2. **v6 converted ceiling into floor.** Same base, only the data swapped to `cot_sft_mix_v6`:
+   greedy **25.67→62.33** (SVAMP) and **31.00→71.33** (ASDiv), with `no_answer` collapsing
+   **53.7%→1.3%** and **59.7%→2.0%**. Budget-forcing went from the only thing that helped to
+   adding *exactly 0.00* — the signature of "no unclosed traces left to recruit". §23's
+   non-termination diagnosis, solved at the weights, in an 18-minute run.
+3. **SFT breadth added ~2pt, through the soup.** DPO was a measured no-op (loss pinned at
+   ln(2)≈0.693, reward margin ~0.001), so the 0.15 partner is effectively the *SFT* checkpoint.
+   The blend gained +2.67/+2.00 greedy and fixed the one general miss — the **grammar-correction**
+   probe, i.e. instruction-following, exactly what 207k UltraChat rows add and what a fact-recall
+   probe cannot see.
+
+### 32b. Things that were predicted wrong (recorded so they are not re-predicted)
+- **"The α sweep will be a no-op."** WRONG. α=0.70 posted the worst greedy (57.33/59.67) but the
+  largest budget-forcing recovery (+7.0/+11.3) = **reintroduced non-termination**. §19's
+  "lower alpha breaks `</think>` closure" reproduced on a new base. **α=0.85 is a real knee that
+  transfers.** Always sweep it; never assume the soup is inert.
+- **"2 epochs of v6 should help"** (a35_bigsft found more CoT data widened the gap). WRONG:
+  greedy −3.0/−5.0 and `no_answer` 4→10 / 6→16. Every delta inside its CI, but consistent in
+  direction across all four measures. **Keep 1 epoch.**
+
+### 32c. Eval-integrity findings — read before quoting any number from this section
+- **Null control passed decisively.** Excess over the magnitude-matched null: self-cons
+  **+67.3 / +77.3**, pass@32 **+77.3 / +83.8** — far above the 3.0 line's +33/+48 and +51/+60
+  (§23c). The gain is capability, not small-integer collision.
+- **⚠️pass@K is the noisiest metric.** Re-evaluating the SAME model with the SAME seed reproduced
+  greedy (62.33) and self-cons (73.67) EXACTLY but moved pass@8 **91.33→85.67**. Self-consistency
+  is a majority vote and absorbs sample flips; pass@K turns on any single one. **Select on
+  self-consistency, use greedy as the deployability check, treat pass@K as a ceiling indicator
+  only — never to separate arms.**
+- The `dpo` arm reads **0.00% greedy math**. Not a bug: it never saw CoT and cannot emit the
+  answer format. It confirms all math capability originates in the CoT stage.
+- Honest blemish on the winner: it is more verbose than v6-direct and on one probe appends a
+  hallucination ("one of the four main stars in our solar system") to a correct answer.
+
+### 32d. Reusable tooling added
+`reasoning/a35_{sft,dpo,cot,soup_eval}.sh` (the stage-gated chain, effective-batch guards that
+REFUSE to run on a wrong split), `a35_v6_probe.sh` / `a35_v6x2.sh` (data ablations),
+`a35_v6_null.sh` (integrity), `a35_{v6,final}_general.sh` (4-quadrant), `a35_status.sh`
+(heartbeat: step-delta + GPU throttle probe), `stage_a35_base_hf.py`, `plot_a35_loss.py`.
+**`sft.py` now has opt-in DDP** (inert at WORLD_SIZE=1), verified 2-GPU vs 1-GPU at identical
+effective batch; it cut stage A from a projected 12.4h to 7:57.
