@@ -841,11 +841,24 @@ class ArgonneModel(PreTrainedModel):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         self.eval()
         device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
         ctx = self.config.max_position_embeddings
+        # Stop at EOS (2026-08-02). This loop previously had NO eos check at all -- its only
+        # exit was `max_length`, so config.eos_token_id was inert and every caller following the
+        # model card's `.generate()` snippet ran to the token budget and then degenerated into
+        # repetition long after the answer was finished. Harmless-looking on a base model (which
+        # just continues text) but bad on a chat/think model, where the assistant turn must end
+        # at <|im_end|>. Longstanding across the whole Argonne line, including the published
+        # 3.0-think bundle -- not introduced by any recent change.
+        # Pass eos_token_id=-1 to explicitly opt out and restore run-to-max_length behavior.
+        if eos_token_id is None:
+            eos_token_id = getattr(self.config, "eos_token_id", None)
+        stop_id = None if eos_token_id is None or eos_token_id < 0 else int(eos_token_id)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=device)
         # KV-cache decode: prefill the prompt once, then feed a single token per
         # step reusing past_key_values. This yields identical logits to the
         # recompute-the-whole-prefix path (gated by verify_cache.py) but turns the
@@ -909,6 +922,12 @@ class ArgonneModel(PreTrainedModel):
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             if input_ids.shape[1] >= max_length:
                 break
+            # Batch-safe: only stop once EVERY row has emitted EOS, so a short sequence cannot
+            # truncate the others. (This arch has no padding support, so batch is normally 1.)
+            if stop_id is not None:
+                finished |= next_token.squeeze(-1).eq(stop_id)
+                if bool(finished.all()):
+                    break
             # Advance the cache by one token unless we must rebuild it next loop
             # (cache full); the top-of-loop guard re-prefills in that case.
             if past[0][0].shape[2] < ctx:
