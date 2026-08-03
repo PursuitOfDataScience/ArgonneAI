@@ -9,9 +9,32 @@ it, which is worse than no check because it adds false confidence. Trivial one-s
 exactly what a user types first. So both models are run head-to-head on simple prompts through
 `from_pretrained` + `.generate()`, the path the HF card actually exposes.
 """
-import argparse, re, sys
+import argparse, importlib.util, re, sys
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+REPO = "/home/youzhi/ArgonneAI"
+
+
+def register_argonne():
+    """Register `argonne2` with the Auto* classes directly.
+
+    run_arm.sh's config patch REMOVES `auto_map` (the vLLM path supplies the classes itself), so
+    `from_pretrained(trust_remote_code=True)` on a raw arm dir raises "Transformers does not
+    recognize this architecture". Earlier probe runs only worked by accident, because they loaded the
+    staged HF bundle (which has auto_map) FIRST and that registered the classes for the whole
+    process; running a candidate alone failed. Registering explicitly removes the ordering
+    dependency -- the same reason `vllm_argonne.register()` exists for the vLLM side.
+    """
+    spec = importlib.util.spec_from_file_location("_argonne_arch", f"{REPO}/model.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    try:
+        AutoConfig.register("argonne2", mod.ArgonneConfig)
+        AutoModelForCausalLM.register(mod.ArgonneConfig, mod.ArgonneModel)
+    except ValueError:
+        pass          # already registered (a dir with auto_map got there first)
+    return mod
 
 def _gen_probes(n=64, seed=11):
     """Programmatic ONE-STEP arithmetic. The five held-out benchmarks are all multi-step word
@@ -45,7 +68,16 @@ PROBES = [
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--models", nargs="+", required=True)
-    ap.add_argument("--max-new", type=int, default=320); a = ap.parse_args()
+    ap.add_argument("--max-new", type=int, default=320)
+    ap.add_argument("--probe-seed", type=int, default=11,
+                    help="seed 11 = the items build_arith_tier.py EXCLUDES. Any other seed is a "
+                         "fresh draw, i.e. a generalisation check beyond the excluded set.")
+    ap.add_argument("--n-gen", type=int, default=64)
+    a = ap.parse_args()
+    register_argonne()
+    global PROBES
+    PROBES = PROBES[:16] + _gen_probes(a.n_gen, a.probe_seed)
+    print(f"probe: 16 hand-written + {a.n_gen} generated (seed {a.probe_seed}) = {len(PROBES)} items")
     for spec in a.models:
         nm, path = spec.split("=", 1)
         tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)

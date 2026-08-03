@@ -2770,3 +2770,51 @@ not to churn a public card for a non-significant mixed change.
 5. Measured negatives not to re-pay: additive RFT null; RLVR-DPO needs β≥0.4 and is
    serving-dependent; the parallel and sequential scaling axes do not compose; dose/α contrasts on
    this recipe are inside run-to-run noise; the distractor-perturb tier is inert.
+### 33u. THREE SEEDS SETTLE IT — the repair is a null too, and a single-seed read misled me twice
+
+§33t withheld `fix2` on one seed and called it a judgment call. Two more seeds of the identical
+recipe (plus the arithmetic probe re-run at a FRESH seed 77, i.e. items `build_arith_tier.py` never
+excluded) turn it into a measurement.
+
+**Multi-step held-out (greedy, 4 sets):**
+
+| arm | SVAMP | ASDiv | MAWPS | GSM-Plus | mean | Δ shipped |
+|---|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 64.50 | 69.90 | 56.80 | 27.80 | **54.75** | — |
+| `vfymw` (the unshippable one) | 66.50 | 74.70 | 56.60 | 31.80 | **57.40** | +2.65 |
+| `fix2` seed 46 | 66.70 | 72.60 | 54.00 | 28.60 | 55.48 | +0.73 |
+| `fix2b` seed 99 | 64.50 | 70.90 | 52.80 | 29.00 | 54.30 | **−0.45** |
+| `fix2c` seed 5150 | 67.00 | 72.00 | 54.80 | 31.40 | 56.30 | +1.55 |
+| **`fix2` recipe, 3 seeds** | | | | | **55.36** | **+0.61**, spread **2.00pt** |
+
++0.61pt with a 2.00pt spread, against §33p's ±1.68pt noise, and **one seed is negative**. Null.
+
+**Arithmetic on the deployed path — and this is the correction:**
+
+| arm | n=80 (seed 11, excluded from training) | n=176 (seed 77, FRESH) |
+|---|---:|---:|
+| shipped | 39/80 (48.8%) | 97/176 (55.1%) |
+| `fix2` seed 46 | 44/80 | 110/176 (62.5%) |
+| `fix2b` seed 99 | **37/80** | **93/176 (52.8%)** |
+| `fix2c` seed 5150 | 43/80 | 115/176 (65.3%) |
+| **3-seed mean** | 41.3/80 (+2.3) | 106/176 (60.2%, **+5.1**) |
+
+⚠️**I reported "+7.4pt, the arithmetic fix generalizes" from `fix2` alone. At three seeds it is +5.1pt
+with a 12.5pt spread and one seed BELOW the shipped model.** So the repair improves arithmetic *on
+average* but not *reliably* — a coin-flip seed can leave it worse than the model it was fixing. The
+claim has to be weakened accordingly.
+
+**The only effect that replicates in all three seeds is a regression: MAWPS** (−2.80, −4.00 with
+p=0.019, −2.00; and −2.50 at MAWPS's full n=520). Consistent sign, one seed individually significant.
+
+**FINAL: nothing from this campaign is shippable. `blend_a085` stays as
+Argonne-3.5-think.** Not a judgment call now: the repaired recipe's multi-step gain is null, its
+arithmetic gain is unreliable, and its one reproducible effect is a MAWPS regression.
+
+**THE DOMINANT METHODOLOGICAL LESSON OF §33, learned twice.** Single-seed reads misled me at both
+decision points: first the "+2.4pt five-set winner" (§33o, withdrawn in §33q), then the "+7.4pt
+arithmetic fix" (here). On this recipe a one-epoch CoT-SFT run carries **±1.7pt on a 5-set mean and up
+to ±12pt on an 80-176 item probe**. Nothing on this line should be believed, and certainly not
+shipped, from one seed — including a *negative* result, which is why the ship-block in §33s was
+re-tested rather than trusted. Budget three seeds per arm from the start; it is cheaper than the two
+retractions it would have prevented.
