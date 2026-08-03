@@ -75,6 +75,20 @@ def fmt_num(x):
     return f"{x:.4f}".rstrip("0").rstrip(".")
 
 
+def n_valid_eqs(think):
+    """Count DISTINCT arithmetically-correct `a op b = c` steps -- the multi-step test."""
+    seen = set()
+    for m in EQ.finditer(think):
+        try:
+            a, op, b, c = float(m.group(1)), m.group(2), float(m.group(3)), float(m.group(4))
+        except ValueError:
+            continue
+        v = _val(a, op, b)
+        if v is not None and abs(v - c) <= 1e-6:
+            seen.add((a, op.lower(), b, c))
+    return len(seen)
+
+
 def recheck_text(think, gold, max_steps=6):
     """Mechanically re-verify every explicit equation. Returns None if there is nothing to check.
 
@@ -162,6 +176,12 @@ def main():
                     help="higher than the v6 cap of 768 ON PURPOSE: a verify row is a short trace "
                          "plus its recheck, and clipping it would truncate the thing being taught")
     ap.add_argument("--min-think-tok", type=int, default=48)
+    ap.add_argument("--min-eqs", type=int, default=0,
+                    help="§33s FIX: require this many DISTINCT valid `a op b = c` steps in the "
+                         "source think block, for every flavour. With 0 the cue gets attached to "
+                         "one-step derivations, the model learns it is part of the default trace, "
+                         "and it then fires on `2 + 2` where the second derivation invents an error "
+                         "(measured: -23.8pt on one-step arithmetic). Use >=2.")
     ap.add_argument("--wrong-clip-frac", type=float, default=0.6,
                     help="when a wrong trace has no locatable bad equation, keep this leading share")
     ap.add_argument("--seed", type=int, default=20260802)
@@ -213,6 +233,9 @@ def main():
             if is_degenerate(th, gold, args.min_think_tok, tok, True, 0):
                 stat["confirm_drop_degenerate"] += 1
                 continue
+            if n_valid_eqs(th) < args.min_eqs:
+                stat["confirm_drop_not_multistep"] += 1
+                continue
             chk = recheck_text(th, gold)
             if chk is None:
                 stat["confirm_drop_no_checkable_step"] += 1
@@ -251,6 +274,9 @@ def main():
             continue
         gold = e["gold"]
         a = pos[0]
+        if n_valid_eqs(a) < args.min_eqs:
+            stat["rederive_drop_not_multistep"] += 1
+            continue
         b = next((x for x in pos[1:] if step_signature(x) != step_signature(a)), None)
         if b is None:
             stat["rederive_drop_no_distinct_second"] += 1
@@ -280,6 +306,9 @@ def main():
             stat["fix_drop_no_clean_positive"] += 1
             continue
         good = pos[0]
+        if n_valid_eqs(good) < args.min_eqs:
+            stat["fix_drop_not_multistep"] += 1
+            continue
         # prefer a wrong trace whose error can actually be LOCATED -- that row can name the step
         wrongs = sorted(e["wrong"], key=len)
         located = [w for w in wrongs if truncate_at_first_bad(strip_think(w) or "") is not None]

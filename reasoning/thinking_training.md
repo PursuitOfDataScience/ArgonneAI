@@ -2722,3 +2722,51 @@ the released Argonne-3.5-think.
 
 **Rule for this line going forward: no reasoning-model release may be gated on multi-step benchmarks
 alone. `a35_effort/simple_probe.py` (80 one-step items, deployed path) is now part of the gate.**
+### 33t. THE FIX ROUND — the gain and the damage are the SAME ROWS
+
+Three repaired arms, each gated on BOTH axes (one-step arithmetic on the deployed
+`from_pretrained`/`.generate()` path, n=80; multi-step held-out sets, paired vs shipped):
+
+| arm | what changed | one-step arith | multi-step mean (4 sets) | ASDiv |
+|---|---|---:|---:|---:|
+| shipped `blend_a085` | — | **39/80 (48.8%)** | 54.75 | 69.90 |
+| `vfymw` (§33s blocker) | verify tier, unrestricted | **21/80 (26.2%)** | **57.40** | **74.70** |
+| `fix1` | verify restricted to **multi-step sources** (`--min-eqs 2`) + 5,000 cue-free arithmetic rows | **43/80 (53.8%)** | 55.48 | 70.60 |
+| `fix2` | fix1 + the mode-wrong RFT slice | **44/80 (55.0%)** | 55.48 | 72.60 |
+| `fix4` | **full** verify tier + 3,800 **bare-numeric-only** counter-examples | 26/80 (32.5%) | 55.92 | **74.00** (p=0.0032) |
+
+**The two hypotheses, and which one the data supports.**
+- *"Bare numeric expressions are the conflict; word problems are fine to verify."* **REFUTED by fix4.**
+  Keeping the full verify tier and adding 3,800 bare-numeric cue-free rows recovered ASDiv (74.00,
+  p=0.0032) but left one-step arithmetic at **26/80** — barely above the broken arm. Counter-examples
+  alone do not stop the cue firing on `2 + 2`.
+- *"The cue must never be trained on one-step derivations."* **SUPPORTED.** Only `--min-eqs 2` (which
+  dropped **15,866** of the `verify_confirm` candidates as one-step) restores arithmetic — and it
+  simultaneously gives back most of the ASDiv gain (74.70 → 70.60/72.60).
+
+**So the gain and the damage are produced by the same rows.** ASDiv is itself a 1-2-step set, so the
+verify rows that teach "check your 1-2-step derivation" are exactly the rows that teach "check
+`2 + 2`". Restricting the tier to multi-step sources removes ~75% of the multi-step gain along with
+~90% of the arithmetic damage. There is no setting in this design that keeps both.
+
+**FINAL DECISION: the public card is NOT replaced. `blend_a085` remains Argonne-3.5-think.**
+The best repaired arm, `fix2`, is **+5.0pt on one-step arithmetic and +0.73pt mean on four multi-step
+sets, with MAWPS −2.80 (p=0.087)**. A +0.73pt mean is inside the **±1.68pt** seed-noise scale measured
+in §33p, and the arithmetic gain is mostly *recovering what the tier broke* rather than beating the
+shipped model. That is a wash with a per-set regression, and §28/§29's standing rule on this line is
+not to churn a public card for a non-significant mixed change.
+
+**What this campaign delivers, then, is knowledge and tooling rather than a release:**
+1. The released model's response to forced extra thinking is **negative on easy word problems**
+   (ASDiv −2.8 over 3 extensions, n=1000) and **positive on adversarial ones** (GSM-Plus +6.2,
+   p=0.00064). Nobody had measured either.
+2. A trained continuation mode **flips that sign** on the easy sets (ASDiv +2.30 p=0.0006, SVAMP
+   +1.10 p=0.035) and internalises verification into the first pass at *fewer* tokens ("wait" in 2.3%
+   of shipped greedy traces vs 59.0%).
+3. **That capability is not free**: it is coupled to a large regression on single-step arithmetic, and
+   the coupling is a property of the data, not a bug in the tier.
+4. **The benchmark suite for this line had a hole big enough to hide 24 points.** Fixed:
+   `reasoning/simple_arith_probe.py` is now a mandatory gate.
+5. Measured negatives not to re-pay: additive RFT null; RLVR-DPO needs β≥0.4 and is
+   serving-dependent; the parallel and sequential scaling axes do not compose; dose/α contrasts on
+   this recipe are inside run-to-run noise; the distractor-perturb tier is inert.
