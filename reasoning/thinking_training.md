@@ -2671,3 +2671,54 @@ p=0.0006, SVAMP +1.10 p=0.035), though not on the harder sets where it already h
 **Recommended recipe if this is ever shipped:** `cot_mix_v6_vfymw` (v6 + the 3-flavour verify tier +
 the mode-wrong RFT slice), 1 epoch from `dpo`, effective batch 12, soup α=0.85 — averaged over ≥3
 seeds, picking the median run, not the best one.
+### 33s. ⛔ SHIP BLOCKED — the verify tier costs 24 points on ONE-STEP arithmetic
+
+The release was staged (`stage_a35_think_hf.py --verify` on `vfymw_a085`: 5 bf16 shards, the four
+config fixes, reload + chat generation terminating cleanly at 118/200 tokens). Its own smoke prompt
+is **"What is 17 - 5?"** and the candidate answered **7**:
+
+> `<think>` First, 17 - 5 = 12. Then 12 - 5 = 7. So, 17 - 5 = 7. **Wait, let me double-check that.
+> Let me derive it a second way to be sure.** First, subtract 5 from 17. 17 - 5 = 12. Then subtract 5
+> from 12. 12 - 5 = 7. **Both ways give 7.** `</think>` The answer is $\boxed{7}$.
+
+It computed 12 correctly, subtracted 5 again, and then the **trained self-verification re-derived the
+same wrong way and confirmed it**. A verification that repeats the original error does not catch it —
+it adds false confidence, which is worse than not checking.
+
+**Measured head-to-head on 80 one-step queries** (16 hand-written + 64 programmatic `a op b`, fixed
+seed, deployed `from_pretrained` + `.generate()` path):
+
+| model | one-step correct | mean tokens (hit / miss) |
+|---|---:|---:|
+| shipped `blend_a085` | **40/80 = 50.0%** | 75 / 94 |
+| candidate `vfymw_a085` | **21/80 = 26.2%** | 89 / 103 |
+
+**−23.8pt.** Examples: `2 + 2` → **6** (108 tok), `1000 - 1` → **998**, `50 - 17` → **16**,
+`7 times 6` → **252**, "12 eggs × 3 cartons" → **12**. The candidate spends *more* tokens on the ones
+it gets wrong: the cue fires on problems that were already finished in one step, and the second
+derivation is where the error enters. This is the §33d C→X flip mechanism, now visible on the inputs
+users actually type first.
+
+**⚠️WHY EVERY BENCHMARK IN THIS CAMPAIGN MISSED IT.** SVAMP, ASDiv, MAWPS, GSM-Plus and math500 are
+**all multi-step word problems**. There is no single-step arithmetic set anywhere in the suite, so a
++2.4pt mean across five held-out sets, ASDiv p=0.0005, GSM-Plus p=0.017, three-seed replication,
+unchanged lm-eval and a passing 4-quadrant probe **all coexisted with a 24-point regression on
+`2 + 2`**. The 4-quadrant probe's math/no-think quadrant is the only thing that touches this and it
+is 10 items scored loosely. v6's `synth_arith` tier (2,500 rows) existed precisely to hold
+single-fact arithmetic; the new tier took 26% of the mix and diluted it.
+
+**DECISION: the public card was NOT replaced.** The staged bundle was deleted. `blend_a085` remains
+the released Argonne-3.5-think.
+
+**What this does and does not invalidate:**
+- **Invalidated as a ship candidate:** every arm in this campaign. They all carry the same tier, so
+  they all likely carry the same regression; only `vfymw_a085` was measured.
+- **NOT invalidated:** the diagnosis (§33a-b), the mechanism result that a trained continuation mode
+  flips the sign of forced-extension response on multi-step problems (§33d/f, ASDiv +2.30 p=0.0006),
+  and every recorded negative (RFT null, DPO β, axes don't compose, seed noise). Those stand.
+- **The obvious fix, untested:** make the verification *conditional* on the problem being multi-step
+  (or restore/upweight a single-step arithmetic tier so the cue does not fire on one-step queries).
+  Any future round must gate on a one-step arithmetic probe, not only on word-problem benchmarks.
+
+**Rule for this line going forward: no reasoning-model release may be gated on multi-step benchmarks
+alone. `a35_effort/simple_probe.py` (80 one-step items, deployed path) is now part of the gate.**
