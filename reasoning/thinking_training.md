@@ -2818,3 +2818,46 @@ to ±12pt on an 80-176 item probe**. Nothing on this line should be believed, an
 shipped, from one seed — including a *negative* result, which is why the ship-block in §33s was
 re-tested rather than trusted. Budget three seeds per arm from the start; it is cheaper than the two
 retractions it would have prevented.
+### 33v. ⚠️§10's NUMERACY DIAGNOSIS IS WRONG — 56% of the arithmetic failures are the operator applied TWICE
+
+Diagnosing the one-step arithmetic weakness §33s exposed (shipped model: 97/176 = 55.1%). For every
+failed `a op b`, test whether the emitted answer equals `(a op b) op b`:
+
+| | shipped `blend_a085` | `fix2` (arith tier @14%) |
+|---|---:|---:|
+| failures | 79/176 | 66/176 |
+| **operator applied TWICE** | **44 (56%)** | **9 (14%)** |
+| other error | 27 (34%) | 48 (73%) |
+| no answer | 8 (10%) | 9 (14%) |
+
+| query | correct | emitted |
+|---|---:|---:|
+| `9 * 9` | 81 | **729** (81 × 9) |
+| `19 * 9` | 171 | **1539** (171 × 9) |
+| `429 + 492` | 921 | **1413** (921 + 492) |
+| `46 + 284` | 330 | **614** (330 + 284) |
+| `17 - 5` | 12 | **7** (12 − 5) |
+| `50 - 17` | 33 | **16** (33 − 17) |
+| `217 - 5` | 212 | **207** (212 − 5) |
+
+**In every case the first computation is CORRECT.** The model knows the arithmetic and then fails to
+stop — it re-applies the same operator to its own result. By operation: sub **30.6%**, add 46.3%,
+mul 54.8%, div 76.5%. Magnitude barely matters (<20: 54.8%, 100-999: 48.3%), which is what you would
+NOT see if this were a fact-recall or carry problem.
+
+**This contradicts §10 and [[think-model-reasoning-is-capability-ceiling]]**, which attributed this
+model's arithmetic weakness to "arithmetic-fact errors from weak pretraining" — a capability ceiling.
+It is not a ceiling. It is a **stopping bug inside the think block**, the same family as §23e's
+`</think>` non-termination: v6 taught the model to close the tag but not to stop *computing*. That
+reframes a diagnosis that has stood since §10 and shaped several later decisions.
+
+**And it says the §33t arithmetic tier was aimed correctly**: one cue-free computation line then close
+cut double-application from 56% → 14% of failures, an 80% reduction in the dominant failure mode. It
+netted only 79→66 because it traded into "other error" (27→48) — the signature of a **dose** problem,
+5,000 terse one-liners at 14% of the mix reshaping the trace distribution too broadly, not of a wrong
+target. Hence `fix3`: the same tier halved to 2,500 rows (~7%, matching v6's `synth_arith` share)
+with the multi-step-gated verify tier, run at **three seeds from the start**.
+
+**Why this is the most promising target left on this line:** it is a mechanical, precisely localised
+bug affecting **44/176 = 25% of all one-step arithmetic queries**, on which the model has *already
+computed the right answer*. Nothing else found in §33 has that property.
