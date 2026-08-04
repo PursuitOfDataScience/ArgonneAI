@@ -5753,3 +5753,49 @@ staged bundle now matches the live config on **all 41 keys**.
 `--out-dir` was added in the same commit because `--dry-run` built the release into a temp directory
 and then deleted it in a `finally` block. That validates the build but leaves nothing to inspect,
 smoke-test or push — so the dry run as it stood could not have caught any of the above.
+
+### 37c. Release smoke test — the staged bundle PASSES through the path a Hub user takes
+
+`350_release_smoke.sh`. Loads the **staged bundle** (not the training output) with
+`trust_remote_code=True` and **deliberately no `register_argonne()`**, because the point is that
+`auto_map` plus the bundled `model.py` are sufficient on their own — the way someone downloading from
+the Hub experiences it. [[think-model-checkpoint-is-healthy]] records a `from_pretrained` buffer bug
+that made a healthy checkpoint emit gibberish *only* through the HF path, which is exactly the class of
+defect fp32→bf16 + 1 file→5 shards can introduce.
+
+| check | result |
+|---|---|
+| load, no manual registration | **2,882,162,688 params** — `auto_map` resolves `ArgonneModel` |
+| config as shipped | `block_size=13568  max_position_embeddings=13568  eos=151645  dtype=bfloat16` |
+| terminates with **no** `eos_token_id` argument passed | **79 tokens, terminated=True** |
+| instruction probe (14 items) | **13/14** — identical to pre-export, same single miss (French) |
+| one-step arithmetic (144 items) | **143/144** — identical to pre-export |
+
+**Both probes reproduce the pre-export numbers exactly**, so the bf16 conversion and 5-way sharding did
+not perturb the weights. The `lm_head.weight | MISSING | newly initialized` line in the transformers
+load report is **benign** — this arch ties input and output embeddings, so `lm_head` is legitimately
+absent from the state dict and populated by tying. That line is alarming and harmless, and the
+arithmetic reproducing to the item is what proves it: a genuinely re-initialised `lm_head` could not
+score 143/144.
+
+The termination row is the one that would not have been caught any other way. Every probe in the
+campaign passes `eos_token_id` explicitly, so all of them terminate regardless of what the config says;
+this is the only test that exercises the default a real caller gets.
+
+### 37d. What remains, and what is deliberately not done
+
+**Ready:** `models/a35_release/genfix46_staged` — 5.4 GB, bf16 5-shard + index, `model.py`, tokenizer,
+chat template, model card, config matching the live repo on all 41 keys, validated above.
+
+**The push is one command and is NOT run:**
+`huggingface-cli upload PursuitOfDataScience/Argonne-3.5-think /project/rcc/youzhi/models/a35_release/genfix46_staged`
+(or `push_model_to_hf.py` without `--dry-run`). Reason in §37's preamble: the owner's rule
+[[dont-substitute-base-or-publish-without-asking]] exists specifically to stop a blanket go-ahead from
+authorising a public push, so a blanket go-ahead cannot authorise this one.
+
+**Also pending on that decision, per the repo rule that a model is not shipped until the README links
+it:** `README.md`'s Argonne 3.5-think section still carries the v1 (`blend_a085`) numbers. If this
+ships, that section needs the §36f/§36j table — 5-set 50.31 → 57.38, arithmetic 55.6% → 99.3%,
+context/instruction unchanged — and the HF card needs to cite the GitHub source both ways. Not edited
+now, because a README on `main` describing an unpublished checkpoint would be wrong in the other
+direction.
