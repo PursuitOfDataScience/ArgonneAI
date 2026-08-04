@@ -5510,3 +5510,81 @@ Also validated in passing: `gpu_wait` now clamps its request to 92% of the card
 (`request 100000MiB > 92% of this 81559MiB card; clamping to 75034MiB`). The campaign's thresholds
 were written for a 139,730 MiB H200 and are unreachable on an 80G H100, so every call would have
 burned its full 600s timeout and then continued anyway — ~10 silent wasted minutes per call.
+
+### 36f. THE GATE — three seeds, five pools, and a §34cb claim that does not survive
+
+`341_gate_genfix.sh`, 62 min. Paired on the same items throughout; `base` and the three `both` seeds
+come from 322's JSONs at byte-identical settings, so this is 3-seed-vs-3-seed, not a single-seed read.
+
+**Greedy, per pool (n = 1000 asdiv / 1000 svamp / 500 mawps / 500 gsmplus / 319 math500):**
+
+| arm | asdiv | svamp | mawps | gsmplus | math500 | **5-set** | seed spread |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `base` = released `blend_a085` | 70.40 | 64.50 | 57.00 | 28.00 | 31.66 | **50.31** | — |
+| `both` s46 | 76.00 | 72.20 | 60.80 | 42.00 | 38.87 | 57.97 | |
+| `both` s5150 | 75.90 | 71.60 | 61.20 | 41.00 | 36.99 | 57.34 | |
+| `both` s99 | 74.50 | 71.20 | 60.80 | 41.60 | 37.30 | 57.08 | |
+| **`both` 3-seed mean** | **75.47** | **71.67** | 60.93 | 41.53 | 37.72 | **57.46** | **0.89pt** |
+| `genfix` s5150 | 74.90 | 69.60 | 61.40 | 41.80 | 38.56 | 57.25 | |
+| `genfix` s46 | 74.90 | 69.60 | 61.20 | 42.00 | 39.18 | 57.38 | |
+| `genfix` s99 | 74.90 | 69.50 | 61.80 | 42.60 | 37.93 | 57.35 | |
+| **`genfix` 3-seed mean** | 74.90 | 69.57 | **61.47** | **42.13** | **38.56** | **57.32** | **0.13pt** |
+
+**Paired McNemar vs the released model, every seed (greedy):**
+
+| arm | asdiv | svamp | mawps | gsmplus | math500 |
+|---|---|---|---|---|---|
+| `genfix` s5150 | +4.50 ** | +5.10 ** | +4.40 * | +13.80 *** | +6.90 * |
+| `genfix` s46 | +4.50 ** | +5.10 ** | +4.20 * | +14.00 *** | +7.52 * |
+| `genfix` s99 | +4.50 ** | +5.00 ** | +4.80 ** | +14.60 *** | +6.27 * |
+
+*(\*\*\* p<1e-4, \*\* p<0.01, \* p<0.05.)* **All five pools significant at all three seeds, same
+direction, no exceptions.**
+
+**SELF-VALIDATION PASSED.** `base` comes out at exactly **50.31** and `both` at exactly **+7.15pt** —
+the two numbers §34ca recorded — recomputed here from independent per-item vectors. The harness is
+measuring the same thing it measured yesterday.
+
+**⚠️RETRACTION of §34cb.** That section concluded, from a 2-seed n=500 read, that *"at the
+seed-matched comparison, `genfix` beats `both` on every axis"* and that the result "is not a trade at
+all." **At the gate's full n with three seeds each, it is not true.** `both` is ahead on asdiv
+(75.47 vs 74.90) and clearly ahead on svamp (71.67 vs 69.57); `genfix` is ahead on mawps, gsmplus and
+math500. Net: **`genfix` − `both` = −0.14pt on the 5-set mean.** The specific claim that flipped is
+ASDiv, which at n=500 read 74.40 (genfix46) vs 74.00 (boths46) — a +0.4 lead that becomes a −1.1
+deficit at n=1000. This is textbook small-n noise, and §34cb should have been read as "genfix does not
+LOSE math," which is what it actually supports.
+
+**So the honest comparison is a wash on math and a clear win on instruction-following:**
+
+| | 5-set greedy | one-step arithmetic | instruction |
+|---|---:|---:|---:|
+| released | 50.31 | 80/144 (55.6%) | 13/14 |
+| `both` 3-seed | **57.46** | 143/144 | **10/14** |
+| `genfix` 3-seed | **57.32** | 142-143/144 | **13/14** |
+
+−0.14pt of 5-set math — a quarter of `both`'s own 0.89pt seed spread, and a twelfth of the 1.68pt
+run-to-run variation §33p measured on this recipe — in exchange for the instruction-following axis.
+**That is the trade to take, and it is why `genfix` is the release candidate rather than `both`.**
+
+Worth noting separately: **`genfix`'s seed spread is 0.13pt across three seeds** (57.25/57.35/57.38)
+versus `both`'s 0.89pt. Restoring the general anchor did not just recover instruction-following, it
+made the recipe markedly more reproducible — which for a release candidate matters on its own.
+
+### 36g. The math500 leak, resolved: real, measured, and immaterial
+
+§36c flagged 17 of 319 judged math500 items as near-duplicates of `med_math` training rows. Re-scoring
+the gate on the 302 clean items (`pool_decontam.py rescore`):
+
+| arm | math500 full (319) | clean (302) | Δ |
+|---|---:|---:|---:|
+| base | 31.66 | 31.46 | −0.20 |
+| `both` s46 | 38.87 | 38.74 | −0.13 |
+| `genfix` s5150 | 38.56 | 38.08 | −0.48 |
+| `genfix` s46 | 39.18 | 39.07 | −0.11 |
+| `genfix` s99 | 37.93 | 37.75 | −0.18 |
+
+Every arm moves by ≤0.5pt and the genfix−base gap is unchanged (+6.90/+7.52/+6.27 full →
++6.62/+7.61/+6.29 clean). **The models are not scoring better on the leaked items than on the clean
+ones.** The contamination is real and should stay documented, but it does not inflate this result and
+it does not change the verdict. That is the useful shape of a contamination finding: quantified, then
+bounded, then shown not to matter — rather than left as a permanent asterisk nobody can size.

@@ -162,6 +162,69 @@ def cmd_rescore(a):
                       f"{ac:>10.2f} {ac-aa:>+7.2f}")
 
 
+def cmd_clean_mix(a):
+    """Write a copy of the mix with every row that near-duplicates ANY eval item removed.
+
+    Decontaminates against the FULL pools, not the judged slice, deliberately: the gate judges
+    `Random(0).shuffle(pool)[:n]`, so a mix cleaned only against that slice would silently re-leak
+    the moment anyone changes --n. Stricter is the right default for a training-side fix.
+    """
+    from datasets import load_from_disk
+
+    mix_q, mix_tier = load_mix(a.mix)
+    mix_tok = [toks(q) for q in mix_q]
+
+    df = Counter()
+    for t in mix_tok:
+        df.update(t)
+    ubiq = {w for w, c in df.items() if c > len(mix_tok) * 0.10}
+    index = defaultdict(list)
+    for i, t in enumerate(mix_tok):
+        for w in t:
+            if w not in ubiq:
+                index[w].append(i)
+
+    from clean_eval import load_clean
+    dirty = {}                                   # mix row -> (jaccard, pool)
+    for pool in a.pools:
+        items = load_clean(pool, 0, seed=0)      # n=0 -> the WHOLE pool
+        hits = 0
+        for q, _ in items:
+            jt = toks(q)
+            cand = Counter()
+            for w in jt:
+                if w in index:
+                    cand.update(index[w])
+            for i in cand:
+                j = len(jt & mix_tok[i]) / len(jt | mix_tok[i])
+                if j >= a.threshold and j > dirty.get(i, (0, ""))[0]:
+                    dirty[i] = (j, pool)
+                    hits += 1
+        print(f"  {pool:<10} {len(items):>5} eval items -> {hits} mix-row hits at J>={a.threshold}")
+
+    per_tier = Counter(mix_tier[i] for i in dirty)
+    print(f"\nremoving {len(dirty)} of {len(mix_q)} rows ({100*len(dirty)/len(mix_q):.2f}%)")
+    for t, c in per_tier.most_common():
+        tot = sum(1 for x in mix_tier if x == t)
+        print(f"  {t:<22} {c:>4} of {tot:>5} ({100*c/tot:5.2f}%)")
+
+    d = load_from_disk(a.mix)
+    d = d["train"] if hasattr(d, "keys") and "train" in d else d
+    keep = [i for i in range(len(mix_q)) if i not in dirty]
+    out = d.select(keep)
+    out.save_to_disk(a.out)
+    print(f"\nwrote {a.out}  ({len(out)} rows)")
+    if a.report:
+        json.dump({"mix": a.mix, "out": a.out, "threshold": a.threshold, "pools": a.pools,
+                   "n_removed": len(dirty), "n_kept": len(keep),
+                   "per_tier_removed": dict(per_tier),
+                   "removed": [{"row": i, "jaccard": round(j, 4), "pool": p,
+                                "tier": mix_tier[i], "q": mix_q[i][:200]}
+                               for i, (j, p) in sorted(dirty.items())]},
+                  open(a.report, "w"), indent=1)
+        print(f"wrote {a.report}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -181,6 +244,15 @@ if __name__ == "__main__":
     r.add_argument("--pool", default="")
     r.add_argument("--cfg", default="", help="restrict to one config, e.g. greedy")
     r.set_defaults(fn=cmd_rescore)
+
+    c = sub.add_parser("clean-mix", help="write a mix copy with near-duplicate rows removed")
+    c.add_argument("--mix", required=True)
+    c.add_argument("--out", required=True)
+    c.add_argument("--pools", nargs="+",
+                   default=["svamp", "asdiv", "mawps", "gsmplus", "math500"])
+    c.add_argument("--threshold", type=float, default=0.70)
+    c.add_argument("--report", default="")
+    c.set_defaults(fn=cmd_clean_mix)
 
     a = ap.parse_args()
     a.fn(a)
