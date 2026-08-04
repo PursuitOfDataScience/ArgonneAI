@@ -5825,3 +5825,105 @@ shorter** than `main`'s, because `main` gained the multi-model index after the b
 merge looked like it would clobber the published README — it did not, because the branch never touched
 that file after the merge base, so git took `main`'s copy cleanly. Verified before pushing rather than
 after.
+
+## §38 — CAN 3.5-THINK IMPROVE FURTHER? Re-opening every conclusion that was measured through the defect (2026-08-04, 17:00 → 01:00)
+
+Owner: *"do more research to see if we can continue to improve argonne3.5 think … 1 H200 … don't stop
+until 1am."*
+
+### 38a. The thesis
+
+§36 got +7.06pt by fixing a data-loading defect, not by inventing anything. That has a corollary worth
+taking seriously: **every recipe decision on this line was measured through that defect.** 1 epoch, LR
+1e-5, α=0.85, effective batch 12, the 768-token trace cap, the 512-token gsm8k cap, and — most
+importantly — the *negative* results. A conclusion of the form "X didn't help" is only as good as the
+data X was trained on. So this round re-opens them, cheapest and strongest-prior first.
+
+### 38b. TRUNCATION WAS ANTI-CORRELATED WITH DIFFICULTY — the finding that reframes everything else
+
+New tool `reasoning/think_len_audit.py` reports per-tier **think**-token length and what
+`--max_think_tokens 128` removed. On the shipped mix:
+
+| tier | % rows cut | **% of think tokens lost** |
+|---|---:|---:|
+| `hard_strict` | 88% | **57%** |
+| `med_openmath` | 89% | **56%** |
+| `hq_opus` | 81% | 47% |
+| `gsm8k_train_short` | 84% | 41% |
+| `med_math` | 44% | 30% |
+| `ms_series` / `ms_divisors` / `ms_algebra` / `ms_geometry` | **0%** | **0%** |
+| `synth_arith` | **0%** | **0%** |
+
+**The easy procedural drills were untouched and the hard tiers lost over half their reasoning.** The
+defect was not a uniform tax; it was a difficulty-graded one, because hard problems need long
+derivations and the cut was at a fixed token count. The model was trained on complete easy procedures
+and half-amputated hard reasoning — which is a fair description of a model that scores 74.90 on ASDiv
+and 39.18 on MATH-500.
+
+**And the two length filters compound.** `hard_strict` has 12,000 source rows. The 768-token mix cap
+admitted **651**. Of those, 88% were then truncated, losing 57% of their think tokens. Effective hard
+reasoning signal reaching the model ≈ **2.3%** of what was available. §36's fix raised that to ~5.4%
+(the cap still binds); §38's `v12_long` raises it to ~20%.
+
+### 38c. The α knee: arithmetic is α-INSENSITIVE (a clean null)
+
+Re-swept α on clean-data weights, no training (`400`/`403`). §19/§32 called 0.85 "the knee" and warned
+that 0.70 reintroduces non-termination — both measured on corrupted-data weights, where the DPO partner
+was doing repair work.
+
+| α | 0.70 | 0.80 | **0.85 (shipped)** | 0.90 | 0.95 | 1.00 (pure CoT) |
+|---|---:|---:|---:|---:|---:|---:|
+| one-step arithmetic /144 | 142 | 142 | **144** | 144 | 144 | 143 |
+
+**Every α ≥98.6%.** The §36 arithmetic repair is carried entirely by the CoT checkpoint and is not a
+property of the blend — so α can be tuned freely on math accuracy without risking the axis that blocked
+§33. Accuracy, though, does move with α: at 0.70, ASDiv 63.80 / GSM-Plus 34.20 versus the shipped
+74.90 / 42.00, so *lower* α remains clearly bad. The upward direction (0.90/0.95/1.00) is what `403`
+tests.
+
+⚠️Note α=0.85 reads 144/144 here against 143/144 in §36's gate — same model, same `--probe-seed 77`.
+Treat this probe as **±1 item**, and do not read a 1-item difference as a result.
+
+### 38d. §33's VERIFY TIER WAS NEVER ACTUALLY TRAINED
+
+This is the most consequential thing found today. §33 built a self-verification tier, measured ≈+2.0pt
+over five held-out sets, and blocked the ship because it cost **−23.8pt on one-step arithmetic** (`2+2`
+→ 6). §33t showed the gain and the damage were the same rows; §33u found the repair null at three
+seeds; the family was abandoned as a dead end.
+
+Measured on `cot_mix_robust`, the mix behind that candidate:
+
+| tier | p50 think tokens | % cut at 128 |
+|---|---:|---:|
+| `pert_verify_fix` | 246 | **100%** |
+| `pert_verify_rederive` | 249 | **100%** |
+| `verify_rederive` | 202 | **98%** |
+| `verify_fix` | 208 | **96%** |
+| `pert_verify_confirm` | 167 | 82% |
+| `verify_confirm` | 150 | 71% |
+| `synth_arith` | 15 | **0%** |
+
+**In a self-verification trace the verification comes after the solve, inside the think block.** Cutting
+at 128 think-tokens removed the verification from essentially every row meant to teach it. The model was
+trained on *"solve, begin re-checking, stop"* — which is precisely the double-application failure §33v
+documented (`2+2` → 4 → apply `+2` again → 6) and precisely the arithmetic regression that blocked the
+ship. §33 did not measure a bad idea; it measured a truncated one.
+
+`402_verify_refix` re-runs that exact mix, that exact recipe, seed 46, with only the loader fixed. The
+comparison is against §33's own `robust_a085` rather than the shipped model, because `cot_mix_robust`
+carries a smaller general anchor (tulu 8000 / ultrachat 3000 vs 9600 / 3400) and comparing across that
+would confound the loader question.
+
+### 38e. The queue
+
+| # | experiment | change | re-opens |
+|---|---|---|---|
+| 401 | long-trace re-admit | `hard_strict` 600→2412, `med_openmath` 300→1048; 31,860 rows @ max_seq 1664 | the 768 cap (§32's "termination pressure") |
+| 402 | verify-tier re-run | `cot_mix_robust`, loader fixed | §33's blocked verify family |
+| 403 | α upward | 0.90 / 0.95 / 1.00, no training | §32's α knee |
+| 404 | gsm8k coverage | 1,446 distinct ×3 → 3,271 distinct ×1 | the 512 cap + the upsampling trade |
+| 409 | 2 epochs | — | §32b's "2 epochs regressed on all four measures" |
+
+Termination is instrumented on every training arm (`no_answer`, against the shipped ~1–2%), because it
+is the axis all four length caps were introduced to protect. If it climbs, the caps were load-bearing
+and that is the finding.
