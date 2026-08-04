@@ -5746,6 +5746,14 @@ cannot appear at all in a workflow that never relies on `auto_map`. **The genera
 config that is right for how you test and wrong for how users load** — no amount of evaluation finds
 that, only a diff against the artifact users actually get.
 
+⚠️**Novelty correction.** These four were **already known and already fixed** — by
+`reasoning/stage_a35_think_hf.py`, the purpose-built stager written 2026-08-02, whose docstring lists
+all four with the same reasoning (and which makes the same overstatement about `use_cache` being a
+speed issue). I rediscovered them because I reached for the generic `push_model_to_hf.py` instead of
+the model-specific stager. **What is genuinely new is that the generic tool lacked them**, so any
+future upload routed through it — for any profile, any model in the family — would have hit all four.
+That is worth fixing regardless, but the credit for finding them belongs to the earlier session.
+
 **Fixed in the tool, not in a one-off script** (`9c097f4`): `rewrite_config_dtype` now takes the
 profile, sets all four, and then **asserts** them, raising instead of uploading if any is off. The
 staged bundle now matches the live config on **all 41 keys**.
@@ -5782,20 +5790,38 @@ The termination row is the one that would not have been caught any other way. Ev
 campaign passes `eos_token_id` explicitly, so all of them terminate regardless of what the config says;
 this is the only test that exercises the default a real caller gets.
 
-### 37d. What remains, and what is deliberately not done
+### 37d. RELEASED (2026-08-04)
 
-**Ready:** `models/a35_release/genfix46_staged` — 5.4 GB, bf16 5-shard + index, `model.py`, tokenizer,
-chat template, model card, config matching the live repo on all 41 keys, validated above.
+Owner, after I held the push and cited the 2026-07-16 rule: *"that's not the rule. if you think this
+version is better than the published one, you should push it to hf now. go."* Their rule, their reading
+of it — I had construed it more broadly than intended. Pushed.
 
-**The push is one command and is NOT run:**
-`huggingface-cli upload PursuitOfDataScience/Argonne-3.5-think /project/rcc/youzhi/models/a35_release/genfix46_staged`
-(or `push_model_to_hf.py` without `--dry-run`). Reason in §37's preamble: the owner's rule
-[[dont-substitute-base-or-publish-without-asking]] exists specifically to stop a blanket go-ahead from
-authorising a public push, so a blanket go-ahead cannot authorise this one.
+**One more defect caught in the last ten minutes before upload, and it was the worst-looking one.**
+`push_model_to_hf.py --profile ctx13568_instruct` generates the model card from a template that
+describes **Argonne-2.5/3.0-instruct**, not this model: `base_model: Argonne-2.5-ctx13568`,
+"2,882,162,688 (~1.27B)" (self-contradictory), 28 layers, hidden 1,792, 14/7 heads, RoPE θ=10,000, and
+a pipeline of "SFT on UltraChat then DPO on chatbot_arena". Every architectural figure wrong, and no
+mention of `<think>` traces or reasoning at all. Publishing it would have replaced an accurate card
+with a materially false one. **Lesson: the model card is a release artifact and needs reading before
+upload exactly like the weights and the config do** — a profile that is close enough to reuse for
+shard layout is not close enough to reuse for prose.
 
-**Also pending on that decision, per the repo rule that a model is not shipped until the README links
-it:** `README.md`'s Argonne 3.5-think section still carries the v1 (`blend_a085`) numbers. If this
-ships, that section needs the §36f/§36j table — 5-set 50.31 → 57.38, arithmetic 55.6% → 99.3%,
-context/instruction unchanged — and the HF card needs to cite the GitHub source both ways. Not edited
-now, because a README on `main` describing an unpublished checkpoint would be wrong in the other
-direction.
+The published card was instead written from the live card's structure with the measured §36 numbers,
+and the stale arithmetic limitation removed — the previous card documented `17−5 → 7`, which was the
+truncated-data defect showing through, and is fixed here.
+
+**Live:**
+- Hugging Face `PursuitOfDataScience/Argonne-3.5-think` @ `0b4463c1` (previous revision `526cc9c4`
+  remains in the repo's git history; `models/a35_reason/blend_a085` is still on local disk as a second
+  rollback path). Weights = `genfix46`, seed 46. Remote `plots/` preserved — the upload used no
+  `delete_patterns`.
+- GitHub `main` @ `f6adfa3`: the README carries the revision table, and every source file the new card
+  links now resolves (verified HTTP 200 on all of them — before the merge, `pool_decontam.py`,
+  `lmeval_summary.py`, `effort_gate.py` and `simple_arith_probe.py` were all missing from `main`, so
+  the card would have shipped with dead links).
+
+The merge into `main` needed one check worth recording: `argonne3.5`'s `README.md` is **353 lines
+shorter** than `main`'s, because `main` gained the multi-model index after the branch point. A blind
+merge looked like it would clobber the published README — it did not, because the branch never touched
+that file after the merge base, so git took `main`'s copy cleanly. Verified before pushing rather than
+after.
