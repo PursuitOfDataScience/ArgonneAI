@@ -20,7 +20,29 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 The reasoning model of the 3.5 line, released as [`PursuitOfDataScience/Argonne-3.5-think`](https://huggingface.co/PursuitOfDataScience/Argonne-3.5-think). Built on [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base); emits an explicit `<think>…</think>` trace then a `\boxed{}` answer.
 
-## vs Argonne 3.0-think
+## Revision 2026-08-04 — retrained on uncorrupted data
+
+**The first release was trained on a corrupted view of its own data.** Two argparse defaults in [`reasoning/cot-sft.py`](reasoning/cot-sft.py) — `--max_think_tokens 128` and `--preserve_raw_reasoning 0` — silently truncated reasoning traces mid-derivation and dropped rows: ~a third of the chain-of-thought tokens, 80.7% of the arithmetic drill tier, and the concluding sentence of most targets. No launcher passed these flags, so every earlier run inherited them.
+
+Fixing the two defaults — **no new data, no new method, same recipe** — produced the current release:
+
+| greedy, paired on identical items | first release | **current** | delta | |
+|---|---:|---:|---:|---|
+| ASDiv (n=1000) | 70.40 | **74.90** | +4.50 | p<0.01 |
+| SVAMP (n=1000) | 64.50 | **69.60** | +5.10 | p<0.01 |
+| MAWPS (n=500) | 57.00 | **61.20** | +4.20 | p<0.05 |
+| GSM-Plus (n=500) | 28.00 | **42.00** | **+14.00** | p<1e-9 |
+| MATH-500 (n=319) | 31.66 | **39.18** | +7.52 | p<0.05 |
+| **five-set mean** | **50.31** | **57.38** | **+7.07** | |
+| one-step arithmetic (144 items) | 80/144 (55.6%) | **143/144 (99.3%)** | **+43.7** | |
+| lm-eval 6-task (`acc_norm`) | 55.21 | 54.87 | −0.34 | flat |
+| instruction probe (14 items) | 13/14 | 13/14 | — | |
+
+Single-step arithmetic is the headline: the first release answered `a op b` wrong about half the time — its own model card documented computing `17−5=12` and then subtracting 5 again to answer 7 — which was the truncated-data defect showing through. **Replicated at three seeds** before release (five-set 57.25 / 57.35 / 57.38, spread 0.13pt; arithmetic 142/143/144 of 144). Significance is exact McNemar on paired outcomes.
+
+GSM-Plus is perturbed GSM8K *test*, so it was audited directly: the training mix's GSM8K tier is 4,338/4,338 from the **train** split with zero test items, and no judged GSM-Plus item exceeds Jaccard 0.60 against any training row. **MATH-500 does carry measured leakage** (17 of 319 items have a near-duplicate in the mix); re-scored on the 302 clean items the current model gets 39.07 vs the first release's 31.46, so the gap is unchanged. Audit tool: [`reasoning/pool_decontam.py`](reasoning/pool_decontam.py). Full diagnosis, fix and gate: [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §34–§37.
+
+## vs Argonne 3.0-think (measured on the first release)
 
 ![3.5-think vs 3.0-think](plots/a35think_vs_3p0.png)
 
@@ -55,10 +77,12 @@ The base raises the **ceiling** (pass@8 58.7 → 74.0) while greedy stays flat; 
 |---|---|---|
 | 1 — SFT | UltraChat 200k | 207,865 rows, 1 epoch, effective batch 20 |
 | 2 — DPO | argilla/dpo-mix-7k | 6,750 pairs, LR 1e-6, β=0.03 |
-| 3 — CoT-SFT | short-trace mix, 26,428 rows all ≤768 tokens | 1 epoch, effective batch 12 |
+| 3 — CoT-SFT | short-trace mix, 28,428 rows all ≤768 tokens | 1 epoch, effective batch 12, **traces preserved whole** |
 | 4 — weight soup | — | 0.85 × CoT + 0.15 × DPO |
 
-α = 0.85 is a measured knee, not a default: α = 0.70 reintroduces non-termination. Full build log, including the ablations that failed and two predictions that turned out wrong, is in [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §32.
+Relative to the first release, stage 3 differs in exactly two ways: reasoning traces are kept whole instead of being cut at 128 tokens, and 2,000 rows of general-instruction anchor were added back. The second part matters — restoring the traces alone costs instruction-following (13/14 → 10/14); with the anchor restored it holds at 13/14 at every seed.
+
+α = 0.85 is a measured knee, not a default: α = 0.70 reintroduces non-termination. Full build log, including the ablations that failed and the predictions that turned out wrong, is in [`reasoning/thinking_training.md`](reasoning/thinking_training.md) — §32 for the original recipe, §34–§37 for the data-corruption diagnosis, the fix, and this release's gate.
 
 ---
 
