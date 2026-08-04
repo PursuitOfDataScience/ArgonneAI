@@ -5457,3 +5457,46 @@ perturbation.
 **Consequence for the gate: report math500 twice** — full pool and the 302-item clean subset
 (`pool_decontam.py rescore`) — and let the four clean pools carry the claim. Do not quote a 5-set
 mean without the footnote.
+
+### 36d. Two of the mandatory axes, now at THREE seeds
+
+The 5-pool gate is still running; these two do not depend on it and are complete.
+
+| arm | seed | instruction (14 items) | one-step arithmetic (144 items) |
+|---|---|---:|---:|
+| released `blend_a085` | — | 13/14 | 77/144 (53.5%) |
+| `both` | s46 | 10/14 | 143/144 |
+| `genfix` | s5150 | 13/14 | 142/144 (98.6%) |
+| `genfix` | s46 | 13/14 | **144/144 (100%)** |
+| `genfix` | **s99** | **13/14** | 143/144 (99.3%) |
+| **`genfix` 3-seed** | | **13/14 at every seed** | **143/144 (99.3%), spread 142-144** |
+
+**The instruction recovery is not a lucky seed: 13/14 three times out of three, and at every seed the
+single miss is the same item** (*"Translate to French: 'good morning'"*), which the released model also
+fails. §34cb established this at two seeds and flagged that a third was required; it replicates.
+
+**Arithmetic is the axis that BLOCKED the §33 ship** (the verify tier cost −23.8pt there, invisible to
+all five benchmarks). At three seeds `genfix` is 99.3% against the released model's 53.5% — a +45.8pt
+swing with a 2-item spread. §33s's veto does not apply to this family.
+
+### 36e. Two operational errors this round, both mine, both worth the record
+
+**1. I sized `--mem` off the wrong phase and lost 35 minutes.** slurmwatch measured the training phase
+at 13.48 GiB, so I cut the worker from 44G to 20G — correctly, for training. The arm then trained for
+52 minutes, exited 0, wrote its weights, and was **OOM-killed in the 2-minute soup step**, because
+`build_ckpt_soup.py` accumulates a whole blended fp32 state dict (11.53 GB) and serialises it: the
+soup, not the training, is the task's peak phase. Recovery was cheap only because the training output
+survived — `339_genfix99_soup.sh` redid the soup alone in 255s rather than re-running the arm.
+*Generalise: on a multi-phase task, sample every phase or size to the known-worst step. A clean
+measurement of the wrong phase is worse than a guess, because it looks authoritative.*
+
+**2. The follow-up number was a trap too.** `/usr/bin/time -v` put the soup's peak RSS at **42.15
+GiB** — while it was running happily under a 32G cgroup limit. ~23 GB of that is reclaimable page
+cache from `safe_open` memory-mapping the two 11.53 GB source files. Sizing `--mem` up off that RSS
+figure would have re-padded the request by ~40%. The OOM-relevant quantity is the anonymous working
+set, exactly as CLAUDE.md's caveat says.
+
+Also validated in passing: `gpu_wait` now clamps its request to 92% of the card
+(`request 100000MiB > 92% of this 81559MiB card; clamping to 75034MiB`). The campaign's thresholds
+were written for a 139,730 MiB H200 and are unreachable on an 80G H100, so every call would have
+burned its full 600s timeout and then continued anyway — ~10 silent wasted minutes per call.
