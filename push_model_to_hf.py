@@ -797,11 +797,17 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
 
       auto_map      popped by the campaign's patch_cfg() -> `from_pretrained(trust_remote_code=True)`
                     cannot find ArgonneModel, so a standalone load from the Hub FAILS OUTRIGHT.
-      block_size    written as 4096 -> the 13,568 context, the headline feature of the 3.5 line,
-                    silently capped at 4096.
+      block_size    written as 4096 -> ArgonneConfig.__init__ maps a `block_size` kwarg ONTO
+                    max_position_embeddings (model.py ~line 90), and it wins over an explicit
+                    max_position_embeddings, so the 13,568 context -- the headline feature of the
+                    3.5 line -- is silently capped at 4096.
       eos_token_id  set to 151643 (<|endoftext|>) instead of 151645 (<|im_end|>) -> .generate()
-                    never stops at the end of a turn.
-      use_cache     False -> published model runs with no KV cache.
+                    never stops at the end of a turn unless the caller passes eos_token_id itself.
+      use_cache     False. NOTE: this one is COSMETIC for this architecture -- ArgonneConfig never
+                    assigns self.use_cache (reading cfg.use_cache raises AttributeError) and
+                    ArgonneModel.generate() passes use_cache=True itself. It is normalised only so
+                    the published config matches the rest of the family and stays correct if
+                    transformers ever starts honouring it. The three above are the real defects.
 
     So this normalises them and then ASSERTS, because "the release quietly had a 4096 context" is not
     something to discover from a user's bug report.
@@ -828,7 +834,7 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     if config.get("auto_map") != AUTO_MAP:
         problems.append("auto_map missing//wrong -> standalone trust_remote_code load will fail")
     if not config.get("use_cache"):
-        problems.append("use_cache is false -> published model would run without a KV cache")
+        problems.append("use_cache is false in the JSON (cosmetic for this arch, but keep the family consistent)")
     if profile in ("instruct", "ctx13568_instruct") and config.get("eos_token_id") != CHAT_EOS_TOKEN_ID:
         problems.append(f"eos_token_id {config.get('eos_token_id')} != {CHAT_EOS_TOKEN_ID} (<|im_end|>)")
     if profile == "ctx13568_instruct":

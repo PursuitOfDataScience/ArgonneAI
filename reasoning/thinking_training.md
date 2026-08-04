@@ -5727,7 +5727,15 @@ four ways, every one silent:
 | `auto_map` | present | **absent** | `from_pretrained(trust_remote_code=True)` cannot find `ArgonneModel` → **a standalone load from the Hub fails outright**; the model looks simply broken to anyone who downloads it |
 | `block_size` | 13568 | **4096** | the trained 13,568 context — the headline feature of the entire 3.5 line — silently capped at 4096 |
 | `eos_token_id` | 151645 `<\|im_end\|>` | **151643** `<\|endoftext\|>` | `.generate()` never stops at the end of a turn unless the caller passes `eos_token_id` by hand |
-| `use_cache` | True | **False** | published model runs with no KV cache |
+| `use_cache` | True | **False** | *nothing* — see the correction below |
+
+⚠️**Correction to the above, made while writing the smoke test: `use_cache` is INERT for this
+architecture, so it is three real defects, not four.** `ArgonneConfig.__init__` never assigns
+`self.use_cache` — reading `cfg.use_cache` raises `AttributeError` — and `ArgonneModel.generate()`
+passes `use_cache=True` itself (`model.py:934`). The JSON field is normalised only to keep the family's
+configs consistent and to stay correct if transformers ever honours it. My first reading of the diff
+asserted the published model "would run with no KV cache"; that was wrong, and the release tool's
+docstring and assertion message say so now. The other three are real, and `auto_map` is severe.
 
 **Where they came from, and why the campaign could not see them.** All four are correct for the *local*
 harness and wrong for a *published artifact*. `run_arm_nt.sh:patch_cfg()` deliberately does
