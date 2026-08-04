@@ -37,6 +37,9 @@ import torch.nn.functional as F
 BUCKETS = [(0, 1024), (1024, 2048), (2048, 4096), (4096, 8192),
            (8192, 13568), (13568, 20480), (20480, 24576)]
 EVAL_LEN = 24576
+# --eval_len extends both of the above (see main()); the 0-1024 control bucket is always kept
+# because it is what makes the attribution airtight -- gains must appear ONLY at long positions.
+EXTRA_EDGES = [32768, 40960, 49152, 65536]
 DOCBIN = "/project/rcc/youzhi/data/proof_pile2_arxiv_qwen3_docbin/data"
 TOKP = "/project/rcc/youzhi/toxic-models/Qwen/Qwen3-0.6B-Base"
 
@@ -104,10 +107,10 @@ def eval_windows(model, windows):
     return {b: (tot[b] / cnt[b] if cnt[b] else float("nan")) for b in BUCKETS}, cnt
 
 
-def get_windows(n_docs, seed=0):
+def get_windows(n_docs, seed=0, glob_pat="*.bin"):
     """Held-out arXiv windows of exactly EVAL_LEN+1 tokens, taken from docs long enough to fill one."""
-    bins = sorted(glob.glob(os.path.join(DOCBIN, "*.bin")))
-    assert bins, "no tokenized arXiv shards yet"
+    bins = sorted(glob.glob(os.path.join(DOCBIN, glob_pat)))
+    assert bins, "no tokenized arXiv shards matching %s" % glob_pat
     rng = np.random.default_rng(seed)
     out = []
     for bp in bins:
@@ -129,6 +132,13 @@ if __name__ == "__main__":
     ap.add_argument("--docs", type=int, default=40)
     ap.add_argument("--arms", default="a35_pre,a35_post")
     ap.add_argument("--out", default="report/exp_longctx_learning.json")
+    ap.add_argument("--eval_len", type=int, default=EVAL_LEN,
+                    help="Window length; buckets auto-extend to cover it.")
+    ap.add_argument("--docbin_glob", default="*.bin",
+                    help="Restrict eval windows to these shards. REQUIRED once a model trains on "
+                         "arXiv: phase C trains on proof-pile-2, so the default '*.bin' would draw "
+                         "eval windows from TRAINED-ON documents. Phase C trains on arXiv_0[0-8]*; "
+                         "pass 'arXiv_09*.bin' to stay on the reserved holdout shards.")
     a = ap.parse_args()
 
     ARMS = {
@@ -149,7 +159,18 @@ if __name__ == "__main__":
     if a4:
         ARMS["a4_anneal"] = (a4[-1], "/home/youzhi/ArgonneAI-4.0")
 
-    w = get_windows(a.docs)
+    if a.eval_len != EVAL_LEN:
+        EVAL_LEN = a.eval_len
+        edges = [e for e in [1024, 2048, 4096, 8192, 13568, 20480, 24576] + EXTRA_EDGES if e < EVAL_LEN]
+        BUCKETS = list(zip([0] + edges, edges + [EVAL_LEN]))
+    ARMS["a4_phaseb"] = ("/project/rcc/youzhi/models/argonne4_midtrain/checkpoint_step_109622.pt",
+                         "/home/youzhi/ArgonneAI-4.0")
+    c = sorted(glob.glob("/project/rcc/youzhi/models/argonne4_midtrain_c/checkpoint_step_*.pt"),
+               key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
+    if c:
+        ARMS["a4_phasec"] = (c[-1], "/home/youzhi/ArgonneAI-4.0")
+    print("eval shards: %s   window %d" % (a.docbin_glob, EVAL_LEN))
+    w = get_windows(a.docs, glob_pat=a.docbin_glob)
     print("eval: %d held-out arXiv windows of %d tokens (%.2fM tokens/arm)"
           % (len(w), EVAL_LEN, len(w) * EVAL_LEN / 1e6), flush=True)
     res = {}
