@@ -5698,3 +5698,50 @@ instruction-following; `genfix` is blocked by nothing measured here.
 **NOT SHIPPED.** Publishing to Hugging Face requires explicit per-action owner approval
 ([[dont-substitute-base-or-publish-without-asking]]), and a blanket "go" on the work is not that. The
 candidate, its three seeds, and this table are ready for that decision.
+
+## §37 — BUILDING THE RELEASE, and four silent config defects that would have shipped a broken model
+
+Owner grant: *"do everything you need. don't need my approval."* Taken as authorising the full release
+BUILD and validation. **Not** taken as authorising the Hugging Face push:
+[[dont-substitute-base-or-publish-without-asking]] was written on 2026-07-16 precisely because a
+blanket "keep pushing" was read as publish authorisation, and its wording is
+*"'keep pushing' ≠ authorization to change inputs or go public"*. A general go-ahead cannot repeal the
+rule the owner wrote to stop general go-aheads. So: everything up to and including the staged, smoke-
+tested artifact; the push itself is one command and remains the owner's.
+
+### 37a. Which seed ships
+
+`genfix46` (seed 46) — best on the two aggregate measures: 5-set greedy **57.38** (vs 57.35 / 57.25)
+and lm-eval acc_norm **54.87** (vs 54.76 / 54.78), with math500 39.18 (highest of the three),
+arithmetic 143/144, instruction 13/14, 4-quadrant 31/40. The three seeds span 0.13pt, so this is
+choosing between near-identical candidates rather than cherry-picking.
+
+### 37b. ⚠️FOUR CONFIG DEFECTS, found only by diffing the staged build against the LIVE repo
+
+`push_model_to_hf.py --profile ctx13568_instruct` produced a bundle in the right shape (bf16, 5 shards,
+338 tensors, 5.76 GB, `model.py` + tokenizer + chat template + card). Its `config.json` was wrong in
+four ways, every one silent:
+
+| key | live `Argonne-3.5-think` | staged build | consequence if shipped |
+|---|---|---|---|
+| `auto_map` | present | **absent** | `from_pretrained(trust_remote_code=True)` cannot find `ArgonneModel` → **a standalone load from the Hub fails outright**; the model looks simply broken to anyone who downloads it |
+| `block_size` | 13568 | **4096** | the trained 13,568 context — the headline feature of the entire 3.5 line — silently capped at 4096 |
+| `eos_token_id` | 151645 `<\|im_end\|>` | **151643** `<\|endoftext\|>` | `.generate()` never stops at the end of a turn unless the caller passes `eos_token_id` by hand |
+| `use_cache` | True | **False** | published model runs with no KV cache |
+
+**Where they came from, and why the campaign could not see them.** All four are correct for the *local*
+harness and wrong for a *published artifact*. `run_arm_nt.sh:patch_cfg()` deliberately does
+`c.pop("auto_map")` and sets `eos_token_id = 151643`, because the local path registers `ArgonneModel`
+by hand and every probe passes `eos_token_id=tok.convert_tokens_to_ids("<|im_end|>")` explicitly. So
+the eos defect was masked by the very probes that would have caught it, and the `auto_map` defect
+cannot appear at all in a workflow that never relies on `auto_map`. **The generalisable failure is a
+config that is right for how you test and wrong for how users load** — no amount of evaluation finds
+that, only a diff against the artifact users actually get.
+
+**Fixed in the tool, not in a one-off script** (`9c097f4`): `rewrite_config_dtype` now takes the
+profile, sets all four, and then **asserts** them, raising instead of uploading if any is off. The
+staged bundle now matches the live config on **all 41 keys**.
+
+`--out-dir` was added in the same commit because `--dry-run` built the release into a temp directory
+and then deleted it in a `finally` block. That validates the build but leaves nothing to inspect,
+smoke-test or push — so the dry run as it stood could not have caught any of the above.
