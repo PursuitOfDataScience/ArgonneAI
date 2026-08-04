@@ -5618,3 +5618,83 @@ genfix−base gap unchanged, and 0.12% of rows cannot move capability measurably
 cosmetically cleaner provenance for a number that has already been shown honest by re-scoring. The
 right use of `_dc` is as the **default mix for future work on this line** — including a4's SFT redo if
 it draws on these tiers — so the caveat never has to be written again.
+
+### 36i. The general leg — flat — and a 3.74pt "regression" that was a metric mix-up
+
+`342_general_genfix.sh`, 87 min. lm-eval 6-task via the vLLM backend + the 4-quadrant probe.
+
+**First, a scare that wasn't.** The summary printed the released model's 6-task mean as **51.47**
+against §33i's recorded **55.21** for the same checkpoint — a 3.74pt phantom regression. Cause: the
+summary loop copy-pasted through `323_general.sh` into `342` does
+`for k,x in v.items(): if k.startswith("acc"): ...; break`, and **both `acc,none` and `acc_norm,none`
+start with "acc"**, so which one it reports depends on dict order. §33i's table is `acc_norm`; today's
+loop grabbed `acc`. The same JSONs hold both:
+
+| task | acc | acc_norm |
+|---|---:|---:|
+| arc_easy | 65.03 | 59.60 |
+| hellaswag | 45.35 | **59.91** |
+| openbookqa | 25.00 | **37.00** |
+
+Recomputed on `acc_norm`, the released model reads **exactly 55.21** — §33i's number to the decimal.
+Nothing regressed; the record is intact. New `reasoning/lmeval_summary.py` prints both metrics side by
+side so this cannot recur, and it immediately flagged that `robust3`'s recorded lm-eval was computed
+over **2 tasks, not 6** (a stale number on an arm §33u already rejected).
+
+**lm-eval, both metrics:**
+
+| arm | acc | acc_norm | Δ acc_norm vs released |
+|---|---:|---:|---:|
+| released `blend_a085` | 51.47 | **55.21** | — |
+| `both` s46 | 51.25 | 55.11 | −0.10 |
+| `genfix` s5150 | 51.19 | 54.78 | −0.43 |
+| `genfix` s46 | 51.21 | 54.87 | −0.34 |
+| `genfix` s99 | 51.20 | 54.76 | −0.45 |
+| **`genfix` 3-seed mean** | 51.20 | **54.80** | **−0.41** |
+
+**4-quadrant probe** (10 items/cell; a sanity check for §12-style collapse, *not* a gate — rule (1) of
+[[gsm8k-contaminated-all-argonne-evals]] is never to gate on it):
+
+| arm | general/nothink | general/think | math/nothink | math/think | total |
+|---|---:|---:|---:|---:|---:|
+| released | 8/10 | 6/10 | 8/10 | 8/10 | 30/40 |
+| `both` s46 | 8/10 | 6/10 | 6/10 | 9/10 | 29/40 |
+| `genfix` s5150 | 8/10 | 8/10 | 7/10 | 9/10 | **32/40** |
+| `genfix` s46 | 8/10 | 6/10 | 7/10 | **10/10** | 31/40 |
+| `genfix` s99 | 8/10 | 7/10 | 7/10 | **10/10** | **32/40** |
+
+`general/nothink` is identical at 8/10 for every arm. **No §12-style collapse, and no task in lm-eval
+moves more than ~1pt.** −0.41pt on a 6-task mean is inside what §33i itself called flat (it accepted
+−0.14 and −0.24), and inside §33's stated ≤−1.0pt criterion.
+
+## §36j — VERDICT: `genfix` PASSES the full §35 gate
+
+| axis | released `blend_a085` | `genfix` 3-seed | result |
+|---|---:|---:|---|
+| 5-set greedy (n=1000/1000/500/500/319) | 50.31 | **57.32** (+7.01) | **PASS** — all 5 pools significant at all 3 seeds |
+| one-step arithmetic (144) | 80/144 (55.6%) | **142.7/144 (99.1%)** | **PASS** — the axis that vetoed §33 |
+| instruction-following (14) | 13/14 | **13/14 at every seed** | **PASS** |
+| lm-eval 6-task (acc_norm) | 55.21 | 54.80 (−0.41) | **PASS** — flat |
+| 4-quadrant | 30/40 | 31.7/40 | **PASS** — no collapse |
+| math500 with the leak removed | 31.46 | 38.3 | **PASS** — gap unchanged |
+| seed spread on the 5-set mean | — | **0.13pt** | tightest on this line |
+
+**This is the first candidate on the argonne-3.5 reasoning line to clear every axis simultaneously**,
+and it does so from **no new data** — only from reading the data that was always there
+([[cot-sft-two-flag-data-corruption]]). §33's family was blocked by arithmetic; `both` was blocked by
+instruction-following; `genfix` is blocked by nothing measured here.
+
+**Honest limits, stated plainly:**
+- `genfix` does **not** beat `both` on math (−0.14pt, §36f); it ties within noise and wins the
+  instruction axis. Anyone quoting "genfix is better" should mean *better overall*, not better at math.
+- The 5-set mean contains math500, which carries measured near-duplicate leakage. Bounded and shown
+  immaterial (§36g), but it should be quoted with the clean-subset number beside it.
+- The instruction probe is **14 items**. 13/14 three times is a replication of a *small* probe, not a
+  broad instruction-following benchmark. It is evidence the §34 regression is gone, not evidence of
+  strength.
+- No tool-calling or coding evaluation was run on this family. §26 found those axes soup-washed-out on
+  the 3.0 line; unmeasured here.
+
+**NOT SHIPPED.** Publishing to Hugging Face requires explicit per-action owner approval
+([[dont-substitute-base-or-publish-without-asking]]), and a blanket "go" on the work is not that. The
+candidate, its three seeds, and this table are ready for that decision.
