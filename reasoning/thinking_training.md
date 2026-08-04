@@ -5588,3 +5588,33 @@ Every arm moves by ≤0.5pt and the genfix−base gap is unchanged (+6.90/+7.52/
 ones.** The contamination is real and should stay documented, but it does not inflate this result and
 it does not change the verdict. That is the useful shape of a contamination finding: quantified, then
 bounded, then shown not to matter — rather than left as a permanent asterisk nobody can size.
+
+### 36h. A decontaminated mix, so the leak cannot propagate — and why NOT to retrain on it
+
+`pool_decontam.py clean-mix` writes a copy of the mix with every row that near-duplicates any eval
+item removed. It decontaminates against the **full** pools, not the judged slice, deliberately: the
+gate judges `Random(0).shuffle(pool)[:n]`, so a mix cleaned only against that slice would silently
+re-leak the moment anyone changed `--n`.
+
+| pool scanned | eval items | mix rows hit at J≥0.70 |
+|---|---:|---:|
+| svamp | 1,000 | **0** |
+| mawps | 520 | **0** |
+| **gsmplus** | **9,233** | **0** |
+| asdiv | 2,249 | 3 |
+| math500 | 319 | **30** |
+
+**GSM-Plus is clean across all 9,233 items, not merely the 500 the gate judges** — a considerably
+stronger clearance than §36c's, and it is the pool carrying the +14pt. (The math500 count reads 30
+here versus §36c's 17 because the unit differs: 17 *eval items* have a near-duplicate in the mix, and
+those 17 are matched by 30 distinct *mix rows*. Same finding, counted from the other end.)
+
+Total removed: **33 of 28,428 rows = 0.12%** — 23 `med_math`, 3 `gsm8k_train_short`, 3 `ms_algebra`,
+2 `ms_divisors`, 1 `hard_strict`, 1 `med_openmath`. Output: `data/cot_sft_mix_v6_gen_dc` (28,395 rows).
+
+**Deliberately NOT retraining the release candidate on it.** Three seeds is ~3.5 GPU-hours, and the
+expected benefit is nil: §36g already showed the leak moves every arm by ≤0.5pt and leaves the
+genfix−base gap unchanged, and 0.12% of rows cannot move capability measurably. Retraining would buy a
+cosmetically cleaner provenance for a number that has already been shown honest by re-scoring. The
+right use of `_dc` is as the **default mix for future work on this line** — including a4's SFT redo if
+it draws on these tiers — so the caveat never has to be written again.
