@@ -780,6 +780,53 @@ class LazySFTDataset(TorchDataset):
         if not self.indices:
             raise RuntimeError("No usable examples with messages found.")
 
+    def audit(self, max_scan: int = 20000, max_drop_frac: float = 0.10) -> float:
+        """Report, per tier, how many rows this loader will silently DISCARD, and abort if too many.
+
+        WHY THIS EXISTS (§34, 2026-08-04). A row that fails `_build` is not skipped -- `__getitem__`
+        replaces it with a randomly chosen surviving row. So the dataset length, the step count and the
+        loss curve are all completely unchanged, and nothing anywhere reports the loss. Under the old
+        defaults (`max_think_tokens=128`, `preserve_raw_reasoning=0`) that silently discarded 11.5% of
+        `cot_sft_mix_v6` -- including 80.7% of the single-fact arithmetic drill -- across two campaigns
+        and ~20 training runs before anyone noticed, and cost the released argonne-3.5-think ~7pt of
+        held-out accuracy and ~45pt of one-step arithmetic. Loss cannot see this. Only counting can.
+        """
+        from collections import Counter
+
+        scan = self.indices if len(self.indices) <= max_scan else self.indices[:max_scan]
+        sampled = len(scan) < len(self.indices)
+        tiers = self.ds["tier"] if "tier" in self.ds.column_names else None
+        tot, bad = Counter(), Counter()
+        for raw_idx in scan:
+            t = tiers[raw_idx] if tiers is not None else "(all)"
+            tot[t] += 1
+            if self._build(raw_idx) is None:
+                bad[t] += 1
+        n, d = sum(tot.values()), sum(bad.values())
+        frac = d / n if n else 0.0
+        note = f" (sampled {n} of {len(self.indices)})" if sampled else ""
+        print(f"\n[loader audit] max_think_tokens={self.max_think_tokens} "
+              f"preserve_raw_reasoning={int(self.preserve_raw_reasoning)} "
+              f"allow_non_reasoning={int(self.allow_non_reasoning)} max_seq_len={self.max_seq_len}{note}",
+              flush=True)
+        print(f"[loader audit] {'tier':<22}{'rows':>8}{'DISCARDED':>18}", flush=True)
+        for t, c in tot.most_common():
+            flag = "   <-- CHECK THIS" if c and bad[t] / c > 0.25 else ""
+            print(f"[loader audit] {str(t):<22}{c:>8}{bad[t]:>9} ({100*bad[t]/c:5.1f}%){flag}", flush=True)
+        print(f"[loader audit] {'TOTAL':<22}{n:>8}{d:>9} ({100*frac:5.1f}%)", flush=True)
+        if d:
+            print("[loader audit] NOTE: discarded rows are REPLACED by a random surviving row, so row "
+                  "count,\n[loader audit]       step count and the loss curve are UNCHANGED. Run "
+                  "reasoning/audit_cot_mix.py\n[loader audit]       for the per-tier effective shares.",
+                  flush=True)
+        if frac > max_drop_frac:
+            raise RuntimeError(
+                f"loader would discard {100*frac:.1f}% of rows (> --max_drop_frac "
+                f"{100*max_drop_frac:.1f}%). This is almost always a flag mistake: pass "
+                f"--max_think_tokens 0 --preserve_raw_reasoning 1 unless you specifically want "
+                f"truncation/canonicalization. Raise --max_drop_frac to override deliberately.")
+        return frac
+
     def __len__(self) -> int:
         return len(self.indices)
 
@@ -1693,9 +1740,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--preserve_raw_reasoning",
         type=int,
-        default=0,
+        default=1,
         choices=[0, 1],
-        help="Use the original assistant <think>...</think> turn as-is instead of canonicalizing it",
+        help=(
+            "Use the original assistant <think>...</think> turn as-is instead of canonicalizing it. "
+            "DEFAULT CHANGED 0 -> 1 on 2026-08-04 (§34). At 0, canonicalize_reasoning_turn() (a) DROPS "
+            "rows whose cleaned think span falls under TRAINING_MIN_THINK_WORDS -- 80.7% of the "
+            "single-fact arithmetic drill -- and (b) deletes any sentence containing 'answer', which is "
+            "the CONCLUDING sentence, from 94.5% of gsm8k_train_short targets. That is the cause of the "
+            "double-application bug in §33v (17-5=12, then 12-5=7). Pass 0 only if you specifically "
+            "want the canonicalizer, and read the loader audit it prints."
+        ),
     )
     p.add_argument(
         "--allow_non_reasoning",
@@ -1707,8 +1762,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max_think_tokens",
         type=int,
-        default=128,
-        help="If > 0, truncate tokens inside <think>...</think> to this length for training",
+        default=0,
+        help=(
+            "If > 0, truncate tokens inside <think>...</think> to this length for training. "
+            "DEFAULT CHANGED 128 -> 0 on 2026-08-04 (§34): at 128 this severed 31.3% of "
+            "cot_sft_mix_v6's reasoning rows MID-DERIVATION (80-89% of the hard math tiers) and then "
+            "trained the model to state the answer anyway. It cost the released argonne-3.5-think ~7pt "
+            "of held-out accuracy. No launcher ever wanted 128; every 3.0-line launcher passed 0."
+        ),
+    )
+    p.add_argument(
+        "--max_drop_frac",
+        type=float,
+        default=0.10,
+        help=(
+            "Abort if the loader would silently discard more than this fraction of rows. Discarded rows "
+            "are RESAMPLED, so row/step counts and the loss curve never reveal them (§34)."
+        ),
     )
     p.add_argument(
         "--max_reasoning_rows",
@@ -1995,6 +2065,8 @@ def main() -> None:
         allow_non_reasoning=args.allow_non_reasoning == 1,
     )
     print(f"Reasoning rows after cheap filters: {len(train_dataset):,}")
+    # §34: report (and refuse) silent row loss BEFORE spending GPU-hours on a corrupted diet.
+    train_dataset.audit(max_drop_frac=args.max_drop_frac)
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         is_rank0 = torch.distributed.get_rank() == 0

@@ -684,6 +684,17 @@ def parse_args():
     parser.add_argument("--private", action="store_true", help="Create the HF repo as private.")
     parser.add_argument("--dry-run", action="store_true", help="Prepare files without uploading.")
     parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Keep the prepared upload folder here instead of deleting it. Without this, --dry-run "
+            "builds the release into a temp dir, prints a file listing, and then removes it in the "
+            "finally block -- so it can validate the BUILD but leaves nothing to inspect, smoke-test "
+            "or later push. With --out-dir the staged release persists and pushing it afterwards is "
+            "`huggingface-cli upload <repo-id> <out-dir>`."
+        ),
+    )
+    parser.add_argument(
         "--shard-count",
         type=int,
         default=DEFAULT_WEIGHT_SHARD_COUNT,
@@ -767,7 +778,40 @@ def split_state_dict_into_shards(state_dict, shard_count, temp_path):
     return total_params
 
 
-def rewrite_config_dtype(temp_path, dtype_name):
+AUTO_MAP = {
+    "AutoConfig": "model.ArgonneConfig",
+    "AutoModel": "model.ArgonneModel",
+    "AutoModelForCausalLM": "model.ArgonneModel",
+}
+CHAT_EOS_TOKEN_ID = 151645          # <|im_end|> -- the turn terminator for the instruct/think chats
+CTX13568 = 13568
+
+
+def rewrite_config_dtype(temp_path, dtype_name, profile=None):
+    """Normalise the config for RELEASE, not for the local eval harness.
+
+    A checkpoint that came out of the reasoning campaign is configured for the LOCAL harness, which
+    registers ArgonneModel by hand, passes eos_token_id explicitly and evaluates through vLLM. Four of
+    those settings are wrong for a published artifact, and all four are silent -- measured 2026-08-04
+    by diffing a staged build against the live Argonne-3.5-think config:
+
+      auto_map      popped by the campaign's patch_cfg() -> `from_pretrained(trust_remote_code=True)`
+                    cannot find ArgonneModel, so a standalone load from the Hub FAILS OUTRIGHT.
+      block_size    written as 4096 -> ArgonneConfig.__init__ maps a `block_size` kwarg ONTO
+                    max_position_embeddings (model.py ~line 90), and it wins over an explicit
+                    max_position_embeddings, so the 13,568 context -- the headline feature of the
+                    3.5 line -- is silently capped at 4096.
+      eos_token_id  set to 151643 (<|endoftext|>) instead of 151645 (<|im_end|>) -> .generate()
+                    never stops at the end of a turn unless the caller passes eos_token_id itself.
+      use_cache     False. NOTE: this one is COSMETIC for this architecture -- ArgonneConfig never
+                    assigns self.use_cache (reading cfg.use_cache raises AttributeError) and
+                    ArgonneModel.generate() passes use_cache=True itself. It is normalised only so
+                    the published config matches the rest of the family and stays correct if
+                    transformers ever starts honouring it. The three above are the real defects.
+
+    So this normalises them and then ASSERTS, because "the release quietly had a 4096 context" is not
+    something to discover from a user's bug report.
+    """
     config_path = temp_path / "config.json"
     if not config_path.is_file():
         return
@@ -775,7 +819,33 @@ def rewrite_config_dtype(temp_path, dtype_name):
     config = json.loads(config_path.read_text())
     config["dtype"] = dtype_name
     config["torch_dtype"] = dtype_name
+    config["auto_map"] = AUTO_MAP
+    config["use_cache"] = True
+
+    if profile in ("instruct", "ctx13568_instruct"):
+        config["eos_token_id"] = CHAT_EOS_TOKEN_ID
+    if profile == "ctx13568_instruct":
+        config["block_size"] = CTX13568
+        config["max_position_embeddings"] = CTX13568
+
     config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+    problems = []
+    if config.get("auto_map") != AUTO_MAP:
+        problems.append("auto_map missing//wrong -> standalone trust_remote_code load will fail")
+    if not config.get("use_cache"):
+        problems.append("use_cache is false in the JSON (cosmetic for this arch, but keep the family consistent)")
+    if profile in ("instruct", "ctx13568_instruct") and config.get("eos_token_id") != CHAT_EOS_TOKEN_ID:
+        problems.append(f"eos_token_id {config.get('eos_token_id')} != {CHAT_EOS_TOKEN_ID} (<|im_end|>)")
+    if profile == "ctx13568_instruct":
+        for k in ("block_size", "max_position_embeddings"):
+            if config.get(k) != CTX13568:
+                problems.append(f"{k} {config.get(k)} != {CTX13568}")
+    if problems:
+        raise SystemExit("release config is wrong:\n  - " + "\n  - ".join(problems))
+    print(f"[config] normalised for release (profile={profile}): auto_map set, use_cache=True"
+          + (f", eos={CHAT_EOS_TOKEN_ID}" if profile in ("instruct", "ctx13568_instruct") else "")
+          + (f", ctx={CTX13568}" if profile == "ctx13568_instruct" else ""))
 
 
 def copy_plot(plot_path, temp_path):
@@ -821,7 +891,7 @@ def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, 
 
     state_dict = load_weight_tensors(model_path)
     parameter_count = split_state_dict_into_shards(state_dict, shard_count, temp_path)
-    rewrite_config_dtype(temp_path, CHECKPOINT_DTYPE)
+    rewrite_config_dtype(temp_path, CHECKPOINT_DTYPE, profile)
 
     model_py = SCRIPT_DIR / "model.py"
     if model_py.is_file():
@@ -910,7 +980,15 @@ def main():
     try:
         push_to_hub(upload_folder, args.repo_id, args.private, args.commit_message, args.dry_run)
     finally:
-        shutil.rmtree(upload_folder, ignore_errors=True)
+        if args.out_dir:
+            dest = Path(args.out_dir).expanduser()
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(upload_folder), str(dest))
+            print(f"staged release kept at: {dest}")
+        else:
+            shutil.rmtree(upload_folder, ignore_errors=True)
 
 
 if __name__ == "__main__":

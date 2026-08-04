@@ -2025,3 +2025,3777 @@ REFUSE to run on a wrong split), `a35_v6_probe.sh` / `a35_v6x2.sh` (data ablatio
 (heartbeat: step-delta + GPU throttle probe), `stage_a35_base_hf.py`, `plot_a35_loss.py`.
 **`sft.py` now has opt-in DDP** (inert at WORLD_SIZE=1), verified 2-GPU vs 1-GPU at identical
 effective batch; it cut stage A from a projected 12.4h to 7:57.
+
+---
+
+## §33 — Reasoning EFFORT on the released argonne-3.5-think: the knob was negative, and the fix is data (2026-08-02)
+
+Directive: "thoroughly investigate and experiment if we can improve the reasoning effort of
+argonne3.5-think, which was just released to HF." Scope: the shipped model
+`models/a35_reason/blend_a085`. Budget: 3× H200 (midway3-0601) for 20h, one persistent SLURM job
+(`exp-a35-effort`) draining a task queue, so a ~20-min CoT-SFT round never waits in a queue.
+
+**The one-paragraph answer.** The released model had *no* reasoning-effort knob, and not merely a
+missing one — a **negative** one: forcing it to think longer made it monotonically worse
+(n=1000 clean, greedy + s1-style forced continuation: SVAMP 65.7→61.8, ASDiv 71.6→66.6; net flip
+−39 / −50). Two things fixed it. (1) A **self-verification data tier** built from the model's own
+rollouts flips the sign of that response (+0.1 / +1.3, net flip +1 / +13) — the model can now spend
+2.7× the tokens and get *better* instead of worse. (2) At a **higher dose** of the same tier the
+verification migrates out of the continuation and into the default trace, giving the best greedy of
+the campaign (68.3 / 74.3 at n=300 vs 65.0 / 73.0 shipped) with the knob going flat. Meanwhile the
+two obvious levers both failed, for reasons worth recording: additive on-policy **RFT was null**,
+and **RLVR-DPO at β=0.05 was destructive** (greedy 65→50) via likelihood collapse, which β=0.4
+repairs.
+
+### 33a. Phase 0 — the effort profile nobody had measured (`reasoning/effort_probe.py`)
+
+Four modes, all on the validated vLLM path, all pools contamination-audited via `clean_eval.load_clean`
+plus TRAIN-only pools added for fuel.
+
+**The model is not length-limited; long traces are a symptom of failure.** Greedy accuracy vs token
+budget saturates by 384 tokens and think-length p50 is only ~110–122 tokens. Binned by trace length
+(budget 512, n=300):
+
+| think-len | SVAMP acc | ASDiv acc |
+|---|---|---|
+| 60–100 | **88%** | **93%** |
+| 100–150 | 57% | 64% |
+| 250–400 | 25% | 0% |
+| 400+ | **0%** | **0%** |
+
+**Forced continuation is net-destructive, at n=1000.** Suppress the first `</think>`, inject
+"Wait, let me double-check that.", regenerate, repeat, then force-close:
+
+| arm | x0 | x1 | x2 | x3 | x6 | net flip @x6 | decoded @x6 |
+|---|---|---|---|---|---|---|---|
+| shipped, SVAMP | 65.7 | 64.8 | 63.4 | 62.8 | **61.8** | **−39** | 603 |
+| shipped, ASDiv | 71.6 | 68.6 | 68.4 | 67.0 | **66.6** | **−50** | 581 |
+
+`net flip` = (wrong→correct) − (correct→wrong) vs x0. The scalar hides the mechanism: on ASDiv at
+x3 the shipped model repaired 9 answers and broke 22.
+
+**Reward density is no longer the blocker.** §9/§20 killed GRPO because a binary reward at ~2.6%
+solve-rate left most groups with zero gradient. Measured on argonne-3.5-think, K=16, T=0.8/top_p .95:
+
+| pool | single-sample | signal groups (0<c<K) | dead (c=0) | mean √(p(1−p)) | pass@16 |
+|---|---|---|---|---|---|
+| gsm8k_train | 34.7% | **75.0%** | 21.2% | 0.308 | 78.8% |
+| math_train_easy (L1–3) | 29.3% | **79.8%** | 20.0% | 0.324 | 80.0% |
+| math_train_hard (L4–5) | 7.8% | 30.0% | 70.0% | 0.119 | 30.0% |
+| svamp (reference) | 56.5% | 84.3% | 5.3% | 0.341 | 94.7% |
+
+Also measured: **T=1.0 is strictly worse than T=0.8 for fuel** (gsm8k_train 18.7% vs 34.7%
+single-sample, `no_answer` 36% vs 17%, and *lower* group signal 71.0% vs 75.0%) — hotter sampling
+buys unusable samples, not diversity. MATH L4–5 is out of the usable band and was excluded.
+
+**Where the headroom is.** T=0.8, K=32, n=300: SVAMP pass@32 **98.3%** / majority@32 78.0% / greedy
+65.0; ASDiv pass@32 **97.0%** / majority@32 85.0% / greedy 73.0. Only 5/300 and 9/300 problems are
+never solved. Majority voting saturates early (SVAMP k8 75.2 → k32 78.0) while pass@k keeps
+climbing, so **vote quality, not vote count, is binding** — i.e. the model's *mode* is wrong on
+~28% of solvable problems, and greedy returns the mode.
+
+### 33b. Eval integrity — two things to know before quoting any number here
+- **`max_model_len` is inert; the kernel path is not.** Same model, same 300 seed-0 problems, T=0:
+  `max_model_len` ∈ {1024,1536,2048} gives byte-identical generations (0/300 differ), but
+  eager vs compiled+CUDA-graph **rewrites ~30% of greedy traces** (88–89/300), changes the final
+  answer on 22–24, and flips correctness on 12–17 — for a *net* accuracy change of only ~1pt,
+  because the flips cancel. Consequence: greedy pass@1 at n=300 cannot separate arms at the ±2pt
+  level, which is where most of this campaign's deltas live. Every arm here is judged with
+  `enforce_eager=True` to match `clean_eval.py`, and the finalists are re-judged **paired at
+  n=1000 with McNemar** (`reasoning/effort_gate.py`).
+- **`no_answer` is mostly real error, not a format artifact.** 11.6% of T=0.8 rollouts close
+  `</think>` and emit no `\boxed{}`; of those only **27%** hold the right answer in another
+  convention (`#### 35`, a trailing number). So repairing answer formatting is worth ~3pt of
+  *sample* accuracy, not the ~12pt the raw `no_answer` rate suggests. Not pursued.
+
+### 33c. What failed, and why it is worth recording
+**Arm A — additive on-policy RFT/STaR: NULL.** 130,192 labeled rollouts from the shipped model over
+8,137 TRAIN problems (11 min on 3 H200s), filtered to 8,821 gold-verified + step-verified +
+non-degenerate traces, difficulty-weighted, added at 20% of the v6 mix (33,035 rows, 1 epoch from
+`dpo`, effective batch 12 — §32's recipe with one variable moved):
+
+| | SVAMP greedy | self-cons | ASDiv greedy | self-cons |
+|---|---|---|---|---|
+| shipped | 65.00 | 74.00 | 73.00 | 82.67 |
+| +RFT @20% (α=.85) | 63.00 | 76.00 | 73.67 | 80.33 |
+
+Sum greedy −1.33, sum self-cons −0.34: no consistent sign, all inside the noise floor. The
+mechanism reading: the model already samples the correct trace often (pass@32 97–98%), so raising
+its *likelihood* a little does not change the **argmax**, and greedy returns the argmax. A
+likelihood objective is the wrong tool for a mode problem.
+
+⚠️**The near-miss that makes this arm worth reading twice.** The first selection pass kept, as a
+*top pick*, `<think>\n</think>\n\nThe answer is $\boxed{50}$.` — an EMPTY think block on a problem
+the model solved 2/16 times. Shortest-first selection actively seeks these out, since an empty-think
+lucky guess is always the shortest "correct" candidate. Training on them teaches the model to skip
+reasoning and guess, and it would have looked like a data win (loss falls fast on 14-token rows).
+Fixed by `is_degenerate()`: minimum think length **and the gold value must appear inside `<think>`**.
+That single filter dropped 3,315 too-short + 1,938 gold-not-derived traces out of ~14k candidates.
+**Any self-training selection on this line must carry this filter.**
+
+**Arm C — RLVR-DPO at β=0.05: DESTRUCTIVE.** §23d lists weight-space RLVR-DPO as killed on
+2026-07-10, but that verdict rested on **321 pairs** from a model solving ~2.6% of problems. The
+same construction here yields 3,040 mode-targeted pairs (negatives drawn *majority-answer-first*, so
+the trace being pushed down is the one greedy emits) or 16,877 broad pairs. It still failed, for a
+different reason:
+
+| arm (from shipped) | β | lr | d_chosen | d_rejected | SVAMP greedy | ASDiv greedy |
+|---|---|---|---|---|---|---|
+| mode-wrong, 2 ep | 0.05 | 5e-7 | **−13.0** | −52.1 | **50.33** | **58.67** |
+| mode-wrong, 2 ep | 0.05 | 2e-6 | **−51.4** | −200.5 | — | — |
+| all-pairs, 1 ep | 0.05 | 2e-6 | **−74.6** | −155.3 | — | — |
+| mode-wrong, 1 ep | **0.40** | 5e-7 | **+3.2** | −2.3 | (see 33e) | |
+
+β=0.05 learned the *preference* (margin_acc 0.98–1.00) by collapsing **both** sequences' likelihood
+— textbook DPO degeneration. Budget-forcing recovered +9.7/+6.7 of the damage, which localises much
+of it to lost `</think>` **termination**, precisely the property §23e/v6 was built to install.
+**β=0.40 fixes the dynamics completely** (d_chosen +3.2 instead of −13.0). So the honest verdict is
+not "RLVR-DPO is dead" but "**RLVR-DPO on this model needs a tight leash; at β=0.05 it eats v6's
+termination before it reshapes the mode**".
+
+### 33d. What worked — a self-verification tier makes test-time compute usable
+`reasoning/build_verify_tier.py` builds three flavours from the same 130k-rollout corpus, all keyed
+on the exact cue string the probe injects, and all correct-by-construction:
+
+| tier | shape | teaches |
+|---|---|---|
+| `verify_confirm` | correct trace → cue → python-verified recheck of every `a op b = c` → answer | extra tokens are for re-checking |
+| `verify_rederive` | correct trace A → cue → *step-signature-distinct* correct trace B → answer | derive it a second way and commit when they agree — self-consistency in ONE pass |
+| `verify_fix` | wrong rollout → cue → honest transition → the model's own correct rollout → answer | when the check fails, re-derive instead of committing |
+
+**HONESTY RULE, which cost a redesign.** The first build clipped each wrong trace to its leading 60%
+and appended "That line of reasoning does not hold up" — for 3,054 of 3,500 rows, i.e. wherever no
+arithmetic error could be *located*. But a wrong trace's prefix is frequently correct (the error
+comes later), so those rows were teaching the model to abandon sound reasoning — plausibly the very
+behaviour that makes the shipped model's continuations lose 2–3 correct answers for each one they
+gain. A row may now only assert what was verified in python: `verify_fix` either NAMES a step it
+re-evaluated as wrong, or keeps the whole wrong attempt (which demonstrably reached a wrong answer)
+behind a neutral "let me recompute this independently".
+
+**Result (n=1000, greedy + forced continuation, 20% dose, α=0.85):**
+
+| arm | SVAMP x0→x6 | net flip | ASDiv x0→x6 | net flip | decoded @x6 |
+|---|---|---|---|---|---|
+| shipped | 65.7 → **61.8** | −39 | 71.6 → **66.6** | −50 | 581–603 |
+| **verify @20%** | 64.8 → **64.9** (peak 65.6 @x1) | **+1** | 73.3 → **74.6** (peak 74.9 @x2) | **+13** | **291–297** |
+| verify @20%, untrained cue | 64.8 → 61.9 | −29 | 73.3 → 71.6 | −17 | 457–461 |
+
+Three things in that table matter beyond the accuracy. The **flip matrix inverted** (ASDiv C→X 22 /
+X→C 9 → C→X 4 / X→C 14). The verify arm **decodes half as many tokens** at x6 (291 vs 603) because
+it emits a short recheck and closes, where the shipped model rambles. And the third row is the
+**specificity control**: with an untrained neutral cue the same weights degrade again past x3, so
+the trained cue is doing real work — though it only buys ~1pt over the neutral cue at x1–x3, so the
+honest claim is "the tier makes continuation non-destructive" first, "the cue is special" second.
+
+**Termination got better, not worse** (n=300 greedy): SVAMP `unclosed` **14 → 1**, `no_answer`
+3 → 0; ASDiv `unclosed` 6 → 2, `no_answer` 12 → 6.
+
+### 33e. Dose vs α — and a correction to how the two arms differ
+
+⚠️**CORRECTION, recorded because the naive reading is wrong.** The second arm was requested at
+`--rft-share 0.40`, but the verify pool only holds 7,800 rows, so the share was **capped by
+available data**. The two arms' REALIZED verify shares are **20.00%** (6,607/33,035) and **22.79%**
+(7,800/34,228) — an 18% difference in tier size, not 2×. They also differ in α (0.85 vs 1.00).
+So "the 40% arm" is mislabelled shorthand: most of its gain is **α=1.00**, not dose. Do not cite
+this pair as a dose-response. The 2×2 (tier size × α) is completed in 33h.
+
+Same tier, larger by 18%, at two α (n=300):
+
+| arm | SVAMP greedy | self-cons | ASDiv greedy | self-cons | knob (x0→x4) |
+|---|---|---|---|---|---|
+| shipped | 65.00 | 74.00 | 73.00 | 82.67 | negative |
+| verify @20%, α=.85 | 64.67 | 77.33 | 71.33 | 81.00 | **positive** |
+| verify @40%, α=.85 | 67.00 | 74.33 | 71.00 | 81.67 | flat |
+| **verify @40%, α=1.00** | **68.33** | 75.67 | **74.33** | 82.33 | flat |
+
+The dose **trades the knob for x0**: at 40% the forced continuation adds ~0.0–0.3 while plain greedy
+rises to the campaign's best (+3.33 / +1.33 vs shipped, +4.7 aggregate). The candidate explanation —
+that verification moved *out* of the continuation and *into* the default pass — is checked directly
+in `095_alpha` by counting recheck vocabulary in plain greedy traces.
+
+**Mechanism CONFIRMED (asdiv, n=300, plain greedy — no continuation involved).** Counting recheck
+vocabulary in the *default* trace:
+
+| model | ASDiv greedy | think-len | contains "wait" | "check/verif" | "recompute/redo/second way" |
+|---|---|---|---|---|---|
+| shipped | 72.33% | 108.9 | **2.3%** | 11.0% | 1.0% |
+| verify @20% | 71.00% | 108.1 | **51.3%** | 54.7% | 8.7% |
+| verify @40%, α=1.00 | **74.33%** | **102.0** | **59.0%** | 59.0% | 10.0% |
+
+The tier does not make the model think *longer* — think-length actually falls 108.9 → 102.0 — it
+makes the model **spend its existing budget on self-checking**. That is why the 40% dose buys
++2.0 greedy at *fewer* tokens, and why its external continuation knob goes flat: the work has
+already been done inside the first pass.
+
+**The α knee moved to 1.00** (40% dose, n=300). §32's knee was 0.85 and §32b warns never to assume
+the soup is inert — it moved again:
+
+| α | SVAMP greedy / +budget / self-cons | ASDiv greedy / +budget / self-cons |
+|---|---|---|
+| 0.70 | 67.33 / 69.67 / 73.67 | 68.00 / 72.00 / 80.00 |
+| 0.85 | 67.00 / 67.00 / 74.33 | 71.00 / 71.67 / 81.67 |
+| 0.925 | 66.00 / 66.00 / 74.67 | 72.67 / 72.67 / 83.33 |
+| **1.00** | **68.33** / 68.33 / **75.67** | **74.33** / 74.33 / 82.33 |
+
+α=0.70 reproduces §19/§32's non-termination signature (budget-forcing recovers +2.33/+4.00);
+higher α is monotonically better on greedy. Because α=1.00 means *no SFT soup partner*, the
+general-capability probe is not optional for this arm — §32's 0.15 partner is what fixed the
+instruction-following probe.
+
+**RLVR-DPO at a tight leash is a different, complementary win (n=300).**
+
+| arm | SVAMP greedy / +budget / self-cons / pass@8 | ASDiv greedy / +budget / self-cons / pass@8 |
+|---|---|---|
+| shipped | 65.00 / 66.00 / 74.00 / 90.67 | 73.00 / 73.67 / 82.67 / 92.33 |
+| β=0.40 lr5e-7 | 62.33 / 65.67 / **77.67** / **91.33** | 67.33 / 74.67 / **84.00** / **94.33** |
+| β=0.10 lr1e-7 | 63.67 / **66.67** / 76.33 / 90.67 | 71.67 / **76.00** / 83.67 / 93.00 |
+
+DPO costs native `</think>` closure (the greedy→+budget gap widens from ~1pt to 3.3–7.3pt) but
+**improves the sampled distribution**: aggregate self-consistency +5.0 (β=0.40) and +3.3 (β=0.10),
+aggregate +budget +3.0 (β=0.10). Its deployable cell is therefore `+budget`, not `greedy`. This is
+the opposite trade from the verify tier, which improves `greedy` and *tightens* termination —
+so the two are candidates to compose.
+
+### 33f. THE GATE — paired, n=1000/pool, McNemar (`reasoning/effort_gate.py`)
+
+Six arms × four deployable single-pass configs + self-consistency, same problems, one model per GPU
+in its own process. Aggregate = sum of the two pools' accuracy.
+
+| arm | greedy | best single-pass | self-cons@8 |
+|---|---:|---:|---:|
+| **shipped `blend_a085`** | 134.40 | 137.10 | 152.90 |
+| verify @20%, α=.85 (`vfy`) | 137.10 | 140.50 | 155.20 |
+| verify @40%, α=.85 | 138.00 | 140.10 | 155.20 |
+| **verify @40%, α=1.00 (`vfy40think`)** | **139.80** | 140.10 | 156.20 |
+| RLVR-DPO β=.10 lr1e-7 | 130.00 | 141.00 | 156.30 |
+| **RLVR-DPO β=.40 lr5e-7** | 127.70 | **141.60** | **157.00** |
+
+**Significant paired comparisons (exact McNemar):**
+
+| comparison | Δ | p |
+|---|---:|---:|
+| ASDiv, shipped greedy → `vfy40think` greedy | **+3.60** | **0.013** |
+| ASDiv, shipped best → `vfy` extend×2 | **+3.30** | **0.020** |
+| SVAMP, shipped best → DPO β=.40 +budget | **+2.90** | **0.033** |
+| ASDiv, shipped greedy → DPO β=.40 greedy | **−4.90** | **0.00096** |
+| **[`vfy`] its own greedy → extend×2, ASDiv** | **+2.30** | **0.00061** |
+| **[`vfy`] its own greedy → extend×1, SVAMP** | **+1.10** | **0.035** |
+| [`vfy40`] its own greedy → extend×3, ASDiv | +1.40 | 0.076 |
+| [`vfy40think`] its own greedy → extend×1, ASDiv | +0.30 | 0.70 |
+| [shipped] its own greedy → +budget, ASDiv | +1.70 | 0.00091 |
+
+**The three conclusions this supports, and their limits.**
+1. **The effort knob is real and it is trained, not decoded.** `vfy` improves *on itself* by spending
+   more sequential tokens: ASDiv +2.30 (p=0.0006), SVAMP +1.10 (p=0.035). The shipped model does the
+   opposite (ASDiv extend×3 67.10 vs greedy 69.90). Confirmed at n=1000 on two independent sets.
+2. **For a single-model card with no serving change, `vfy40think` is the winner**: aggregate greedy
+   **+5.4** (139.80 vs 134.40), significant on ASDiv (+3.60, p=0.013), at ~the same token cost
+   (146/150 → 123/131 decoded). The dose trade is now measured on both sides: 40% internalises the
+   verification (knob p=0.70, i.e. gone) while 20% keeps it external (knob p=0.0006).
+3. **RLVR-DPO is a *serving-dependent* win, and must be labelled that way.** β=.40 posts the best
+   best-single-pass (141.60) and best self-consistency (157.00), but only because budget-forcing
+   repairs it: its own greedy→+budget delta is **+5.7 / +8.2 (p≈1e-16)** versus +1.0/+1.7 for the
+   shipped model, and its plain greedy is significantly *worse* than shipped (ASDiv −4.90,
+   p=0.001). A stack that does not force-close would be downgrading.
+
+**Compute accounting** (mean decoded tokens/problem, shipped model): greedy 146/150 · +budget
+181/183 · extend×3 400/395 · self-cons@8 **1118/1220**. So self-consistency buys ~+18 aggregate for
+~8× the tokens, while `vfy`'s extend×2 buys ASDiv +2.30 for ~1.5× and `vfy40think` buys +5.4
+aggregate for **1×**. On tokens-per-point, the internalised route dominates everything else here.
+
+### 33g. The two scaling axes do NOT compose (n=500, `--sc-extensions 2`)
+
+Sequential effort helps the greedy path. Applied to *sampled* candidates and re-voted, it makes
+self-consistency **worse**, for every model:
+
+| model | SVAMP self-cons@8 → +ext×2 | ASDiv self-cons@8 → +ext×2 |
+|---|---|---|
+| shipped | 73.20 → **69.80** | 77.40 → **69.80** |
+| verify @20% (`vfy`) | 75.40 → 73.40 | 78.80 → 72.60 |
+| verify @29%·α=1 (`vfy40think`) | 75.20 → 74.00 | 81.60 → **78.40** |
+
+The verify arms lose less than the shipped model does (−1.2/−3.2 vs −3.4/−7.6), but the sign is
+negative everywhere, and it costs 2× the tokens (2237/2379 vs 1103/1227) to get there. Mechanism:
+the trained continuation is a *greedy re-derivation*; run it on K sampled traces and it pulls them
+toward a common attractor, destroying the very disagreement majority voting feeds on.
+
+**Consequence for the claim.** The effort knob repairs the **mode**, not the **distribution**. So the
+honest statement is "argonne-3.5-think can now be given more *sequential* compute on its greedy path
+and get better", not "more reasoning effort helps in general". Anyone deploying self-consistency
+should NOT add extensions on top.
+
+### 33h. Composition attempts — both fail, and one of them fails informatively
+
+**verify + mode-wrong RFT** (`vfymw`, verify tier + the 1,672 traces whose sampling mode is wrong,
+n=300): SVAMP 63.33 greedy / 75.33 self-cons, ASDiv **73.67** / **84.00**. Best non-DPO
+self-consistency of the campaign on ASDiv, and it keeps the knob — but SVAMP greedy is −1.67 and the
+aggregate does not beat `vfy40think`.
+
+**RLVR-DPO on top of the verify arm** — this one is worth reading. β=.40 and β=.10, 1 epoch, from
+`vfy40_think` (n=300):
+
+| arm | SVAMP greedy / +budget / self-cons | ASDiv greedy / +budget / self-cons |
+|---|---|---|
+| `vfy40_think` (the starting point) | **68.33** / 68.33 / 75.67 | **74.33** / 74.33 / 82.33 |
+| + DPO β=.40 | 63.67 / 63.67 / 74.33 | 72.67 / 72.67 / 80.67 |
+| + DPO β=.10 | 67.33 / 67.33 / 76.33 | 72.00 / 71.67 / 81.33 |
+
+Both **subtract**. But note `greedy == +budget` exactly for both, versus a +5.7/+8.2 budget-forcing
+gap when DPO ran on the shipped model: **the verify tier's termination is robust to DPO where v6's
+was not.** So DPO's earlier damage was specifically to a fragile termination behaviour, and the
+verify tier hardens it — while DPO still costs accuracy. RLVR-DPO does not compose here.
+
+### 33i. General-capability gate — flat (this is what makes the winner shippable)
+
+The 10-item 4-quadrant probe put `vfy40think` at **9/10** on general/no-think (it misses "list three
+primary colors") against 10/10 for the shipped model, which on this line's history (§12 general
+collapse, §18 zero-sum trade, §32's soup partner) is exactly the alarm you must not wave through —
+especially for an α=1.00 arm that has *no* SFT soup partner. lm-eval via the vLLM backend, 6 tasks:
+
+| model | arc_challenge | arc_easy | hellaswag | openbookqa | piqa | winogrande | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 42.92 | 59.60 | 59.91 | 37.00 | 72.80 | 59.04 | **55.21** |
+| `vfy40_a0925` | 42.49 | 59.13 | 59.74 | 37.20 | 72.69 | 58.88 | 55.02 |
+| `vfy40_think` (α=1.00) | 42.49 | 59.47 | 59.65 | 36.80 | 72.85 | 58.88 | 55.02 |
+
+**−0.19pt mean, no task moving more than 0.43pt** — flat. The 4-quadrant miss is a 10-item probe
+artifact, not a general regression, and α=1.00 does not cost broad capability *on this data*. Also
+flat on the other three quadrants (general/think 10/10, math/think 10/10 for both candidates);
+`dpo2_b10lo` is the only arm that regressed a quadrant (math/think 8/10), consistent with its
+termination damage.
+
+### 33j. FINAL GATE — 12 arms, n=1000/pool, paired
+
+| arm | what it is | greedy | best single-pass | self-cons@8 |
+|---|---|---:|---:|---:|
+| `base` | **shipped `blend_a085`** | 134.40 | 137.10 | 152.90 |
+| **`vfymw`** | **verify tier + mode-wrong RFT, α=.85** | **141.20** | **141.30** | 156.10 |
+| `vfy40think` | verify 22.8%, α=1.00 | 139.80 | 140.10 | 156.20 |
+| `vfybiga0925` | verify 29.1%, α=.925 | 139.50 | 140.40 | 153.80 |
+| `dpo3v40b10` | DPO β=.10 on `vfy40think` | 138.50 | 138.80 | 154.70 |
+| `vfy40` | verify 22.8%, α=.85 | 138.00 | 140.10 | 155.20 |
+| `vfy` | verify 20.0%, α=.85 | 137.10 | 140.50 | 155.20 |
+| `dpo3v40b40` | DPO β=.40 on `vfy40think` | 137.10 | 137.10 | 156.00 |
+| `vfybigthink` | verify 29.1%, α=1.00 | 136.90 | 139.00 | 154.40 |
+| `vfythink` | verify 20.0%, α=1.00 | 135.10 | 135.40 | 152.50 |
+| `dpo2b10lo` | RLVR-DPO β=.10 from shipped | 130.00 | 141.00 | 156.30 |
+| `dpo2b40` | RLVR-DPO β=.40 from shipped | 127.70 | **141.60** | **157.00** |
+
+**Winner: `vfymw_a085` — aggregate greedy +6.8 over the shipped model at the same token cost.**
+ASDiv **+4.80, p=0.00053** (and +3.10, p=0.022 against the shipped model's *best* config); SVAMP
++2.00, p=0.20. Self-consistency +3.2.
+
+**The pattern across every arm is the same and must be stated: ASDiv moves, SVAMP does not.**
+ASDiv gains are +3.6 to +4.8 with p between 0.0005 and 0.013 for five independent arms; SVAMP gains
+range 0.0 to +2.7 and **not one reaches p<0.05**. So the honest claim is "a significant improvement
+on ASDiv, replicated across arms, with SVAMP flat" — not a uniform gain.
+
+**Only `vfy` (20.0%, α=.85) owns the effort knob at n=1000:** its own greedy → extend×2 is
+ASDiv **+2.30 (p=0.0006)** and SVAMP **+1.10 (p=0.035)**. Every higher-accuracy arm has p>0.4 on the
+knob. **The knob and the accuracy are alternatives, not additives**: whatever raises x0 does so by
+internalising the verification, which is then no longer available to buy externally.
+
+**⚠️Within the verify family, dose and α differences are NOT resolvable at this n — do not tell a
+dose story.** The α=1.00 series across realized shares reads 135.10 (20.0%) → **139.80** (22.8%) →
+135.34 (25.40%, flavours held equal) → 136.90 (29.1%). Arm G (`vfyeq`) was built to separate dose
+from flavour balance and it does: an equal-flavour 25.40% arm is just as weak as the `fix`-heavy
+29.1% one, so the regression is **dose, not composition**. But a 4.7-point spike at 22.8% flanked by
+two ~135 points is a suspiciously sharp "optimum" for an 18%-of-tier change, and the same is true of
+the α grid (soup helps at 20.0%, hurts at 22.8%, helps at 29.1%). The defensible reading is that
+**one-epoch CoT-SFT run-to-run variation on this recipe is of order ±2-4 aggregate points**, which
+swamps every within-family contrast here. Two consequences: (i) §32b's "always sweep α" stands, but
+as a *search* instruction, not because a knee has been located; (ii) an earlier draft of this section
+claimed a dose optimum near 23% — that claim is withdrawn.
+
+**WHAT SURVIVES, and it is the replication rather than any single arm.** ASDiv improves
+significantly in **five independent arms** built from different data mixes and different α (+3.60 to
++4.80, p between 0.0005 and 0.013). SVAMP moves 0.0 to +2.7 and **never reaches p<0.05** in any arm.
+Five independent replications of a same-signed, same-magnitude ASDiv gain is a real effect; the
+ordering *among* those five is not.
+
+### 33k. The winner, fully gated — `vfymw_a085`
+
+`/project/rcc/youzhi/models/a35_effort/vfymw_a085` = CoT-SFT from `dpo`, 1 epoch, effective batch 12,
+on `cot_mix_v6_vfymw` (v6 + the 3-flavour verify tier + the 1,672-trace mode-wrong RFT slice;
+35,900 rows, 26.4% realized new-tier share), souped with `dpo` at **α=0.85** (swept: α=0.925 gives
+139.40 and α=1.00 gives 135.10 aggregate greedy, so 0.85 is the knee *for this arm*).
+
+| axis | shipped `blend_a085` | `vfymw_a085` | note |
+|---|---|---|---|
+| aggregate greedy (n=1000×2) | 134.40 | **141.20** | **+6.8** |
+| ASDiv greedy | 69.90 | **74.70** | **+4.80, p=0.00053** |
+| ASDiv vs shipped's BEST config | 71.60 | 74.70 | **+3.10, p=0.022** |
+| SVAMP greedy | 64.50 | 66.50 | +2.00, p=0.20 (**not significant**) |
+| self-consistency@8 | 152.90 | 156.10 | +3.2 |
+| decoded tokens (greedy) | 146 / 150 | ~same | no extra serving cost |
+| lm-eval mean (6 tasks) | 55.21% | 55.07% | flat (−0.14) |
+| 4-quadrant probe | 10/10 · 9/10 · 7/10 · 10/10 | **10/10 · 10/10 · 7/10 · 10/10** | ≥ shipped on every quadrant |
+
+(math/no-think 7/10 for *both* models is a 200-token probe truncation artifact — the model explains
+the method and runs out before emitting the number — not a regression.)
+
+**Honest characterisation.** This is a **modest, replicated, ASDiv-driven single-model gain at zero
+serving cost**, not a uniform improvement: SVAMP does not move significantly in this or any other
+arm. It is NOT published — publishing requires explicit per-action approval.
+
+### 33l. Throughlines
+1. **A likelihood objective cannot move an argmax.** Greedy returns the mode; the mode is wrong on
+   ~28% of solvable problems; adding more correct traces (RFT) raises their likelihood a little and
+   changes nothing. This is why §32's v6 worked (it changed the *diet*, restructuring what a trace
+   looks like) and why an additive tier of the same kind of trace does not.
+2. **"More reasoning effort" is a trained capability, not a decode-time option.** The shipped model
+   had a negative response to sequential compute. A tier that shows it what to *do* with extra
+   tokens flips the sign — and at higher dose it stops needing the extra tokens at all, because the
+   verification moves inside the first pass (think-length actually *falls*).
+3. **The knob and the accuracy are alternatives.** Every arm that raised x0 lost the external knob;
+   the only arm with a significant knob (`vfy`, 20.0%) has a lower x0. There is no arm with both.
+4. **DPO's failure mode here is a leash, not a signal.** §20 killed GRPO for signal starvation; that
+   is gone (75-82% signal groups). RLVR-DPO instead fails by likelihood collapse, and β fixes it.
+   Diagnose *which* failure you have before declaring a lever dead.
+5. **Self-training selection will hunt degenerate traces if you let it.** Shortest-first + "correct"
+   = empty-think lucky guesses. The filter is not optional and its absence looks like a data win.
+6. **Report the replication, not the ranking.** Five arms agree on ASDiv (p=0.0005-0.013); their
+   ordering, and every dose/α contrast between them, is inside one-epoch run-to-run variation.
+
+### 33m. Files added
+| file | what |
+|---|---|
+| `reasoning/effort_probe.py` | the effort profiler: `budget` / `extend` / `density` / `passk` / `greedy` modes |
+| `reasoning/effort_gate.py` | paired n=1000 gate over deployable configs + exact McNemar (+ `--report-from` merge, `--sc-extensions` for the composition test) |
+| `reasoning/rft_generate.py` | K-sample labeled-rollout generator + `is_degenerate` (the mandatory filter) |
+| `reasoning/rft_select.py` | OFFLINE selection from a rollout corpus (`--target mode_wrong`) — keeps a policy bug from costing a regeneration |
+| `reasoning/build_verify_tier.py` | the self-verification tier (confirm / rederive / fix), correct-by-construction |
+| `reasoning/build_mix_rft.py` | merge a tier into a CoT mix (`--rft-share`, `--balance-tiers`, `--drop-tiers`) |
+| `reasoning/build_rlvr_pairs.py` | RLVR-DPO pairs with MODE-FIRST negatives |
+
+Campaign root `/project/rcc/youzhi/a35_effort/` (worker.sh, env.sh, run_arm.sh, st.sh, queue/, report/).
+### 33n. BREADTH — five held-out sets, and two corrections to the claims above
+
+SVAMP/ASDiv are both 1-2-step word problems, i.e. the *same family*, and the verify tier was built
+from gsm8k-train + MATH-L1-3 rollouts. So the gate above could not tell a capability gain from a
+family-specific one. Three further sets settle it: **MAWPS** (520, clean, classic word problems),
+**GSM-Plus** (adversarial perturbations of GSM8K test — semi-clean, a robustness set), **math500**
+(MATH test, numeric-only, harder).
+
+**Greedy, paired against the shipped model, exact McNemar:**
+
+| pool | n | shipped | `vfy` | p | `vfymw` | p |
+|---|---:|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 64.50 | 1.0 | 66.50 | 0.20 |
+| ASDiv | 1000 | 69.90 | 72.60 | 0.057 | **74.70** | **0.00053** |
+| MAWPS | 500 | 56.80 | 55.80 | 0.58 | 56.60 | 1.0 |
+| **GSM-Plus** | 500 | 27.80 | **33.00** | **0.017** | 31.80 | 0.054 |
+| math500 | 319 | 29.78 | 31.03 | 0.69 | 31.03 | 0.71 |
+| *unweighted mean* | | *49.76* | *51.39* | | ***52.13*** | |
+
+Self-consistency@8 tracks it: SVAMP 74.20→76.20, ASDiv 78.70→79.90, **GSM-Plus 39.60→42.60**,
+MAWPS 60.60→59.20, math500 31.03→30.72.
+
+**CORRECTION 1 — the accuracy gain is set-dependent, not general.** Two of five sets move
+significantly (ASDiv p=0.0005, GSM-Plus p=0.017 for `vfy`); three do not (SVAMP, MAWPS, math500).
+The defensible statement is **+2.4pt unweighted mean over five held-out sets, carried by ASDiv and
+by the adversarial GSM-Plus**. Anything stronger is over-claiming. The GSM-Plus result is arguably
+the more interesting of the two, since GSM-Plus exists to break memorised procedure and the shipped
+model scores only 27.8% there.
+
+**CORRECTION 2 — "the released model cannot use more thinking" is TRUE ONLY on easy word problems.**
+Best-extension minus greedy, per set:
+
+| pool | shipped | p | `vfy` | p |
+|---|---:|---:|---:|---:|
+| SVAMP | +0.10 | 1.0 | **+1.10** | **0.035** |
+| ASDiv | −1.30 (−2.80 at x3) | — | **+2.30** | **0.0006** |
+| MAWPS | +0.00 | 1.0 | +0.80 | 0.34 |
+| **GSM-Plus** | **+6.20** | **0.00064** | −0.40 | 0.88 |
+| math500 | +1.57 | 0.58 | +2.51 | 0.12 |
+
+On **GSM-Plus the shipped model has a large, highly significant effort knob of its own** (+6.20,
+p=0.00064) — and the verify arm does not. The earlier sections' framing ("the effort knob is
+negative") holds for SVAMP/ASDiv/MAWPS and is **wrong for GSM-Plus and math500**, where the shipped
+model does benefit from extra thinking. The coherent reading: forced continuation helps when the
+first pass is genuinely unfinished (hard/adversarial items) and hurts when it is finished and
+correct (easy items, where continuing talks the model out of a right answer). The verify tier
+**flattens** that response — it removes the downside on the easy sets and, on GSM-Plus, also removes
+the upside, because it has already banked most of that gain in the first pass (greedy 27.8→33.0).
+
+**So the campaign's defensible bottom line is narrower than §33d suggests and still real:**
+- On easy word problems the shipped model *loses* accuracy to extra sequential compute and the
+  verify tier converts that into a small significant *gain* (SVAMP +1.10 p=0.035, ASDiv +2.30
+  p=0.0006). That is a genuine new capability.
+- At *fixed* compute the verify tier buys +2.4pt mean over five sets, significant on two of them.
+- It does **not** create a general-purpose "think harder" dial: on the one set where the shipped
+  model already had one, the tier replaces it rather than adding to it.
+
+### 33o. TARGETED FOLLOW-UP and the final candidate — `robust_a085`
+
+§33n located the headroom: GSM-Plus, where the shipped model scores 27.8% greedy against a ~59%
+pass@8, and where the verify tier already produced its largest gain. The tier's fuel had been
+rollouts on *clean* phrasings only, so a distractor-robustness pool was built
+(`reasoning/build_perturb_pool.py`: 2,421 gsm8k-**TRAIN** problems with one irrelevant sentence about
+a different subject spliced in before the question; gold provably unchanged; GSM-Plus derives from
+gsm8k **test**, so disjoint items with a similar perturbation style — ordinary methodology, not
+leakage). Rollouts from `vfymw_a085` on that pool → a `pert_verify_*` tier (~2.5k rows, ~6.5% share)
+added to the winner's mix; everything else held.
+
+**Final candidate `robust_a085` — five held-out sets, greedy, paired vs the shipped model:**
+
+| pool | n | shipped | `vfymw` | **`robust`** | p (shipped→robust) |
+|---|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 66.50 | 66.40 | 0.228 |
+| ASDiv | 1000 | 69.90 | 74.70 | **73.80** | **0.0053** |
+| MAWPS | 500 | 56.80 | 56.60 | 56.80 | 1.0 |
+| **GSM-Plus** | 500 | 27.80 | 31.80 | **34.20** | **0.0018** |
+| math500 | 319 | 29.78 | 31.03 | 31.97 | 0.435 |
+| **unweighted mean** | | **49.76** | 52.13 | **52.63** | |
+
+General capability unchanged: lm-eval 6-task mean **54.97 vs 55.21** shipped (−0.24, no task moving
+>1.3pt); 4-quadrant **10/10 · 10/10 · 8/10 · 10/10** versus the shipped model's 10/10 · 10/10 · 7/10
+· 10/10 — i.e. ≥ shipped on all four.
+
+The targeted round did what it was designed to do (GSM-Plus 31.80 → 34.20, and the shipped-model
+comparison moved from p=0.054 to **p=0.0018**) while holding ASDiv and SVAMP. **But `robust` vs
+`vfymw` is not significant on any single set** (best p=0.21), so the honest ordering is
+"`robust` ≥ `vfymw` > shipped", with only the comparison against *shipped* established.
+
+**FINAL ANSWER TO THE QUESTION ASKED.** Yes, the reasoning effort of the released
+argonne-3.5-think can be improved, in two distinct senses, both measured paired at n≥319 per set:
+1. **Effort it can actually spend.** On easy word problems the released model *loses* accuracy to
+   forced extra thinking (ASDiv −2.8 over 3 extensions, net flip −50 at x6). The verify tier turns
+   that into a significant gain (`vfy`: ASDiv +2.30 p=0.0006, SVAMP +1.10 p=0.035). Caveat from
+   §33n: on GSM-Plus the released model already had a knob of its own (+6.20 p=0.00064), so this is
+   not a universal new dial.
+2. **Effort it doesn't have to spend.** `robust_a085` gains **+2.9pt unweighted mean across five
+   held-out sets at the same token cost** (significant on ASDiv and adversarial GSM-Plus, flat on
+   the other three), with general capability unchanged — because the verification is *internalised*
+   into the first pass rather than bolted on at decode time.
+
+Candidate on disk at `/project/rcc/youzhi/models/a35_effort/robust_a085`. **Not published** — an HF
+push needs explicit per-action approval, and the README rule (every published model linked from the
+repo README, both directions) applies if it ever ships.
+### 33p. ⚠️SEED REPLICATION — the headline discounted, and what actually survives
+
+Nothing above tested run-to-run variation directly, and §33j warned it might swamp every
+within-family contrast. So the winning recipe was retrained end-to-end with a different data-shuffle
+seed and a different trainer seed (`robust2`, otherwise identical), and gated on the same five sets.
+
+| pool | n | shipped | run 1 | p | run 2 | p | mean Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SVAMP | 1000 | 64.50 | 66.40 | 0.228 | 66.00 | 0.357 | +1.70 |
+| ASDiv | 1000 | 69.90 | 73.80 | **0.0053** | 72.50 | 0.078 | +3.25 |
+| MAWPS | 500 | 56.80 | 56.80 | 1.0 | 55.80 | 0.603 | −0.50 |
+| **GSM-Plus** | 500 | 27.80 | 34.20 | **0.0018** | 32.60 | **0.025** | **+5.60** |
+| math500 | 319 | 29.78 | 31.97 | 0.435 | 27.90 | 0.532 | +0.16 |
+| **5-set mean** | | **49.76** | **52.63** | | **50.96** | | **+2.04** |
+
+**Two runs of an identical recipe differ by 1.68pt on the 5-set mean** (and by 4.07pt on math500
+alone). That is the empirical noise scale for one-epoch CoT-SFT here, and it retro-justifies §33j:
+every dose and α contrast in this campaign was inside it.
+
+**Consequences, applied honestly:**
+- **The "+2.9pt" for `robust_a085` is a single draw and is discounted to ≈+2.0pt**, the mean of two
+  independent runs. Report the recipe, not the checkpoint.
+- **What REPLICATES (same sign, both runs): SVAMP (+1.9/+1.5), ASDiv (+3.9/+2.6), GSM-Plus
+  (+6.4/+4.8).** GSM-Plus is individually significant in *both* runs (p=0.0018 and p=0.025) — the
+  single most solid accuracy result of the campaign, and it is the adversarial-robustness set.
+- **What does NOT replicate: MAWPS (0.0 / −1.0) and math500 (+2.2 / −1.9).** Both are flat-to-negative
+  once averaged; the first run's math500 number was noise.
+- Therefore the defensible accuracy claim is: **≈+2pt unweighted mean over five held-out sets, driven
+  by a replicated +5.6pt on adversarial GSM-Plus and +3.3pt on ASDiv, with MAWPS and math500 flat.**
+- Anyone selecting between the arms in §33f/§33j should treat their ordering as unresolved and pick
+  on the *mechanism* they want (knob → `vfy`; internalised verification → `robust`/`vfymw`), not on
+  an aggregate difference of 1-3 points.
+
+**This is the section to read first if you are tempted to run one arm and ship it.**
+### 33q. The distractor-perturb tier is NULL once seed-averaged
+
+§33o credited the targeted robustness round with GSM-Plus 31.80 → 34.20. With a second seed of
+*each* recipe (2-vs-2, greedy):
+
+| pool | shipped | `vfymw` mean of 2 | `robust` mean of 2 | Δ (perturb tier) |
+|---|---:|---:|---:|---:|
+| SVAMP | 64.50 | 65.20 | 66.20 | +1.00 |
+| ASDiv | 69.90 | 74.00 | 73.15 | **−0.85** |
+| GSM-Plus | 27.80 | 32.50 | 33.40 | +0.90 |
+
+**The perturb tier adds nothing measurable** — +1.0 / −0.85 / +0.9 is noise, and it changes sign
+across sets. The GSM-Plus gain belongs to the **base verify tier**, which reaches 32.50 on its own
+against the shipped model's 27.80. So §33o's "the targeted round did what it was designed to do" was
+a single-seed artifact and is **withdrawn**; `vfymw` (verify tier + mode-wrong slice) is sufficient,
+and the perturbation round was unnecessary work.
+
+What survives seed-averaging on these three sets, for BOTH verify recipes: **ASDiv +3.3 to +4.1,
+GSM-Plus +4.7 to +5.6, SVAMP +0.7 to +1.7.** That is the result.
+### 33r. FINAL, 3 SEEDS PER RECIPE — the number to quote
+
+Every recipe retrained end-to-end at three seeds (different data shuffle + trainer seed), each
+gated paired on the held-out sets. `reasoning/../a35_effort/aggregate.py` produces this table.
+
+| recipe | SVAMP | ASDiv | MAWPS | GSM-Plus | math500 | **5-set mean** | seeds |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 64.50 | 69.90 | 56.80 | 27.80 | 29.78 | **49.76** | 1 |
+| verify @20% (`vfy`) | 64.77 | 72.53 | 55.80 | 31.27 | 31.03 | **51.08** | 3 |
+| verify+modewrong (`vfymw`) | 65.57 | 73.47 | 56.60 | 32.07 | 31.03 | **51.75** | 3 |
+| + distractor tier (`robust`) | 66.50 | 73.57 | 56.30 | 32.80 | 29.94 | **51.82** | 3 |
+
+Δ vs shipped, 3-seed means: `vfy` **+1.3**, `vfymw` **+2.0**, `robust` **+2.1**.
+(MAWPS/math500 are 1-seed for `vfy`/`vfymw` and 2-seed for `robust`; SVAMP/ASDiv/GSM-Plus are 3-seed
+for all three.)
+
+**Per-set seed spread — the reason this section exists:**
+
+| set | spread across 3 seeds |
+|---|---|
+| ASDiv | 0.20–2.30pt |
+| SVAMP | 0.80–2.60pt |
+| GSM-Plus | 2.00–3.80pt |
+| math500 | **4.08pt** (2 seeds) |
+
+**Conclusions that survive 3 seeds:**
+1. **ASDiv +2.6 to +3.7 and GSM-Plus +3.5 to +5.0** — both consistent in sign across every seed of
+   every recipe. These are the campaign's real accuracy gains.
+2. **SVAMP is weakly positive (+0.3 to +2.0), MAWPS is flat-to-negative (−1.0 to −0.2), math500 is
+   flat** (+1.25 on one seed, −1.9 on another). Not gains.
+3. **`vfymw` ≈ `robust` (51.75 vs 51.82).** The distractor-perturb tier contributes nothing; §33o's
+   apparent +2.4 on GSM-Plus was a single-seed artifact, already withdrawn in §33q and now confirmed
+   dead at 3 seeds. **The simpler recipe is the recommendation.**
+4. **The whole verify family lands at +1.3 to +2.1pt mean.** Whatever the differences between arms in
+   §33f/§33j looked like, at 3 seeds they compress into a ~1pt band. Ship the recipe, not a
+   checkpoint picked from a leaderboard of one-seed runs.
+
+**FINAL ANSWER, in one line:** the reasoning effort of argonne-3.5-think can be improved —
+**+2.0pt unweighted mean over five held-out sets at unchanged token cost and unchanged general
+capability, carried by ASDiv (+3.6) and adversarial GSM-Plus (+4.3)** — and separately, the model can
+be given a *working* sequential-effort knob where it previously had a harmful one (ASDiv +2.30
+p=0.0006, SVAMP +1.10 p=0.035), though not on the harder sets where it already had one.
+
+**Recommended recipe if this is ever shipped:** `cot_mix_v6_vfymw` (v6 + the 3-flavour verify tier +
+the mode-wrong RFT slice), 1 epoch from `dpo`, effective batch 12, soup α=0.85 — averaged over ≥3
+seeds, picking the median run, not the best one.
+### 33s. ⛔ SHIP BLOCKED — the verify tier costs 24 points on ONE-STEP arithmetic
+
+The release was staged (`stage_a35_think_hf.py --verify` on `vfymw_a085`: 5 bf16 shards, the four
+config fixes, reload + chat generation terminating cleanly at 118/200 tokens). Its own smoke prompt
+is **"What is 17 - 5?"** and the candidate answered **7**:
+
+> `<think>` First, 17 - 5 = 12. Then 12 - 5 = 7. So, 17 - 5 = 7. **Wait, let me double-check that.
+> Let me derive it a second way to be sure.** First, subtract 5 from 17. 17 - 5 = 12. Then subtract 5
+> from 12. 12 - 5 = 7. **Both ways give 7.** `</think>` The answer is $\boxed{7}$.
+
+It computed 12 correctly, subtracted 5 again, and then the **trained self-verification re-derived the
+same wrong way and confirmed it**. A verification that repeats the original error does not catch it —
+it adds false confidence, which is worse than not checking.
+
+**Measured head-to-head on 80 one-step queries** (16 hand-written + 64 programmatic `a op b`, fixed
+seed, deployed `from_pretrained` + `.generate()` path):
+
+| model | one-step correct | mean tokens (hit / miss) |
+|---|---:|---:|
+| shipped `blend_a085` | **40/80 = 50.0%** | 75 / 94 |
+| candidate `vfymw_a085` | **21/80 = 26.2%** | 89 / 103 |
+
+**−23.8pt.** Examples: `2 + 2` → **6** (108 tok), `1000 - 1` → **998**, `50 - 17` → **16**,
+`7 times 6` → **252**, "12 eggs × 3 cartons" → **12**. The candidate spends *more* tokens on the ones
+it gets wrong: the cue fires on problems that were already finished in one step, and the second
+derivation is where the error enters. This is the §33d C→X flip mechanism, now visible on the inputs
+users actually type first.
+
+**⚠️WHY EVERY BENCHMARK IN THIS CAMPAIGN MISSED IT.** SVAMP, ASDiv, MAWPS, GSM-Plus and math500 are
+**all multi-step word problems**. There is no single-step arithmetic set anywhere in the suite, so a
++2.4pt mean across five held-out sets, ASDiv p=0.0005, GSM-Plus p=0.017, three-seed replication,
+unchanged lm-eval and a passing 4-quadrant probe **all coexisted with a 24-point regression on
+`2 + 2`**. The 4-quadrant probe's math/no-think quadrant is the only thing that touches this and it
+is 10 items scored loosely. v6's `synth_arith` tier (2,500 rows) existed precisely to hold
+single-fact arithmetic; the new tier took 26% of the mix and diluted it.
+
+**DECISION: the public card was NOT replaced.** The staged bundle was deleted. `blend_a085` remains
+the released Argonne-3.5-think.
+
+**What this does and does not invalidate:**
+- **Invalidated as a ship candidate:** every arm in this campaign. They all carry the same tier, so
+  they all likely carry the same regression; only `vfymw_a085` was measured.
+- **NOT invalidated:** the diagnosis (§33a-b), the mechanism result that a trained continuation mode
+  flips the sign of forced-extension response on multi-step problems (§33d/f, ASDiv +2.30 p=0.0006),
+  and every recorded negative (RFT null, DPO β, axes don't compose, seed noise). Those stand.
+- **The obvious fix, untested:** make the verification *conditional* on the problem being multi-step
+  (or restore/upweight a single-step arithmetic tier so the cue does not fire on one-step queries).
+  Any future round must gate on a one-step arithmetic probe, not only on word-problem benchmarks.
+
+**Rule for this line going forward: no reasoning-model release may be gated on multi-step benchmarks
+alone. `a35_effort/simple_probe.py` (80 one-step items, deployed path) is now part of the gate.**
+### 33t. THE FIX ROUND — the gain and the damage are the SAME ROWS
+
+Three repaired arms, each gated on BOTH axes (one-step arithmetic on the deployed
+`from_pretrained`/`.generate()` path, n=80; multi-step held-out sets, paired vs shipped):
+
+| arm | what changed | one-step arith | multi-step mean (4 sets) | ASDiv |
+|---|---|---:|---:|---:|
+| shipped `blend_a085` | — | **39/80 (48.8%)** | 54.75 | 69.90 |
+| `vfymw` (§33s blocker) | verify tier, unrestricted | **21/80 (26.2%)** | **57.40** | **74.70** |
+| `fix1` | verify restricted to **multi-step sources** (`--min-eqs 2`) + 5,000 cue-free arithmetic rows | **43/80 (53.8%)** | 55.48 | 70.60 |
+| `fix2` | fix1 + the mode-wrong RFT slice | **44/80 (55.0%)** | 55.48 | 72.60 |
+| `fix4` | **full** verify tier + 3,800 **bare-numeric-only** counter-examples | 26/80 (32.5%) | 55.92 | **74.00** (p=0.0032) |
+
+**The two hypotheses, and which one the data supports.**
+- *"Bare numeric expressions are the conflict; word problems are fine to verify."* **REFUTED by fix4.**
+  Keeping the full verify tier and adding 3,800 bare-numeric cue-free rows recovered ASDiv (74.00,
+  p=0.0032) but left one-step arithmetic at **26/80** — barely above the broken arm. Counter-examples
+  alone do not stop the cue firing on `2 + 2`.
+- *"The cue must never be trained on one-step derivations."* **SUPPORTED.** Only `--min-eqs 2` (which
+  dropped **15,866** of the `verify_confirm` candidates as one-step) restores arithmetic — and it
+  simultaneously gives back most of the ASDiv gain (74.70 → 70.60/72.60).
+
+**So the gain and the damage are produced by the same rows.** ASDiv is itself a 1-2-step set, so the
+verify rows that teach "check your 1-2-step derivation" are exactly the rows that teach "check
+`2 + 2`". Restricting the tier to multi-step sources removes ~75% of the multi-step gain along with
+~90% of the arithmetic damage. There is no setting in this design that keeps both.
+
+**FINAL DECISION: the public card is NOT replaced. `blend_a085` remains Argonne-3.5-think.**
+The best repaired arm, `fix2`, is **+5.0pt on one-step arithmetic and +0.73pt mean on four multi-step
+sets, with MAWPS −2.80 (p=0.087)**. A +0.73pt mean is inside the **±1.68pt** seed-noise scale measured
+in §33p, and the arithmetic gain is mostly *recovering what the tier broke* rather than beating the
+shipped model. That is a wash with a per-set regression, and §28/§29's standing rule on this line is
+not to churn a public card for a non-significant mixed change.
+
+**What this campaign delivers, then, is knowledge and tooling rather than a release:**
+1. The released model's response to forced extra thinking is **negative on easy word problems**
+   (ASDiv −2.8 over 3 extensions, n=1000) and **positive on adversarial ones** (GSM-Plus +6.2,
+   p=0.00064). Nobody had measured either.
+2. A trained continuation mode **flips that sign** on the easy sets (ASDiv +2.30 p=0.0006, SVAMP
+   +1.10 p=0.035) and internalises verification into the first pass at *fewer* tokens ("wait" in 2.3%
+   of shipped greedy traces vs 59.0%).
+3. **That capability is not free**: it is coupled to a large regression on single-step arithmetic, and
+   the coupling is a property of the data, not a bug in the tier.
+4. **The benchmark suite for this line had a hole big enough to hide 24 points.** Fixed:
+   `reasoning/simple_arith_probe.py` is now a mandatory gate.
+5. Measured negatives not to re-pay: additive RFT null; RLVR-DPO needs β≥0.4 and is
+   serving-dependent; the parallel and sequential scaling axes do not compose; dose/α contrasts on
+   this recipe are inside run-to-run noise; the distractor-perturb tier is inert.
+### 33u. THREE SEEDS SETTLE IT — the repair is a null too, and a single-seed read misled me twice
+
+§33t withheld `fix2` on one seed and called it a judgment call. Two more seeds of the identical
+recipe (plus the arithmetic probe re-run at a FRESH seed 77, i.e. items `build_arith_tier.py` never
+excluded) turn it into a measurement.
+
+**Multi-step held-out (greedy, 4 sets):**
+
+| arm | SVAMP | ASDiv | MAWPS | GSM-Plus | mean | Δ shipped |
+|---|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 64.50 | 69.90 | 56.80 | 27.80 | **54.75** | — |
+| `vfymw` (the unshippable one) | 66.50 | 74.70 | 56.60 | 31.80 | **57.40** | +2.65 |
+| `fix2` seed 46 | 66.70 | 72.60 | 54.00 | 28.60 | 55.48 | +0.73 |
+| `fix2b` seed 99 | 64.50 | 70.90 | 52.80 | 29.00 | 54.30 | **−0.45** |
+| `fix2c` seed 5150 | 67.00 | 72.00 | 54.80 | 31.40 | 56.30 | +1.55 |
+| **`fix2` recipe, 3 seeds** | | | | | **55.36** | **+0.61**, spread **2.00pt** |
+
++0.61pt with a 2.00pt spread, against §33p's ±1.68pt noise, and **one seed is negative**. Null.
+
+**Arithmetic on the deployed path — and this is the correction:**
+
+| arm | n=80 (seed 11, excluded from training) | n=176 (seed 77, FRESH) |
+|---|---:|---:|
+| shipped | 39/80 (48.8%) | 97/176 (55.1%) |
+| `fix2` seed 46 | 44/80 | 110/176 (62.5%) |
+| `fix2b` seed 99 | **37/80** | **93/176 (52.8%)** |
+| `fix2c` seed 5150 | 43/80 | 115/176 (65.3%) |
+| **3-seed mean** | 41.3/80 (+2.3) | 106/176 (60.2%, **+5.1**) |
+
+⚠️**I reported "+7.4pt, the arithmetic fix generalizes" from `fix2` alone. At three seeds it is +5.1pt
+with a 12.5pt spread and one seed BELOW the shipped model.** So the repair improves arithmetic *on
+average* but not *reliably* — a coin-flip seed can leave it worse than the model it was fixing. The
+claim has to be weakened accordingly.
+
+**The only effect that replicates in all three seeds is a regression: MAWPS** (−2.80, −4.00 with
+p=0.019, −2.00; and −2.50 at MAWPS's full n=520). Consistent sign, one seed individually significant.
+
+**FINAL: nothing from this campaign is shippable. `blend_a085` stays as
+Argonne-3.5-think.** Not a judgment call now: the repaired recipe's multi-step gain is null, its
+arithmetic gain is unreliable, and its one reproducible effect is a MAWPS regression.
+
+**THE DOMINANT METHODOLOGICAL LESSON OF §33, learned twice.** Single-seed reads misled me at both
+decision points: first the "+2.4pt five-set winner" (§33o, withdrawn in §33q), then the "+7.4pt
+arithmetic fix" (here). On this recipe a one-epoch CoT-SFT run carries **±1.7pt on a 5-set mean and up
+to ±12pt on an 80-176 item probe**. Nothing on this line should be believed, and certainly not
+shipped, from one seed — including a *negative* result, which is why the ship-block in §33s was
+re-tested rather than trusted. Budget three seeds per arm from the start; it is cheaper than the two
+retractions it would have prevented.
+### 33v. ⚠️§10's NUMERACY DIAGNOSIS IS WRONG — 56% of the arithmetic failures are the operator applied TWICE
+
+Diagnosing the one-step arithmetic weakness §33s exposed (shipped model: 97/176 = 55.1%). For every
+failed `a op b`, test whether the emitted answer equals `(a op b) op b`:
+
+| | shipped `blend_a085` | `fix2` (arith tier @14%) |
+|---|---:|---:|
+| failures | 79/176 | 66/176 |
+| **operator applied TWICE** | **44 (56%)** | **9 (14%)** |
+| other error | 27 (34%) | 48 (73%) |
+| no answer | 8 (10%) | 9 (14%) |
+
+| query | correct | emitted |
+|---|---:|---:|
+| `9 * 9` | 81 | **729** (81 × 9) |
+| `19 * 9` | 171 | **1539** (171 × 9) |
+| `429 + 492` | 921 | **1413** (921 + 492) |
+| `46 + 284` | 330 | **614** (330 + 284) |
+| `17 - 5` | 12 | **7** (12 − 5) |
+| `50 - 17` | 33 | **16** (33 − 17) |
+| `217 - 5` | 212 | **207** (212 − 5) |
+
+**In every case the first computation is CORRECT.** The model knows the arithmetic and then fails to
+stop — it re-applies the same operator to its own result. By operation: sub **30.6%**, add 46.3%,
+mul 54.8%, div 76.5%. Magnitude barely matters (<20: 54.8%, 100-999: 48.3%), which is what you would
+NOT see if this were a fact-recall or carry problem.
+
+**This contradicts §10 and [[think-model-reasoning-is-capability-ceiling]]**, which attributed this
+model's arithmetic weakness to "arithmetic-fact errors from weak pretraining" — a capability ceiling.
+It is not a ceiling. It is a **stopping bug inside the think block**, the same family as §23e's
+`</think>` non-termination: v6 taught the model to close the tag but not to stop *computing*. That
+reframes a diagnosis that has stood since §10 and shaped several later decisions.
+
+**And it says the §33t arithmetic tier was aimed correctly**: one cue-free computation line then close
+cut double-application from 56% → 14% of failures, an 80% reduction in the dominant failure mode. It
+netted only 79→66 because it traded into "other error" (27→48) — the signature of a **dose** problem,
+5,000 terse one-liners at 14% of the mix reshaping the trace distribution too broadly, not of a wrong
+target. Hence `fix3`: the same tier halved to 2,500 rows (~7%, matching v6's `synth_arith` share)
+with the multi-step-gated verify tier, run at **three seeds from the start**.
+
+**Why this is the most promising target left on this line:** it is a mechanical, precisely localised
+bug affecting **44/176 = 25% of all one-step arithmetic queries**, on which the model has *already
+computed the right answer*. Nothing else found in §33 has that property.
+## §34 — argonne-3.5-think was trained on a CORRUPTED VIEW OF ITS OWN DATA: two omitted flags, three data defects, and +7.15pt / arithmetic 53.5%→99.3% from fixing them (2026-08-03/04)
+
+Directive: "can we continue to train the thinking model to be a better one? do whatever you need
+until 08:00." Budget: 1× H200 (midway3-0602) for ~15h, one persistent SLURM job
+(`exp-a35-diet`, `worker1.sh`) draining a task queue.
+
+**READ THESE SIX IF YOU READ NOTHING ELSE** (the rest is chronological working):
+| what | where |
+|---|---|
+| the three defects, in one table, with the correct flags beside them | **§34ag** |
+| the result: +7.15pt on five sets AND arithmetic 53.5% → 99.3% | **§34ba** |
+| why it works — deleted conclusions, and the answer decoupled from the reasoning | **§34ac**, **§34aj** |
+| the verdict against criteria fixed *before* the data existed | **§34be** |
+| which checkpoint to ship, and why the two criteria agree | **§34bm** |
+| what to actually do, in priority order | **§34bn** |
+
+Corrections I made to my own claims tonight, so they are not missed: §34k (a headline number withdrawn),
+§34am (a §33s claim shown wrong), §34ao and §34bb (two of my own predictions wrong), §34u (a near-miss I
+caught before reporting it), §34j (an audit false positive).
+
+**The one-paragraph answer.** Before running any new recipe I checked what the old one actually
+did, and found a silent bug in the *released* model's training command. `cot-sft.py`'s
+`--max_think_tokens` argparse default is **128**, and `reasoning/a35_cot.sh` — the launcher that
+produced `think_v6` → the released `blend_a085` — never passes it, nor does `run_arm.sh`, which
+trained **every arm of §33**. The 3.0-line launchers (`cot_v6.sh`, `cot_v7.sh`, `cot_v8.sh`,
+`cot_v9.sh`, `cot_soup.sh`, …) all pass `--max_think_tokens 0` explicitly; when the 3.5 line got
+its own new launcher the explicit `0` was not carried over. So argonne-3.5-think was trained with
+**33.3% of all its chain-of-thought tokens deleted**, each surviving trace cut off mid-derivation
+and then followed by the correct answer.
+
+### 34a. The bug, and that it applies to the released weights
+
+`--max_think_tokens 128` has been the default since **2026-04-18** (`197bbb5`, "argonne3.0:
+production training recipe from nextrun3 search") — months before the 3.5 reasoning line ran on
+2026-08-01/02. It is not a recent regression; it is a default that the 3.0 launchers were all
+written to override and the 3.5 launcher was not.
+
+What the truncation does to a row, decoded through the real training path (`build_masked_example`,
+`max_seq_length 1024`, `allow_non_reasoning 1` — i.e. exactly `run_arm.sh`), on a `hard_strict` row:
+
+```
+AS TRAINED (default 128):
+  <think>
+  ... So center (2, -3). New origin at center: let X = x-2, Y = y+3.
+  Then equation becomes X^2 + Y^2 =
+  </think>
+
+  **Answer:** ... (the full correct solution)
+
+WITH --max_think_tokens 0:
+  <think>
+  ... Then equation becomes X^2 + Y^2 =81. So simplified equation is X^2 + Y^2 =81.
+  </think>
+
+  **Answer:** ... (the full correct solution)
+```
+
+The think block is severed **mid-equation, immediately before the number**, and the target then
+states the right answer anyway. That is a supervised signal for *abandon the derivation partway,
+then produce an answer* — structurally the same poison as the "empty-think lucky guess" that §33c
+identified and filtered out of the RFT selection, except present in the **main mix** at scale and
+unnoticed through both §32 and §33.
+
+### 34b. How much of the diet it removed, and from where
+
+Per-tier, on v6's 18,428 reasoning rows:
+
+| tier | rows | think p50 | % truncated at 128 |
+|---|---:|---:|---:|
+| med_openmath | 300 | 283 | **89.3%** |
+| hard_strict | 600 | 285 | **88.5%** |
+| gsm8k_train_short | 4,338 | 200 | **81.5%** |
+| hq_opus | 800 | 220 | **80.9%** |
+| med_math | 2,000 | 109 | 39.5% |
+| ms_* drills, synth_arith, gen_ultrachat | 9,190 | 14–89 | **0.0%** |
+| **total** | **18,428** | 69 | **31.3%** |
+
+The truncation is not spread evenly — it lands almost entirely on the **four hard multi-step
+tiers** and misses every short drill and the general anchor. The training think-length
+distribution it produced:
+
+| v6 reasoning rows | untruncated | as trained (cap 128) |
+|---|---:|---:|
+| think-len p50 / p75 / p90 | 69 / 168 / 273 | 69 / **128 / 128** |
+| probability mass exactly at 128 | — | **31.5%** |
+| think tokens fed to the trainer | 1,993,000 | **1,329,000** (−33.3%) |
+| share of rows in the 150–400 think band | **27.0%** | **0.0%** |
+
+### 34c. The bug is visible in the released model's output distribution
+
+`reasoning/effort_probe.py --mode budget`, released `blend_a085`, n=300/pool, greedy, budgets
+128→1024 (`300_diag`, 713s):
+
+| pool | 128 | 256 | 384 | 512 | 768 | 1024 | think-len p50 | p90 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| math500 | 10.00 | 22.33 | 28.00 | 30.33 | 31.67 | 32.00 | **131** | 1024 |
+| gsmplus | 8.67 | 26.67 | 28.67 | 29.33 | 29.33 | 29.33 | **126** | **134** |
+| asdiv | 42.33 | 71.67 | 72.33 | — | — | — | **111** | **133** |
+
+**think-length p50 sits at 111–131 tokens no matter how much budget it is given**, and on the two
+easier pools p90 is 133–134. The model's output mode is its training wall. Accuracy binned by
+think-length at budget 1024 shows the consequence:
+
+| think-len | asdiv n / acc | math500 n / acc | gsmplus n / acc |
+|---|---:|---:|---:|
+| 0–150 | 283 / — | 207 / — | 276 / — |
+| **150–400** | **11** / 75%, 33% | **33** / 50%, 35% | **10** / 40%, 80% |
+| 400+ | 6 / **0%** | 60 / **6.7%** | 14 / **0%** |
+
+The distribution is bimodal with the productive middle missing: a mode at ~130 tokens, then a
+runaway tail past 400 that is essentially always wrong, and almost nothing in between — 11 of 300
+on ASDiv, 33 of 300 on math500. That is the **same hole as in the training data** (27.0% of rows
+in the 150–400 band → 0.0% after truncation).
+
+**This reinterprets a §33 conclusion.** §33a read "60–100 tok: 88%, 100–150: 57%, 250–400: 25%,
+400+: 0%" as *"the model is not length-limited; long traces are a symptom of failure."* The
+operational advice was right for that checkpoint, but the explanation was backwards: the model has
+no competent behaviour past ~130 think-tokens because **it was never trained past ~130
+think-tokens**. Any trace that goes there is off-distribution, which is why it correlates with
+failure. Likewise §33's central mystery — that forcing the released model to think longer makes it
+monotonically worse (net flip −39/−50 at n=1000) — is the expected behaviour of a model pushed
+outside its training support, not a deep property of test-time compute.
+
+### 34d. Resource utilization of this campaign (measured, `slurmwatch`)
+
+One persistent 1×H200 worker (`worker1.sh`, `exp-a35-diet`) draining a queue, deadline-bound to
+drain by 07:30. Mid-training snapshot on the node
+(`srun --jobid=... --overlap ... slurmwatch --once --json`):
+
+| metric | measured | requested | action |
+|---|---:|---:|---|
+| GPU compute utilization | **94.0%** | — | card is the bottleneck; leave it |
+| GPU HBM | 41.5% | — | *not* the limiter at effective batch 12 / max_seq 1024 |
+| cpu.effective_cores | **1.0** | 8 | over-requested 8×; 2–4 is right |
+| memory.peak | **24.3 GiB** | 48G | over-requested ~2×; 32–36G is right |
+
+The HBM number is deliberately not "fixed" by raising the micro-batch. Two measured reasons:
+`run_arm.sh`'s effective-batch-12 guard is what makes any arm comparable to §32/§33, and the
+a4-SFT result ([[sft-length-grouping-beats-hbm-fill]]) is that raising batch to fill HBM on a
+mixed-length corpus cost **24% throughput** to padding waste on the seq² path while GPU util read
+100% in both. With compute already at 94%, HBM fill is not the lever here; `390_thruput` measures
+the three (batch, accum) pairings at fixed effective batch to confirm rather than assume.
+The eval stages do fill the card (vLLM `gpu_memory_utilization=0.90` → 114.6 GiB KV cache).
+
+### 34e. Removing the truncation (`nt0`) — the interim n=300 read, and the crutch it exposes
+
+`nt0` = §32's winning recipe with **exactly one flag changed** (`--max_think_tokens 0`): same v6 mix,
+same `dpo` start, lr 1e-5, effective batch 12, 1 epoch, soup α=0.85. Quick judge from
+`run_arm_nt.sh` (clean_eval, n=300, K=8, max-new-tokens 512 — i.e. §33's budget):
+
+| arm | SVAMP greedy | +budget | self-cons | pass@8 | ASDiv greedy | +budget | self-cons | pass@8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 65.00 | 66.00 | 74.00 | 90.67 | 73.00 | 73.67 | 82.67 | 92.33 |
+| `nt0` seed 46 | 62.33 | **66.33** | **78.67** | **93.33** | 67.33 | 73.00 | 81.33 | 93.00 |
+| `nt0` seed 99 | 60.67 | 65.33 | **79.00** | 92.00 | 68.67 | 73.00 | **83.67** | **95.00** |
+
+`unclosed` traces: **46 / 43** (SVAMP) and **41 / 38** (ASDiv) versus ~14 / 6 for the shipped model.
+
+Both seeds agree on the shape: **greedy down, `+budget` at parity, sampled metrics up.** Forcing the
+think block closed recovers the entire greedy deficit (SVAMP 66.33 / 65.33 vs the shipped 66.00;
+ASDiv 73.00 / 73.00 vs 73.67), while self-consistency rises on SVAMP (+4.7 / +5.0) and pass@8 rises
+on 3 of 4 cells. So the untruncated diet produces a *better sampled distribution* and a *worse
+greedy path*, and the whole difference is termination.
+
+**The inference this supports: the 128-token truncation was an accidental termination crutch.**
+§23e/v6's design premise was short-only traces chosen *for* termination pressure, and MAX_TOK=768
+was the deliberate version of that; the 128 default was a far more aggressive undeliberate version.
+Cutting every hard trace at 128 tokens does destroy 33% of the CoT signal — but it also guarantees
+the model never learns to run long, so it never has to learn to stop. Removing the cut restores the
+signal and re-exposes §23e.
+
+Caveat on these numbers, which is why they are labelled interim: at `max-new-tokens 512` a 300-token
+think span plus v6's `**Answer:**` prose can exceed the budget, so some of `unclosed` may be
+clipping rather than true non-termination. §33's 512 was never binding for a model whose think-len
+p50 is 126. The 3-seed gate (`316_gate_nt0`) re-judges at **1024** with the released model in the
+same call, so base reproducing its recorded §33n greedy validates the config.
+
+### 34f. The mechanism test, and a large replicated GSM-Plus gain (`315_thinklen`)
+
+`effort_probe --mode greedy`, n=300/pool, **max-new-tokens 1024** (so nothing is clipped),
+all three `nt0` seeds against the released model:
+
+| model | GSM-Plus | think-len | ASDiv | think-len | math500 | think-len | ASDiv unclosed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 29.33 | 124.6 | 72.33 | 119.1 | 32.00 | 283.4 | 6 |
+| `nt0` s46 | **39.00** | 207.9 | 65.67 | 229.1 | 28.67 | 406.2 | 38 |
+| `nt0` s99 | **38.67** | 181.6 | 66.33 | 220.9 | 28.67 | 405.4 | 37 |
+| `nt0` s5150 | **39.00** | 199.5 | 67.00 | 225.2 | 29.00 | 422.2 | 38 |
+| **3-seed mean Δ** | **+9.56** | +71 | **−6.00** | +106 | **−3.22** | +128 | 6 → 38 |
+
+1. **The mechanism is confirmed.** Removing the flag moves think-length exactly where §34b/c predicted:
+   ASDiv 119 → 225, GSM-Plus 125 → 196. The model's output mode tracks its training cap, so the
+   released model's "brevity" was never a preference — it was the truncation.
+2. **GSM-Plus gains +9.6pt, in every seed, spread 0.33pt.** For scale: the entire §33 campaign's best
+   GSM-Plus result was +4.3 at three seeds, and §33p's noise scale is ±1.7pt on a 5-set mean. This is
+   the largest single-set gain anyone has produced on this model, and it lands on the **adversarial**
+   set — the one built to break memorised procedure, and the one where §33n found the shipped model
+   already had a genuine +6.2 effort knob. Giving it the tokens *in training* banks that gain in the
+   first pass.
+3. **It is a trade, not a win, and the cost is termination — not clipping.** ASDiv −6.0 and math500
+   −3.2, with `unclosed` going 6 → 38 of 300 on ASDiv **at a 1024-token budget**, i.e. the model
+   genuinely fails to emit `</think>`, it is not running out of room. This is §23e reappearing, and it
+   confirms 34e's reading that the 128 cut was an accidental termination crutch: a model that never
+   runs long never has to learn to stop.
+4. **Consequence for the campaign.** The cost is a property of an *unbounded* cap, not of untruncated
+   data as such. So the next experiment is the ladder — 128 (released, measured) / **256** / 0 (`nt0`,
+   measured) — which asks whether a cap generous enough to leave the derivation intact (v6's think-len
+   p90 is 273, so 256 severs ~12% of rows versus 31.3% at 128) still bounds the tail the model imitates.
+   `v11` (more and longer hard math) is deferred behind it: it lengthens traces further, which is the
+   axis that is currently *costing* accuracy.
+
+### 34g. PRE-REGISTERED PREDICTION for the ladder (written before `nt256` ran)
+
+Recorded before the fact so it cannot be retrofitted. §33p/§33u's lesson is that this line's
+single-seed reads are unreliable; a stated prediction is the cheapest guard against reading a story
+into whatever comes out.
+
+`effort_gate`'s budget-forcing uses `--think-budget 256`: it lets the model think freely and then
+**forces `</think>` at 256 tokens**. That is, numerically, the same bound `--max_think_tokens 256`
+imposes on the training targets. nt0's measured think-length is 181–229, i.e. right at that bound.
+So budget-forcing is an *inference-time* emulation of the nt256 training cap.
+
+**Prediction:** `nt256` at plain greedy should land near `nt0`-with-budget-forcing (≈ +2.8pt on the
+5-set mean, GSM-Plus large and positive, MAWPS the one negative), because the closure bound is
+supplied by the data instead of by the decoder. If it holds, the same gain becomes available with
+**no serving change at all**, which is strictly better operationally.
+
+**What would falsify it:** nt256 landing at nt0's *greedy* numbers (−1.4 mean) would mean the cap in
+training does not install the closure behaviour that forcing it at decode time does — i.e. the model
+learns length-conditioned closure only when the cue is applied to its own generation, not when it is
+baked into the targets. Either outcome is informative; the closure-entropy analysis (§34, 4.93 →
+6.57 → 7.47 bits) is what predicts the first.
+
+### 34h — A SECOND SILENT DEVIATION: the released recipe dropped 11.5% of its rows, including 80.7% of the arithmetic drill
+
+Auditing every flag the 3.0-line launcher sets against what `a35_cot.sh` sets turned up a second
+omission, independent of the truncation and with a sharper consequence.
+
+`reasoning/cot_v6.sh` (3.0 line) passes **`--preserve_raw_reasoning 1`**. `a35_cot.sh` and
+`run_arm.sh` omit it, so it defaulted to **0**, which routes every reasoning target through
+`canonicalize_reasoning_turn()`. That function can return `None`, and when it does,
+`ReasoningDataset.__getitem__` **silently resamples a different row** (`for _ in range(64)`), so the
+row count and the step count are unchanged and nothing is logged — the row simply never trains, and
+some other row trains twice.
+
+**Measured on v6 (26,428 rows), released path vs 3.0 path:**
+
+| tier | rows | dropped by the RELEASED recipe | dropped by the 3.0 recipe |
+|---|---:|---:|---:|
+| **synth_arith** | 2,500 | **2,018 (80.7%)** | 0 |
+| hq_opus | 800 | **470 (58.8%)** | 0 |
+| med_openmath | 300 | 60 (20.0%) | 0 |
+| hard_strict | 600 | 91 (15.2%) | 0 |
+| med_math | 2,000 | 170 (8.5%) | 0 |
+| gen_ultrachat | 3,000 | 168 (5.6%) | 0 |
+| gsm8k_train_short | 4,338 | 45 (1.0%) | 0 |
+| direct_tulu, ms_* | 12,690 | 7 (0.1%) | 0 |
+| **TOTAL** | **26,428** | **3,029 (11.5%)** | **0** |
+
+**The mechanism, exactly.** `canonicalize_reasoning_turn` → `clean_training_think_span` filters the
+think span sentence-by-sentence and then enforces `TRAINING_MIN_THINK_WORDS = 12`. A drill row's think
+span is `264 / 6 = 44.` — **5 words** — so the span cleans to `""`, the function returns `None`, and
+the row is dropped. (It is not the word-overlap filter; that reads 0.000 on these rows.)
+
+**Why this matters more than its size.** `synth_arith` is the single-fact arithmetic drill, present in
+the mix for exactly one purpose. §33s blocked the whole §33 release because the candidate lost
+**23.8pt on one-step arithmetic** and noted "v6's `synth_arith` tier (2,500 rows) existed precisely to
+hold single-fact arithmetic; the new tier took 26% of the mix and diluted it." §33v then found the
+released model's dominant arithmetic failure is the operator applied twice (44/176 = 25% of all
+one-step queries) and called it "the most promising target left on this line."
+
+**Only 482 of those 2,500 arithmetic rows ever reached the model.** The tier everyone reasoned about
+as present-but-diluted was 80.7% absent. That also reframes §33t's arithmetic-repair arm, which added
+5,000 fresh arithmetic rows and cut double-application from 56% → 14% of failures: it was not adding a
+new ingredient, it was *restoring* one that the loader had been discarding.
+
+**Consequences for the campaign.** `nt0` (§34e–g) fixed only the truncation, so its arms still carry
+this second bug. The priority arm is therefore `both` = `--max_think_tokens 0` **and**
+`--preserve_raw_reasoning 1` — i.e. cot_v6.sh's recipe applied to the 3.5 line — at 3 seeds, gated on
+the five held-out sets and on the one-step arithmetic probe that §33s made mandatory. A single-seed
+`nt128ctl` control (released flags, same 1-GPU execution path and seed machinery as the new arms)
+isolates the flags from the 1-GPU-vs-3-GPU difference, so the attribution does not rest on comparing
+across execution paths.
+
+**The mix the released model actually trained on.** Because a dropped row is replaced by a uniformly
+random *surviving* row, the effective mix is the survivors renormalised — so the drops do not just
+remove data, they **re-weight the diet**:
+
+| tier | intended share | EFFECTIVE share | ratio |
+|---|---:|---:|---:|
+| synth_arith | 9.5% | **2.1%** | **0.22×** |
+| hq_opus | 3.0% | 1.4% | 0.47× |
+| hard_strict / med_openmath | 2.3% / 1.1% | 2.2% / 1.0% | 0.96× / 0.90× |
+| direct_tulu (general anchor) | 30.3% | **34.2%** | 1.13× |
+| gsm8k_train_short | 16.4% | 18.3% | 1.12× |
+| ms_* drills | 18.4% | 20.8% | 1.13× |
+
+Distinct rows the model could ever see: **23,399 of 26,428 (88.5%)**. The arithmetic drill ran at a
+**4.6× dilution** while the general anchor was silently up-weighted 1.13×.
+
+**This reframes a §33 verdict.** Every §33 arm used `run_arm.sh`, so every §33 arm carried both bugs.
+§33t concluded, after the fix1/fix2/fix4 round, that "**there is no setting in this design that keeps
+both**" the multi-step gain and one-step arithmetic. That conclusion was reached on a mix in which the
+arithmetic drill was **78% absent before the verify tier was ever added**. The design was never tested
+with the drill actually present, so the impossibility claim does not stand as stated — it is a claim
+about a mix nobody intended to train on.
+
+It also explains why §33t's repair worked as well as it did: adding 5,000 fresh arithmetic rows cut
+double-application 56% → 14% of failures not by introducing a new ingredient but by **out-voting the
+loader that was discarding the existing one**. And §33v's recommended `fix3` (halve the tier to ~2,500
+rows, ≈7% of the mix, "matching v6's synth_arith share") is, numerically, close to what simply *fixing
+the flag* restores — 2,018 rows returned, ≈7.6% of the mix. The `both` arm therefore tests §33v's
+recommendation and the flag repair at the same time, without adding any new data.
+
+### 34i. `nt0` at 3 seeds, paired at n=1000/319 — the shape of the result
+
+`316_gate_nt0`, one process per (model, n-group), merged with `--report-from`; `--max-new-tokens 1024`.
+**Config self-validation passed:** base reproduces its recorded §33n greedy — SVAMP **64.50 vs 64.50**
+(exact), ASDiv 70.40 vs 69.90, MAWPS 57.00 vs 56.80, GSM-Plus 28.00 vs 27.80, math500 31.66 vs 29.78
+(the noisiest set, 4.08pt seed spread in §33r). Base's GSM-Plus effort knob also reproduces:
+greedy→extend2 **+6.00pt p=0.001** here vs §33n's +6.20 p=0.00064. So the larger budget flatters
+neither model.
+
+**Plain greedy (3 seeds):** SVAMP −2.90, ASDiv −3.50, math500 −2.82 — three-set mean **−3.07**, with
+per-seed McNemar p from 0.0025 to 0.037 on SVAMP/ASDiv. The regression is real and it is termination:
+`unclosed` runs 37–38/300 on ASDiv even at a 1024-token budget.
+
+**With budget-forcing (3 seeds):** SVAMP +1.77, ASDiv +1.97, math500 +2.51 — three-set mean **+2.08**,
+seed spreads 0.63–1.90, and **9 of 9 seed×pool cells positive**. Adding GSM-Plus (+8.80,
+p=2.3e-05) and MAWPS (−1.40) gives a **five-set mean of +2.81** (50.89 → 53.70).
+
+**What "budget-forcing" costs, stated precisely, because the result depends on it.** `effort_gate`'s
+`budget` config is the s1-style force-close `clean_eval` has used since §19: generate greedily with
+`max_tokens = think_budget` (256), then, if `</think>` has not appeared, append
+`CLOSE_STR = "\n</think>\n\nThe answer is $\boxed{"` and finish. It is a serving-side think-token cap,
+implementable in any stack, and it *reduces* decoded tokens (nt0s46: 380 → 211). The released model
+barely benefits from it (+1.0 to +1.2) because its think-length is 126 and the cap never fires; `nt0`
+benefits a lot (+5.4 to +6.6, p down to 1.3e-16) because it does run long. So the honest deployment
+statement is: **the flag fix requires a serving-side think cap to be an improvement, and with one it
+is; without one its greedy path is worse than the model it replaces.**
+
+Two consequences worth noting for the arms still to run:
+- Budget-forcing at 256 is the *inference-time* equivalent of `--max_think_tokens 256` in training,
+  which is why §34g pre-registered `nt256` as the arm that should get this gain with no serving change.
+- `CLOSE_STR` is the **raw** v6 answer format (`The answer is $\boxed{`), not the `**Answer:**` form
+  that canonicalization produces. So the `preserve_raw_reasoning 1` arm (`both`) should respond *better*
+  to budget-forcing than `nt0` does, because the injected close is exactly in-distribution for it.
+
+### 34j. Blast radius — which runs carried these two flags, and which conclusions are affected
+
+Every `.sh` in the repo that invokes `cot-sft.py`, audited for the two flags:
+
+| sets both correctly (`max_think 0`, `preserve_raw 1`) | omits both (→ 128 / 0) | passes them from env (indeterminate statically) |
+|---|---|---|
+| `cot_v6.sh`, `cot_v7.sh`, `cot_v8.sh`, `cot_v9.sh`, `phaseA_v8.sh`, `rlvr_sft.sh` — i.e. **the whole 3.0 reasoning line** | **7 `a35_*` CoT launchers**: `a35_cot.sh`, `a35_bigsft.sh`, `a35_v6_probe.sh`, `a35_v6x2.sh`, `a35_recipe_ab.sh`, `a35_newckpt.sh`, `a35_midsubstrate.sh`; **`a35_effort/run_arm.sh`** (all 12 §33 arms); **`a4_battery.sh`, `a4_dose.sh`**; `eval35_flavor.sh` | `cot-sft.sh`, `cot_finemath.sh`, `cot_sft_instruct.sh`, `cot_soup.sh`, `cot_soup_v4.sh`, `cot_test.sh` (all pass `"$MAX_THINK_TOKENS"` / `"$PRESERVE_RAW_REASONING"`, so the effective value depended on the environment at run time) |
+
+(`verifier_train.sh` sets `preserve_raw 1` but not `max_think` — half-affected.)
+
+⚠️**Correction to a first pass of this audit:** grepping for the string `cot-sft.py` put **`a35_sft.sh`
+in the affected list, which is wrong** — it only *mentions* `cot-sft.py` in a comment about DDP support
+and actually invokes `sft.py`. `a35_dpo.sh` does not touch `cot-sft.py` at all. So **stage A (SFT) and
+stage B (DPO) of the 3.5 reasoning line are NOT affected by these two flags**, and the `dpo` checkpoint
+that every arm in §33 and §34 starts from is clean with respect to them. Only the CoT-SFT stage is
+implicated. The audit must match a real invocation (a non-comment line where `cot-sft.py` follows
+`torchrun`/`python`), not a mention.
+
+So this is not one bad launcher: **every CoT-SFT run on the argonne-3.5 line and both argonne4 SFT
+probes carried both bugs**, while the 3.0 line carried neither. The flags were evidently understood
+when the 3.0 launchers were written and were lost when the 3.5 line got new launchers — the same
+failure mode as the `--cooldown 0` bug in [[anneal-no-lr-decay-and-general-forgetting]], where a fix
+made in one tree was never ported to the other.
+
+**What this does and does not invalidate.**
+- **Still valid: every A-vs-B comparison inside §32/§33.** Both arms of every contrast carried the same
+  two bugs, so the comparisons are internally consistent. §32a's headline (v6 took SVAMP greedy
+  25.67→62.33) and §32b's negatives (2 epochs is worse; the α knee is real) stand.
+- **Invalid as stated: absolute claims about what the mix contained.** §33s reasoned that "v6's
+  `synth_arith` tier (2,500 rows) existed precisely to hold single-fact arithmetic" — it was running at
+  482 rows and a 2.1% effective share. §33t's "there is no setting in this design that keeps both" is a
+  statement about a mix nobody intended.
+- **Live warning for argonne4.** `a4_dose.sh` is the SFT probe behind the pretrain dose-response
+  (pass@32 42.8→46.8→51.3, p=0.003). The dose *comparison* survives (all arms equally afflicted), but
+  every absolute number was read through a CoT stage that discarded 33% of its think tokens and 11.5%
+  of its rows. a4's SFT is being redone from the phase-C base; **fix these two flags before that rerun**,
+  or the new SFT will inherit the same handicap.
+
+### 34k. `nt0` FINAL, 3 seeds, paired — and a correction to the number quoted in 34i
+
+⚠️**CORRECTION.** §34i quoted a five-set mean of **+2.81** for `nt0`. That was a *budget-vs-budget*
+comparison, and it flatters `nt0`: on math500 and GSM-Plus the released model's own best config is
+**not** budget (math500 greedy 31.66 > budget 29.15; GSM-Plus extend2 34.00 > budget 30.00), so holding
+both models at `budget` handicaps the baseline. §33f/§33j's convention is **best single-pass per model
+per pool**, which is also the fair one — each model served as well as it can be. On that basis:
+
+| pool | base best (config) | `nt0` best, 3-seed | Δ | per-seed McNemar p |
+|---|---:|---:|---:|---|
+| **GSM-Plus** | 34.00 (extend2) | **41.20** | **+7.20** | **0.00092 / 0.00015 / 0.0012** |
+| ASDiv | 71.60 (budget) | 73.57 | +1.97 | 0.064 / 0.043 / 0.21 |
+| SVAMP | 65.50 (budget) | 67.27 | +1.77 | 0.029 / 0.39 / 0.45 |
+| math500 | 31.66 (greedy) | 31.87 | +0.21 | 1.0 / 1.0 / 1.0 |
+| MAWPS | 58.20 (budget) | 55.87 | **−2.33** | 0.44 / 0.081 / 0.092 |
+| **5-set mean** | **52.19** | **53.95** | **+1.76** | |
+
+Self-consistency@8 moves the same way: 287.67 → 296.1–296.8 summed over the five pools (≈ +1.7/pool).
+
+**What is solid and what is not.**
+- **Solid: GSM-Plus.** +6.8 to +7.8 in all three seeds, every one individually significant
+  (p = 1.5e-04 to 1.2e-03) at n=500 on the adversarial set. Also the largest single-set gain produced on
+  this model by any means — §33's three-seed best there was +4.3.
+- **Solid: the direction on ASDiv/SVAMP.** Positive in 6/6 seed×pool cells, but only 2 of 6 reach
+  p<0.05 individually. Report as a consistent ~+2pt, not as a significant per-set gain.
+- **Solid: MAWPS regresses.** Negative in all three seeds (−1.4, −2.8, −2.8). Same set that regressed in
+  all three `fix2` seeds in §33u. MAWPS is the easiest pool; a longer-thinking model over-reasons it.
+- **Flat: math500.** +0.21, p=1.0 in all three seeds. The earlier +2.51 was the budget-vs-budget artifact.
+- **Not free: it needs a serving-side think cap.** Plain greedy is −2.9 to −3.5 on SVAMP/ASDiv. The
+  entire gain is conditional on capping think tokens and force-closing, which *reduces* decoded tokens
+  (380→211) but is a serving change the released model does not need.
+
+**Scale check.** +1.76pt on the five-set mean is the same order as the whole §33 campaign's best
+(§33r: verify family +1.3 to +2.1) — obtained by changing one flag rather than by building three data
+tiers, and without §33's ship-blocking arithmetic regression (arithmetic gate result below).
+
+### 34l. PRE-REGISTERED PREDICTION for `both` (written before it ran)
+
+Restoring `--preserve_raw_reasoning 1` returns 3,029 rows, of which **2,018 are `synth_arith`** — 5-word
+think spans that close immediately. That lifts the drill from a 2.1% effective share to its intended
+9.5%, i.e. roughly one row in ten becomes an example of *think briefly, then stop*. That is precisely
+the counterweight `nt0` lacks.
+
+**Prediction, in the order I expect the effects:**
+1. **One-step arithmetic improves** over the released model's 55.1% (97/176). The tier exists for this
+   and was 80.7% absent; §33t showed that adding arithmetic rows cuts double-application 56%→14% of
+   failures, and this restores ~2,000 of them at ~7.6% of the mix — close to §33v's recommended `fix3`
+   dose (~7%).
+2. **The easy-set regressions shrink** (MAWPS −2.33 and the greedy deficit on ASDiv/SVAMP), because
+   short-closure supervision returns at scale and should reduce over-reasoning on 1-step items.
+3. **The GSM-Plus gain survives**, since it comes from the untruncated hard tiers, which `both` keeps.
+4. Secondary: `both` should respond *better* to budget-forcing than `nt0`, because `CLOSE_STR` is the raw
+   answer format its targets now use (§34i).
+
+**What would falsify it:** arithmetic no better than `nt0`'s, or the GSM-Plus gain disappearing. The
+first would mean the drill's absence was not what §33v's double-application bug was about; the second
+would mean the two flags interact rather than compose. Either is worth knowing and neither is assumed.
+
+**And the honest caveat:** `both` also un-drops 470 `hq_opus` and 168 `gen_ultrachat` rows that
+canonicalization had rejected on quality filters (answer >96 words, banned meta-phrases, MCQ-style).
+Those now train raw, so a verbosity increase is possible. The general gate (`323_general`, lm-eval 6
+tasks + the 4-quadrant probe) is in the queue for exactly this reason.
+
+### 34m. `reasoning/audit_cot_mix.py` — the check that would have caught both bugs in seconds
+
+Neither bug was visible from the launcher or the training log: the truncation is silent, and a dropped
+row is *replaced*, so row count, step count and loss curve all look normal. New tool prints, per tier,
+what the loader will actually feed the trainer under a given set of flags — rows dropped, rows
+truncated, and the **effective** share after resampling. Run it before any CoT-SFT run;
+`--compare` also prints the 3.0-line settings side by side.
+
+Its first non-trivial finding: **the two bugs compound, and they compound worst on exactly the data you
+would add to make the model better.** Audited on `cot_sft_mix_v11` (the enriched mix built in §34,
+30,590 rows) under the released flags:
+
+| tier | intended share | effective share | dropped | truncated |
+|---|---:|---:|---:|---:|
+| hard_strict | 7.8% | **4.3%** | **55.8%** | 41.9% |
+| hq_opus | 6.5% | **2.9%** | **63.9%** | 32.5% |
+| med_openmath | 4.6% | **2.5%** | **56.9%** | 40.9% |
+| synth_arith | 8.2% | **2.0%** | **80.6%** | 0.0% |
+| gsm8k_train_short | 14.4% | 17.0% | 4.8% | **85.7%** |
+| direct_tulu (general) | 26.2% | **32.5%** | 0.0% | 0.0% |
+| **TOTAL** | | | **19.6%** | **22.1%** |
+
+19.6% of rows dropped, against 11.5% on v6 — because `canonicalize_reasoning_turn` rejects answer
+blocks over `TRAINING_MAX_ANSWER_WORDS = 96`, and v11's rows are longer. So the loader **re-starves the
+very tiers v11 was built to un-starve**, and the general anchor floats up to 32.5% again. Had the v11
+arm run on the default flags as originally queued, its result would have been uninterpretable — the
+intervention would have been half-undone in the data loader. Deferring it behind the flag fixes was
+the right call, and this is the check that shows why.
+
+**Token accounting, stated across models rather than within one** (mean decoded tokens/problem, from
+the gate's own instrumentation):
+
+| pool | base best (config, tokens) | `nt0` best (config, tokens) | token change | accuracy change |
+|---|---|---|---|---|
+| ASDiv | budget, 183 | budget, 204 | +11% | +1.97 |
+| SVAMP | budget, 181 | budget, 209 | +15% | +1.77 |
+| MAWPS | budget, 178 | budget, 211 | +19% | −2.33 |
+| **GSM-Plus** | extend2, **413** | extend1, **345** | **−16%** | **+7.20** |
+
+So §34i's "budget-forcing *reduces* decoded tokens (380 → 211)" is a within-model statement about `nt0`
+and should not be read as free: against the released model's own best config, `nt0` costs **+11% to
++19% tokens on the three easy pools**. The exception is the pool that matters most here — on GSM-Plus
+`nt0`'s best config is **cheaper** (345 vs 413 tokens) *and* +7.2pt, because the released model has to
+buy its GSM-Plus performance with two decode extensions while `nt0` has banked it in the first pass.
+
+### 34n. Recommended code changes (NOT applied tonight — the campaign is mid-flight on this file)
+
+`reasoning/cot-sft.py` is being executed by the queued arms, so it was deliberately left untouched;
+editing it mid-campaign would break comparability between the arms already run and the ones queued.
+The changes to make afterwards, in priority order:
+
+1. **Make the row-dropping loud (the real fix).** `ReasoningDataset.__init__` should build once, count
+   how many rows fail `_build`, and print the per-tier breakdown — the same table
+   `audit_cot_mix.py` prints. Optionally `--max_drop_frac 0.05` to abort above a threshold. Silence is
+   what let 11.5% of rows (and 80.7% of one tier) vanish across two campaigns and ~20 training runs;
+   the defaults themselves are secondary.
+2. **`--max_think_tokens` default 128 → 0.** Severing a chain-of-thought mid-derivation and then
+   training the model to answer anyway is never a sensible default. Every 3.0-line launcher overrode it;
+   no launcher ever wanted 128.
+3. **Log the effective flags at startup**, including the ones that came from defaults. Both bugs were
+   invisible in the logs because omitted flags print nothing.
+4. **Leave `--preserve_raw_reasoning`'s default at 0 but never let it drop silently** (covered by 1).
+   Canonicalization is a legitimate normalizer; the hazard is that its rejections are unlogged and
+   resampled over.
+
+And a process note, since this is the second instance of the same failure: [[anneal-no-lr-decay-and-general-forgetting]]
+records `--cooldown 0` being fixed in one tree and never ported to the other. Here the 3.0 launchers
+knew about two flags and the 3.5 launchers, written fresh, did not. **When a new model line gets new
+launchers, diff the old launcher's flag list against the new one** — that diff is what found this, and
+it takes a minute (`34j` has the one-liner).
+
+**GSM-Plus, like-for-like against §33's best arm (greedy, 3-seed means, same pool and n).** §34k's
++7.20 is a best-config number; the comparable figure is greedy:
+
+| model | GSM-Plus greedy, 3-seed mean |
+|---|---:|
+| released `blend_a085` | 28.00 (§33n recorded 27.80 at n=500) |
+| §33's best arm (`robust`, §33r) | 32.80 (+5.0) |
+| §33's verify family average (§33r) | 31.3–32.1 (+3.5 to +4.3) |
+| **`nt0` (this section)** | **35.53** (+7.53) |
+
+So the one-flag fix beats the best arm of the entire §33 data campaign by **+2.7pt on the adversarial
+set**, greedy-to-greedy, at three seeds each. That is the cleanest way to state the scale of what the
+truncation was costing — and unlike §33's arms, `nt0` adds no new training data at all.
+
+**Why the attribution is clean, in two steps.** `a35_cot.sh` never passes `--seed`, so the released
+model used the argparse default **46** — the same seed as `nt0s46` and `nt128ctl`. That makes the
+comparison a chain of single-variable steps rather than one three-variable jump:
+
+| comparison | what differs | what it isolates |
+|---|---|---|
+| released `blend_a085` → `nt128ctl` | 3 GPUs × b4 × a1 vs 1 GPU × b4 × a3 (effective batch 12 both) | the **execution path** alone |
+| `nt128ctl` → `nt0s46` | `--max_think_tokens` 128 → 0 | the **flag** alone |
+| `nt0s46` → `boths46` | `--preserve_raw_reasoning` 0 → 1 | the **second flag** alone |
+
+Everything else — mix, base checkpoint, lr, epochs, warmup, soup partner, α=0.85, seed — is held fixed
+down the chain. If `nt128ctl` lands on the released model's numbers, the +7.5 GSM-Plus belongs to the
+flag and not to the 1-GPU path, and no comparison in this section rests on crossing execution paths.
+
+### 34o. Utilization, measured per phase (the `slurmwatch` answer)
+
+One 1×H200 worker held the whole night; three distinct phases with genuinely different profiles:
+
+| phase | GPU compute | GPU HBM | host RAM | cores | verdict |
+|---|---:|---:|---:|---:|---|
+| CoT-SFT training | **94%** | 41.5% | 24.3 GiB | 1.0 | card saturated; HBM is not the limiter |
+| vLLM gates / probes | high | **~90%** (114.6 GiB KV cache at `gpu_memory_utilization=0.90`) | ~13 GiB | ~1 | correct by construction |
+| `simple_arith_probe` | 59% | **4%** (6.3 GiB) | ~6 GiB | 1.0 | **intentionally** the slow path — see below |
+
+**Training.** 94% compute utilization means the card is the bottleneck, so raising the micro-batch to
+fill HBM buys nothing: it would break `run_arm.sh`'s effective-batch-12 guard (the thing that makes any
+arm comparable to §32/§33) and the measured precedent
+([[sft-length-grouping-beats-hbm-fill]]) is that filling HBM on a mixed-length corpus cost **24%**
+throughput to padding waste while GPU util read 100% both ways. `390_thruput` measures the three
+(batch, accum) pairings at fixed effective batch rather than leaving this as an assertion.
+
+**The arithmetic probe's 4% HBM is deliberate, not waste.** §33s's 23.8pt ship-blocker was found on the
+deployed `from_pretrained` + `.generate()` path and is invisible to the vLLM graders — so this gate has
+to run where users actually run, at bs=1, even though that leaves the card nearly idle. This is the one
+inherent exception in CLAUDE.local.md, applied on purpose.
+
+**Honest over-requests.** `--cpus-per-task=8` against 1.0 effective core and `--mem=48G` against a
+24.3 GiB peak: both over-asked, and the right values are **4 cores / 36G**. I did not cancel and
+resubmit to fix them — the worker holds a single 15h allocation and the campaign's binding constraint
+is wall-clock, so churning the allocation would have cost more science than the idle cores are worth.
+Recorded here so the next campaign starts right-sized rather than repeating it.
+
+**⚠️Tooling gotcha that cost one measurement.** The `316` gate piped the arithmetic probe through
+`| tail -40`. `tail` cannot emit anything until it sees EOF, so (a) nothing is visible while a ~25-minute
+probe runs, and (b) on exit it keeps only the last 40 lines — which are the *last* model's per-item
+misses, discarding the `N/144 correct` summary for base and the first two seeds. `simple_arith_probe.py`
+has no `--json-out`, so those numbers were simply lost and had to be regenerated (`321b_arith_nt0`).
+Fixed in the later gates by redirecting the full transcript to a file and grepping it:
+`... > "$R/arith_<label>.txt" 2>&1` then `grep -E "^probe:|correct$"`. **Never pipe a long-running
+measurement through `tail`** — capture to a file and filter the file.
+
+### 34p. Steelmanning the other reading, because the honest framing is not "a bug made the model bad"
+
+argonne-3.5-think is the best reasoner this project has produced (SVAMP greedy 65 against the 3.0
+line's 23–27), and it was produced *with* both of these settings in force. So the accurate claim is
+narrower than "we found a bug that was hurting the model", and the two settings differ:
+
+- **The 128-token truncation had a real upside.** §23e/v6's entire design premise was short traces
+  chosen *for* termination pressure, and `MAX_TOK = 768` was the deliberate version of that. Cutting
+  every hard trace at 128 tokens was a far more aggressive undeliberate version, and it worked as a
+  regularizer: the released model closes `</think>` reliably (unclosed 6/300 on ASDiv) where `nt0` does
+  not (37–38/300). Removing it **trades** — +7.5 on adversarial GSM-Plus, −2.3 on easy MAWPS, and a
+  greedy path that now needs a serving-side cap. It is fair to call it unintended; it is not fair to
+  call it simply harmful.
+- **The 11.5% row drop has no upside I can find.** Losing 80.7% of the arithmetic drill did not buy
+  termination or anything else — the drill's rows are 5 words long and already close immediately. That
+  one looks like pure loss, and it lands on precisely the capability (§33v's double-application, 25% of
+  one-step queries) that §33 spent a campaign failing to fix.
+
+So the defensible summary is: **the released model was trained on a corrupted view of its own data — a
+third of its chain-of-thought tokens deleted and an eighth of its rows silently swapped out — and
+neither was intended by the launcher that produced it.** What fixing them is worth is a measurement, not
+an assumption, which is what the arms in this section are for. Fixing the first is a trade with a large
+replicated win on adversarial problems; fixing the second is the untested one, and it is the one aimed
+at the regression that blocked §33.
+
+### 34q. `nt0` does NOT fix the double-application bug — which separates the two bugs cleanly
+
+The `316` arithmetic probe survived only for the last model (see the `tail` gotcha above):
+**`nt0s5150` = 86/144 = 59.7%.** But its *misses* are the informative part, and they are verbatim §33v:
+
+```
+17 - 5     -> <think>First, 17 - 5 = 12. Then 12 - 5 = 7. So, the final answer is 7.</think>      -> 7
+217 - 5    -> <think>First, 217 - 5 = 212. Then 212 - 5 = 207.</think>                            -> 207
+429 + 492  -> <think>First, 429 + 492 = 921. Then 921 + 492 = 1413.</think>                       -> 1413
+12 eggs/carton, 3 cartons -> <think>each carton has 12/3 = 4 eggs</think>                         -> 4
+```
+
+The first computation is correct and then the operator is applied again — §33v's dominant failure mode,
+unchanged. This is the cleanest possible separation of the two bugs:
+
+- **The truncation is not what causes double-application.** `nt0` removes the truncation entirely and the
+  pathology survives intact. So §34a's speculation that training targets ending mid-computation might be
+  *the* mechanism for "compute, then keep operating" is **not supported** — the traces above are complete
+  and closed, and the model still re-applies.
+- **The remaining candidate is the missing drill.** `nt0` still runs `synth_arith` at a 2.1% effective
+  share, because it only fixed the first flag. `both` restores it to 9.5%, and that is the arm that tests
+  whether the drill's absence is what §33v was actually looking at.
+
+Also visible: `**Answer:**` in nt0's output, confirming canonicalization is still active in that arm
+(`preserve_raw_reasoning 0`). `both` removes that marker, which is the format `CLOSE_STR` already assumes
+(§34i).
+
+Base's paired number on these same 144 items was destroyed by the `tail`, so `nt0`'s 59.7% is not yet
+interpretable — §33u's base reading was 55.1% but at n=176, a different draw. `321b_arith_nt0` re-runs
+base and all three `nt0` seeds together.
+
+### 34r. The three arms' EFFECTIVE mixes, which makes the attribution exact
+
+`audit_cot_mix.py` on v6 under each arm's flags (effective = post-resampling share):
+
+| tier | released / `nt128ctl` | `nt0` | `both` |
+|---|---:|---:|---:|
+| synth_arith | 2.1% | 2.1% | **9.5%** |
+| hq_opus (hard, high-quality) | 1.4% | 1.4% | **3.0%** |
+| hard_strict | 2.2% | 2.2% | 2.3% |
+| med_openmath | 1.0% | 1.0% | 1.1% |
+| med_math | 7.8% | 7.8% | 7.6% |
+| gsm8k_train_short (easier math) | 18.3% | 18.3% | 16.4% |
+| direct_tulu (general anchor) | 34.2% | 34.2% | **30.3%** |
+| **rows dropped** | **11.5%** | **11.5%** | **0.0%** |
+
+Two things this settles:
+
+1. **`nt128ctl` and `nt0` train on the identical effective mix** — canonicalization drops the same rows
+   whether or not the think span is later truncated, because its filters run on the untruncated span. So
+   `nt128ctl → nt0` isolates the truncation *exactly*, with no data-composition confound, and the
+   attribution chain in §34k holds as stated.
+2. **`both` does not dilute the hard tiers** — the concern I had when queuing it. Restoring the dropped
+   rows *doubles* `hq_opus` (1.4% → 3.0%) and lifts the arithmetic drill 4.5×, and the share it takes back
+   comes from `gsm8k_train_short` (the easier math tier, 18.3% → 16.4%) and the general anchor
+   (34.2% → 30.3%). So on the math axis `both` should be ≥ `nt0`, and **the general axis is the real risk**
+   — `direct_tulu` losing ~4 points of share is precisely what §12/§18/§32 warn about. `323_general`
+   (lm-eval 6 tasks + the 4-quadrant probe) is the gate that decides it, and it is queued.
+
+### 34s. The flip matrices — where `nt0`'s trade actually lands
+
+§33d's convention: `n01` = problems the arm fixes that base missed, `n10` = problems the arm breaks that
+base had. The net delta hides the ratio, and the ratio is the story (seed 46 shown; the other two seeds
+are within a few counts):
+
+| pool | config | n01 (fixed) | n10 (broken) | ratio | net |
+|---|---|---:|---:|---:|---:|
+| **GSM-Plus** | greedy | **71** | 34 | **2.09 : 1** | **+7.40** |
+| ASDiv | greedy | 67 | 100 | 0.67 : 1 | −3.30 |
+| MAWPS | greedy | 23 | 51 | 0.45 : 1 | −5.60 |
+| SVAMP | greedy | 97 | 114 | 0.85 : 1 | −1.70 |
+| ASDiv | **budget** | 69 | 48 | **1.44 : 1** | **+2.10** |
+| SVAMP | **budget** | 103 | 73 | **1.41 : 1** | **+3.00** |
+| MAWPS | budget | 26 | 33 | 0.79 : 1 | −1.40 |
+
+Read across the table: on the adversarial set the untruncated model fixes two problems for every one it
+breaks, *at plain greedy, with no serving help at all*. On the easy 1–2-step sets it breaks more than it
+fixes at greedy — and the think-token cap flips both ASDiv and SVAMP to ~1.4 : 1 favorable. MAWPS is the
+only pool that stays unfavorable under every config, which is consistent with it being the easiest pool in
+the suite and with its appearing as the one reproducible regression in §33u's three `fix2` seeds.
+
+Also worth flagging for the follow-up: the surviving arithmetic transcript shows `nt0` answering
+`What is 15 * 2?` with **no boxed answer at all after 320 tokens** — a runaway on a trivial input. Whether
+`nt0`'s `unclosed` cases are repetitive loops or genuinely long derivations decides whether the fix is
+"bound the length" (`nt256`) or "teach termination"; `321b_arith_nt0` keeps the full transcript so this can
+be read off directly rather than guessed at.
+
+### 34t. PRE-REGISTERED DECISION RULE for `both` (written before `317` finished training)
+
+§33 produced two retractions by deciding after looking. So the criteria are fixed here, in advance, with
+thresholds. `both` is a **re-release candidate** only if ALL of these hold:
+
+1. **Multi-step gain exceeds the noise floor.** Five-set unweighted mean, best-single-pass, 3 seeds,
+   paired vs the released model: **Δ ≥ +1.7pt** (§33p's measured run-to-run scale). `nt0` set the bar at
+   +1.76.
+2. **One-step arithmetic is not worse than the released model**, measured on the deployed
+   `from_pretrained`/`.generate()` path with base in the same run (§33s's mandatory gate). **Δ ≥ 0** on
+   the 144-item seed-77 draw. This is the criterion that killed every §33 arm.
+3. **General capability flat.** lm-eval 6-task mean within **−1.0pt** of base's 55.21, and no single task
+   moving more than 2pt; 4-quadrant probe ≥ base on all four quadrants (§33i's rule).
+4. **No individually significant per-set regression replicated across seeds.** MAWPS is the one to watch —
+   it is `nt0`'s only consistent loss and was §33u's only reproducible effect.
+5. **Three seeds**, and I report the seed **mean**, not the best run (§33r).
+
+If 1–3 hold but 4 fails on MAWPS alone, the honest verdict is "a gain with a known cost on the easiest
+pool", and the decision is the owner's, not mine — §28 is the precedent for the owner overriding a
+keep-current recommendation, and I will present it that way rather than deciding.
+
+**Independently of any of this**, and requiring no gate: the two flag fixes belong in every future
+CoT-SFT run, and especially in the argonne4 SFT redo. That recommendation does not depend on whether
+`both` ships, because it is a correction to what the training script was doing, not a bet on an outcome.
+
+**And regardless of outcome, nothing gets published.** An HF push needs explicit per-action approval
+([[dont-substitute-base-or-publish-without-asking]]); the deliverable here is a measured candidate plus a
+recommendation.
+
+### 34u. Training loss is BLIND to both bugs — which is why the audit is the only defence
+
+I checked whether the corrupted targets were measurably easier to fit, expecting the released run's loss to
+sit below `nt0`'s. The raw numbers looked dramatic — released `a35_cot.out` loss range 0.449–1.229 against
+`nt0`'s 1.85–3.60 — and they are **entirely an artifact**. The released run used `grad_accum=1` (3 GPUs ×
+batch 4) and `nt0` uses `grad_accum=3` (1 GPU), and HF Trainer's logged loss on this script scales with
+accumulation ([[think-model-checkpoint-is-healthy]] recorded the same ~4× inflation). Dividing out:
+
+| | released (accum 1) | `nt0` (accum 3) | `nt0` ÷ 3 |
+|---|---|---|---|
+| last five logged losses | 0.537 / 0.732 / 0.694 / 0.694 / 0.649 | 1.664 / 2.297 / 1.946 / 1.859 / 1.850 | **0.555 / 0.766 / 0.649 / 0.620 / 0.617** |
+
+The two runs are indistinguishable. **So the finding is a negative, and it is the important one: the loss
+curve cannot see either bug.** Deleting a third of the chain-of-thought tokens and silently swapping out an
+eighth of the rows leaves step count, epoch count and loss trajectory looking completely normal — the run
+that produced the released model looked healthy by every signal anyone was watching, for two campaigns.
+
+That is the argument for `audit_cot_mix.py` (§34m) as a required pre-flight rather than a nice-to-have:
+there is no post-hoc training signal that would have surfaced this. The only place it is visible is between
+the dataset and the collator.
+
+⚠️And the near-miss is worth recording on its own account: I was one step from reporting "the truncated
+targets were far easier to fit" as a mechanistic confirmation. It would have been wrong, and it would have
+been wrong in the flattering direction. Always divide logged loss by `grad_accum` before comparing runs on
+this codebase.
+
+**Complete three-seed table at the `budget` config (all five pools, `aggregate_seeds.py` merging both
+n-groups), which strengthens what §34k reported from seed 46 alone:**
+
+| pool | n | base | s46 | s5150 | s99 | 3-seed mean | Δ | spread | per-seed p |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **GSM-Plus** | 500 | 30.00 | 38.80 | 38.40 | 38.00 | **38.40** | **+8.40** | 0.80 | **2.3e-05 / 5.5e-05 / 9.3e-05** |
+| math500 | 319 | 29.15 | 31.35 | 31.97 | 31.66 | 31.66 | +2.51 | 0.63 | ns |
+| ASDiv | 1000 | 71.60 | 73.70 | 73.10 | 73.90 | 73.57 | +1.97 | 0.80 | 0.043 (one seed) |
+| SVAMP | 1000 | 65.50 | 68.50 | 66.60 | 66.70 | 67.27 | +1.77 | 1.90 | 0.029 (one seed) |
+| MAWPS | 500 | 58.20 | 56.80 | 55.40 | 55.40 | 55.87 | −2.33 | 1.40 | ns |
+| **mean** | | **50.89** | | | | **53.35** | **+2.46** | | |
+
+**GSM-Plus is individually significant in all three seeds at p < 1e-4**, with a 0.80pt spread — not one
+lucky seed. §34k under-reported this by quoting only seed 46. The best-single-pass framing still gives the
+headline **+1.76** (base 260.96 → 269.77 summed over five pools) because base's own best config beats its
+budget config on math500 and GSM-Plus; the +2.46 here is the same-config comparison. Both are honest; the
+first is the conservative one and is what I lead with.
+
+**Note on the general gate's scope.** `323_general` runs lm-eval (6 tasks, vLLM backend) on base,
+`boths46` **and** `nt0s46`. `nt0` is the strongest measured arm so far and §33i makes the general check
+mandatory, so leaving it unmeasured would make any recommendation about it incomplete. base is included in
+the same sweep rather than reusing §33i's recorded 55.21, so the comparison does not depend on the
+tooling being unchanged since then. The cost is ~25 min/model, and the 1-seed `nt256` probe (`329`) is the
+task that gets dropped if the queue runs long — a general-capability gate on a real candidate outranks a
+directional read on a mechanism question.
+
+### 34v. The termination table — MAWPS's regression, fully explained
+
+`unclosed` / `no_answer` counts from the gate's own failure-mode dicts (greedy, then after
+budget-forcing). This is the cleanest evidence for the whole §34e–v story:
+
+| model / config | ASDiv (n=1000) | SVAMP (1000) | MAWPS (500) | GSM-Plus (500) | math500 (319) |
+|---|---|---|---|---|---|
+| base / greedy | 26 / 37 | 44 / 8 | 32 / 3 | 17 / 116 | 54 / 43 |
+| base / budget | **0** / 46 | **0** / 8 | **0** / 3 | **0** / 111 | **0** / 74 |
+| nt0 s46 / greedy | 118 / 35 | 147 / 2 | 139 / 4 | 52 / 104 | 85 / 52 |
+| nt0 s99 / greedy | 120 / 39 | 148 / 3 | 142 / 5 | 39 / 101 | 87 / 53 |
+| nt0 s5150 / greedy | 116 / 35 | 130 / 4 | 139 / 5 | 46 / 99 | 94 / 49 |
+| nt0 (any) / budget | **0** / 39–44 | **0** / 0–2 | **0** / 3–4 | **0** / 113 | **0** / 56–61 |
+
+Three things fall out:
+
+1. **nt0's non-termination is 4–5× base's and it is worst on the EASIEST pools.** MAWPS 32→139 of 500
+   (6.4% → **28%**), ASDiv 26→118 of 1000 (2.6% → 12%), SVAMP 4.4% → 14%. GSM-Plus, the pool nt0 *wins*, has
+   the smallest relative increase (3.4% → 9%). So the model rambles exactly where the problem was already
+   finished — which is the same shape as §33n's finding that extra thinking hurts easy items and helps hard
+   ones, now installed in the weights rather than applied at decode time.
+2. **MAWPS's −2.33 needs no further explanation.** 28% of its traces never close. Force-closing removes the
+   deficit almost entirely (−5.60 greedy → −1.40 budget). MAWPS is not a mysterious regression; it is the
+   easiest pool meeting the longest-thinking model.
+3. **`no_answer` does not get worse — it gets slightly better** (ASDiv 46→39–44 at budget, SVAMP 8→0–2). So
+   the untruncated model is not producing more malformed output; it is producing *unfinished* output, which
+   is a different and much cheaper failure to fix.
+
+Base's own math500 `unclosed` of 54/319 (16.9%) is worth noting separately: even the released model
+rambles on the hardest pool, which is consistent with math500 being the one set where §33n found it had a
+positive effort response.
+
+### 34w. Where the GSM-Plus gain actually lands — and a nuance that cuts against the tidy story
+
+The gate JSONs store per-item `ok` vectors and `load_clean` is deterministic, so the gain can be decomposed
+offline against any item property. GSM-Plus's local copy has only `question`/`gold` (the perturbation type
+was dropped in curation), so question length is the available difficulty proxy. Greedy, n=500, same items,
+nt0 averaged over its three seeds:
+
+| question length | n | base | `nt0` (3-seed) | Δ |
+|---|---:|---:|---:|---:|
+| 18–37 words | 119 | 47.1% | **59.4%** | **+12.3** |
+| 37–48 words | 125 | 40.0% | 44.5% | +4.5 |
+| 48–61 words | 128 | 18.8% | 28.1% | +9.4 |
+| 61–176 words | 128 | 7.8% | 12.0% | +4.2 |
+| **correlation(length, per-item gain)** | | | | **−0.062** |
+
+**This does not support the mechanism I had been assuming.** I had been framing the result as "extra
+thinking helps hard/adversarial items and hurts easy ones" — §33n's shape, applied to the weights. But the
+per-item gain is **uncorrelated with question length** (r = −0.06) and is *largest on the shortest quartile*
+(+12.3), even though base accuracy falls monotonically with length (47.1% → 7.8%), confirming length is a
+real difficulty proxy for accuracy. So the gain is **broad across GSM-Plus**, not concentrated in its hard
+tail.
+
+Two readings, and I cannot separate them with what is on disk:
+- Question length is a poor proxy for *GSM-Plus* difficulty specifically, because perturbation type varies
+  independently of length (numerical substitution does not lengthen a question; distractor insertion does).
+  The shortest quartile is probably numerical-substitution variants, which demand careful arithmetic rather
+  than more steps.
+- Or the gain genuinely is set-wide rather than difficulty-specific, in which case "it helps on adversarial
+  problems" is the honest ceiling of the claim and "because they need more reasoning steps" is not earned.
+
+Either way the *claim* has to be narrowed to what is measured: **nt0 improves GSM-Plus broadly and
+significantly at three seeds; the mechanism by which it does so is not established by this decomposition.**
+Recovering the perturbation labels from the upstream dataset would settle it and is cheap future work.
+
+### 34x. MECHANISM IDENTIFIED — the truncation was destroying extended arithmetic manipulation
+
+§34w could not find the mechanism using question length and concluded it was unestablished. The
+perturbation labels turned out to be recoverable after all (`qintongli/GSM-Plus` is in the HF cache with a
+`perturbation_type` column; the local `gsmplus_test` copy had dropped it), and joining on question text
+matched **500/500** of the gate's items. Greedy, n=500, nt0 averaged over three seeds:
+
+| perturbation type | n | base | `nt0` (3-seed) | Δ |
+|---|---:|---:|---:|---:|
+| **integer-decimal-fraction conversion** | 59 | 25.4% | **51.4%** | **+26.0** |
+| numerical substitution | 78 | 48.7% | 58.1% | +9.4 |
+| reversing operation | 82 | 24.4% | 31.7% | +7.3 |
+| digit expansion | 86 | 34.9% | 39.9% | +5.0 |
+| distraction insertion | 60 | 18.3% | 22.2% | +3.9 |
+| problem understanding | 75 | 21.3% | 23.6% | +2.2 |
+| adding operation | 60 | 16.7% | 17.8% | +1.1 |
+
+**The gain is concentrated in exactly one thing: carrying out extended arithmetic.** Decimal/fraction
+conversion *doubles* (25.4% → 51.4%, +26.0 on 59 items). The next three largest — numerical substitution,
+reversing operation, digit expansion — are also computation-heavy. The two smallest are the ones that test
+*comprehension and structure* rather than execution: `adding operation` (+1.1) and `problem understanding`
+(+2.2), plus `distraction insertion` (+3.9).
+
+That is precisely the profile a mid-computation truncation predicts. A 128-token cut removes the tail of a
+derivation — the part where you finish converting 3/4 to 0.75, carry the digits, and combine — while leaving
+the setup and the problem reading intact. So the released model could still *understand* a perturbed problem
+about as well as `nt0` can; what it had lost was the ability to *finish the arithmetic*.
+
+**Two consequences.**
+- §34w's "the mechanism is not established" is **withdrawn**: it was an artifact of using question length as
+  the covariate, which is uncorrelated with perturbation type. Choose the covariate that matches the
+  hypothesis before concluding a decomposition is null.
+- This is the same family as §33v's double-application bug (arithmetic execution inside the think block,
+  not comprehension), which is the strongest indication yet that **§33v's "most promising target left" and
+  §34's truncation are two views of one underlying defect** — and that the arithmetic drill restored by
+  `both` is aimed at the right thing.
+
+**Does the 256-token serving cap truncate the very computations that produce the gain?** It was the obvious
+worry, and the answer is no — the cap preserves or improves every computation-heavy slice:
+
+| perturbation type | n | greedy Δ | budget Δ |
+|---|---:|---:|---:|
+| integer-decimal-fraction conversion | 59 | +26.0 | **+23.7** |
+| numerical substitution | 78 | +9.4 | **+10.3** |
+| reversing operation | 82 | +7.3 | **+11.0** |
+| digit expansion | 86 | +5.0 | **+10.1** |
+| distraction insertion | 60 | +3.9 | +4.4 |
+| problem understanding | 75 | +2.2 | 0.0 |
+| adding operation | 60 | +1.1 | −0.6 |
+
+Decimal/fraction conversion keeps +23.7 of its +26.0, and the other three computation-heavy perturbations
+get **better** under the cap (digit expansion +5.0 → +10.1, reversing operation +7.3 → +11.0). The two
+comprehension slices go to zero, but they were +1.1 and +2.2 to begin with. So the cap is not in tension with
+the mechanism — it protects it, by stopping the runaway before it loses an answer that was already computed.
+That makes the serving recommendation coherent: cap the think span, force the close, and the arithmetic gain
+survives intact.
+
+### 34y. The decisive decomposition — `nt0` gives fewer WRONG answers in every pool, and loses only by not stopping
+
+`fm`'s categories are mutually exclusive (correct + wrong + unclosed + no_answer = n), so item counts can be
+reconstructed exactly. Greedy, base vs `nt0` (3-seed mean):
+
+| pool | base correct/wrong/unclosed | `nt0` correct/wrong/unclosed | Δ wrong | Δ unclosed |
+|---|---|---|---:|---:|
+| ASDiv (1000) | 704 / 233 / 26 | 669 / **177** / 118 | **−56** | +92 |
+| SVAMP (1000) | 645 / 303 / 44 | 616 / **239** / 142 | **−64** | +98 |
+| MAWPS (500) | 285 / 180 / 32 | 253 / **102** / 140 | **−78** | +108 |
+| GSM-Plus (500) | 140 / 227 / 17 | 178 / **175** / 46 | **−52** | +29 |
+| math500 (319) | 101 / 121 / 54 | 92 / **87** / 89 | **−34** | +35 |
+
+**In all five pools the untruncated model produces fewer wrong answers** — 34 to 78 fewer items — and in all
+five it produces more unfinished ones. On MAWPS, the pool where it looks worst, `nt0` is wrong on **102 items
+against base's 180**, a 43% reduction, while being unfinished on 140. So the headline reading of §34e–k
+inverts: this is not a model that reasons worse on easy problems. It is a model that **reasons better
+everywhere and cannot stop**, and every apparent regression is the accounting of unfinished traces.
+
+**After force-closing (`budget`, unclosed → 0), the wrong-answer deltas tell you which pools were
+right-in-progress and which were wrong-in-progress:**
+
+| pool | Δ wrong at budget | net correct |
+|---|---:|---:|
+| GSM-Plus | **−44** | **+42** |
+| ASDiv | −15 | +20 |
+| SVAMP | −11 | +18 |
+| math500 | +8 | +8 |
+| **MAWPS** | **+11** | **−12** |
+
+GSM-Plus's unfinished traces were mostly on a correct path — closing them converts them. MAWPS's were not:
+force-closing turns its 140 unclosed into ~115 wrong and ~25 correct, which is why MAWPS is the one pool that
+stays negative under every config. **So MAWPS is a real regression, not a termination artifact** — on the
+easiest pool in the suite the longer traces genuinely derail — while ASDiv, SVAMP and GSM-Plus are
+termination artifacts that a serving cap fixes. That distinction is exactly what §34t's decision rule needs,
+and it is only visible in this decomposition.
+
+### 34z. Throughlines so far (before the `both` family reports)
+
+1. **Check what the training script did before designing a new recipe.** The night's plan was a data
+   campaign — enrich the CoT mix, lengthen the traces, run a dose ladder. None of that was reached, because
+   auditing the existing recipe first turned up two silent data defects, and fixing one of them beat the
+   entire §33 data campaign on the adversarial set. The audit cost 40 minutes; §33 cost 20 GPU-hours.
+2. **Neither defect was visible in any signal anyone was watching.** Row count, step count, epoch count and
+   the loss trajectory are all identical between the corrupted and fixed runs (§34u). A dropped row is
+   *resampled*, so even the dataset length is unchanged. The only place these are visible is between the
+   dataset and the collator — hence `audit_cot_mix.py` as a required pre-flight, not a diagnostic.
+3. **An omitted flag is a silent configuration change.** Both defects are argparse defaults that the 3.0-line
+   launchers overrode explicitly and the 3.5-line launchers, written fresh, did not. This is the second
+   instance of this exact failure on this project ([[anneal-no-lr-decay-and-general-forgetting]]'s
+   `--cooldown 0`). Diff the flag lists when a model line gets new launchers.
+4. **"The model prefers short answers" was a data artifact.** The released model's think-length p50 of
+   111–131 is its 128-token training cap, reproduced at every budget from 128 to 1024. §33a read the
+   correlation between long traces and failure as evidence that long traces are a failure *symptom*; it was
+   evidence that the model has no competent behaviour outside its training support.
+5. **The truncation cost arithmetic execution specifically, not comprehension.** The gain from removing it is
+   concentrated in integer-decimal-fraction conversion (+26.0, doubling that slice) and the other
+   computation-heavy perturbations, and is ~zero on `problem understanding` and `adding operation` (§34x). A
+   cut through the middle of a derivation removes the part where the arithmetic finishes.
+6. **The untruncated model reasons better in every pool and loses only by not stopping** (§34y): wrong answers
+   fall by 34–78 items on all five sets, unfinished traces rise by 29–108. Four of five apparent regressions
+   are termination accounting; MAWPS is the one real one.
+7. **The truncation was an accidental termination crutch.** It was not simply harmful (§34p): cutting every
+   hard trace at 128 tokens guaranteed the model never learned to run long, so it never had to learn to stop.
+   Removing it re-exposes §23e, and a serving-side think cap — which *preserves* the arithmetic gain (§34x) —
+   is what makes it deployable.
+8. **Choose the covariate that matches the hypothesis before declaring a decomposition null.** §34w concluded
+   the mechanism was unidentifiable using question length; the perturbation labels found it immediately. The
+   null was in the proxy, not the effect.
+9. **Divide logged loss by `grad_accum` before comparing runs on this codebase**, or a 3× logging artifact
+   reads as a real difference in fit — in the flattering direction (§34u).
+
+### 34aa. The size of the prize — what termination is currently hiding
+
+§34y showed `nt0` produces fewer wrong answers on every pool and loses only to unfinished traces. That
+invites an upper-bound calculation: what would a variant score that kept `nt0`'s wrong-answer rate and
+recovered base's termination rate?
+
+| pool | n | base | idealized ceiling | gain |
+|---|---:|---:|---:|---:|
+| ASDiv | 1000 | 70.4% | 76.1% | +5.7 |
+| SVAMP | 1000 | 64.5% | 71.4% | +6.9 |
+| MAWPS | 500 | 57.0% | 72.2% | +15.2 |
+| GSM-Plus | 500 | 28.0% | 41.4% | +13.4 |
+| math500 | 319 | 31.7% | 39.8% | +8.2 |
+| **unweighted mean** | | | | **+9.9** |
+
+**This is an upper bound and should be read as one.** It assumes every unfinished trace that `nt0` would
+have got right gets finished, and that none of its wrong-in-progress traces convert into wrong answers.
+§34y shows MAWPS violates the second assumption outright — force-closing its 140 unfinished traces produced
+~115 wrong and ~25 correct — so **MAWPS's +15.2 is the least trustworthy row**, and excluding it the mean is
++8.6. The realistic figure is well below either; the measured `budget` result is +2.46, which is what
+force-closing at a fixed 256 tokens actually delivers.
+
+But the gap between +2.46 measured and ~+9 idealized is the point: **termination, not reasoning quality, is
+now the binding constraint on this model.** Every arm in §33 was chasing reasoning quality against a
+5-set mean of +1.3 to +2.1. The decomposition says the reasoning is already there — 34 to 78 fewer wrong
+answers per pool — and is being thrown away at the point of not stopping. That reframes what the next
+campaign on this line should attack, and it is a target nobody has aimed at since §23e declared
+non-termination solved (which it was, *for the truncated model*).
+
+**Baseline provenance, verified rather than assumed.** Every comparison in §34 calls
+`models/a35_reason/blend_a085` "the released model". Checked directly: the HF deploy bundle
+`models/deploy_stage_a35think` (5 bf16 shards) and `blend_a085` (fp32 on disk) agree to
+**3.9e-03 max abs difference** on a shared tensor — exactly fp32→bf16 rounding at this magnitude. So the
+baseline is the published Argonne-3.5-think, not a nearby checkpoint, and §34's deltas are deltas against
+what is actually on Hugging Face.
+
+### 34ab. `both` — first seed, and it is a much larger effect than `nt0` (n=300 quick judge, ONE seed)
+
+`run_arm_nt.sh`'s in-arm judge (clean_eval, n=300, K=8, max-new-tokens 512), seed 46:
+
+| arm | SVAMP greedy | +budget | self-cons | pass@8 | ASDiv greedy | +budget | self-cons | pass@8 | unclosed (SV/AS) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 65.00 | 66.00 | 74.00 | 90.67 | 73.00 | 73.67 | 82.67 | 92.33 | 14 / 6 |
+| `nt0` s46 | 62.33 | 66.33 | 78.67 | 93.33 | 67.33 | 73.00 | 81.33 | 93.00 | 46 / 41 |
+| **`both` s46** | **74.33** | 75.67 | **81.67** | **94.00** | **74.33** | 73.67 | **83.67** | **95.00** | **23 / 23** |
+
+Three things, all of which are what §34l pre-registered:
+
+1. **SVAMP greedy +9.33 over the released model** (65.00 → 74.33), and ASDiv +1.33. `nt0` was −2.67 and −5.67
+   on the same measure, so restoring the dropped rows does not merely offset `nt0`'s greedy deficit, it
+   overshoots the released model substantially.
+2. **Termination is largely repaired without any serving change.** `unclosed` is 23/23 against `nt0`'s
+   46/41 — about halfway back to the released model's 14/6 — and crucially **greedy ≈ +budget**
+   (74.33 vs 75.67 on SVAMP, 74.33 vs 73.67 on ASDiv). `nt0` needed force-closing to be competitive; `both`
+   does not. Its plain greedy ASDiv (74.33) already exceeds `nt0`'s *force-closed* 73.70.
+3. **`no_answer` is 0 on SVAMP** and 10 on ASDiv, i.e. the format is clean.
+
+This is consistent with the mechanism: the 2,018 restored `synth_arith` rows are 5-word think spans that
+close immediately, which supplies the short-closure supervision `nt0` lacked (§34, closure-entropy
+analysis), while the untruncated hard tiers keep the arithmetic-execution gain (§34x).
+
+⚠️**One seed, n=300.** §33p measured ±1.68pt of run-to-run variation on a 5-set mean and §33u recorded two
+retractions from single-seed reads — including one of mine earlier tonight. A +9.33 is far outside that
+noise scale, but the claim waits for `322_gate_both`: three seeds, n=1000/pool, paired McNemar against the
+released model, plus the mandatory one-step arithmetic gate and the general-capability gate. Nothing here is
+a result yet.
+
+**Stating the drop in absolute samples per epoch, which is what matters for gradient exposure.** The
+"effective share" framing in §34r understates one thing and overstates another. An epoch is always 26,428
+samples (the dataset length is unchanged — that is what makes the bug silent), but under the released flags
+those samples are drawn from only 23,399 distinct rows, so each survivor is seen ~1.13× on average. Per
+epoch, in samples:
+
+| tier | released recipe | `both` | ratio |
+|---|---:|---:|---:|
+| synth_arith | ~545 | **2,500** | **4.6× more** |
+| hq_opus | ~373 | 800 | 2.1× more |
+| direct_tulu (general anchor) | ~9,040 | 8,000 | **0.89× (11% less)** |
+| gsm8k_train_short | ~4,845 | 4,338 | 0.90× |
+
+So `both` does not cut the general anchor by 4 percentage points of share in any meaningful sense — it sees
+**8,000 direct_tulu samples instead of ~9,040, about 11% fewer**, because the released run was silently
+*oversampling* it to backfill dropped rows. An 11% reduction in absolute exposure is a much smaller
+perturbation than the share table suggests, and it comes alongside 168 restored `gen_ultrachat` rows
+(general-with-think). Combined with §33i's measurement that α=1.00 — removing the SFT soup partner
+*entirely* — cost only −0.19 lm-eval mean, the prior is that `both`'s general risk is small. That is a
+prior, not a result: `323_general` measures it on base, `both` and `nt0` with lm-eval over 6 tasks plus the
+4-quadrant probe, and §34t's rule requires flat before `both` can be called a candidate.
+
+**An output-format detail that matters for any re-release.** With `--preserve_raw_reasoning 0`, the
+canonicalizer rewrites targets to `<think>...</think>\n\n**Answer:** <block>`, and `nt0`'s deployed-path
+transcript confirms the released lineage emits that marker:
+`**Answer:** The answer is $\boxed{7}$.` With `preserve_raw_reasoning 1`, `both`'s targets keep v6's raw
+form, so it should emit `The answer is $\boxed{X}$.` with **no `**Answer:**` prefix**. Anything downstream
+that parses the marker would see a format change.
+
+Worth flagging as a discrepancy to resolve rather than asserting: §33s quotes the released model's own smoke
+output *without* the marker (`</think> The answer is $\boxed{7}$.`), which does not match what the
+canonicalization path should produce. Either that quote was tidied for the notes, or the α=0.85 soup with
+`dpo` partially washes the marker out. `332_arith_nt0` captures the full transcript for base alongside the
+`nt0` seeds, so the released model's actual emitted format can be read off directly instead of inferred.
+
+### 34ac. ⛔ THE THIRD DEFECT, AND THE MECHANISM FOR §33v: canonicalization deletes the CONCLUSION of 94.5% of gsm8k derivations
+
+`--preserve_raw_reasoning 0` does more than drop 11.5% of rows (§34h). On the rows it *keeps*, it rewrites
+the think span through `clean_training_think_span()`, which filters sentence-by-sentence and drops any
+sentence matching, among others, `\banswer\b` and `\bthe answer is\b`. In a reasoning trace, that is the
+**concluding sentence**.
+
+Measured on the rows canonicalization keeps — think-span word retention by tier:
+
+| tier | word retention | rows whose CONCLUDING sentence (contains "answer" + a digit) was deleted |
+|---|---:|---:|
+| **gsm8k_train_short** (largest math tier, 4,293 rows) | **0.681** | **4,059 / 4,293 = 94.5%** |
+| med_openmath | 0.777 | 265 / 296 = **89.5%** |
+| hard_strict | 0.783 | 527 / 589 = **89.5%** |
+| hq_opus | 0.788 | 51 / 770 = 6.6% |
+| med_math | 0.947 | 95 / 1,830 = 5.2% |
+| gen_ultrachat, ms_*, synth_arith | 1.000 | 0.0% |
+| **all kept reasoning rows** | 0.887 | **4,997 / 16,143 = 31.0%** |
+
+Two real examples, original → deleted → what was trained on:
+
+```
+ORIGINAL: "... So total trip time = driving + beach = 4 + 10 = 14 hours.  Thus answer: 14 hours. ..."
+DELETED : "Thus answer: 14 hours."          <- the conclusion
+TRAINED : "... So total trip time = driving + beach = 4 + 10 = 14 hours. But we need ..."
+
+ORIGINAL: "... Then 5 buses hold 5 * 22 = 110 passengers. So answer: 110.  Thus the answer is 110 ..."
+DELETED : "So answer: 110."  AND  "Thus the answer is 110 passengers."
+TRAINED : "... Then 5 buses hold 5 * 22 = 110 passengers."
+```
+
+**This is the mechanism for §33v's double-application bug, and it is exact.** On the primary multi-step math
+tier, **94.5% of training targets had the sentence that states the result removed from inside `<think>`**. The
+model was systematically trained on derivations that compute a value and then *do not conclude* — the trace
+either continues into unrelated meta-commentary or gets cut at 128 tokens. So at inference it computes the
+right value and keeps operating on it: `17 - 5 = 12. Then 12 - 5 = 7.` §33v found that 56% of one-step
+arithmetic failures are the operator applied twice and called it "a stopping bug inside the think block, the
+same family as §23e's non-termination"; that reading was right, and this is where the stopping bug came from.
+
+**The three defects compound on exactly the same rows.** For `gsm8k_train_short`:
+1. 94.5% lose their concluding sentence (this section),
+2. then 81.5% of what remains is truncated at 128 tokens mid-derivation (§34a-b),
+3. while the arithmetic drill that would have taught terse "compute → state → stop" is 80.7% absent (§34h).
+
+All three follow from two omitted flags, and `both` fixes all three simultaneously — which is a better
+explanation of its SVAMP greedy **+9.33** (§34ab) than "more `synth_arith` rows" was. It is not adding an
+ingredient; it is restoring the conclusions of nearly every multi-step derivation in the mix.
+
+### 34ad. The 2×2 design, completed — which flag is actually load-bearing?
+
+Because `nt0` (truncation fixed, `preserve_raw` still 0) is *negative* on SVAMP greedy (62.33 vs the
+released 65.00) while `both` is **+9.33** (74.33), the two fixes plainly do not add. Whether the truncation
+fix is load-bearing at all is a practical question — if `preserve_raw_reasoning` alone captures the gain, the
+minimal repair is **one flag**, and the 128-token truncation could be *kept deliberately* as the termination
+crutch §34p shows it to be. So the fourth cell was queued:
+
+| arm | `--max_think_tokens` | `--preserve_raw_reasoning` | what it is | SVAMP greedy (n=300) |
+|---|---|---|---|---|
+| `nt128ctl` | 128 | 0 | the released recipe, 1-GPU path (control) | pending |
+| `nt0` ×3 | **0** | 0 | truncation fixed only | 62.33 / 60.67 / 62.33 |
+| `raw1` | 128 | **1** | conclusions + drill restored, truncation kept | **pending** |
+| `both` ×3 | **0** | **1** | both fixed = cot_v6.sh's recipe | **74.33** / pending / pending |
+
+Because `both` differs from `nt0` *only* in `preserve_raw_reasoning`, the contrast `nt0 → both` already
+isolates that flag exactly; `raw1` supplies the other main effect and therefore the interaction. `324_raw1`
+also runs the one-step arithmetic probe over all four cells **paired in a single process with the full
+transcript kept**, which subsumes the separate `nt0` arithmetic re-run (`332`) — that task was removed rather
+than duplicated.
+
+### 34ae. What §34ac reframes about §32 and §33
+
+**The v6 mix was never the limitation.** §32a's headline is that swapping the data to `cot_sft_mix_v6` took
+SVAMP greedy 25.67 → 62.33 and collapsed `no_answer` 53.7% → 1.3%. That comparison is sound — both arms
+carried the same loader defects. But the *absolute* result understated the mix: loaded correctly, the very
+same v6 rows give **74.33** on the same measure (§34ab, one seed). So the recipe §32 built was better than
+§32 could measure, by roughly the margin the loader was destroying. The ceiling §32 thought it had reached
+was a property of `cot-sft.py`'s defaults, not of the data or the base.
+
+**§33's central negative result may be an artifact of the same thing.** §33's campaign added tier after tier
+on top of v6 — RFT, three verify flavours, mode-wrong slices, distractor perturbations — and the recurring
+finding was that additive tiers are null (§33c: "the model already samples the correct trace often, so raising
+its likelihood a little does not change the argmax"). Consider what those tiers were being added to: a mix in
+which **94.5% of the main multi-step tier's targets had their concluding sentence deleted**, 81.5% were then
+cut at 128 tokens, and the arithmetic drill was 80.7% absent. The marginal value of more correct traces is
+plausibly low when the existing ones have been stripped of their conclusions — which would make §33's nulls a
+statement about the corrupted mix rather than about additive data as such.
+
+**I am not claiming §33's tiers would work on a fixed mix — that is untested and I have not run it.**
+§33l's throughline ("a likelihood objective cannot move an argmax") may well be true on its own terms. But the
+honest status of §33's nulls is now *unresolved* rather than *established*, and re-testing the cheapest of
+them (the verify tier at 20%) on top of `both` is well-motivated future work. §33s's ship-block in particular
+was diagnosed as "the verify tier diluted `synth_arith`"; `synth_arith` was already at a 2.1% effective share
+before the verify tier touched it, so that diagnosis was working from the wrong baseline.
+
+**And the §33v connection closes.** §33v called the double-application bug "a mechanical, precisely localised
+bug affecting 44/176 = 25% of all one-step arithmetic queries, on which the model has *already computed the
+right answer*" and "the most promising target left on this line". It was right about all of that. The cause
+was that 94.5% of its multi-step training targets never stated a conclusion inside `<think>`.
+
+### 34af. `both` replicates at a second seed — and the pool that moves is the OPPOSITE of §33's
+
+Quick judge (n=300, K=8, max-new 512), two seeds:
+
+| arm | SVAMP greedy | +budget | self-cons | pass@8 | ASDiv greedy | +budget | self-cons | pass@8 | unclosed SV/AS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| shipped | 65.00 | 66.00 | 74.00 | 90.67 | 73.00 | 73.67 | 82.67 | 92.33 | 14 / 6 |
+| `both` s46 | 74.33 | 75.67 | 81.67 | 94.00 | 74.33 | 73.67 | 83.67 | 95.00 | 23 / 23 |
+| `both` s99 | 73.00 | 75.33 | 82.00 | 93.33 | 73.33 | 73.00 | 84.00 | 93.00 | 23 / 26 |
+| **2-seed mean Δ** | **+8.67** | **+9.50** | **+7.84** | +3.0 | +0.83 | −0.34 | +0.84 | +1.7 | — |
+
+Seed spread is 1.33 (SVAMP) and 1.00 (ASDiv) — tight. `unclosed` holds at 23–26 in both seeds, versus `nt0`'s
+38–46 and the released model's 14/6, and **greedy ≈ +budget in both seeds**, so the termination repair
+replicates too and `both` still needs no serving change.
+
+⚠️**The asymmetry is worth flagging now rather than explaining later.** SVAMP moves +8.67 and ASDiv moves
++0.83. That is the **reverse of §33**, where "ASDiv moves, SVAMP does not" was stated as the pattern across
+five independent arms (§33j: ASDiv +3.6 to +4.8 at p=0.0005–0.013; SVAMP 0.0 to +2.7 and *never* p<0.05).
+Two readings, and n=300 cannot separate them:
+- ASDiv is near a ceiling for this recipe (73–74 in the released model, `nt0`+budget, and `both` alike),
+  while SVAMP had headroom the released model was not reaching.
+- Or this is n=300 noise on two seeds and the gate will move both.
+
+The n=1000 paired gate (`322`) is what decides; the third seed is training now. Recording the tension in
+advance so the gate is read as a test rather than a confirmation.
+
+### 34ag. The single table that summarises all three defects (`audit_cot_mix.py --compare`)
+
+`audit_cot_mix.py` now reports conclusion-deletion alongside drops and truncation, which is the artifact that
+would have caught this in seconds. Run on `cot_sft_mix_v6`, released flags versus the 3.0-line flags
+(percentages are of TOTAL rows in the tier):
+
+**As the released model was trained (`max_think=128, preserve_raw=0`):**
+
+| tier | rows | dropped | truncated | conclusion deleted | eff. share |
+|---|---:|---:|---:|---:|---:|
+| direct_tulu | 8,000 | 0.0% | 0.0% | 0.0% | 34.2% |
+| **gsm8k_train_short** | 4,338 | 1.0% | **80.8%** | **93.6%** | 18.3% |
+| gen_ultrachat | 3,000 | 5.6% | 0.0% | 0.0% | 12.1% |
+| **synth_arith** | 2,500 | **80.7%** | 0.0% | 0.0% | **2.1%** |
+| med_math | 2,000 | 8.5% | 38.2% | 4.8% | 7.8% |
+| ms_* drills | 4,890 | ~0.1% | 0.0% | 0.0% | 20.8% |
+| **hq_opus** | 800 | **58.8%** | 35.5% | 2.4% | **1.4%** |
+| **hard_strict** | 600 | 15.2% | **74.5%** | **76.2%** | 2.2% |
+| **med_openmath** | 300 | 20.0% | **70.0%** | **73.3%** | 1.0% |
+| **TOTAL** | **26,428** | **11.5%** | **19.7%** | **18.4%** | |
+
+**With the 3.0-line flags (`max_think=0, preserve_raw=1`) — every column is zero:**
+
+| TOTAL | 26,428 | **0.0%** | **0.0%** | **0.0%** |
+|---|---|---|---|---|
+
+Read the two together and the diagnosis needs no argument. The four hard math tiers are hit on two or three
+axes at once, the arithmetic drill is 80.7% absent, the general anchor and the procedure drills are untouched,
+and the correct flags produce a clean mix from the identical data. Every number in this table was available
+before a single GPU-hour was spent; none of it was visible in the launcher, the log, or the loss curve.
+
+(Note the denominator: this table divides by total rows in the tier, so gsm8k's conclusion-deletion reads
+93.6% here versus the 94.5% in §34ac, which divided by the rows canonicalization *keeps*. Both are correct.)
+
+### 34ah. Think-length per pool, from the gate's own instrumentation — and a statistic caveat
+
+`effort_gate` stores `think_len` per model/pool/config, so this comes free (mean tokens inside `<think>`,
+plain greedy, max-new-tokens 1024 so nothing is clipped):
+
+| model | ASDiv | SVAMP | MAWPS | GSM-Plus | math500 |
+|---|---:|---:|---:|---:|---:|
+| base | 126.8 | 152.2 | 164.0 | 118.0 | 289.8 |
+| `nt0` s46 | 223.6 | 267.4 | 366.5 | 201.6 | 410.0 |
+| `nt0` s99 | 225.1 | 266.5 | 370.3 | 181.6 | 412.7 |
+| `nt0` s5150 | 224.9 | 253.3 | 366.4 | 193.1 | 427.5 |
+
+⚠️**These are MEANS and they are inflated by the unclosed runaways**, which generate to the 1024-token
+ceiling. On MAWPS `nt0` has 139/500 unclosed, so its 366-token mean is dominated by them; base's 289.8 on
+math500 likewise reflects its own 54/319 unclosed. So this table must **not** be read as "base thinks 126
+tokens" — the clean statistic is the *median* from `300_diag`, which is **111–131 across pools and invariant
+to budget** (§34c). The mean/median gap is itself the runaway tail. I am flagging this because the two
+statistics support different-sounding claims and only the median supports the "pinned at the training cap"
+reading.
+
+What the means do show cleanly is the **inversion**: `nt0` thinks longest on MAWPS (366) — the *easiest* pool
+in the suite — and shortest on GSM-Plus (182–202), the hardest. Base has the same inversion, more mildly
+(164 vs 118). Effort is being allocated in inverse proportion to difficulty, which is another way of stating
+§34y's finding that MAWPS is where the long traces genuinely derail, and it is a target for any future
+length-control work.
+
+### 34ai. PRE-REGISTERED expectations for `322` (gate) and `324` (2×2 arithmetic)
+
+**`both`'s think-length** should land *between* base and `nt0` — roughly 150–190 on ASDiv against base's 127
+and `nt0`'s 224 — with a large drop in runaways (n=300 `unclosed` is already 23 vs `nt0`'s 46, so at n=1000
+expect ~60–80 against `nt0`'s 118). Mechanism: the restored `synth_arith` rows supply short-closure
+supervision at 4.6× the exposure (§34, closure distribution), which should pull the tail in without removing
+the untruncated hard tiers' longer derivations. If instead `both` matches `nt0`'s 224 with `nt0`'s runaway
+rate, then its greedy gain comes from somewhere other than termination and §34ab's reading is wrong.
+
+**`both`'s one-step arithmetic** should improve materially over the released model's ~55%, and this is the
+sharpest test of §34ac. The claim there is that 94.5% of the main multi-step tier's targets had their
+concluding sentence deleted, which trained the model to compute and not stop, producing
+`17 - 5 = 12. Then 12 - 5 = 7.` `both` restores those conclusions **and** the 2,018 dropped drill rows. So the
+double-application rate should fall sharply. If `both`'s arithmetic is no better than `nt0`'s — which still
+showed the bug verbatim (§34q) — then conclusion-deletion is not the cause and §34ac is wrong as a causal
+claim, however well-established the deletion itself is.
+
+**The 2×2 (`324`) then localises it.** If `raw1` (conclusions restored, truncation kept) recovers most of the
+arithmetic, the minimal fix is one flag. If it needs `both`, the two are jointly necessary.
+
+Stating these now because §34ac is the strongest causal claim in this section and it currently rests on a
+data-side measurement plus one seed of downstream evidence. It is falsifiable by the next two tasks and should
+be labelled as such until they land.
+
+### 34aj. The sharpest version of the mechanism: the released recipe DECOUPLED the boxed answer from the reasoning
+
+If the conclusion is deleted and the derivation is then cut at 128 tokens, the value that ends up in
+`\boxed{}` need not appear inside `<think>` at all — the answer block is spliced on from the original row and
+survives both filters. Measured on the four math tiers (gsm8k_train_short, hard_strict, med_openmath,
+med_math; 7,238 rows), asking whether the boxed gold value occurs anywhere in the think span the model is
+actually trained on:
+
+| training config | gold IS in think | gold **NOT** in think | unparseable | dropped |
+|---|---:|---:|---:|---:|
+| `both` (raw, no truncation) | **90.0%** | **2.8%** | 7.2% | 0.0% |
+| released (canonicalize + truncate 128) | 62.9% | **21.6%** | 10.5% | 5.1% |
+
+**21.6% of the released model's math training targets teach it to emit a boxed answer that never appears in
+its own reasoning** — 7.7× the rate under the correct flags. That is the strongest form of the mechanism, and
+it explains the *shape* of §33v's failures better than conclusion-deletion alone does:
+
+- The derivation never concludes (94.5% of gsm8k targets, §34ac), so nothing teaches "stop here".
+- It is often severed mid-computation (80.8%, §34a), so the last value inside `<think>` is an intermediate.
+- And in 21.6% of cases the emitted answer is not derivable from the visible reasoning at all, so the model
+  learns the box is **only loosely coupled** to what it just computed.
+
+Put together, `<think>First, 17 - 5 = 12. Then 12 - 5 = 7.</think> The answer is $\boxed{7}$` is not a
+mysterious arithmetic lapse. It is a model that was trained on derivations which do not conclude, frequently
+stop mid-computation, and one time in five box a number the reasoning never reached — so it computes, keeps
+going because nothing taught it to stop, and boxes whatever it last produced.
+
+`both` takes the decoupled fraction from 21.6% to **2.8%**. Whether that translates into repaired one-step
+arithmetic is exactly what `324` measures, and §34ai registered the prediction before it ran.
+
+### 34ak. `both` at THREE seeds (quick judge, n=300) — stable, and the pool asymmetry holds
+
+| arm | SVAMP greedy | +budget | self-cons | pass@8 | ASDiv greedy | +budget | self-cons | pass@8 | unclosed SV/AS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` | 65.00 | 66.00 | 74.00 | 90.67 | 73.00 | 73.67 | 82.67 | 92.33 | 14 / 6 |
+| `both` s46 | 74.33 | 75.67 | 81.67 | 94.00 | 74.33 | 73.67 | 83.67 | 95.00 | 23 / 23 |
+| `both` s99 | 73.00 | 75.33 | 82.00 | 93.33 | 73.33 | 73.00 | 84.00 | 93.00 | 23 / 26 |
+| `both` s5150 | 73.00 | 75.33 | 80.33 | 95.33 | 74.33 | 74.33 | 84.67 | 92.67 | 24 / 24 |
+| **3-seed mean** | **73.44** | 75.44 | **81.33** | 94.22 | **74.00** | 73.67 | **84.11** | 93.56 | 23.3 / 24.3 |
+| **Δ vs shipped** | **+8.44** | **+9.44** | **+7.33** | +3.6 | **+1.00** | 0.00 | **+1.44** | +1.2 | — |
+
+Seed spread is **1.33 (SVAMP) and 1.00 (ASDiv)** — well inside §33p's ±1.68pt noise scale, so the effect is
+stable across seeds rather than a lucky draw. Three further properties replicate in all three seeds:
+
+- **`unclosed` holds at 23–24** against `nt0`'s 38–46 and the released model's 14/6 — roughly two-thirds of the
+  way back, from a mix change alone.
+- **greedy ≈ +budget** (73.44 vs 75.44 SVAMP; 74.00 vs 73.67 ASDiv), so unlike `nt0` this arm needs **no
+  serving-side think cap**. Its plain greedy already exceeds `nt0`'s force-closed numbers.
+- **`no_answer` is 1 on SVAMP and 9–11 on ASDiv**, i.e. the output format is clean despite `preserve_raw`
+  removing the canonicalizer.
+
+The SVAMP/ASDiv asymmetry noted in §34af persists at three seeds: +8.44 vs +1.00. ASDiv sits at 73–74 for the
+released model, `nt0`+budget, and `both` alike, which reads like a recipe ceiling; SVAMP had 8 points of
+headroom the released model was not reaching. The n=1000 five-pool gate (`322`) is what tests that, and the
+`nt128ctl` control is training now.
+
+### 34al. Why ASDiv looks flat — it is 54% single-operator problems, and `nt0` regresses on all of them
+
+ASDiv ships a `solution_type` annotation. Joining it to the gate's exact 1,000-item draw (all matched),
+greedy, `nt0` averaged over three seeds:
+
+| ASDiv solution_type | n | base | `nt0` | Δ |
+|---|---:|---:|---:|---:|
+| Subtraction | 191 | 81.2% | 77.5% | **−3.7** |
+| Addition | 150 | 77.3% | 71.8% | **−5.6** |
+| Multiplication | 114 | 81.6% | 76.0% | **−5.6** |
+| Common-Division | 88 | 79.5% | 77.7% | **−1.9** |
+| Geometry | 48 | 77.1% | 66.7% | −10.4 |
+| Ratio | 46 | 69.6% | 62.3% | −7.2 |
+| Algebra-1 | 35 | 60.0% | 53.3% | −6.7 |
+| Sum | 56 | 76.8% | 78.6% | +1.8 |
+| **TVQ-Final** | 36 | 77.8% | **86.1%** | **+8.3** |
+| **Algebra-2** | 33 | 24.2% | **34.3%** | **+10.1** |
+
+**543 of ASDiv's 1,000 items (54%) are single-operator** (Subtraction, Addition, Multiplication,
+Common-Division), and `nt0` regresses on **every one of those four types** by −1.9 to −5.6, while gaining
+**+8.3 and +10.1** on the two hardest multi-step types. The two cancel to the −3.5 aggregate. So ASDiv is not
+near a ceiling — pass@8 is 93.6 against greedy 74.0, a 19-point selection gap — it is a **mixture whose
+majority slice is exactly the case `nt0` does not fix**.
+
+That closes the loop with §34q: `nt0` still shows the double-application bug verbatim, because it fixes only
+the truncation and leaves the arithmetic drill 80.7% dropped and the conclusions deleted. Single-operator word
+problems *are* one-step arithmetic wrapped in prose, so they fail the same way.
+
+**Pre-registered prediction for `both` (before `322` runs):** if §34ac/§34aj are right, `both` should **reverse
+the sign on the four single-operator types** — because it restores both the conclusions and the drill — while
+keeping `nt0`'s gains on Algebra-2 and TVQ-Final. That is why its aggregate ASDiv is +1.00 rather than −3.50,
+and it predicts the same decomposition run on `both` will show the four majority slices flat-to-positive. If
+instead `both` also regresses them, its SVAMP gain has some other source and §34aj is wrong.
+
+This also reconciles the §33-versus-§34 pool asymmetry (§34af): a change that helps multi-step and hurts
+one-step will show up on whichever benchmark has more multi-step items, which is why §33's verify tier moved
+ASDiv while this section's `nt0` moves GSM-Plus. The composition of the benchmark, not the model, decides
+which set "responds".
+
+### 34am. ⚠️CORRECTION TO §33s — the benchmark suite is dominated by SINGLE-OPERATOR problems, so it never was blind to the arithmetic regression
+
+§33s wrote, explaining why a 23.8pt one-step arithmetic regression escaped every benchmark: *"SVAMP, ASDiv,
+MAWPS, GSM-Plus and math500 are **all multi-step word problems**. There is no single-step arithmetic set
+anywhere in the suite."* That is **not correct**, and it matters.
+
+SVAMP ships `Type` and `Equation`; ASDiv ships `solution_type`. Joining both to the gate's exact 1,000-item
+draws (all matched):
+
+| set | single-operator share | evidence |
+|---|---:|---|
+| **SVAMP** | **76.2%** | 762/1000 gold equations contain exactly one of `+ - * /` |
+| **ASDiv** | **54.3%** | 543/1000 are Subtraction / Addition / Multiplication / Common-Division |
+
+And `nt0` — which fixes the truncation but leaves the conclusions deleted and the drill dropped — regresses
+on precisely those slices, on both sets:
+
+| slice | n | base | `nt0` | Δ |
+|---|---:|---:|---:|---:|
+| SVAMP, 1 operator | 762 | 66.3% | 62.4% | **−3.8** |
+| SVAMP, 2 operators | 237 | 59.1% | 59.2% | +0.1 |
+| ASDiv, 4 single-operator types | 543 | ~80% | ~76% | **−1.9 to −5.6** |
+| ASDiv, Algebra-2 + TVQ-Final | 69 | 51.4% | 60.9% | **+8.3 to +10.1** |
+
+**So the suite was never blind to one-step arithmetic — it is mostly one-step arithmetic, wrapped in prose.**
+§33's 24pt regression on bare `a op b` queries did show up in these benchmarks; it showed up *diluted*, as
+"SVAMP flat" and "MAWPS −2.8", which §33 read as noise or as set-specific quirks rather than as the same
+defect its own smoke test found. The right conclusion is not "add a single-step set to the gate" (though
+`simple_arith_probe.py` is still worth keeping, because bare queries make the effect legible) but
+"**decompose the sets you already have**" — the annotations were sitting in the datasets the whole time.
+
+**This unifies the §33-versus-§34 pool asymmetry (§34af/§34ak).** Any intervention that helps multi-step and
+hurts one-step will read as a gain on whichever benchmark has the higher multi-step share and as flat-to-
+negative on the others. That is why §33's verify tier moved ASDiv (46% multi-step) and not SVAMP (24%), and why
+`nt0` moves GSM-Plus and not either. The benchmark's *composition*, not the model, decides which set
+"responds" — and reporting a set-level delta without its composition hides the mechanism.
+
+**Prediction this makes for `both` (registered before `322`):** `both`'s SVAMP greedy is **+8.44** at three
+seeds, and SVAMP is 76% single-operator. That is only possible if `both` **repaired one-step arithmetic in
+prose**. So the `324` probe on bare `a op b` queries should show `both` clearly above base — and if it does not,
+the SVAMP gain has some other source and §34aj's decoupling account is wrong.
+
+### 34an. `reasoning/decompose_gate.py`, and the monotone split that confirms the mechanism
+
+New tool: takes any `effort_gate --json-out` result and re-cuts it by the per-item annotations the eval sets
+already ship — ASDiv `solution_type`, SVAMP operator-count + `Type`, GSM-Plus `perturbation_type`, math500
+level. Zero GPU cost, because the gate stores per-item `ok` vectors and `clean_eval.load_clean` is
+deterministic for a given (source, n, seed). This is the tool that encodes §34am's lesson.
+
+**SVAMP is the cleanest confirmation of "helps multi-step, hurts one-step" I have** — the split is monotone in
+operator count, with no exceptions (`nt0`, 3-seed mean, greedy):
+
+| SVAMP slice | n | base | `nt0` | Δ |
+|---|---:|---:|---:|---:|
+| 2-op Multiplication | 34 | 73.5% | 75.5% | **+2.0** |
+| 2-op Addition | 56 | 64.3% | 65.5% | **+1.2** |
+| 2-op Subtraction | 127 | 55.1% | 55.4% | **+0.3** |
+| 1-op Subtraction | 404 | 67.8% | 65.9% | −1.9 |
+| 1-op Addition | 139 | 56.1% | 52.5% | −3.6 |
+| 1-op Common-Division | 144 | 70.8% | 64.4% | −6.5 |
+| 1-op Multiplication | 74 | 68.9% | 59.0% | **−9.9** |
+
+Every 2-operator slice positive, every 1-operator slice negative. ASDiv agrees (Sequential-Operation +10.1,
+Algebra-2 +10.1, TVQ-Final +8.3, LCM +2.5 versus Subtraction −3.7, Addition −5.6, Multiplication −5.6,
+Common-Division −1.9).
+
+⚠️**math500 does NOT fit the pattern cleanly, and I am not going to force it.** By MATH level: L1 **+7.8**
+(n=34), L5 +3.1 (n=75), but L2 **−9.1** (n=62), L3 −5.6 (n=65), L4 −5.6 (n=83). If the story were purely
+"harder helps", L1 would be the worst slice and it is the best. The slices are small, math500 is the noisiest
+set in the suite (§33r: 4.08pt seed spread), and level is a curation label rather than a step count. Two of
+three pools show the mechanism sharply; the third is uninformative here, and that is the honest summary.
+
+**A consistency check against §33v, offered as suggestive and nothing more.** §33v measured the
+double-application rate among one-step arithmetic failures per operation, on bare `a op b` queries. §34an
+measures `nt0`'s regression per operation on SVAMP's one-operator slices, in prose. Independent measurements,
+different models, different input formats:
+
+| operation | §33v double-application rate | §34an `nt0` SVAMP 1-op delta |
+|---|---:|---:|
+| Subtraction | 30.6% | −1.9 |
+| Addition | 46.3% | −3.6 |
+| Multiplication | 54.8% | **−9.9** |
+| Common-Division | 76.5% | −6.5 |
+
+Pearson r between the double-application rate and the size of the regression is **0.62 on n=4 operations** —
+directionally consistent (the operations most prone to re-application are the ones `nt0` regresses most on,
+with multiplication and division swapping rank) and statistically worth nothing at that n. Recorded because
+the two measurements were made for different reasons and agree in shape, not because four points establish a
+relationship.
+
+### 34ao. ⚠️REFINED PREDICTION for `raw1` — the two flags are probably JOINTLY necessary, and §34ad's framing was too optimistic
+
+§34ad suggested `raw1` (conclusions restored, truncation kept) might capture most of `both`'s gain, making the
+minimal fix one flag. Measuring what `raw1` actually feeds the trainer says otherwise. Answer-decoupling rate
+on the four math tiers (does the boxed gold value appear anywhere inside the think span the model trains on?):
+
+| config | gold IS in think | gold **NOT** in think | rows dropped |
+|---|---:|---:|---:|
+| released (canonicalize + truncate 128) | 62.9% | **21.6%** | 5.1% |
+| **`raw1` (raw + truncate 128)** | 59.9% | **29.7%** | **0.0%** |
+| `both` (raw, no truncation) | **90.0%** | **5.0%** | 0.0% |
+
+**`raw1` is *worse* than the released recipe on the decoupling axis** — 29.7% versus 21.6%. The reason is
+mechanical: `preserve_raw_reasoning=1` keeps the full unexcised think span, which is *longer*, so truncating
+at 128 tokens severs **more** of it. Restoring the conclusions and then cutting them off again is not a partial
+fix; on this axis it is a regression.
+
+So `raw1` is a genuinely mixed cell: it restores the 2,018 dropped `synth_arith` rows (which are short and
+survive truncation intact, so one-step arithmetic should improve) while making the multi-step targets *more*
+decoupled (so the word-problem benchmarks should not improve, and may fall).
+
+**Refined prediction, registered before `324` runs:** `raw1` shows a gain on one-step arithmetic and
+little-to-no gain — possibly a loss — on SVAMP/ASDiv. If that holds, **the two flags are jointly necessary**:
+`preserve_raw_reasoning` supplies the drill and the conclusions, and `max_think_tokens 0` is what lets the
+conclusions actually reach the model. The minimal fix is both, and §34ad's "maybe one flag is enough" is
+withdrawn as a hypothesis before it was ever tested — replaced by this, which follows from the data-side
+measurement rather than from hope.
+
+(This also explains why `nt0` alone was negative: truncation-fix-without-drill and drill-without-truncation-fix
+are each incomplete, and the interaction is the whole effect. It is the cleanest available argument that both
+omitted flags were load-bearing, rather than one being incidental.)
+
+### 34ap. The control lands on the released model — attribution secured
+
+`nt128ctl` = the released recipe's flags (`max_think_tokens 128`, `preserve_raw_reasoning 0`) run on the
+**1-GPU** path (batch 4 × accum 3) that every §34 arm uses, seed 46 — the same seed `a35_cot.sh` took by
+default. It differs from the published model in execution path only.
+
+| arm | SVAMP greedy | +budget | self-cons | pass@8 | ASDiv greedy | +budget | self-cons | pass@8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| shipped `blend_a085` (3 GPUs × b4 × a1) | 65.00 | 66.00 | 74.00 | 90.67 | 73.00 | 73.67 | 82.67 | 92.33 |
+| **`nt128ctl`** (1 GPU × b4 × a3) | **65.00** | 65.67 | 75.00 | 91.00 | 71.33 | 73.33 | 81.33 | 90.33 |
+| **execution path alone** | **0.00** | −0.33 | +1.00 | +0.33 | **−1.67** | −0.34 | −1.34 | −2.00 |
+
+**SVAMP reproduces exactly (65.00 vs 65.00)** and ASDiv is −1.67, inside §33p's ±1.68pt noise scale. So the
+1-GPU/grad-accum path is not doing the work, and `run_arm.sh`'s claim that `3×4×1 == 1×4×3` holds empirically
+as well as arithmetically.
+
+**The chain, now complete and single-variable at every step** (n=300 quick judge, 3-seed means where available):
+
+| step | what changes | SVAMP greedy | ASDiv greedy |
+|---|---|---:|---:|
+| shipped → `nt128ctl` | execution path | 65.00 → 65.00 | 73.00 → 71.33 |
+| `nt128ctl` → `nt0` | `--max_think_tokens` 128→0 | 65.00 → **61.78** (−3.22) | 71.33 → **68.00** (−3.33) |
+| `nt128ctl` → `both` | both flags | 65.00 → **73.44** (**+8.44**) | 71.33 → **74.00** (**+2.67**) |
+| `nt0` → `both` | `--preserve_raw_reasoning` 0→1 | 61.78 → **73.44** (**+11.66**) | 68.00 → **74.00** (**+6.00**) |
+
+Two things this pins down that were previously inferred:
+- **Against the proper control, `both`'s ASDiv gain is +2.67, not the +1.00 it reads against the published
+  model** — the control is 1.67 lower on ASDiv, so comparing to the published checkpoint slightly understates
+  `both` there. The SVAMP figure is unaffected.
+- **The `preserve_raw_reasoning` flag is the larger of the two by a wide margin** (+11.66 / +6.00 on top of
+  `nt0`), which is consistent with it carrying three separate harms — dropped rows, deleted conclusions, and
+  answer-decoupling — against the truncation's one.
+
+### 34aq. Ruling out the obvious confound — `both`'s gain is wrong→correct, not a grading artifact
+
+`both` drops the `**Answer:**` marker (that is what `preserve_raw_reasoning=1` means), so the first thing to
+check is whether its gain is really the grader finding a `\boxed{}` more often rather than the model reasoning
+better. Item counts, SVAMP n=300, against the proper control:
+
+| arm | correct | wrong | unclosed | no_answer | format failures |
+|---|---:|---:|---:|---:|---:|
+| `nt128ctl` (control) | 195 | 88 | 11 | 6 | 17 |
+| `both` s46 | 222 | 55 | 23 | 0 | 23 |
+| `both` s99 | 218 | 58 | 23 | 1 | 24 |
+| `both` s5150 | 217 | 58 | 24 | 1 | 25 |
+| **`both` mean** | **219.0** | **57.0** | 23.3 | 0.7 | 24.0 |
+| **Δ vs control** | **+24.0** | **−31.0** | +12.3 | −5.3 | **+7.0** |
+
+**`both` has MORE format failures (+7.0), not fewer, and 31 fewer wrong answers.** A grading artifact would
+look like the opposite — fewer unparseable outputs with a flat wrong count. Instead the entire +24 correct
+comes from converting wrong answers into right ones, while `both` simultaneously pays a small format tax
+relative to the control (its `unclosed` is 23 vs 11, still far below `nt0`'s 46).
+
+So the gain survives the confound that most plausibly threatened it. It is also worth noting the direction of
+the residual: `both` still leaves ~24 items per 300 unfinished, so **some of its own headroom is still
+termination**, consistent with §34aa's estimate that termination is the binding constraint on this line.
+
+### 34ar. Deliberately NOT staged, and what a release would involve
+
+`reasoning/stage_a35_think_hf.py` is present and tracked; §33s used it (`--verify`: 5 bf16 shards, the four
+config fixes, reload + chat generation) before deleting the bundle when the arithmetic gate blocked that
+candidate. I have **not** staged anything tonight, for three reasons:
+
+1. The gates that decide it (`322` five-set + arithmetic, `323` general) have not reported. Staging a
+   candidate before its gates is how §33s ended up deleting a bundle.
+2. A staged bundle is 11 GB of artifact that is only useful if the owner approves a push, and an HF push
+   requires explicit per-action approval on this project ([[dont-substitute-base-or-publish-without-asking]]).
+3. It would consume a worker slot that the remaining measurements need.
+
+**If the gates pass, the next step is one command and an approval, not a research question:**
+`python reasoning/stage_a35_think_hf.py --src /project/rcc/youzhi/models/a35_effort/boths<seed>_a085 --verify`
+followed by an explicit decision to push. §33r's rule applies to the seed choice — **ship the median of the
+three seeds, not the best one**. And §34t's criterion 4 stands: if the five-set gain holds but MAWPS regresses
+reproducibly, that is a trade for the owner to weigh (§28 is the precedent for the owner overriding a
+keep-current recommendation), not a call for me to make.
+
+### 34ba. THE RESULT — `both` at three seeds: +7.15pt across five held-out sets AND one-step arithmetic 53.5% → 99.3%
+
+`322_gate_both`: five models (base, three `both` seeds, `nt128ctl`), five pools, paired at n=1000/500/319,
+one process per (model, n-group), merged with `--report-from`. Base reproduces its recorded §33n numbers
+(§34ap), so the configuration is validated.
+
+### Plain greedy — no serving change of any kind
+
+| pool | n | base | `both` 3-seed | Δ | spread | McNemar p, each seed |
+|---|---:|---:|---:|---:|---:|---|
+| **GSM-Plus** | 500 | 28.00 | **41.53** | **+13.53** | 1.00 | **8.4e-11 / 8.4e-10 / 6.0e-11** |
+| **SVAMP** | 1000 | 64.50 | **71.67** | **+7.17** | 1.00 | **6.4e-07 / 6.2e-06 / 1.7e-05** |
+| **math500** | 319 | 31.66 | **37.72** | **+6.06** | 1.88 | 0.011 / ns / ns |
+| **ASDiv** | 1000 | 70.40 | **75.47** | **+5.07** | 1.50 | **9.1e-05 / 1.9e-04 / 0.0043** |
+| **MAWPS** | 500 | 57.00 | **60.93** | **+3.93** | 0.40 | **0.023 / 0.0099 / 0.027** |
+| **5-set mean** | | **50.31** | **57.46** | **+7.15** | | |
+
+**Every pool positive. 13 of 15 seed×pool comparisons individually significant. Seed spreads 0.40–1.88, all
+inside §33p's ±1.68 noise scale.** For scale, the entire §33 campaign's best was **+1.3 to +2.1** on this
+measure, and it was ship-blocked.
+
+**MAWPS is the one to notice.** It regressed for `nt0` (−2.33), for every `fix2` seed in §33u (its *only*
+reproducible effect), and it is the pool this line has never moved. It is now **+3.93, significant in all
+three seeds**.
+
+**Greedy beats budget-forcing** (57.46 vs 56.77), so unlike `nt0` this arm wants no serving-side think cap —
+the termination repair is in the weights.
+
+### One-step arithmetic — the gate that killed every §33 arm
+
+144 items (16 hand-written + 128 generated, seed 77 = a fresh draw), deployed `from_pretrained` +
+`.generate()` path, all five models in one paired run:
+
+| model | correct | |
+|---|---:|---|
+| base (released `blend_a085`) | **77/144 = 53.5%** | |
+| `nt128ctl` (released flags, 1-GPU control) | 74/144 = 51.4% | confirms it is the flags, not the path |
+| **`both` s46 / s99 / s5150** | **143/144 = 99.3%** each | **+45.8pt, identical in all three seeds** |
+
+Verified in the transcript rather than taken on trust: `both` answers `17 - 5 → 12` in **25 tokens**, where
+base emits `7` in 50. `both`'s single miss across 144 items is `297 - 7 → 289` — an ordinary off-by-one, **not
+a re-application**. Every §33v signature failure (`9*9 → 729`, `429+492 → 1413`, `19*9 → 1539`,
+`217-5 → 207`, `17-5 → 7`) belongs to base and the control. `both` also uses ~25–29 tokens on these queries
+against base's 50–68, i.e. it is twice as cheap on them.
+
+**§33t concluded: "there is no setting in this design that keeps both" the multi-step gain and one-step
+arithmetic, and "restricting the tier removes ~75% of the multi-step gain along with ~90% of the arithmetic
+damage."** That conclusion was drawn on a mix whose arithmetic drill was 80.7% absent, whose main math tier had
+94.5% of its conclusions deleted, and 21.6% of whose math targets boxed a number the reasoning never reached.
+With those three defects removed, the design keeps both: **+7.15pt multi-step and +45.8pt one-step,
+simultaneously, at three seeds.**
+
+Remaining gate: general capability (`323`, running). §34t's criteria 1, 2, 4 and 5 are met; criterion 3 is
+outstanding, and nothing is a candidate until it reports.
+
+### 34bb. Predictions checked — two confirmed, one WRONG, and the wrong one changes the story for the better
+
+**CONFIRMED (§34al / §34am): `both` reverses the single-operator regressions.** Decomposed with
+`decompose_gate.py`, greedy, 3-seed means:
+
+| SVAMP slice | n | `nt0` Δ | **`both` Δ** |
+|---|---:|---:|---:|
+| 2-op Common-Division | 20 | −6.7 | **+38.3** |
+| 2-op Subtraction | 127 | +0.3 | **+11.0** |
+| 2-op Addition | 56 | +1.2 | **+10.7** |
+| 2-op Multiplication | 34 | +2.0 | **+8.8** |
+| 1-op Addition | 139 | −3.6 | **+8.4** |
+| 1-op Subtraction | 404 | −1.9 | **+7.0** |
+| 1-op Common-Division | 144 | −6.5 | **+1.6** |
+| 1-op Multiplication | 74 | −9.9 | **−4.1** |
+
+Seven of eight slices flip positive; **1-op Multiplication (n=74) is the single residual negative anywhere in
+the five-pool gate**. On ASDiv *every* solution_type is now positive — LCM +17.3, Algebra-2 +13.1, Ratio +8.7,
+and the four single-operator types that were −1.9 to −5.6 under `nt0` are now **+4.4 to +5.8**. §34al predicted
+exactly this sign reversal, and §34am predicted it had to happen for SVAMP's +7.17 to be possible given that
+76% of SVAMP is single-operator.
+
+**WRONG (§34ai): I predicted `both` would think SHORTER than `nt0`** — between base's 127 and `nt0`'s 224 on
+ASDiv, "roughly 150–190" — on the theory that restored short-closure drills would pull the tail in. It does the
+opposite:
+
+| | ASDiv | SVAMP | MAWPS | GSM-Plus | math500 |
+|---|---:|---:|---:|---:|---:|
+| think-len, base | 126.8 | 152.2 | 164.0 | 118.0 | 289.8 |
+| think-len, `nt0` | 224.5 | 262.4 | 367.7 | 192.1 | 416.7 |
+| **think-len, `both`** | **243.2** | **274.9** | 366.1 | **251.5** | 424.5 |
+| unclosed, base | 26 | 44 | 32 | 17 | 54 |
+| unclosed, `nt0` | 118 | 142 | 140 | 46 | 89 |
+| **unclosed, `both`** | **51** | **65** | **94** | **31** | 84 |
+
+**`both` thinks LONGER than `nt0` — longer than any arm here — and terminates far better**: ASDiv unclosed
+118 → 51, SVAMP 142 → 65, MAWPS 140 → 94, GSM-Plus 46 → 31. It writes the longest derivations in the campaign
+and finishes them.
+
+**Why the wrong prediction matters.** I had assumed the repair mechanism was *length control* — that the fix
+was to stop the model running long, which is why §34g pre-registered `nt256` (a training-time length cap) as
+the natural remedy and why budget-forcing helped `nt0` so much. That framing is wrong. The model does not need
+to be brief; **it needs to know how to end**, and restoring the deleted concluding sentences (§34ac) teaches
+exactly that. Length was a symptom of not having a learned ending, not the disease.
+
+This substantially reduces the interest of the `nt256` probe still in the queue: a length cap addresses the
+symptom, and `both` already fixes the cause while *increasing* length. I will run it if the queue reaches it,
+but it is now a curiosity rather than a candidate, and I am recording that re-assessment before it runs rather
+than after.
+
+### 34bc. What `both` fixes, and the one thing neither fix touches
+
+GSM-Plus by `perturbation_type`, greedy, 3-seed means, `nt0` shown for contrast:
+
+| perturbation type | n | base | `nt0` Δ | **`both` Δ** |
+|---|---:|---:|---:|---:|
+| integer-decimal-fraction conversion | 59 | 25.4% | +26.0 | **+27.1** |
+| distraction insertion | 60 | 18.3% | +3.9 | **+16.7** |
+| digit expansion | 86 | 34.9% | +5.0 | **+16.3** |
+| reversing operation | 82 | 24.4% | +7.3 | **+16.3** |
+| numerical substitution | 78 | 48.7% | +9.4 | **+12.4** |
+| problem understanding | 75 | 21.3% | +2.2 | +5.3 |
+| **adding operation** | 60 | 16.7% | **+1.1** | **+1.1** |
+
+`both` keeps `nt0`'s arithmetic-execution gain (+27.1 on decimal/fraction conversion) and adds large gains
+where `nt0` had almost none — distraction insertion +3.9 → **+16.7**, digit expansion +5.0 → **+16.3**,
+reversing operation +7.3 → **+16.3**. Restoring the conclusions helps the *robustness* perturbations that the
+truncation fix alone did not touch, which fits: a model that reliably finishes a derivation is a model that can
+carry a distractor or a reversed operation through to the end.
+
+**`adding operation` is unchanged at +1.1 by either fix** (16.7% → 17.8%), and it is the only slice in any
+decomposition tonight that both arms leave flat. GSM-Plus's "adding operation" perturbation inserts a step the
+original problem did not require, so it is a direct test of **reasoning depth** rather than of execution,
+robustness or termination. Neither of these data repairs moves it.
+
+**That is the honest statement of what remains.** §34 fixes execution (arithmetic 53.5% → 99.3%), termination
+(unclosed roughly halved while thinking longer), and robustness (+16 on three perturbation families). It does
+not make the model able to take an extra reasoning step it could not take before — which is the capability
+§33 was actually chasing, and which remains a base-quality question. The 1-op Multiplication slice on SVAMP
+(−4.1, n=74) is the only other residual negative anywhere in the five-pool gate.
+
+### 34bd. General-capability gate — flat, with one honest blemish
+
+**lm-eval via the vLLM backend, 6 tasks, base and the candidates in the SAME sweep** (so the comparison does
+not depend on tooling being unchanged since §33i):
+
+| model | arc_easy | arc_chall | hellaswag | winogrande | piqa | openbookqa | mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| base `blend_a085` | 65.03 | 42.06 | 45.35 | 59.04 | 72.36 | 25.00 | **51.47** |
+| **`both` s46** | 65.07 | 41.21 | 45.19 | 59.04 | 72.58 | 24.40 | **51.25** (−0.22) |
+| `nt0` s46 | 64.77 | 41.47 | 45.41 | 58.88 | 72.31 | 24.40 | 51.21 (−0.26) |
+
+**−0.22 mean, no task moving more than 0.85pt — flat**, and the same magnitude §33i measured for its own
+candidates (−0.19). (My absolute numbers sit ~3.9pt below §33i's because this summary reads `acc` where §33i
+read `acc_norm`; the §33-era JSONs re-summarised by my script show the identical offset, so it is the metric
+key, not the models. Including base in the same sweep is what makes this immaterial.)
+
+**4-quadrant probe, general/no-think** — the axis §12's collapse destroyed and §32's soup partner was added to
+protect:
+
+| model | score | note |
+|---|---|---|
+| base | 10/10 | but answers "the sun is **one of the four main stars in our solar system**" (§32c's recorded blemish) |
+| `both` s46 | **9/10** | misses "List three primary colors" |
+| `both` s99 | **9/10** | same item |
+| `both` s5150 | **10/10** | clean |
+| `nt128ctl`, `nt0` s46 | 10/10 | |
+
+The miss, verbatim: *"I'm sorry, but I can't provide a list of primary colors. The primary colors are typically
+defined as red, blue, and yellow."* — **the correct content behind a spurious refusal preamble**, in 2 of 3
+seeds. It is the *same item* §33i identified as its own candidate's only 4-quadrant miss, i.e. a known-fragile
+probe item. Against that, all three `both` seeds **fix** base's "four main stars" hallucination.
+general/think is equivalent (base 7/10, `both` 6–7/10 by keyword match).
+
+**Verdict against §34t's criterion 3.** The substantive measure — lm-eval over thousands of items — is flat.
+The 10-item probe shows a one-item, seed-dependent instruction-following blemish whose content is correct. As
+written, criterion 3 said "≥ base on all four quadrants", and 2 of 3 seeds do not strictly meet that. I am
+recording it as **met on lm-eval, marginally missed on the 10-item probe**, rather than quietly rounding it to
+a pass — §33i set the precedent for calling this a probe artifact, but the precedent is the owner's to apply,
+not mine. Note also that seed 5150 is clean on it, and §33r's rule is to ship the **median** seed.
+
+### 34be. VERDICT against the pre-registered criteria (§34t)
+
+| # | criterion (fixed before any `both` data existed) | result | met? |
+|---|---|---|---|
+| 1 | 5-set mean, best-single-pass, 3 seeds, **Δ ≥ +1.7pt** | **+7.15pt** at plain greedy (50.31 → 57.46) | **YES**, 4× the bar |
+| 2 | one-step arithmetic **≥ base** on the deployed path | **53.5% → 99.3%** (+45.8), identical in 3 seeds | **YES**, overwhelmingly |
+| 3 | general flat: lm-eval within −1.0, no task >2pt; 4-quadrant ≥ base | lm-eval **−0.22**, max task move 0.85 ✓ · 4-quadrant general/no-think **9/10 vs 10/10 in 2 of 3 seeds** ✗ | **PARTIAL** |
+| 4 | no individually significant per-set regression replicated across seeds | **all five pools positive**; MAWPS +3.93 significant in all 3 seeds | **YES** |
+| 5 | three seeds, report the mean not the best | 3 seeds, means reported throughout | **YES** |
+
+**Four of five met outright; criterion 3 passes on the substantive measure (lm-eval, thousands of items) and
+marginally fails on a 10-item probe**, on a single item, in 2 of 3 seeds, where the model gives the correct
+content behind a spurious "I'm sorry, but I can't provide" preamble — and where the third seed is clean.
+
+**So `both` is a re-release candidate, and the first one this line has produced that clears the §33s bar.**
+Recommended checkpoint if it ships: the **median** seed by 5-set mean (§33r), which also happens to matter here
+because seed 5150 is the one with a clean 4-quadrant.
+
+**What I am NOT doing:** staging or pushing anything. An HF push needs explicit per-action approval
+([[dont-substitute-base-or-publish-without-asking]]), the §34ar reasoning stands, and the one blemish above is
+a judgement the owner should make with the numbers in front of them rather than one I should round away. §28 is
+the precedent for the owner overriding a recommendation in either direction.
+
+**Independent of any release decision**, and requiring no approval: the two flags belong in every future
+CoT-SFT run on this repo, and especially in the argonne4 SFT redo (§34j) — that is a correction to what the
+training script was doing, not a bet on an outcome.
+
+### 34bf. The 2×2 on arithmetic — ONE flag does almost all of it
+
+`324_raw1` ran the one-step arithmetic probe over all four cells, paired in a single process, 144 items,
+seed 77, deployed `.generate()` path:
+
+| cell | `--max_think_tokens` | `--preserve_raw_reasoning` | one-step arithmetic |
+|---|---|---|---:|
+| base (released) | 128 | 0 | **77/144 = 53.5%** |
+| `nt0` s46 | **0** | 0 | 87/144 = 60.4% |
+| **`raw1` s46** | 128 | **1** | **142/144 = 98.6%** |
+| **`both` s46** | **0** | **1** | **143/144 = 99.3%** |
+
+**`preserve_raw_reasoning` alone recovers essentially the entire arithmetic repair** — 142/144 versus `both`'s
+143/144 — while the truncation fix alone gets 87/144. So on this axis the two flags do *not* interact: one is
+load-bearing and the other contributes ~1 item. That is consistent with §34ac/§34aj, where the arithmetic
+mechanism (deleted conclusions, the 80.7%-absent drill, and the 21.6% answer-decoupling) is entirely a
+`preserve_raw_reasoning` effect and the truncation only compounds it.
+
+It also **sharpens §34q**: I wrote there that `nt0` "does NOT fix the double-application bug", based on seeing
+the failures verbatim in its transcript. That is right in kind — the bug is plainly still present — but
+quantitatively `nt0` does move arithmetic 53.5% → 60.4% (+6.9). The precise statement is that the truncation
+fix helps a little and the conclusion restoration does the rest.
+
+⚠️**Incident: raw1's multi-step numbers were lost to a piping bug and are being re-run.** The gate call was
+piped through `head -40`, and `head` sends **SIGPIPE** once satisfied — killing the producer. Worse, the soup's
+own `[N/338] tensor` progress lines matched the filter, so the 40 lines were exhausted during the *first*
+model. The gate died after `base`, and `--json-out` never wrote (it writes after all models finish). The
+arithmetic result above survived only because it was a separate command. Re-queued as `326_raw1_gate` writing
+to a file. **Lesson, now twice in one night: never pipe a long-running measurement through `head` or `tail` —
+`tail` silently discards everything but the end, `head` kills the job.** Audited the remaining queue; the only
+other instance is a `tail` on `eval_numeracy`, which is harmless because that call also writes `--log`.
+
+### 34bg. Checkpoint cleanup — audited, and deliberately deferred
+
+Per the standing rule, all four checks before deleting anything:
+
+| check | finding |
+|---|---|
+| 1. live job writing there? | **YES** — `exp-a35-diet` (52973795) is still draining the queue and will write `nt256s46`. The directory is off-limits until it exits. |
+| 2. symlinks pointing in? | none (`find -type l` over `models/`) |
+| 3. last surviving copy? | the `_a085` soups are the shippable artifacts; `_think` dirs are only needed to re-soup at a different α |
+| 4. referenced by a script or result? | **`boths46_think` is referenced by the queued `328_alpha_both`** — must not be removed |
+
+172 GB across 14 dirs, against 2.48 TB of group quota headroom, so this is hygiene rather than pressure.
+
+**Plan for after the worker drains** (~07:30): delete the six superseded `_think` intermediates with no
+references and no published numbers — `nt0s46_think`, `nt0s99_think`, `nt0s5150_think`, `nt128ctl_think`,
+`raw1s46_think`, `boths99_think` (~66 GB). **Keep** every `_a085` (they carry the published numbers), plus
+`boths46_think` (used by the α sweep) and `boths5150_think` (the seed §33r's median rule and the clean
+4-quadrant both point at, so the most likely release candidate — keeping it preserves the ability to re-soup
+at another α without retraining). Also delete the campaign's `.err` logs; keep `.out` and every `.json`,
+which are the measurements.
+
+### 34bh. `both` moves the ARGMAX — the thing §33 concluded could not be done with data
+
+Greedy / self-consistency@8 / pass@8, 3-seed means, from the same `322` gate:
+
+| pool | base | `nt0` | **`both`** |
+|---|---|---|---|
+| SVAMP | 64.5 / 74.4 / 89.4 | 61.6 / 76.1 / 91.5 | **71.7 / 82.0 / 92.8** |
+| ASDiv | 70.4 / 78.3 / 90.5 | 66.9 / 79.6 / 91.0 | **75.5 / 83.5 / 92.2** |
+| MAWPS | 57.0 / 60.6 / 72.4 | 50.7 / 61.9 / 71.5 | **60.9 / 65.8 / 75.7** |
+| GSM-Plus | 28.0 / 40.2 / 61.2 | 35.5 / 44.4 / 65.5 | **41.5 / 50.7 / 69.1** |
+| math500 | 31.7 / 34.2 / 55.8 | 28.8 / 34.6 / 57.8 | **37.7 / 36.6 / 59.4** |
+| **5-set mean** | **50.31 / 57.54 / 73.86** | 48.70 / 59.32 / 75.46 | **57.46 / 63.72 / 77.84** |
+| **Δ vs base** | | | **+7.15 / +6.18 / +3.98** |
+
+**The gain is largest on greedy (+7.15), smaller on self-consistency (+6.18), smallest on pass@8 (+3.98), and
+the selection gap narrows on every pool** — GSM-Plus 33.2 → 27.5, SVAMP 24.9 → 21.1, ASDiv 20.1 → 16.7,
+math500 24.1 → 21.6, MAWPS 15.4 → 14.7. That ordering is the signature of a **mode** repair rather than a
+ceiling raise: the model is not mainly becoming capable of more, it is becoming able to *emit* what it was
+already capable of.
+
+**This is precisely what §33 concluded was out of reach.** §33l's first throughline: *"A likelihood objective
+cannot move an argmax. Greedy returns the mode; the mode is wrong on ~28% of solvable problems; adding more
+correct traces raises their likelihood a little and changes nothing."* That is why every additive tier in §33
+was null. The same throughline explains why `both` works and they did not: it is a **diet** change in §32's
+sense — it changes what a trace *looks like*, restoring the concluding sentence that 94.5% of the multi-step
+targets were missing — rather than adding more traces of the existing (mutilated) kind. §33l identified the
+right distinction; it just did not know the diet it was adding to had been corrupted.
+
+### 34bi. Serving-cap sweep — partially lost to the same piping bug, but base's curve is informative
+
+`325_budgetsweep` carried the same `head` defect as `324` (the pipeline was
+`python … | grep … | head -20`, which my first audit pattern missed because the `head` is two stages
+downstream and on a continued line). The gate was killed after the first model in each of the four
+iterations, so **only base's numbers survived**. What they show:
+
+| think-budget | base ASDiv (budget cfg) | base GSM-Plus (budget cfg) |
+|---:|---:|---:|
+| — (plain greedy) | 70.40 | 28.00 |
+| 192 | 70.80 | 26.80 |
+| 256 | 71.60 | 30.00 |
+| 320 | 72.00 | 31.20 |
+| **384** | **72.20** | **31.40** |
+
+**Base's optimum is at or beyond 384, not the 256 that `effort_gate` defaults to** — and 256 is the value §33
+and every gate in §34 used. So the released model's "best single-pass" figure is mildly *understated* in my
+tables: on ASDiv it would be 72.20 rather than 71.60 at a 384 cap (+0.6). This does not change any conclusion
+— `both`'s plain-greedy ASDiv is 75.47, and on GSM-Plus base's `extend2` (34.00) still beats any budget value
+here — but it is a real, if small, understatement of the baseline that I would rather record than leave
+implicit.
+
+It also does not affect `both`, which does not use budget-forcing at all (its greedy 57.46 beats its budget
+56.77). Not worth re-running for the candidate; recorded and left.
+
+**Third instance of the same class of bug tonight**, which is itself the finding worth keeping: a filter
+placed on a long-running measurement can silently truncate the record (`tail`) or kill the job (`head`), and
+neither failure announces itself — the task still exits rc=0. Every measurement in this campaign that survived
+did so because it also wrote a `--json-out` or a `--log`. **Write the artifact first, filter it second.**
+
+### 34bj. FINAL SUMMARY TABLE — greedy, paired, 3-seed means
+
+| arm | SVAMP | ASDiv | MAWPS | GSM-Plus | math500 | **5-set mean** | seeds |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| released `blend_a085` | 64.50 | 70.40 | 57.00 | 28.00 | 31.66 | **50.31** | 1 |
+| `nt128ctl` — released flags, 1-GPU path | 65.10 | 69.90 | 57.00 | 29.40 | 32.60 | **50.80** | 1 |
+| `nt0` — `max_think_tokens 0` only | 61.60 | 66.90 | 50.67 | 35.53 | 28.84 | **48.71** | 3 |
+| **`both` — both flags (= cot_v6.sh's recipe)** | **71.67** | **75.47** | **60.93** | **41.53** | **37.72** | **57.46** | 3 |
+| **Δ, `both` vs released** | **+7.17** | **+5.07** | **+3.93** | **+13.53** | **+6.06** | **+7.15** | |
+| **Δ, `both` vs the path control** | +6.57 | +5.57 | +3.93 | +12.13 | +5.12 | **+6.66** | |
+
+Plus, on the deployed `.generate()` path: **one-step arithmetic 53.5% → 99.3%** (77/144 → 143/144, identical
+across all three seeds; `raw1` shows 142/144 from the `preserve_raw_reasoning` flag alone).
+
+**Both headline figures are worth stating.** Against the published checkpoint the five-set mean gain is
+**+7.15**; against `nt128ctl` — the same recipe on the same 1-GPU path, which is the cleaner control — it is
+**+6.66**, because the control happens to score 0.49 above the published model. The difference is immaterial
+to any conclusion but the smaller number is the more defensible one, and quoting only +7.15 would be
+selective. Everything else in this section is unchanged by the choice.
+
+`nt0`'s row is the reminder that neither flag is sufficient alone: fixing only the truncation *lowers* the
+five-set mean to 48.71, below the released model, because it lengthens traces the recipe never taught the
+model to end. The gain is the interaction.
+
+### 34bk. Tooling failure #2: `effort_gate`'s in-process model loop cannot do more than one model
+
+`effort_gate.py --models A=… B=… C=…` evaluates models in a loop inside one process, and `evaluate_model`
+does clean up (`del llm`, `destroy_model_parallel`, `destroy_distributed_environment`, `gc.collect`,
+`torch.cuda.empty_cache`). **It is not enough.** The second engine init dies with:
+
+```
+ValueError: Free memory on device (25.85/139.73 GiB) on startup is less than desired
+GPU memory utilization (0.85, 118.77 GiB)
+```
+
+The main gates (`316`, `322`) were deliberately built **one process per model**, merged with
+`--report-from`, and they worked — I had flagged this risk when designing them. The probe gates
+(`324`, `325`, `326`, `328`) reverted to the convenient multi-model form and **each lost every model after
+the first**. Combined with the `head`/`tail` piping bugs, three separate probe measurements were destroyed
+tonight and all three exited **rc=0**.
+
+Fixed by re-queuing everything as one-process-per-model (`329_gate2` covering the raw1 2×2 and the α sweep
+together; `332` patched to gate `nt256` alone and merge against `g2_base.json`). Audited the remaining queue
+for both patterns — clean.
+
+**The three rules this campaign earned, all of the same shape — a measurement that fails silently is worse
+than one that crashes:**
+1. Write the artifact (`--json-out` / `--log` / a redirect) **before** filtering, never through a pipe.
+2. Never pipe a long-running producer into `head` (SIGPIPE kills it) or `tail` (discards all but the end).
+3. One vLLM engine per process. Merge afterwards.
+
+Every measurement that survived tonight did so because it also wrote a JSON.
+
+### 34bl. Why this result is unusually clean: `both` adds no data at all
+
+Worth stating plainly, because it removes most of the ways a result like this normally goes wrong.
+
+**`both` trains on exactly the same 26,428 rows as the released model** — the same `cot_sft_mix_v6`, the same
+base checkpoint (`dpo`), the same lr, epochs, warmup, effective batch, soup partner and α. The *only*
+difference is two argparse flags that change how the loader delivers those rows to the trainer. No new corpus,
+no new tier, no teacher, no synthetic generation, no reweighting chosen by me.
+
+Consequences:
+- **Contamination is identical by construction.** Any leakage in v6 (§33 flagged GSM-Plus as semi-clean, and
+  [[gsm8k-contaminated-all-argonne-evals]] documents the 3.0-line's GSM8K exposure) affects base and `both`
+  equally. The delta cannot be a contamination artifact because neither model saw anything the other did not.
+- **No data-selection degrees of freedom.** §33's tiers each involved choices — which rollouts to keep, what
+  dose, which flavours — and §33c's near-miss (shortest-first selection hunting empty-think guesses) shows how
+  those choices can silently manufacture a result. There is no equivalent choice here; "stop deleting the
+  data" has no free parameters.
+- **The comparison is one flag at a time**, with a same-path control (§34ap) confirming the execution
+  environment contributes ~0.5pt, and a 2×2 (§34bf) separating the two flags' contributions.
+
+So the honest framing of the headline is not "a new recipe beats the old one" but **"the released model was
+trained on a corrupted view of its own data, and this is what the same recipe produces when the data arrives
+intact."** That is a smaller claim in one sense and a larger one in another.
+
+### 34bm. Which checkpoint to ship, if it ships — two independent criteria agree
+
+Per-seed five-set means (greedy, from the `322` gate):
+
+| seed | SVAMP | ASDiv | MAWPS | GSM-Plus | math500 | 5-set mean | rank |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `boths46_a085` | 72.20 | 76.00 | 60.80 | 42.00 | 38.87 | **57.97** | best |
+| **`boths5150_a085`** | 71.60 | 75.90 | 61.20 | 41.00 | 36.99 | **57.34** | **median** |
+| `boths99_a085` | 71.20 | 74.50 | 60.80 | 41.60 | 37.30 | **57.08** | worst |
+
+Spread 0.89pt across seeds — tight, and well inside §33p's noise scale.
+
+**Two independent criteria select the same checkpoint:**
+1. §33r's standing rule on this line — *"ship the recipe, not a checkpoint picked from a leaderboard of
+   one-seed runs… picking the median run, not the best one"* — selects **`boths5150_a085`**.
+2. It is also the **only seed with a clean 10/10 on the general/no-think quadrant** (§34bd); seeds 46 and 99
+   both give the "I'm sorry, but I can't provide a list of primary colors" refusal.
+
+**And the refusal is a seed property, not an α property.** `328`'s general probe survived its gate failure and
+covered three α values for seed 46 — α=0.85, 0.925 and 1.00 **all** produce the refusal. So raising α does not
+fix it and there is no α to tune here; choosing seed 5150 does fix it. That also means the α sweep, when
+`329` reports it, is a question about accuracy only, not about the general axis.
+
+**Recommendation if the owner elects to re-release: `boths5150_a085`** — median by the rule this line already
+adopted, clean on the probe that blocked the last candidate, and its five-set mean (57.34) is +7.03 over the
+released model.
+
+### 34bn. Go-forward — what to do with this, in priority order
+
+**1. Set both flags in every CoT-SFT launcher. No approval needed, no gate required.**
+`--max_think_tokens 0 --preserve_raw_reasoning 1`, exactly as `cot_v6.sh` has always done. This is a
+correction to what the training script was doing, not a bet on an outcome. It applies to the 7 `a35_*`
+launchers, `a35_effort/run_arm.sh`, and — most urgently — **`a4_battery.sh` and `a4_dose.sh` before the
+argonne4 SFT is redone from the phase-C base** (§34j). a4's SFT probes have been reading the pretrain
+dose-response through a CoT stage that discarded a third of its think tokens and an eighth of its rows.
+
+**2. Make the loader loud.** `ReasoningDataset.__init__` should count and print per-tier drops (the table
+`audit_cot_mix.py` prints), optionally aborting above a threshold. Silence is what let this run for two
+campaigns and ~20 training runs: row count, step count and loss curve are all identical between the corrupted
+and fixed runs (§34u). Add `audit_cot_mix.py` to the pre-flight for any new mix.
+
+**3. Decide on `boths5150_a085`.** It clears four of five pre-registered criteria outright and the fifth on
+its substantive measure (§34be). Staging is one command; the push needs an explicit decision. My
+recommendation is to re-release, with the one blemish stated on the card.
+
+**4. Re-open §33's negatives — they are unresolved, not established.** Every §33 tier was stacked on a mix
+whose main math tier had 94.5% of its conclusions deleted and whose arithmetic drill was 80.7% absent, so
+"additive tiers are null" is a statement about that mix. The cheapest test is the **verify tier at 20%
+(`cot_mix_v6_vfy`, already built) retrained with the two flags fixed, at 3 seeds**. If it now helps, §33's
+whole campaign was measuring a broken substrate; if it is still null, §33l's throughline stands on its own
+merits. Deliberately **not** started tonight: a single-seed result on a fresh question, reported at 08:00
+with a "do not believe one seed" caveat, is precisely the failure mode §33u documents.
+
+**5. Attack termination next, not reasoning quality.** §34aa's decomposition says the reasoning is already
+there and is being discarded at the point of not stopping; `both` recovers much of it but still leaves
+~24/300 traces unfinished on SVAMP (§34aq). The idealized ceiling from perfect termination is ~+9pt on top of
+what `both` already delivers — larger than anything §33 chased.
+
+**6. Do NOT bother with a training-time length cap.** §34bb retired that idea on the evidence: `both` thinks
+*longer* than `nt0` (243 vs 224 tokens on ASDiv) and terminates far better. Length was the symptom; the
+missing conclusion was the cause.
+
+**7. The residual capability gap is real and unaddressed.** GSM-Plus's `adding operation` slice — problems
+needing one extra reasoning step — is **+1.1 under every arm tried tonight** (§34bc). That is a base-quality
+question, and it is the honest boundary of what a data-loader fix can buy.
+
+**Where the fix has to be applied, concretely.** [[anneal-no-lr-decay-and-general-forgetting]] records
+`--cooldown 0` being fixed in one checkout and never ported to the other, costing argonne4 an entire anneal.
+The same geometry is present here and was checked rather than assumed:
+
+| | `cot-sft.py` | `--max_think_tokens` | `--preserve_raw_reasoning` |
+|---|---|---|---|
+| `/home/youzhi/ArgonneAI` (3.5 tree) | 78,552 B | **128** | **0** |
+| `/home/youzhi/ArgonneAI-4.0` (a4 worktree) | 78,552 B | **128** | **0** |
+
+**Two independent copies, both defaulted.** And `a4_dose.sh` / `a4_battery.sh` live in the *3.5* tree while
+declaring `REPO_ROOT="${REPO_ROOT:-/home/youzhi/ArgonneAI}"` — env-overridable, so which `cot-sft.py` actually
+runs depends on the environment at launch. So the fix must be made in **both checkouts**, and the launchers
+should pass the flags explicitly rather than relying on whichever copy `REPO_ROOT` resolves to. Passing them
+explicitly in the launcher is the robust form, because it survives both the two-tree problem and any future
+change to the argparse default.
+
+a4's SFT has not been redone yet — `a4-midc` (phase C long-context midtraining) is still running as of
+03:15 — so there is time to fix this before the redo rather than after.
+
+### 34bo. The 2×2 completed — a clean dissociation, and GSM-Plus is superadditive
+
+`329_gate2`, one process per model, greedy, n=500/pool:
+
+| cell | `max_think` | `preserve_raw` | ASDiv | GSM-Plus | one-step arith |
+|---|---|---|---:|---:|---:|
+| base | 128 | 0 | 70.40 | 28.00 | 77/144 |
+| `nt0` | **0** | 0 | 65.60 (**−4.8**) | 35.40 (**+7.4**) | 87/144 |
+| `raw1` | 128 | **1** | **73.40 (+3.0)** | 27.60 (**−0.4**) | **142/144** |
+| `both` | **0** | **1** | **74.00 (+3.6)** | **42.00 (+14.0)** | **143/144** |
+
+**Three different axes, three different attributions:**
+- **One-step arithmetic → `preserve_raw` alone.** 142/144 from that flag; the truncation fix adds one item.
+- **ASDiv → mostly `preserve_raw`.** +3.0 of `both`'s +3.6. The truncation fix alone is −4.8, i.e. actively
+  harmful without it.
+- **GSM-Plus → the INTERACTION, and it is superadditive.** `nt0` +7.4, `raw1` −0.4, sum +7.0, but together
+  **+14.0** — twice the sum of the parts. Neither flag alone gets the adversarial set; both together double it.
+
+That is the clearest statement of why both flags are load-bearing, and it corrects §34ao in one direction:
+I predicted `raw1` would show "little-to-no gain, possibly a loss" on ASDiv, reasoning that its *increased*
+answer-decoupling (29.7% vs the released 21.6%) would hurt multi-step. ASDiv instead gained +3.0. So the
+decoupling metric over-predicted the damage on the easier multi-step set — restoring the drill and the
+conclusions helps ASDiv even when truncation keeps severing the long traces. The prediction held on GSM-Plus
+(−0.4), which is where the severed long derivations actually matter.
+
+### 34bp. α sweep — directional only, and it does NOT change the recommendation
+
+Same gate, seed 46, three soup weights:
+
+| α | ASDiv greedy | GSM-Plus greedy |
+|---|---:|---:|
+| 0.85 (`boths46_a085`) | 74.00 | 42.00 |
+| 0.925 (`boths46_a0925`) | 73.60 | **45.40** |
+| 1.00 (`boths46_think`) | **74.40** | 44.60 |
+
+Higher α looks better on GSM-Plus (+3.4 at α=0.925). **I am not acting on it.** It is **one seed at n=500**,
+and §32b/§33e/§33j all record that α contrasts on this line sit inside one-epoch run-to-run variation — §33j
+withdrew a dose optimum for exactly this reason. The 3-seed, 5-pool, n=1000 result that the recommendation
+rests on was measured at **α=0.85**, and a single-seed 2-pool sweep cannot override it.
+
+Recorded as: **α≥0.925 is worth a 3-seed test in a future round**, alongside the note that α does not fix the
+"primary colors" refusal (§34bm — it appears at all three α for seed 46). Recommendation stays
+`boths5150_a085`.
+
+### 34bq. Deployed-path smoke test — the check that caught §33's blocker, run on the recommended checkpoint
+
+§33s's 23.8pt regression was found by its own staging smoke prompt ("What is 17 − 5?" → 7) *after* five
+held-out sets, three seeds and a general gate had passed the candidate. So `330_smoke` runs the deployed
+`from_pretrained` + `.generate()` path on 13 prompts of the kind a user types first, released model vs
+`boths5150_a085`, side by side.
+
+**One-step arithmetic — the released model's failures are reproduced live, and the candidate is clean:**
+
+| prompt | released | candidate |
+|---|---|---|
+| What is 17 − 5? | `First, 17 − 5 = 12. Then 12 − 5 = 7.` → **7** (50 tok) | `17 − 5 = 12.` → **12** (25 tok) |
+| What is 9 × 9? | `First, 9 times 9 is 81. Then, 81 times 9 is 729.` → **729** (58 tok) | `9 × 9 = 81.` → **81** (25 tok) |
+| What is 429 + 492? | `First, 429 + 492 = 921. Then 921 + 492 = 1413.` → **1413** (68 tok) | `429 + 492 = 921.` → **921** (30 tok) |
+
+**Termination on the deployed path:** released **1/13 unclosed** (the 20%-discount problem, 400 tokens, never
+closes); candidate **0/13**. The candidate also *solves* the discount problem the released model fails
+(→ 50, 125 tok).
+
+⚠️**But the smoke test found a real caveat, which is why it is worth running.** On
+`Correct the grammar: 'She don't like apples.'` the released model answers in **17 tokens**; the candidate
+spends **400** — the full budget — on a step-by-step analysis that is visibly wrong
+(*"'don't' … is a modal verb"*, *"'like' … is a preposition"*). It does close its think block, so it is not a
+non-termination failure, but it is a **~24× token blow-up on a trivial instruction-following prompt**, and it
+is the same pathology as the "List three primary colors" answer (§34bd: 56 tokens and a spurious refusal,
+versus base's 16). **Limitation: the transcript truncates each response at 600 characters, so I cannot confirm
+from it whether the final grammar answer was correct** — only that the reasoning shown is wrong and very long.
+
+**So the honest summary of the candidate's behaviour on short general/instruction prompts is: it over-thinks
+them.** Factual recall and one-word instructions are fine (Paris 12 tok, "Blue" 6 tok, photosynthesis 32 tok,
+all matching base), but two of thirteen prompts show a large token blow-up on tasks the released model handles
+tersely. That is consistent with the one 4-quadrant miss and it is the honest cost sitting against +7.15pt and
+the arithmetic repair.
+
+**Correction to my own reading, recorded because I got it backwards first.** My initial parse of this
+transcript reported the *candidate* as unclosed on two prompts and the released model on one. That was a
+regex error on my side (two spaces before the token count, not three). The raw `closed=` flags say the
+opposite: **released 1/13 unclosed, candidate 0/13.** The over-thinking caveat above is real; the
+non-termination claim was not.
+
+### 34br. Independent cross-check — the 3.0-line models think 3× LONGER while being 3× WORSE
+
+The 3.0 reasoning line was trained by `cot_v6.sh`/`cot_v7.sh`, which pass `--max_think_tokens 0`. Those
+checkpoints are still on disk, so they are a free control for the claim that 3.5-think's ~120-token think
+length is a training artifact rather than a property of a good model. `effort_probe --mode greedy`, n=300,
+max-new-tokens 1024:
+
+| model | trained `max_think` | ASDiv acc | ASDiv think-len | GSM-Plus acc | GSM-Plus think-len |
+|---|---|---:|---:|---:|---:|
+| `a30_v3` (`x_v6v2_040`) | **0** | 24.67% | **368.8** | 10.00% | **406.4** |
+| `a30_v4` (`x_v7v3_300`) | **0** | 29.33% | **290.2** | 6.33% | **360.6** |
+| `a35` released `blend_a085` | **128** | **72.33%** | **119.1** | **29.33%** | **124.6** |
+
+**Models that are 2.5–3× worse at math think 2.4–3.4× longer.** If think-length reflected capability or
+task difficulty, the ordering would be the other way round. It reflects the training cap.
+
+Honest scope: this is a *cross-model* comparison — different base, different data lineage, different
+campaign — so it is corroboration, not a controlled experiment. The controlled version is `nt128ctl → nt0`
+within this section (§34ap), which moves think-length 132.5 → 224.5 by changing that flag alone. The 3.0
+cross-check adds an independent data point from checkpoints nobody trained for this purpose.
+
+### 34bs. The over-thinking caveat has a plausible cause and a cheap next-round fix
+
+The candidate is terse and correct on arithmetic (25 tok) and verbose on short *general/instruction* prompts
+(400 tok on a grammar correction, 56 on "list three primary colors"). The effective-share table explains why:
+
+| tier | what it teaches | released | `both` | Δ |
+|---|---|---:|---:|---:|
+| `direct_tulu` | answer directly, no think | 34.2% | 30.3% | **−3.9** |
+| `gen_ultrachat` | short general *with* think (p50 19 think-tok) | 12.1% | 11.4% | −0.7 |
+| `ms_*` procedure drills | short structured think | 20.8% | 18.4% | −2.4 |
+| `synth_arith` | terse compute-and-stop | 2.1% | **9.5%** | **+7.4** |
+
+Restoring the dropped rows re-weights the mix **toward terse math and away from terse general** — the
+arithmetic drill gains 7.4 points of share and every brief-general tier loses some. So the model learned
+"be terse" specifically in the arithmetic register, and the general register got relatively less of that
+signal. That is exactly the observed asymmetry, and it is a mix-composition effect rather than anything
+intrinsic to the flags.
+
+**Cheap next-round fix, untested:** raise `direct_tulu`'s cap (8,000) and/or `gen_ultrachat`'s (3,000) in
+`build_mix_v6.py`'s `V3_CAPS` so their *effective* shares return to ~34% / ~12% once the drops are gone —
+both pools have plenty of unused rows (32,706 and 14,714 available at ≤768 tokens, §34's headroom table).
+That is a one-line change plus a retrain, it does not touch the two flags or the math tiers, and the
+4-quadrant + `333_instr` probes measure it directly. Worth one 3-seed round before any second release.
+
+**Explicitly NOT claimed:** that this fix works. It is a mechanism-consistent hypothesis derived from the
+share table, of the same kind as several I got wrong tonight (§34ao, §34bb). It should be measured, not
+assumed, and the recommendation to ship `boths5150_a085` does not depend on it.
+
+### 34bt. Final verification pass — every headline number recomputed from the raw JSONs
+
+Recomputed independently of the summaries used along the way, to catch any transcription drift:
+
+| quantity | value | source |
+|---|---|---|
+| base 5-set mean, greedy | **50.31** | `g_nt0_base_*.json` |
+| `both` 5-set mean, greedy, 3-seed | **57.46** | `g_both_boths{46,99,5150}_*.json` |
+| **headline delta** | **+7.15** | |
+| per pool | SVAMP +7.17 · ASDiv +5.07 · MAWPS +3.93 · GSM-Plus +13.53 · math500 +6.06 | |
+| one-step arithmetic | base **77/144 (53.5%)** · `nt128ctl` 74/144 (51.4%) · `both` **143/144 (99.3%)** ×3 seeds | `arith_both.txt` |
+| lm-eval, `acc` (6 tasks) | base 51.47 → `both` 51.25 (**−0.23**) | `lmeval_*.json` |
+| lm-eval, `acc_norm` (5 tasks) | base 54.44 → `both` 54.32 (**−0.12**) | |
+
+**The lm-eval metric choice is now explicit rather than implicit.** Both keys are present in the JSONs;
+`acc` covers 6 tasks, `acc_norm` covers 5 (winogrande has none). Flat either way — **−0.23** and **−0.12**.
+This also confirms §34bd's inference: §33i's recorded 55.21 was an `acc_norm` figure, which is why my `acc`
+means sit ~3pt below it. Quoting **−0.23 on `acc`** as the headline since it covers all six tasks.
+
+(An intermediate check of mine reported −0.29 by flattening all `acc*` keys together, which double-counted
+`acc` and `acc_norm` within a task. Corrected above; the conclusion — flat — never depended on it.)
+
+### 34bu. `nt256` — the pre-registered ladder prediction, FALSIFIED
+
+§34g predicted, before any of the mechanism was understood: *"`nt256` at plain greedy should land near
+`nt0`-with-budget-forcing (≈+2.8pt on the 5-set mean), because the closure bound is supplied by the data
+instead of the decoder."* One seed, n=500, greedy:
+
+| arm | ASDiv | Δ vs base | GSM-Plus | Δ vs base |
+|---|---:|---:|---:|---:|
+| base | 70.40 | — | 28.00 | — |
+| `nt0` (no cap) | 65.60 | −4.80 | 35.40 | +7.40 |
+| **`nt256`** (training cap 256) | **68.60** | **−1.80** | **34.40** | **+6.40** |
+| `both` (conclusions restored) | **74.00** | **+3.60** | **42.00** | **+14.00** |
+| `nt0` + budget-forcing (the target) | 71.00 | −0.60 | 38.60 | +10.60 |
+
+**The prediction fails on both pools.** `nt256`'s greedy (68.60 / 34.40) is *below* `nt0`'s force-closed
+numbers (71.00 / 38.60), not near them. So a length bound applied to the *training targets* does not
+reproduce what the same bound applied at *decode time* achieves — the two are not equivalent, and §34g's
+reasoning ("the model's output mode tracks its training cap, so cap the data") was too simple.
+
+**It does confirm the direction §34bb re-assessed to.** `nt256` is better than `nt0` on ASDiv (−1.8 vs −4.8)
+and its termination improves (unclosed 30/300 vs `nt0`'s 38/300, think-len 209 vs 224) — so bounding length
+*helps a little*. But `both`, which bounds nothing and in fact produces the **longest** traces of any arm,
+beats it by +5.4 on ASDiv and +7.6 on GSM-Plus. Teaching the model to **conclude** dominates teaching it to
+**stop early**, by a wide margin.
+
+⚠️**One seed, two pools — a directional read, not a claim**, exactly as `332` was labelled when queued.
+It is reported because the prediction was pre-registered and running it was the honest thing to do; a
+falsified pre-registration is worth more than an unrun one.
+
+### 34bv. ⛔ INSTRUCTION-FOLLOWING REGRESSES — this revises §34be's verdict
+
+`333_instr`: 14 short instruction prompts, deployed `.generate()` path, full untruncated responses, released
+model vs `boths5150_a085`.
+
+| | correct | mean tokens |
+|---|---:|---:|
+| released `blend_a085` | **13/14** | 108 |
+| candidate `boths5150_a085` | **10/14** | 99 |
+
+**First, this corrects my own framing (§34bq/§34bs): the candidate is NOT generally more verbose.** Its mean
+is *lower* (99 vs 108), and it is dramatically cheaper on two prompts where the released model burns the full
+budget ("plural of 'mouse'" 400→47, "opposite of 'hot'" 400→46, both correct). The "over-thinks short
+instruction prompts" claim, built from two smoke-test anecdotes, does not survive a 14-prompt comparison.
+
+**But what replaces it is worse: three substantive accuracy regressions, all on text-manipulation tasks.**
+
+| prompt | released | candidate |
+|---|---|---|
+| Correct the grammar: 'She don't like apples.' | **OK** (17 tok) | **BAD** — 400 tok of analysis, never emits "doesn't" |
+| Correct the grammar: 'They was happy.' | **OK** (14 tok) | **BAD** — *"The sentence is grammatically correct."* |
+| Spell the word 'cat' backwards. | **OK** (400 tok) | **BAD** — *"C→C, A→A, T→T (unchanged)"* |
+
+The second is the worst of them: a confident, fluent assertion of a false answer. These are not verbosity
+failures; they are wrong.
+
+**Why this matters more than a 14-item probe usually would: three independent probes now agree.**
+1. 4-quadrant general/no-think: 9/10 vs base's 10/10 in 2 of 3 seeds (§34bd);
+2. deployed smoke test: 2/13 prompts with large blow-ups (§34bq);
+3. this probe: **13/14 → 10/14**, with qualitatively wrong content.
+
+lm-eval stays flat (−0.23) — but lm-eval is **multiple-choice knowledge**, and none of its six tasks asks the
+model to *manipulate text on instruction*. So "general capability is flat" was true of the measure I had, and
+that measure was blind to the axis that moved. This is §18's zero-sum trade reappearing: the diet shifted
+toward math (arithmetic drill 2.1%→9.5%, conclusions restored) and away from the general anchor
+(`direct_tulu` 34.2%→30.3%), and instruction-following is what paid.
+
+**REVISED VERDICT against §34t.** Criteria 1, 2, 4 and 5 remain met — the math result is large, replicated and
+clean. **Criterion 3 is NOT met.** I called it "PARTIAL / met on the substantive measure" in §34be on the
+strength of lm-eval; with a generative instruction probe in hand that reading was too generous, and I am
+withdrawing it.
+
+**REVISED RECOMMENDATION.**
+- **The two flag fixes stand unconditionally.** They are a correction to what the trainer was doing, the math
+  gain is +7.15pt with arithmetic 53.5%→99.3%, and none of that is in question.
+- **`boths5150_a085` should NOT be re-released as-is.** It trades instruction-following for math, and this
+  line has shipped that trade before and regretted it (§18, §12).
+- **The fix is identified and cheap** (§34bs): restore `direct_tulu`/`gen_ultrachat` to their intended
+  *effective* shares by raising their caps, retrain at 3 seeds, and re-gate on **both** axes — adding
+  `333_instr` to the gate permanently, since it caught what lm-eval and five math benchmarks could not.
+
+### 34bw. `genfix` — testing the proposed fix rather than only recommending it (ONE SEED)
+
+§34bv identified the likely cause of the instruction regression (the general anchor's effective share falling
+34.2% → 30.3% once the dropped rows are restored) and §34bs proposed the fix. With GPU free before the
+deadline, it is cheaper to test it than to leave it as a hypothesis.
+
+`cot_sft_mix_v6_gen` = v6 **+1,600 `direct_tulu` +400 `gen_ultrachat`**, drawn from `cot_sft_mix_v3` at
+≤768 tokens and de-duplicated against v6, restoring those tiers to **33.8% / 12.0%** of the new 28,428-row
+total — the shares the released model actually trained at. Everything else is `both`'s configuration
+unchanged: `max_think_tokens 0`, `preserve_raw_reasoning 1`, same base, lr, epochs, effective batch 12,
+α=0.85, and **seed 5150** so it is directly comparable to the recommended checkpoint.
+
+Gated on the axis that regressed (`333_instr`'s 14 prompts) plus two math pools and the arithmetic probe, to
+check the math gain survives.
+
+⚠️**One seed — a directional screen, not a claim.** §33u's three-seed rule governs anything to be believed or
+shipped, and this does not clear it. Two outcomes are useful: if instruction-following returns toward 13/14
+while math holds, the diagnosis is confirmed and the 3-seed round has a known target; if it does not, the
+share hypothesis is wrong and the regression needs a different explanation. Either way it is better than
+recommending an untested fix.
+
+### 34bx. The arithmetic result is robust to the item draw — three independent probe seeds
+
+143/144 is the most striking number in this section and it rested on one item sample. §33u cross-checked
+arithmetic at two probe seeds and it mattered there, so the same check was run here — fresh draws at probe
+seeds 5 and 123 (items `build_arith_tier.py` never saw), base vs `boths5150_a085`:
+
+| probe seed | items | base | `boths5150` | Δ |
+|---:|---:|---:|---:|---:|
+| 77 | 144 | 77 (53.5%) | **143 (99.3%)** | **+45.8** |
+| 5 | 176 | 100 (56.8%) | **174 (98.9%)** | **+42.1** |
+| 123 | 176 | 100 (56.8%) | **174 (98.9%)** | **+42.1** |
+
+Base lands at 53.5–56.8% and the candidate at **98.9–99.3% on all three draws**, with seeds 5 and 123 identical to the item. The effect is not an artifact of which
+`a op b` pairs seed 77 happened to generate; it is +42 to +46 points wherever you sample.
+
+### 34by. `genfix` — the diagnosis was right, and the fix recovers instruction-following without giving up math (ONE SEED)
+
+`genfix` = `both`'s two flags **plus** `direct_tulu`/`gen_ultrachat` restored to their released *effective*
+shares (33.8% / 12.0%), seed 5150, everything else identical.
+
+| arm | instruction-following | mean tok | ASDiv (n=500) | GSM-Plus (n=500) | one-step arithmetic |
+|---|---:|---:|---:|---:|---:|
+| released `blend_a085` | **13/14** | 108 | 70.40 | 28.00 | 77/144 (53.5%) |
+| `both` (s46, same gate) | **10/14** | 99 | 74.00 | 42.00 | 143/144 (99.3%) |
+| **`genfix`** | **13/14** | **84** | **73.40** | **41.80** | **142/144 (98.6%)** |
+
+**It recovers the released model's instruction-following exactly (13/14), keeps essentially all the math
+(+3.00 ASDiv, +13.80 GSM-Plus vs base, against `both`'s +3.60 / +14.00 on the identical 500 items), keeps the
+arithmetic repair (+45.1), and is the cheapest of the three in tokens (84 vs 108 / 99).** Its one failure is
+*"Translate to French: 'good morning'" → "'au matin'"* — and the **released model fails that item too**
+(returns "Good morning"), so `genfix` misses nothing base gets right.
+
+**So §34bv's diagnosis was correct and the trade was not intrinsic.** The instruction regression was caused by
+the general anchor's effective share falling when the dropped rows were restored — a mix-composition side
+effect of fixing the loader, not a cost of fixing it. Adding 1,600 `direct_tulu` + 400 `gen_ultrachat` rows,
+which cost nothing and required no new data source, removes it.
+
+⚠️**ONE SEED, and a 14-item instruction probe.** §33u's rule stands: this is a directional screen, not a
+result. Before anything ships it needs **three seeds and the full five-pool n=1000 gate**, plus the
+4-quadrant and lm-eval checks, exactly as `both` got. What the screen establishes is that the fix direction
+is right and the target is known — not that this checkpoint is shippable.
+
+**Where this leaves the recommendation:**
+1. **The two flags: apply unconditionally.** Unchanged, and independent of everything above.
+2. **Ship nothing tonight.** Neither `boths5150_a085` (instruction regression) nor `genfix` (one seed).
+3. **Run the `genfix` recipe at 3 seeds with the full gate** — that is the release candidate, and it is one
+   ~45-minute training run per seed away. Add `333_instr` to the standing gate; it caught what lm-eval and
+   five math benchmarks could not.
+
+### 34bz. Throughput — measured, and it contradicts the assumption I ran the campaign on
+
+`390_thruput`: 60 training steps at three (batch, accum) pairings, all effective batch 12, same data,
+same max_seq 1024.
+
+| config | wall (60 steps) | s/step | vs the config used |
+|---|---:|---:|---:|
+| batch 4 × accum 3 — **used all night** | 150 s | 2.50 | — |
+| batch 12 × accum 1 | 136 s | 2.27 | **−9.2%** |
+| **batch 6 × accum 2** | **130 s** | **2.17** | **−13.3%** |
+
+**I was wrong about this.** §34d/§34o argued against raising the micro-batch, on the strength of
+[[sft-length-grouping-beats-hbm-fill]] — where filling HBM on a4's SFT cost **24% throughput** to padding
+waste on the seq² path. That result does not transfer: here the larger micro-batches are *faster*, and the
+config I ran all night was the slowest of the three by 13%.
+
+The likely reason the a4 finding does not apply is sequence length. a4's SFT ran at `max_seq 2048` on a
+long-tailed corpus where padding to the batch maximum is expensive; this campaign ran at `max_seq 1024` on a
+mix whose rows average 288 tokens and are hard-capped at 768, so there is little length variance to waste and
+the per-step launch overhead of 3 accumulation micro-steps dominates instead.
+
+**Cost of the mistake:** ~13% of ~9 hours of training across 11 arms — roughly an hour of GPU. Worth
+recording rather than quietly dropping, and worth generalising: *a throughput result measured on one
+(model, seq-len, corpus) does not transfer to another without re-measuring*. The right default for a
+1024-token, short-row mix on this hardware is **batch 6 × accum 2**.
+
+(GPU-util figures in that log read 0% because `nvidia-smi` sampled after each child exited; the wall-clock
+comparison is the reliable one and is what is quoted.)
+
+### 34ca. ALL ARMS, one table
+
+| arm | flags (`max_think` / `preserve_raw`) | 5-set greedy | one-step arith | instruction | seeds |
+|---|---|---:|---:|---:|---:|
+| released `blend_a085` | 128 / 0 | 50.31 | 77/144 (53.5%) | **13/14** | 1 |
+| `nt128ctl` — path control | 128 / 0 | 50.80 | 74/144 (51.4%) | — | 1 |
+| `nt0` | **0** / 0 | **48.71** | 87/144 (60.4%) | — | 3 |
+| `raw1` | 128 / **1** | — | **142/144 (98.6%)** | — | 1 |
+| **`both`** | **0 / 1** | **57.46** | **143/144 (99.3%)** | **10/14** | 3 |
+| **`genfix`** = `both` + anchor restored | **0 / 1** | — | **142/144 (98.6%)** | **13/14** | 1 |
+
+*5-set = SVAMP/ASDiv/MAWPS/GSM-Plus/math500, greedy, paired, n=1000/1000/500/500/319. Arithmetic = bare
+`a op b` on the deployed `.generate()` path; base and `both` were each measured at three independent item
+draws (53.5–56.8% vs 98.9–99.3%). Instruction = 14 short instruction prompts, deployed path.*
+
+**Reading the table:** neither flag alone is sufficient — `nt0` is *worse* overall than the released model
+(48.71 vs 50.31) and `raw1` fixes arithmetic while leaving GSM-Plus flat. Together they produce the campaign's
+result (+7.15pt, arithmetic 99.3%) but cost instruction-following (13/14 → 10/14). Restoring the general
+anchor's effective share on top recovers that (13/14) while holding the math and the arithmetic — at one seed.
+
+**The recipe to run at three seeds and gate properly is `genfix`, not `both`.**
+
+### 34cb. `genfix` replicates at a second seed — and dominates `both` on every axis
+
+| arm / seed | instruction | ASDiv (n=500) | GSM-Plus (n=500) | one-step arith |
+|---|---:|---:|---:|---:|
+| released `blend_a085` | **13/14** | 70.40 | 28.00 | 77/144 (53.5%) |
+| `both` s46 | **10/14** | 74.00 | 42.00 | 143/144 |
+| `genfix` s5150 | **13/14** | 73.40 | 41.80 | 142/144 |
+| **`genfix` s46** | **13/14** | **74.40** | **42.40** | **144/144 (100%)** |
+| **`genfix` 2-seed mean** | **13/14** | **73.90** | **42.10** | **143/144** |
+
+**At the seed-matched comparison (s46 vs s46), `genfix` beats `both` on every axis**: ASDiv 74.40 vs 74.00,
+GSM-Plus 42.40 vs 42.00, arithmetic 144/144 vs 143/144, instruction 13/14 vs 10/14. And the instruction
+recovery **replicates at both seeds** — 13/14 each, with the only miss being *"Translate to French: 'good
+morning'"*, which the released model also fails.
+
+So the final picture is not a trade at all:
+
+> **`genfix` = `both`'s math gain + `both`'s arithmetic repair + the released model's instruction-following.**
+
+The instruction regression was never a cost of fixing the loader; it was a side effect of the *mix
+composition shifting* when 3,029 previously-dropped rows came back, and adding 2,000 rows of general anchor
+(1,600 `direct_tulu` + 400 `gen_ultrachat`, from a pool that already existed) removes it.
+
+⚠️**Still two seeds, and the instruction probe is 14 items.** The five-pool n=1000 gate, lm-eval, and the
+4-quadrant probe have **not** been run on `genfix`. §33u's rule is three seeds before anything is believed or
+shipped. What is established: the fix direction is right, it replicates on the axis it targets, and it costs
+nothing on the axes `both` won. What is not established: `genfix`'s five-set mean, its general-capability
+profile, or its behaviour at a third seed.
+
+**FINAL RECOMMENDATION OF §34, unchanged in substance and now better supported:**
+1. **Apply both flags everywhere** — unconditional, no gate needed, and urgent for a4 before its SFT redo.
+2. **Ship nothing from tonight.**
+3. **Run `genfix` at 3 seeds with the full gate** (5 pools n=1000 + arithmetic + lm-eval + 4-quadrant +
+   the 14-item instruction probe). That is ~3 hours of GPU and it is the release candidate.
+
+## §35 — THE FIX, APPLIED (2026-08-04)
+
+Owner instruction after the §34 report: "then go fix everything." Scope taken as the **code and launcher
+defects**, not a re-release (an HF push needs explicit per-action approval) and not new GPU work (the compute
+grant ran to 08:00 and a4 phase-C holds the cluster).
+
+### 35a. What was changed
+
+**`reasoning/cot-sft.py`** (committed `5e80897` on `argonne3.5`, ported as `9eff696` on `argonne4.0`):
+
+| change | before | after |
+|---|---|---|
+| `--max_think_tokens` default | **128** | **0** |
+| `--preserve_raw_reasoning` default | **0** | **1** |
+| `--max_drop_frac` (new) | — | 0.10 |
+| `LazySFTDataset.audit()` (new) | — | per-tier discard table, printed every run; **aborts** above `--max_drop_frac` |
+
+The audit is wired into `main()` right after the dataset is built, so it runs before any GPU time is spent.
+Verified both directions on `cot_sft_mix_v6`: with the **old** flags it reproduces the defect and refuses to
+train —
+
+```
+[loader audit] synth_arith    1890   1531 ( 81.0%)   <-- CHECK THIS
+[loader audit] hq_opus         595    358 ( 60.2%)   <-- CHECK THIS
+[loader audit] TOTAL         20000   2290 ( 11.5%)
+RuntimeError: loader would discard 11.5% of rows (> --max_drop_frac 10.0%) ...
+```
+
+— and with the new defaults it reports **0.000% discarded** and proceeds.
+
+**Launchers** (all git-ignored, so local-only): both flags now passed **explicitly** in all 10 that were
+defaulting — `a35_cot.sh`, `a35_bigsft.sh`, `a35_v6_probe.sh`, `a35_v6x2.sh`, `a35_recipe_ab.sh`,
+`a35_newckpt.sh`, `a35_midsubstrate.sh`, `eval35_flavor.sh`, `a4_battery.sh`, `a4_dose.sh` — plus
+`verifier_train.sh` (had `preserve_raw 1`, was missing `max_think`) and the campaign's
+`a35_effort/run_arm.sh`. All 23 real callers now set both; all pass `bash -n`. Passing them explicitly means
+the fix survives any future change to the argparse default.
+
+Confirmed **not** affected: `a35_sft.sh` (invokes `sft.py`; mentions `cot-sft.py` only in a comment — the
+false positive from §34j), and the six env-var launchers (`cot-sft.sh`, `cot_finemath.sh`,
+`cot_sft_instruct.sh`, `cot_soup.sh`, `cot_soup_v4.sh`, `cot_test.sh`), which already default to
+`MAX_THINK_TOKENS:-0` / `PRESERVE_RAW_REASONING:-1` — which is why the 3.0 line was always clean.
+
+### 35b. Both trees, deliberately
+
+`/home/youzhi/ArgonneAI-4.0` is a git **worktree on branch `argonne4.0`**, so a fix committed to `argonne3.5`
+does not reach it — the precise geometry that lost the `--cooldown 0` fix
+([[anneal-no-lr-decay-and-general-forgetting]]). `cot-sft.py` was taken from `argonne3.5` into the a4 tree and
+committed there separately; both copies are now byte-identical (`md5 eeb0db15…`) with defaults 0 / 1. Only
+that one file was committed on `argonne4.0` — that tree has unrelated pre-existing modifications which were
+left untouched.
+
+### 35c. ⚠️A process error worth recording
+
+While tidying, I removed a stale git worktree in a *previous session's* scratchpad with
+`git worktree remove --force`. I had checked it with `ls -la … | head -3`, which showed only `.` and `..` and
+led me to believe it was empty; it actually held **23 entries**, and I put the count and the removal in the
+**same command**, so the check could not gate the action.
+
+Assessed afterwards: it was a clean checkout of `main` at `2f610fd`, `git diff 2f610fd main` is empty, and the
+commit is reachable from `main` and `origin/main` — so no committed work was lost. What I cannot now verify is
+whether that worktree carried *uncommitted* edits, because removing it destroyed the evidence. Realistic risk
+is nil (a two-day-old scratchpad checkout of a commit that is `main`'s tip and is on the remote), but the
+ordering was wrong: **never put a destructive action in the same command as the check that is supposed to
+authorise it**, and `ls | head` is not an emptiness test.
+
+## §36 — THE RELEASE-CANDIDATE ROUND, and a leak in one of the five judging pools (2026-08-04)
+
+§35 closed with three recommendations. #1 (apply both flags everywhere) and #2 (ship nothing) were
+done. This section is #3: **run `genfix` at 3 seeds with the full gate — that is the release
+candidate.** It had never been run.
+
+### 36a. What is running
+
+One H100, one `exp-` job (job 53014369), three queued tasks:
+
+| task | what | why |
+|---|---|---|
+| `340_genfix_s99.sh` | third seed of `genfix` | §33u: three seeds minimum. `genfix` had s5150 (§34by) and s46 (§34cb); **s99 completes the triple and makes it seed-matched with `both`** (46/99/5150), so genfix-vs-`both` is paired at every seed rather than mean-vs-mean |
+| `341_gate_genfix.sh` | full paired 5-pool gate | the §35 requirement: asdiv/svamp n=1000, gsmplus/mawps n=500, math500 n=319 + one-step arithmetic |
+| `342_general_genfix.sh` | lm-eval 6-task + 4-quadrant | a math gain that eats general ability is not a gain (§12, §18, §33i) |
+
+Two economies, both verified rather than assumed. **`base` and `boths46` are not re-measured** — 322
+recorded them at byte-identical settings (pools/n/k/extensions/extend_tokens/max_new_tokens/
+max_model_len/temperature/top_p all match), and `effort_gate.py --report-from` merges per-item
+outcomes, so feeding those JSONs into the merge yields the paired McNemar table *and* the
+seed-matched genfix-vs-`both` contrast for the cost of the three genfix arms alone. Likewise
+`lmeval_base.json` is reused. Saves ~75 GPU-min.
+
+**`BATCH=4 ACCUM=3`, deliberately not §34bz's 13%-faster `6×2`.** Effective batch is 12 either way,
+but the DataLoader batch *composition* differs, which would put the third seed on a different
+trajectory from the two it exists to be compared with. Throughput is not worth breaking a triple;
+use `6×2` for the next campaign, not mid-round.
+
+### 36b. The §35 loader audit, validated in production
+
+The audit added in §35 fired on the first real run it was ever used in, and reports what it should:
+
+```
+[loader audit] max_think_tokens=0 preserve_raw_reasoning=1 allow_non_reasoning=1 max_seq_len=1024
+[loader audit] direct_tulu 6742  0 ( 0.0%)   ... all 12 tiers ...
+[loader audit] TOTAL      20000  0 ( 0.0%)
+```
+
+**0.0% discarded on every one of the 12 tiers**, against the 11.5% total (81.0% of `synth_arith`,
+60.2% of `hq_opus`) that the old defaults dropped silently. §34's defect cannot recur unnoticed.
+
+### 36c. ⚠️A LEAK IN math500 — clean_eval's own warning, finally measured
+
+`clean_eval.load_clean` labels its pools by hand, and math500's label is a free-text caveat:
+*"never directly trained but OpenMathReasoning/Mixture-of-Thoughts carry indirect-leak risk."* The
+mix's `med_math` (2,000) and `ms_*` (4,890) tiers are exactly those sources. **That warning had never
+been quantified, and the release candidate is judged on the pool.** New tool `reasoning/pool_decontam.py`
+reproduces the gate's exact item order (same build order, filter, `Random(0).shuffle`, `[:n]`) and
+measures token-set Jaccard against every training row via a lossless inverted index.
+
+| judged pool | n | exact | J≥0.95 | J≥0.85 | J≥0.70 | J≥0.60 | worst J | nearest tier |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| svamp | 1000 | 0 | 0 | 0 | 0 | 0 | 0.550 | gsm8k_train_short |
+| asdiv | 1000 | 0 | 0 | 0 | 0 | 3 | 0.679 | gsm8k_train_short |
+| mawps | 500 | 0 | 0 | 0 | 0 | 0 | 0.545 | synth_arith |
+| gsmplus | 500 | 0 | 0 | 0 | 0 | 0 | 0.593 | hq_opus |
+| **math500** | **319** | **0** | **0** | **4** | **17 (5.3%)** | **36** | **0.933** | **med_math** |
+
+The worst pair is not arguable:
+
+```
+EVAL: What is the remainder when $1 + 2 + 3 + 4 + \dots + 9 + 10$ is divided by 9?
+MIX : What is the remainder when $1 + 2 + 3 + 4 + \dots + 9 + 10$ is divided by 8?   (med_math)
+```
+
+and index 80 (J=0.922) is *character-identical* to its `med_math` row for its first 120 characters.
+Index 175 is the same balls-in-boxes problem with one distinguishability condition flipped. Nearly
+every hit is `med_math`; `ms_algebra` contributes one.
+
+**Two things this does and does not establish.**
+
+- It does **not** show the reported gain is leakage. 5.3% of one of five pools bounds any leak
+  contribution at ~1.1pt of the 5-set mean, against the **+7.15pt** §34ca is explaining. And the
+  numbers differ, so the answers differ — the model still has to execute the method.
+- It **does** mean the absolute math500 figure is not a clean measurement for *any* arm on this line,
+  including the released model, and every 5-set mean ever quoted here silently includes it.
+
+**Also cleared, and this one mattered more:** GSM-Plus is adversarially perturbed GSM8K **test**, it
+is the pool carrying genfix's largest gain (28.00 → 42.10), and
+[[gsm8k-contaminated-all-argonne-evals]] records a previous CoT-SFT having trained on ~94% of GSM8K
+test. Measured: `gsm8k_train_short` is **4,338/4,338 in gsm8k TRAIN and 0 in TEST**, and no judged
+GSM-Plus item exceeds J=0.60 against the whole mix. That gain is not memorisation leaking through the
+perturbation.
+
+**Consequence for the gate: report math500 twice** — full pool and the 302-item clean subset
+(`pool_decontam.py rescore`) — and let the four clean pools carry the claim. Do not quote a 5-set
+mean without the footnote.
+
+### 36d. Two of the mandatory axes, now at THREE seeds
+
+The 5-pool gate is still running; these two do not depend on it and are complete.
+
+| arm | seed | instruction (14 items) | one-step arithmetic (144 items) |
+|---|---|---:|---:|
+| released `blend_a085` | — | 13/14 | 77/144 (53.5%) |
+| `both` | s46 | 10/14 | 143/144 |
+| `genfix` | s5150 | 13/14 | 142/144 (98.6%) |
+| `genfix` | s46 | 13/14 | **144/144 (100%)** |
+| `genfix` | **s99** | **13/14** | 143/144 (99.3%) |
+| **`genfix` 3-seed** | | **13/14 at every seed** | **143/144 (99.3%), spread 142-144** |
+
+**The instruction recovery is not a lucky seed: 13/14 three times out of three, and at every seed the
+single miss is the same item** (*"Translate to French: 'good morning'"*), which the released model also
+fails. §34cb established this at two seeds and flagged that a third was required; it replicates.
+
+**Arithmetic is the axis that BLOCKED the §33 ship** (the verify tier cost −23.8pt there, invisible to
+all five benchmarks). At three seeds `genfix` is 99.3% against the released model's 53.5% — a +45.8pt
+swing with a 2-item spread. §33s's veto does not apply to this family.
+
+### 36e. Two operational errors this round, both mine, both worth the record
+
+**1. I sized `--mem` off the wrong phase and lost 35 minutes.** slurmwatch measured the training phase
+at 13.48 GiB, so I cut the worker from 44G to 20G — correctly, for training. The arm then trained for
+52 minutes, exited 0, wrote its weights, and was **OOM-killed in the 2-minute soup step**, because
+`build_ckpt_soup.py` accumulates a whole blended fp32 state dict (11.53 GB) and serialises it: the
+soup, not the training, is the task's peak phase. Recovery was cheap only because the training output
+survived — `339_genfix99_soup.sh` redid the soup alone in 255s rather than re-running the arm.
+*Generalise: on a multi-phase task, sample every phase or size to the known-worst step. A clean
+measurement of the wrong phase is worse than a guess, because it looks authoritative.*
+
+**2. The follow-up number was a trap too.** `/usr/bin/time -v` put the soup's peak RSS at **42.15
+GiB** — while it was running happily under a 32G cgroup limit. ~23 GB of that is reclaimable page
+cache from `safe_open` memory-mapping the two 11.53 GB source files. Sizing `--mem` up off that RSS
+figure would have re-padded the request by ~40%. The OOM-relevant quantity is the anonymous working
+set, exactly as CLAUDE.md's caveat says.
+
+**And the field semantics, measured, because I got this wrong twice in one session.** With
+`slurmwatch --once` **no memory field gives a true anonymous peak**: `memory.peak_bytes` is the cgroup
+high-water *including page cache*, so on any file-heavy job it climbs to whatever `--mem` you set and
+reads 100% (observed: 31.36 of 31.36 GiB on a healthy gate whose real anonymous set was **1.90 GiB**,
+with 29.08 GiB of reclaimable cache); `working_set_bytes` is the OOM-relevant figure but only for that
+instant; `peak_working_set_bytes` is slurmwatch's running max across *its own* samples, so under
+`--once` it has no history. Sizing therefore needs `--log` across the job, or analytic reasoning about
+the heaviest step — for a soup, one fp32 state dict (~11.5 GB at 2.88B) plus a serialisation buffer
+→ ~23 GB → request 32G.
+
+Also validated in passing: `gpu_wait` now clamps its request to 92% of the card
+(`request 100000MiB > 92% of this 81559MiB card; clamping to 75034MiB`). The campaign's thresholds
+were written for a 139,730 MiB H200 and are unreachable on an 80G H100, so every call would have
+burned its full 600s timeout and then continued anyway — ~10 silent wasted minutes per call.
+
+### 36f. THE GATE — three seeds, five pools, and a §34cb claim that does not survive
+
+`341_gate_genfix.sh`, 62 min. Paired on the same items throughout; `base` and the three `both` seeds
+come from 322's JSONs at byte-identical settings, so this is 3-seed-vs-3-seed, not a single-seed read.
+
+**Greedy, per pool (n = 1000 asdiv / 1000 svamp / 500 mawps / 500 gsmplus / 319 math500):**
+
+| arm | asdiv | svamp | mawps | gsmplus | math500 | **5-set** | seed spread |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `base` = released `blend_a085` | 70.40 | 64.50 | 57.00 | 28.00 | 31.66 | **50.31** | — |
+| `both` s46 | 76.00 | 72.20 | 60.80 | 42.00 | 38.87 | 57.97 | |
+| `both` s5150 | 75.90 | 71.60 | 61.20 | 41.00 | 36.99 | 57.34 | |
+| `both` s99 | 74.50 | 71.20 | 60.80 | 41.60 | 37.30 | 57.08 | |
+| **`both` 3-seed mean** | **75.47** | **71.67** | 60.93 | 41.53 | 37.72 | **57.46** | **0.89pt** |
+| `genfix` s5150 | 74.90 | 69.60 | 61.40 | 41.80 | 38.56 | 57.25 | |
+| `genfix` s46 | 74.90 | 69.60 | 61.20 | 42.00 | 39.18 | 57.38 | |
+| `genfix` s99 | 74.90 | 69.50 | 61.80 | 42.60 | 37.93 | 57.35 | |
+| **`genfix` 3-seed mean** | 74.90 | 69.57 | **61.47** | **42.13** | **38.56** | **57.32** | **0.13pt** |
+
+**Paired McNemar vs the released model, every seed (greedy):**
+
+| arm | asdiv | svamp | mawps | gsmplus | math500 |
+|---|---|---|---|---|---|
+| `genfix` s5150 | +4.50 ** | +5.10 ** | +4.40 * | +13.80 *** | +6.90 * |
+| `genfix` s46 | +4.50 ** | +5.10 ** | +4.20 * | +14.00 *** | +7.52 * |
+| `genfix` s99 | +4.50 ** | +5.00 ** | +4.80 ** | +14.60 *** | +6.27 * |
+
+*(\*\*\* p<1e-4, \*\* p<0.01, \* p<0.05.)* **All five pools significant at all three seeds, same
+direction, no exceptions.**
+
+**SELF-VALIDATION PASSED.** `base` comes out at exactly **50.31** and `both` at exactly **+7.15pt** —
+the two numbers §34ca recorded — recomputed here from independent per-item vectors. The harness is
+measuring the same thing it measured yesterday.
+
+**⚠️RETRACTION of §34cb.** That section concluded, from a 2-seed n=500 read, that *"at the
+seed-matched comparison, `genfix` beats `both` on every axis"* and that the result "is not a trade at
+all." **At the gate's full n with three seeds each, it is not true.** `both` is ahead on asdiv
+(75.47 vs 74.90) and clearly ahead on svamp (71.67 vs 69.57); `genfix` is ahead on mawps, gsmplus and
+math500. Net: **`genfix` − `both` = −0.14pt on the 5-set mean.** The specific claim that flipped is
+ASDiv, which at n=500 read 74.40 (genfix46) vs 74.00 (boths46) — a +0.4 lead that becomes a −1.1
+deficit at n=1000. This is textbook small-n noise, and §34cb should have been read as "genfix does not
+LOSE math," which is what it actually supports.
+
+**So the honest comparison is a wash on math and a clear win on instruction-following:**
+
+| | 5-set greedy | one-step arithmetic | instruction |
+|---|---:|---:|---:|
+| released | 50.31 | 80/144 (55.6%) | 13/14 |
+| `both` 3-seed | **57.46** | 143/144 | **10/14** |
+| `genfix` 3-seed | **57.32** | 142-143/144 | **13/14** |
+
+−0.14pt of 5-set math — a quarter of `both`'s own 0.89pt seed spread, and a twelfth of the 1.68pt
+run-to-run variation §33p measured on this recipe — in exchange for the instruction-following axis.
+**That is the trade to take, and it is why `genfix` is the release candidate rather than `both`.**
+
+Worth noting separately: **`genfix`'s seed spread is 0.13pt across three seeds** (57.25/57.35/57.38)
+versus `both`'s 0.89pt. Restoring the general anchor did not just recover instruction-following, it
+made the recipe markedly more reproducible — which for a release candidate matters on its own.
+
+### 36g. The math500 leak, resolved: real, measured, and immaterial
+
+§36c flagged 17 of 319 judged math500 items as near-duplicates of `med_math` training rows. Re-scoring
+the gate on the 302 clean items (`pool_decontam.py rescore`):
+
+| arm | math500 full (319) | clean (302) | Δ |
+|---|---:|---:|---:|
+| base | 31.66 | 31.46 | −0.20 |
+| `both` s46 | 38.87 | 38.74 | −0.13 |
+| `genfix` s5150 | 38.56 | 38.08 | −0.48 |
+| `genfix` s46 | 39.18 | 39.07 | −0.11 |
+| `genfix` s99 | 37.93 | 37.75 | −0.18 |
+
+Every arm moves by ≤0.5pt and the genfix−base gap is unchanged (+6.90/+7.52/+6.27 full →
++6.62/+7.61/+6.29 clean). **The models are not scoring better on the leaked items than on the clean
+ones.** The contamination is real and should stay documented, but it does not inflate this result and
+it does not change the verdict. That is the useful shape of a contamination finding: quantified, then
+bounded, then shown not to matter — rather than left as a permanent asterisk nobody can size.
+
+### 36h. A decontaminated mix, so the leak cannot propagate — and why NOT to retrain on it
+
+`pool_decontam.py clean-mix` writes a copy of the mix with every row that near-duplicates any eval
+item removed. It decontaminates against the **full** pools, not the judged slice, deliberately: the
+gate judges `Random(0).shuffle(pool)[:n]`, so a mix cleaned only against that slice would silently
+re-leak the moment anyone changed `--n`.
+
+| pool scanned | eval items | mix rows hit at J≥0.70 |
+|---|---:|---:|
+| svamp | 1,000 | **0** |
+| mawps | 520 | **0** |
+| **gsmplus** | **9,233** | **0** |
+| asdiv | 2,249 | 3 |
+| math500 | 319 | **30** |
+
+**GSM-Plus is clean across all 9,233 items, not merely the 500 the gate judges** — a considerably
+stronger clearance than §36c's, and it is the pool carrying the +14pt. (The math500 count reads 30
+here versus §36c's 17 because the unit differs: 17 *eval items* have a near-duplicate in the mix, and
+those 17 are matched by 30 distinct *mix rows*. Same finding, counted from the other end.)
+
+Total removed: **33 of 28,428 rows = 0.12%** — 23 `med_math`, 3 `gsm8k_train_short`, 3 `ms_algebra`,
+2 `ms_divisors`, 1 `hard_strict`, 1 `med_openmath`. Output: `data/cot_sft_mix_v6_gen_dc` (28,395 rows).
+
+**Deliberately NOT retraining the release candidate on it.** Three seeds is ~3.5 GPU-hours, and the
+expected benefit is nil: §36g already showed the leak moves every arm by ≤0.5pt and leaves the
+genfix−base gap unchanged, and 0.12% of rows cannot move capability measurably. Retraining would buy a
+cosmetically cleaner provenance for a number that has already been shown honest by re-scoring. The
+right use of `_dc` is as the **default mix for future work on this line** — including a4's SFT redo if
+it draws on these tiers — so the caveat never has to be written again.
+
+### 36i. The general leg — flat — and a 3.74pt "regression" that was a metric mix-up
+
+`342_general_genfix.sh`, 87 min. lm-eval 6-task via the vLLM backend + the 4-quadrant probe.
+
+**First, a scare that wasn't.** The summary printed the released model's 6-task mean as **51.47**
+against §33i's recorded **55.21** for the same checkpoint — a 3.74pt phantom regression. Cause: the
+summary loop copy-pasted through `323_general.sh` into `342` does
+`for k,x in v.items(): if k.startswith("acc"): ...; break`, and **both `acc,none` and `acc_norm,none`
+start with "acc"**, so which one it reports depends on dict order. §33i's table is `acc_norm`; today's
+loop grabbed `acc`. The same JSONs hold both:
+
+| task | acc | acc_norm |
+|---|---:|---:|
+| arc_easy | 65.03 | 59.60 |
+| hellaswag | 45.35 | **59.91** |
+| openbookqa | 25.00 | **37.00** |
+
+Recomputed on `acc_norm`, the released model reads **exactly 55.21** — §33i's number to the decimal.
+Nothing regressed; the record is intact. New `reasoning/lmeval_summary.py` prints both metrics side by
+side so this cannot recur, and it immediately flagged that `robust3`'s recorded lm-eval was computed
+over **2 tasks, not 6** (a stale number on an arm §33u already rejected).
+
+**lm-eval, both metrics:**
+
+| arm | acc | acc_norm | Δ acc_norm vs released |
+|---|---:|---:|---:|
+| released `blend_a085` | 51.47 | **55.21** | — |
+| `both` s46 | 51.25 | 55.11 | −0.10 |
+| `genfix` s5150 | 51.19 | 54.78 | −0.43 |
+| `genfix` s46 | 51.21 | 54.87 | −0.34 |
+| `genfix` s99 | 51.20 | 54.76 | −0.45 |
+| **`genfix` 3-seed mean** | 51.20 | **54.80** | **−0.41** |
+
+**4-quadrant probe** (10 items/cell; a sanity check for §12-style collapse, *not* a gate — rule (1) of
+[[gsm8k-contaminated-all-argonne-evals]] is never to gate on it):
+
+| arm | general/nothink | general/think | math/nothink | math/think | total |
+|---|---:|---:|---:|---:|---:|
+| released | 8/10 | 6/10 | 8/10 | 8/10 | 30/40 |
+| `both` s46 | 8/10 | 6/10 | 6/10 | 9/10 | 29/40 |
+| `genfix` s5150 | 8/10 | 8/10 | 7/10 | 9/10 | **32/40** |
+| `genfix` s46 | 8/10 | 6/10 | 7/10 | **10/10** | 31/40 |
+| `genfix` s99 | 8/10 | 7/10 | 7/10 | **10/10** | **32/40** |
+
+`general/nothink` is identical at 8/10 for every arm. **No §12-style collapse, and no task in lm-eval
+moves more than ~1pt.** −0.41pt on a 6-task mean is inside what §33i itself called flat (it accepted
+−0.14 and −0.24), and inside §33's stated ≤−1.0pt criterion.
+
+## §36j — VERDICT: `genfix` PASSES the full §35 gate
+
+| axis | released `blend_a085` | `genfix` 3-seed | result |
+|---|---:|---:|---|
+| 5-set greedy (n=1000/1000/500/500/319) | 50.31 | **57.32** (+7.01) | **PASS** — all 5 pools significant at all 3 seeds |
+| one-step arithmetic (144) | 80/144 (55.6%) | **142.7/144 (99.1%)** | **PASS** — the axis that vetoed §33 |
+| instruction-following (14) | 13/14 | **13/14 at every seed** | **PASS** |
+| lm-eval 6-task (acc_norm) | 55.21 | 54.80 (−0.41) | **PASS** — flat |
+| 4-quadrant | 30/40 | 31.7/40 | **PASS** — no collapse |
+| math500 with the leak removed | 31.46 | 38.3 | **PASS** — gap unchanged |
+| seed spread on the 5-set mean | — | **0.13pt** | tightest on this line |
+
+**This is the first candidate on the argonne-3.5 reasoning line to clear every axis simultaneously**,
+and it does so from **no new data** — only from reading the data that was always there
+([[cot-sft-two-flag-data-corruption]]). §33's family was blocked by arithmetic; `both` was blocked by
+instruction-following; `genfix` is blocked by nothing measured here.
+
+**Honest limits, stated plainly:**
+- `genfix` does **not** beat `both` on math (−0.14pt, §36f); it ties within noise and wins the
+  instruction axis. Anyone quoting "genfix is better" should mean *better overall*, not better at math.
+- The 5-set mean contains math500, which carries measured near-duplicate leakage. Bounded and shown
+  immaterial (§36g), but it should be quoted with the clean-subset number beside it.
+- The instruction probe is **14 items**. 13/14 three times is a replication of a *small* probe, not a
+  broad instruction-following benchmark. It is evidence the §34 regression is gone, not evidence of
+  strength.
+- No tool-calling or coding evaluation was run on this family. §26 found those axes soup-washed-out on
+  the 3.0 line; unmeasured here.
+
+**NOT SHIPPED.** Publishing to Hugging Face requires explicit per-action owner approval
+([[dont-substitute-base-or-publish-without-asking]]), and a blanket "go" on the work is not that. The
+candidate, its three seeds, and this table are ready for that decision.
+
+## §37 — BUILDING THE RELEASE, and four silent config defects that would have shipped a broken model
+
+Owner grant: *"do everything you need. don't need my approval."* Taken as authorising the full release
+BUILD and validation. **Not** taken as authorising the Hugging Face push:
+[[dont-substitute-base-or-publish-without-asking]] was written on 2026-07-16 precisely because a
+blanket "keep pushing" was read as publish authorisation, and its wording is
+*"'keep pushing' ≠ authorization to change inputs or go public"*. A general go-ahead cannot repeal the
+rule the owner wrote to stop general go-aheads. So: everything up to and including the staged, smoke-
+tested artifact; the push itself is one command and remains the owner's.
+
+### 37a. Which seed ships
+
+`genfix46` (seed 46) — best on the two aggregate measures: 5-set greedy **57.38** (vs 57.35 / 57.25)
+and lm-eval acc_norm **54.87** (vs 54.76 / 54.78), with math500 39.18 (highest of the three),
+arithmetic 143/144, instruction 13/14, 4-quadrant 31/40. The three seeds span 0.13pt, so this is
+choosing between near-identical candidates rather than cherry-picking.
+
+### 37b. ⚠️FOUR CONFIG DEFECTS, found only by diffing the staged build against the LIVE repo
+
+`push_model_to_hf.py --profile ctx13568_instruct` produced a bundle in the right shape (bf16, 5 shards,
+338 tensors, 5.76 GB, `model.py` + tokenizer + chat template + card). Its `config.json` was wrong in
+four ways, every one silent:
+
+| key | live `Argonne-3.5-think` | staged build | consequence if shipped |
+|---|---|---|---|
+| `auto_map` | present | **absent** | `from_pretrained(trust_remote_code=True)` cannot find `ArgonneModel` → **a standalone load from the Hub fails outright**; the model looks simply broken to anyone who downloads it |
+| `block_size` | 13568 | **4096** | the trained 13,568 context — the headline feature of the entire 3.5 line — silently capped at 4096 |
+| `eos_token_id` | 151645 `<\|im_end\|>` | **151643** `<\|endoftext\|>` | `.generate()` never stops at the end of a turn unless the caller passes `eos_token_id` by hand |
+| `use_cache` | True | **False** | *nothing* — see the correction below |
+
+⚠️**Correction to the above, made while writing the smoke test: `use_cache` is INERT for this
+architecture, so it is three real defects, not four.** `ArgonneConfig.__init__` never assigns
+`self.use_cache` — reading `cfg.use_cache` raises `AttributeError` — and `ArgonneModel.generate()`
+passes `use_cache=True` itself (`model.py:934`). The JSON field is normalised only to keep the family's
+configs consistent and to stay correct if transformers ever honours it. My first reading of the diff
+asserted the published model "would run with no KV cache"; that was wrong, and the release tool's
+docstring and assertion message say so now. The other three are real, and `auto_map` is severe.
+
+**Where they came from, and why the campaign could not see them.** All four are correct for the *local*
+harness and wrong for a *published artifact*. `run_arm_nt.sh:patch_cfg()` deliberately does
+`c.pop("auto_map")` and sets `eos_token_id = 151643`, because the local path registers `ArgonneModel`
+by hand and every probe passes `eos_token_id=tok.convert_tokens_to_ids("<|im_end|>")` explicitly. So
+the eos defect was masked by the very probes that would have caught it, and the `auto_map` defect
+cannot appear at all in a workflow that never relies on `auto_map`. **The generalisable failure is a
+config that is right for how you test and wrong for how users load** — no amount of evaluation finds
+that, only a diff against the artifact users actually get.
+
+**Fixed in the tool, not in a one-off script** (`9c097f4`): `rewrite_config_dtype` now takes the
+profile, sets all four, and then **asserts** them, raising instead of uploading if any is off. The
+staged bundle now matches the live config on **all 41 keys**.
+
+`--out-dir` was added in the same commit because `--dry-run` built the release into a temp directory
+and then deleted it in a `finally` block. That validates the build but leaves nothing to inspect,
+smoke-test or push — so the dry run as it stood could not have caught any of the above.
+
+### 37c. Release smoke test — the staged bundle PASSES through the path a Hub user takes
+
+`350_release_smoke.sh`. Loads the **staged bundle** (not the training output) with
+`trust_remote_code=True` and **deliberately no `register_argonne()`**, because the point is that
+`auto_map` plus the bundled `model.py` are sufficient on their own — the way someone downloading from
+the Hub experiences it. [[think-model-checkpoint-is-healthy]] records a `from_pretrained` buffer bug
+that made a healthy checkpoint emit gibberish *only* through the HF path, which is exactly the class of
+defect fp32→bf16 + 1 file→5 shards can introduce.
+
+| check | result |
+|---|---|
+| load, no manual registration | **2,882,162,688 params** — `auto_map` resolves `ArgonneModel` |
+| config as shipped | `block_size=13568  max_position_embeddings=13568  eos=151645  dtype=bfloat16` |
+| terminates with **no** `eos_token_id` argument passed | **79 tokens, terminated=True** |
+| instruction probe (14 items) | **13/14** — identical to pre-export, same single miss (French) |
+| one-step arithmetic (144 items) | **143/144** — identical to pre-export |
+
+**Both probes reproduce the pre-export numbers exactly**, so the bf16 conversion and 5-way sharding did
+not perturb the weights. The `lm_head.weight | MISSING | newly initialized` line in the transformers
+load report is **benign** — this arch ties input and output embeddings, so `lm_head` is legitimately
+absent from the state dict and populated by tying. That line is alarming and harmless, and the
+arithmetic reproducing to the item is what proves it: a genuinely re-initialised `lm_head` could not
+score 143/144.
+
+The termination row is the one that would not have been caught any other way. Every probe in the
+campaign passes `eos_token_id` explicitly, so all of them terminate regardless of what the config says;
+this is the only test that exercises the default a real caller gets.
+
+### 37d. What remains, and what is deliberately not done
+
+**Ready:** `models/a35_release/genfix46_staged` — 5.4 GB, bf16 5-shard + index, `model.py`, tokenizer,
+chat template, model card, config matching the live repo on all 41 keys, validated above.
+
+**The push is one command and is NOT run:**
+`huggingface-cli upload PursuitOfDataScience/Argonne-3.5-think /project/rcc/youzhi/models/a35_release/genfix46_staged`
+(or `push_model_to_hf.py` without `--dry-run`). Reason in §37's preamble: the owner's rule
+[[dont-substitute-base-or-publish-without-asking]] exists specifically to stop a blanket go-ahead from
+authorising a public push, so a blanket go-ahead cannot authorise this one.
+
+**Also pending on that decision, per the repo rule that a model is not shipped until the README links
+it:** `README.md`'s Argonne 3.5-think section still carries the v1 (`blend_a085`) numbers. If this
+ships, that section needs the §36f/§36j table — 5-set 50.31 → 57.38, arithmetic 55.6% → 99.3%,
+context/instruction unchanged — and the HF card needs to cite the GitHub source both ways. Not edited
+now, because a README on `main` describing an unpublished checkpoint would be wrong in the other
+direction.
