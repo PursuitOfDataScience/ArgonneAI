@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Stage the argonne3.5 reasoning model (blend_a085) as a Hugging Face model repo.
+"""Stage the argonne3.5 reasoning model as a Hugging Face model repo.
 
-Source: /project/rcc/youzhi/models/a35_reason/blend_a085 = 0.85*think_v6 + 0.15*dpo.
+Pass --src explicitly. The default below is the FIRST release (blend_a085); the currently published
+Argonne-3.5-think is `genfix46_a085` from the §36 gate, staged and uploaded 2026-08-04.
+
+⚠️This script stages WEIGHTS + CONFIG only -- it writes no model card. The card is a release artifact
+too: `push_model_to_hf.py --profile ctx13568_instruct` generates one from a template describing
+Argonne-2.5/3.0-instruct, which would publish the wrong architecture and the wrong training story.
+Write the card from the LIVE card plus new measurements and pass it via
+`push_model_to_hf.py --card-file`.
 
 FOUR CONFIG FIXES the source dir needs before it is publishable. These are not cosmetic --
 the first one silently breaks generation for every `.generate()` user:
@@ -10,12 +17,17 @@ the first one silently breaks generation for every `.generate()` user:
     stage-C vLLM config patch where stop tokens are supplied separately by the engine so it never
     mattered. For a CHAT model loaded through transformers it matters completely: generation must
     halt at <|im_end|> (151645) at the end of the assistant turn, or the model runs on past its
-    answer. deploy_hf.py flags this exact bug (§5/§16), and the published Argonne-3.0-think
-    uses 151645.
+    answer. The published Argonne-3.0-think uses 151645. Note every probe in the reasoning campaign
+    passes eos_token_id explicitly, so this defect is INVISIBLE to all of them -- the --verify pass
+    below is the only thing that exercises the default a real caller gets.
  2. auto_map added, matching 3.0-think (AutoConfig + AutoModel + AutoModelForCausalLM), so
     trust_remote_code=True resolves the custom argonne2 classes standalone.
- 3. use_cache false -> true. It is false because the dir was written by a TRAINING script;
-    leaving it off disables the KV cache and makes generation quadratically slow.
+ 3. use_cache false -> true. Cosmetic for THIS architecture, despite how it reads: ArgonneConfig
+    never assigns self.use_cache (reading cfg.use_cache raises AttributeError) and
+    ArgonneModel.generate() passes use_cache=True itself, so the JSON value cannot slow anything
+    down. Normalised only to keep the family's configs consistent and to stay correct if
+    transformers ever honours it. (Corrected 2026-08-04; the original claim here that it "disables
+    the KV cache and makes generation quadratically slow" was wrong.)
  4. block_size 4096 -> 13568, to stop contradicting max_position_embeddings.
 
 Verifies by reloading and running a real CHAT-templated generation, asserting the output
