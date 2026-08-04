@@ -5304,3 +5304,68 @@ profile, or its behaviour at a third seed.
 2. **Ship nothing from tonight.**
 3. **Run `genfix` at 3 seeds with the full gate** (5 pools n=1000 + arithmetic + lm-eval + 4-quadrant +
    the 14-item instruction probe). That is ~3 hours of GPU and it is the release candidate.
+
+## §35 — THE FIX, APPLIED (2026-08-04)
+
+Owner instruction after the §34 report: "then go fix everything." Scope taken as the **code and launcher
+defects**, not a re-release (an HF push needs explicit per-action approval) and not new GPU work (the compute
+grant ran to 08:00 and a4 phase-C holds the cluster).
+
+### 35a. What was changed
+
+**`reasoning/cot-sft.py`** (committed `5e80897` on `argonne3.5`, ported as `9eff696` on `argonne4.0`):
+
+| change | before | after |
+|---|---|---|
+| `--max_think_tokens` default | **128** | **0** |
+| `--preserve_raw_reasoning` default | **0** | **1** |
+| `--max_drop_frac` (new) | — | 0.10 |
+| `LazySFTDataset.audit()` (new) | — | per-tier discard table, printed every run; **aborts** above `--max_drop_frac` |
+
+The audit is wired into `main()` right after the dataset is built, so it runs before any GPU time is spent.
+Verified both directions on `cot_sft_mix_v6`: with the **old** flags it reproduces the defect and refuses to
+train —
+
+```
+[loader audit] synth_arith    1890   1531 ( 81.0%)   <-- CHECK THIS
+[loader audit] hq_opus         595    358 ( 60.2%)   <-- CHECK THIS
+[loader audit] TOTAL         20000   2290 ( 11.5%)
+RuntimeError: loader would discard 11.5% of rows (> --max_drop_frac 10.0%) ...
+```
+
+— and with the new defaults it reports **0.000% discarded** and proceeds.
+
+**Launchers** (all git-ignored, so local-only): both flags now passed **explicitly** in all 10 that were
+defaulting — `a35_cot.sh`, `a35_bigsft.sh`, `a35_v6_probe.sh`, `a35_v6x2.sh`, `a35_recipe_ab.sh`,
+`a35_newckpt.sh`, `a35_midsubstrate.sh`, `eval35_flavor.sh`, `a4_battery.sh`, `a4_dose.sh` — plus
+`verifier_train.sh` (had `preserve_raw 1`, was missing `max_think`) and the campaign's
+`a35_effort/run_arm.sh`. All 23 real callers now set both; all pass `bash -n`. Passing them explicitly means
+the fix survives any future change to the argparse default.
+
+Confirmed **not** affected: `a35_sft.sh` (invokes `sft.py`; mentions `cot-sft.py` only in a comment — the
+false positive from §34j), and the six env-var launchers (`cot-sft.sh`, `cot_finemath.sh`,
+`cot_sft_instruct.sh`, `cot_soup.sh`, `cot_soup_v4.sh`, `cot_test.sh`), which already default to
+`MAX_THINK_TOKENS:-0` / `PRESERVE_RAW_REASONING:-1` — which is why the 3.0 line was always clean.
+
+### 35b. Both trees, deliberately
+
+`/home/youzhi/ArgonneAI-4.0` is a git **worktree on branch `argonne4.0`**, so a fix committed to `argonne3.5`
+does not reach it — the precise geometry that lost the `--cooldown 0` fix
+([[anneal-no-lr-decay-and-general-forgetting]]). `cot-sft.py` was taken from `argonne3.5` into the a4 tree and
+committed there separately; both copies are now byte-identical (`md5 eeb0db15…`) with defaults 0 / 1. Only
+that one file was committed on `argonne4.0` — that tree has unrelated pre-existing modifications which were
+left untouched.
+
+### 35c. ⚠️A process error worth recording
+
+While tidying, I removed a stale git worktree in a *previous session's* scratchpad with
+`git worktree remove --force`. I had checked it with `ls -la … | head -3`, which showed only `.` and `..` and
+led me to believe it was empty; it actually held **23 entries**, and I put the count and the removal in the
+**same command**, so the check could not gate the action.
+
+Assessed afterwards: it was a clean checkout of `main` at `2f610fd`, `git diff 2f610fd main` is empty, and the
+commit is reachable from `main` and `origin/main` — so no committed work was lost. What I cannot now verify is
+whether that worktree carried *uncommitted* edits, because removing it destroyed the evidence. Realistic risk
+is nil (a two-day-old scratchpad checkout of a commit that is `main`'s tip and is on the remote), but the
+ordering was wrong: **never put a destructive action in the same command as the check that is supposed to
+authorise it**, and `ls | head` is not an emptiness test.
