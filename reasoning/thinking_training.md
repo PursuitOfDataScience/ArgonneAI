@@ -5369,3 +5369,91 @@ whether that worktree carried *uncommitted* edits, because removing it destroyed
 is nil (a two-day-old scratchpad checkout of a commit that is `main`'s tip and is on the remote), but the
 ordering was wrong: **never put a destructive action in the same command as the check that is supposed to
 authorise it**, and `ls | head` is not an emptiness test.
+
+## §36 — THE RELEASE-CANDIDATE ROUND, and a leak in one of the five judging pools (2026-08-04)
+
+§35 closed with three recommendations. #1 (apply both flags everywhere) and #2 (ship nothing) were
+done. This section is #3: **run `genfix` at 3 seeds with the full gate — that is the release
+candidate.** It had never been run.
+
+### 36a. What is running
+
+One H100, one `exp-` job (job 53014369), three queued tasks:
+
+| task | what | why |
+|---|---|---|
+| `340_genfix_s99.sh` | third seed of `genfix` | §33u: three seeds minimum. `genfix` had s5150 (§34by) and s46 (§34cb); **s99 completes the triple and makes it seed-matched with `both`** (46/99/5150), so genfix-vs-`both` is paired at every seed rather than mean-vs-mean |
+| `341_gate_genfix.sh` | full paired 5-pool gate | the §35 requirement: asdiv/svamp n=1000, gsmplus/mawps n=500, math500 n=319 + one-step arithmetic |
+| `342_general_genfix.sh` | lm-eval 6-task + 4-quadrant | a math gain that eats general ability is not a gain (§12, §18, §33i) |
+
+Two economies, both verified rather than assumed. **`base` and `boths46` are not re-measured** — 322
+recorded them at byte-identical settings (pools/n/k/extensions/extend_tokens/max_new_tokens/
+max_model_len/temperature/top_p all match), and `effort_gate.py --report-from` merges per-item
+outcomes, so feeding those JSONs into the merge yields the paired McNemar table *and* the
+seed-matched genfix-vs-`both` contrast for the cost of the three genfix arms alone. Likewise
+`lmeval_base.json` is reused. Saves ~75 GPU-min.
+
+**`BATCH=4 ACCUM=3`, deliberately not §34bz's 13%-faster `6×2`.** Effective batch is 12 either way,
+but the DataLoader batch *composition* differs, which would put the third seed on a different
+trajectory from the two it exists to be compared with. Throughput is not worth breaking a triple;
+use `6×2` for the next campaign, not mid-round.
+
+### 36b. The §35 loader audit, validated in production
+
+The audit added in §35 fired on the first real run it was ever used in, and reports what it should:
+
+```
+[loader audit] max_think_tokens=0 preserve_raw_reasoning=1 allow_non_reasoning=1 max_seq_len=1024
+[loader audit] direct_tulu 6742  0 ( 0.0%)   ... all 12 tiers ...
+[loader audit] TOTAL      20000  0 ( 0.0%)
+```
+
+**0.0% discarded on every one of the 12 tiers**, against the 11.5% total (81.0% of `synth_arith`,
+60.2% of `hq_opus`) that the old defaults dropped silently. §34's defect cannot recur unnoticed.
+
+### 36c. ⚠️A LEAK IN math500 — clean_eval's own warning, finally measured
+
+`clean_eval.load_clean` labels its pools by hand, and math500's label is a free-text caveat:
+*"never directly trained but OpenMathReasoning/Mixture-of-Thoughts carry indirect-leak risk."* The
+mix's `med_math` (2,000) and `ms_*` (4,890) tiers are exactly those sources. **That warning had never
+been quantified, and the release candidate is judged on the pool.** New tool `reasoning/pool_decontam.py`
+reproduces the gate's exact item order (same build order, filter, `Random(0).shuffle`, `[:n]`) and
+measures token-set Jaccard against every training row via a lossless inverted index.
+
+| judged pool | n | exact | J≥0.95 | J≥0.85 | J≥0.70 | J≥0.60 | worst J | nearest tier |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| svamp | 1000 | 0 | 0 | 0 | 0 | 0 | 0.550 | gsm8k_train_short |
+| asdiv | 1000 | 0 | 0 | 0 | 0 | 3 | 0.679 | gsm8k_train_short |
+| mawps | 500 | 0 | 0 | 0 | 0 | 0 | 0.545 | synth_arith |
+| gsmplus | 500 | 0 | 0 | 0 | 0 | 0 | 0.593 | hq_opus |
+| **math500** | **319** | **0** | **0** | **4** | **17 (5.3%)** | **36** | **0.933** | **med_math** |
+
+The worst pair is not arguable:
+
+```
+EVAL: What is the remainder when $1 + 2 + 3 + 4 + \dots + 9 + 10$ is divided by 9?
+MIX : What is the remainder when $1 + 2 + 3 + 4 + \dots + 9 + 10$ is divided by 8?   (med_math)
+```
+
+and index 80 (J=0.922) is *character-identical* to its `med_math` row for its first 120 characters.
+Index 175 is the same balls-in-boxes problem with one distinguishability condition flipped. Nearly
+every hit is `med_math`; `ms_algebra` contributes one.
+
+**Two things this does and does not establish.**
+
+- It does **not** show the reported gain is leakage. 5.3% of one of five pools bounds any leak
+  contribution at ~1.1pt of the 5-set mean, against the **+7.15pt** §34ca is explaining. And the
+  numbers differ, so the answers differ — the model still has to execute the method.
+- It **does** mean the absolute math500 figure is not a clean measurement for *any* arm on this line,
+  including the released model, and every 5-set mean ever quoted here silently includes it.
+
+**Also cleared, and this one mattered more:** GSM-Plus is adversarially perturbed GSM8K **test**, it
+is the pool carrying genfix's largest gain (28.00 → 42.10), and
+[[gsm8k-contaminated-all-argonne-evals]] records a previous CoT-SFT having trained on ~94% of GSM8K
+test. Measured: `gsm8k_train_short` is **4,338/4,338 in gsm8k TRAIN and 0 in TEST**, and no judged
+GSM-Plus item exceeds J=0.60 against the whole mix. That gain is not memorisation leaking through the
+perturbation.
+
+**Consequence for the gate: report math500 twice** — full pool and the 302-item clean subset
+(`pool_decontam.py rescore`) — and let the four clean pools carry the claim. Do not quote a 5-set
+mean without the footnote.
