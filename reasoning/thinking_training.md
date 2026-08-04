@@ -5496,6 +5496,16 @@ cache from `safe_open` memory-mapping the two 11.53 GB source files. Sizing `--m
 figure would have re-padded the request by ~40%. The OOM-relevant quantity is the anonymous working
 set, exactly as CLAUDE.md's caveat says.
 
+**And the field semantics, measured, because I got this wrong twice in one session.** With
+`slurmwatch --once` **no memory field gives a true anonymous peak**: `memory.peak_bytes` is the cgroup
+high-water *including page cache*, so on any file-heavy job it climbs to whatever `--mem` you set and
+reads 100% (observed: 31.36 of 31.36 GiB on a healthy gate whose real anonymous set was **1.90 GiB**,
+with 29.08 GiB of reclaimable cache); `working_set_bytes` is the OOM-relevant figure but only for that
+instant; `peak_working_set_bytes` is slurmwatch's running max across *its own* samples, so under
+`--once` it has no history. Sizing therefore needs `--log` across the job, or analytic reasoning about
+the heaviest step — for a soup, one fp32 state dict (~11.5 GB at 2.88B) plus a serialisation buffer
+→ ~23 GB → request 32G.
+
 Also validated in passing: `gpu_wait` now clamps its request to 92% of the card
 (`request 100000MiB > 92% of this 81559MiB card; clamping to 75034MiB`). The campaign's thresholds
 were written for a 139,730 MiB H200 and are unreachable on an 80G H100, so every call would have
