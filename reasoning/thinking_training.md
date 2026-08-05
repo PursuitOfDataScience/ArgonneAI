@@ -6262,3 +6262,161 @@ negative and both lengthened traces (−1.65, −5.05).
 pass@8 gap (57.38 → ~77.8), which is a SELECTION problem. The levers that have ever moved it here are a
 better base or a serving-system change. Post-training data composition on this recipe is exhausted, and
 tonight is the measurement that says so — thirteen arms, one mechanism, no gains.
+
+---
+
+## §39 — THE argonne4.0 PHASE-C BASE: it CLEARS the §15 gate, and phase C is a DOMAIN TRADE, not a context extension (2026-08-05)
+
+argonne4.0 phase C (ctx 13,568 → 65,536) was ~91% done and mid-WSD-cooldown when this was measured, and
+it hands off to SFT + the reasoning line next. So the question is not "is phase C finished" but **"is
+phase C the right SEED, and what does its base quality predict for the recipe."** Job 53072616
+(`reasoning/a4_pcgate.sh`, 1×H100, 1h34, read-only — the training chain was untouched).
+
+**The headline checkpoint was PINNED** (`--pin a4_phasec=...step_112412.pt`, a new flag on
+`exp_longctx_learning.py`). Phase C writes a checkpoint roughly hourly, and the probe previously globbed
+"the latest" at stage start, so a multi-stage job would silently have measured *different models* in
+different stages. It also now `torch.load(..., mmap=True)`: a training `.pt` is ~2/3 optimizer state, and
+reading 4.2 GB of weights was pulling all 12.4 GB into RAM (measured working set 9.98 GB after the fix).
+
+### 39a. THE §15 BASE GATE — CLEARED, by phase B and by phase C. The first a4 checkpoints to do it.
+
+| arm | math std | math ext | **math /40** | gen std | gen ext | **gen /30** | gate |
+|---|---:|---:|---:|---:|---:|---:|---|
+| phase B 109,622 | 16/20 | 16/20 | **32** | 15/15 | 13/15 | **28** | **CLEARED** |
+| phase C 112,372 | 17/20 | 18/20 | **35** | 15/15 | 14/15 | **29** | **CLEARED** |
+| phase C 112,412 | 17/20 | 16/20 | **33** | 15/15 | 14/15 | **29** | **CLEARED** |
+
+Against the pretrain-era history (`report/a4_gatedose_*.json`), where a4 NEVER cleared both axes:
+
+| pretrain step | math std | gen std | gate |
+|---|---:|---:|---|
+| 37,924 | 12 | 13 | no |
+| 43,672 | 11 | 13 | no |
+| 49,947 | 10 | 13 | no |
+| 59,723 | **14** | 12 | math only |
+| 60,127 | 12 | 12 | no |
+
+So phase A anneal + B + C moved a4 from "never cleared" to cleared with margin. **3.5 cleared this same
+gate at 14/20 · 14/15 at 2.88B params; a4 reads 17/20 · 15/15 at 1.04B** — ahead of the base that
+produced 3.5-think, at 36% of the parameters.
+
+**Two caveats that bound how far that can be pushed.** (1) `gen std` is 15/15 on all three arms — the axis
+is SATURATED, so the gate cannot rank them. (2) The two phase-C arms are 40 steps (~13M tokens) apart and
+differ by **2 points on pooled math** (35 vs 33). That is §31's ±2 probe noise reproducing on demand, and
+it is why two adjacent checkpoints were run rather than one. **Phase C is therefore INDISTINGUISHABLE from
+phase B on this gate** — the honest phase-C number is ~34/40 ± 1 against phase B's 32/40.
+
+### 39b. TIER CE — phase C is WORSE on 7 of 8 reasoning-anneal tiers, and the 50% replay did not hold them
+
+`tier_ce_probe.py`, 1M held-out tokens/tier, block 1024. Negative = phase C better.
+
+| tier | phase B CE | phase C CE | Δ | PPL change |
+|---|---:|---:|---:|---:|
+| **reason_r1** | 1.9262 | 2.4516 | **+0.5254** | **+69.1%** |
+| **code_github** | 0.7765 | 1.0018 | **+0.2253** | **+25.3%** |
+| math_openmath | 0.6595 | 0.7613 | +0.1018 | +10.7% |
+| tool_agentic | 0.4399 | 0.5090 | +0.0691 | +7.2% |
+| code_compprog | 0.9237 | 0.9795 | +0.0559 | +5.7% |
+| reason_mot | 1.0013 | 1.0535 | +0.0522 | +5.4% |
+| think_05m | 0.7377 | 0.7753 | +0.0376 | +3.8% |
+| general_edu | 2.6506 | 2.6099 | −0.0407 | −4.0% |
+
+This matters because `build_phasec_data.py` was **explicitly designed to prevent it**: phase C is 50% long
+arXiv + 50% replay, and the docstring cites the §12 incident by name as the reason. **The mitigation was
+reasoned correctly and still did not work** — the reasoning tiers degraded anyway, worst on exactly the
+tier (`am_r1`) whose distribution the reasoning line trains on. `general_edu` is the only gain, and it is
+the CONTAMINATED tier for a4 (no holdout), so it is valid only as a within-model B-vs-C reading.
+
+### 39c. LONG-CONTEXT NLL — phase C wins at EVERY position, which is why it is NOT a context extension
+
+Held-out arXiv shards only (`arXiv_09*`; phase C trains on `arXiv_0[0-8]*`). eval_len 49,152, 24 windows.
+
+| bucket | phase B | phase C | Δ |
+|---|---:|---:|---:|
+| **0–1024** | 2.4009 | 1.9906 | **−0.410** |
+| 1024–2048 | 2.0611 | 1.6966 | −0.365 |
+| 2048–4096 | 1.7047 | 1.4106 | −0.294 |
+| 4096–8192 | 1.4274 | 1.1613 | −0.266 |
+| 8192–13568 | 1.2417 | 1.0011 | **−0.241** |
+| 13568–20480 | 1.1970 | 0.9455 | −0.251 |
+| 20480–24576 | 1.2198 | 0.9250 | −0.295 |
+| 24576–32768 | 1.1978 | 0.8844 | −0.313 |
+| 32768–40960 | 1.3162 | 0.9170 | −0.399 |
+| 40960–49152 | 1.2998 | 0.8403 | −0.459 |
+
+At 65,536 (10 windows) the same shape holds, tail bucket 49152–65536: 1.0972 → 0.7889 (−0.308).
+
+**Read against the probe's own falsifiable H3** — *"effective context extension → the gap GROWS with
+position; a uniform offset means generic training instead."* The gap is not growing; it is **U-shaped**,
+and it is **as large at 0–1024 (−0.41) as in the 40k–49k tail (−0.46)**, with the MINIMUM in the middle.
+Phase C did not need to extend position 0–1024 and improved there most of all.
+
+**The attribution is clean because two instruments measure the same positions on different corpora.** Both
+the tier probe (block 1024) and this probe's 0–1024 bucket score positions 0–1023 with no prior context.
+They disagree in SIGN: −0.41 nats on arXiv, +0.04 to +0.53 nats on the reasoning tiers. **That rules out
+context length and leaves distribution: phase C moved toward arXiv and away from the reasoning corpus.**
+
+### 39d. REAL BENCHMARKS — MC up ~1pt, GENERATIVE MATH down. vLLM validated on the a4 arch.
+
+`run_lmeval_vllm.py`, gated on stage 3.5: **VLLM_GATE 6/6, token-for-token greedy vs `model.py`.** The port
+was validated on 3.5 (12 query / 4 KV heads); this is the first proof it is exact on **a4's 6/2 config**,
+so the fast path is now available for the whole a4 line (`vllm_argonne.py` needed no change — head_dim is
+256 in both, and it reads head counts from config).
+
+| task / metric | phase B | phase C | Δ |
+|---|---:|---:|---:|
+| sciq acc_norm | 77.80 | **80.40** | +2.60 |
+| arc_challenge acc | 31.40 | **33.87** | +2.47 |
+| arc_easy acc | 60.77 | **62.71** | +1.94 |
+| hellaswag acc_norm | 43.85 | **45.30** | +1.45 |
+| mmlu | 24.73 | **25.95** | +1.22 |
+| sciq acc | 85.50 | **86.60** | +1.10 |
+| arc_easy acc_norm | 54.88 | **55.89** | +1.01 |
+| piqa acc_norm | 67.08 | **68.01** | +0.92 |
+| hellaswag acc | 35.51 | **36.15** | +0.64 |
+| winogrande | 56.35 | **56.67** | +0.32 |
+| piqa acc | 67.36 | 67.30 | −0.05 |
+| arc_challenge acc_norm | 35.75 | 35.67 | −0.09 |
+| openbookqa acc | 22.60 | 22.20 | −0.40 |
+| openbookqa acc_norm | 32.20 | 31.60 | −0.60 |
+| **14 MC cells, mean** | **45.68** | **46.59** | **+0.91** |
+| **gsm8k strict-match** | **9.70** | **8.11** | **−1.59** |
+| gsm8k flexible-extract | 10.16 | 8.57 | −1.59 |
+
+**The ONLY benchmark phase C loses is the generative one**, by 16% relative (128 → 107 of 1319 items).
+Alone that is ~1.4σ and not significant. But it points the same way as §39b's `math_openmath` (+10.7% PPL)
+and `reason_r1` (+69%), and **two independent instruments agreeing is a signal, not noise.** The MC gains
+have an obvious source: the largest single one is `sciq` (+2.60), which is what 3B tokens of arXiv buys.
+
+**MMLU is the standout weakness: 24.73 → 25.95 against 25.0 chance, i.e. at the FLOOR.** That independently
+confirms the banked finding that GENERAL, not math, is a4's binding axis.
+
+### 39e. VERDICT — phase C trades generative reasoning for scientific text and long-context reach
+
+Four instruments, one consistent story:
+
+| axis | phase C vs phase B |
+|---|---|
+| §15 base gate | equal (inside ±2 probe noise); both CLEARED |
+| MC benchmarks | +0.91 mean, driven by sciq/arc |
+| arXiv NLL, all positions | −0.24 to −0.46 nats (better) |
+| **reasoning-anneal CE** | **worse on 7/8 tiers** |
+| **generative math (gsm8k)** | **−1.59pt (−16% relative)** |
+
+**For a line whose deliverable is a generative reasoner, that trade runs the wrong way.** Phase C's gains
+are on multiple-choice and on its own training domain; its losses are on generation, which is what the
+reasoning recipe produces.
+
+**Honest bounds.** (1) Phase C was **mid-cooldown** at step 112,412 (197 of 458 cooldown steps, LR
+6.1e-5 → 1e-5, ~261 steps and 0.26B tokens remaining) — these are a lower bound on the finished stage, and
+the trade may soften. (2) The long-context eval corpus IS phase C's training domain, so its win there
+cannot be read as capability. (3) gsm8k is 1.4σ on its own. (4) `general_edu` is contaminated for a4.
+
+**What this does NOT say.** It does not say phase C was a mistake — it bought a real 65,536 window and a
+measured 3.0B-token improvement on long scientific text, which phase B does not have. It says the two
+seeds are **good at different things**, and the reasoning line should not assume the longer-context one is
+automatically the better seed.
+
+**The cheap decisive test, if the seed choice matters:** run the SAME CoT-SFT from both seeds and compare
+on `clean_eval`. That is ~1 GPU-hour per arm and it measures the thing the CE and gsm8k readings can only
+predict. Recorded as an OFFER, not run.

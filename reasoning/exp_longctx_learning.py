@@ -54,7 +54,9 @@ def load_ckpt(pt_path, repo, theta=1e6):
     for line in open(os.path.join(repo, "pretrain.py")):
         if re.match(r"^[A-Z][A-Z0-9_]*\s*=\s*(True|False|None|[-\d.eE]+)\s*(#.*)?$", line):
             exec(line, ns)
-    ck = torch.load(pt_path, map_location="cpu", weights_only=False)
+    # mmap: a training .pt is ~2/3 optimizer state. Without this the whole 12.4 GB file lands in
+    # RAM just to read the 4.2 GB of weights, which is the difference between a 24G and a 48G job.
+    ck = torch.load(pt_path, map_location="cpu", weights_only=False, mmap=True)
     st = ck["model_state_dict"]
     for pfx in ("_orig_mod.", "module."):
         if any(k.startswith(pfx) for k in st):
@@ -132,6 +134,11 @@ if __name__ == "__main__":
     ap.add_argument("--docs", type=int, default=40)
     ap.add_argument("--arms", default="a35_pre,a35_post")
     ap.add_argument("--out", default="report/exp_longctx_learning.json")
+    ap.add_argument("--pin", action="append", default=[], metavar="ARM=CKPT.pt",
+                    help="Pin an arm to an explicit .pt instead of globbing the latest. Required "
+                         "when the run being measured is STILL TRAINING: a4_phasec otherwise "
+                         "resolves to whatever checkpoint exists at the moment this stage starts, "
+                         "so a multi-stage job silently measures two different models.")
     ap.add_argument("--eval_len", type=int, default=EVAL_LEN,
                     help="Window length; buckets auto-extend to cover it.")
     ap.add_argument("--docbin_glob", default="*.bin",
@@ -169,6 +176,12 @@ if __name__ == "__main__":
                key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
     if c:
         ARMS["a4_phasec"] = (c[-1], "/home/youzhi/ArgonneAI-4.0")
+    for spec in a.pin:
+        arm, _, pt = spec.partition("=")
+        assert arm in ARMS, "cannot pin unknown arm %r (known: %s)" % (arm, ",".join(sorted(ARMS)))
+        assert os.path.exists(pt), "pinned checkpoint does not exist: %s" % pt
+        ARMS[arm] = (pt, ARMS[arm][1])
+        print("PINNED %s -> %s" % (arm, pt))
     print("eval shards: %s   window %d" % (a.docbin_glob, EVAL_LEN))
     w = get_windows(a.docs, glob_pat=a.docbin_glob)
     print("eval: %d held-out arXiv windows of %d tokens (%.2fM tokens/arm)"
