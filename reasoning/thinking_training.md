@@ -5995,3 +5995,58 @@ monotonicity is doing more work here than any single comparison.
 with fixing the one general-probe miss, and a 2-pool math screen cannot see instruction-following,
 termination, or general knowledge. That is exactly the §33s trap — a math gain invisible to the axis it
 damages. `403b` gates it on all three before this counts as an improvement.
+
+### 38i. 404 — gsm8k COVERAGE-FOR-UPSAMPLING IS SIGNIFICANTLY NEGATIVE
+
+`cot_sft_mix_v13_gsmlong`: the gsm8k tier rebuilt at cap 1536 / upsample 1 (3,271 distinct train
+problems) in place of cap 512 / upsample 3 (1,446 distinct, each shown three times). Mix 27,361 rows,
+seed 46, max_seq 1664, loader audit clean.
+
+| pool (n=500 greedy, paired) | shipped | `gsmlong46` | delta | p |
+|---|---:|---:|---:|---:|
+| **GSM-Plus** (the target pool) | 42.40 | 36.00 | **−6.40** | **0.0035** |
+| **ASDiv** | 74.40 | 69.40 | **−5.00** | **0.013** |
+| MATH-500 | 39.18 | 35.42 | −3.76 | 0.18 |
+| **3-pool mean** | **51.99** | **46.94** | **−5.05** | |
+
+Two pools significantly worse, and **termination collapsed**: unclosed 45/300 and 46/300 (≈15%) versus
+the shipped 26/300 and 21/300 (≈8%). Arithmetic held at 144/144, so this is not a numeracy failure —
+it is a *finishing* failure.
+
+"More distinct problems beat repeats" is a sound principle that is wrong here, and the reason is
+visible in the termination numbers: the 3× repetition of SHORT, cleanly-closed gsm8k derivations was
+doing format work, not information work. Removing it — and admitting 513–1536-token derivations in its
+place — cost the model its ability to close a trace, and greedy accuracy follows termination on this
+model.
+
+## §38j — THE ANSWER: the 768-token cap is the load-bearing constraint, and it is about TERMINATION, not difficulty
+
+Four arms, one consistent mechanism. Sorting them by what they did to trace length:
+
+| arm | change to trace length | unclosed /300 | 3-pool mean vs shipped |
+|---|---|---:|---:|
+| shipped `genfix46` | — (≤768) | 26 / 21 | — |
+| **402 verify tier** | none (≤768), denser reasoning | 32 / 21 | **+0.19** (ASDiv **+4.20**) |
+| **403 α=1.00** | none (no data change at all) | 17 / 23 | **+2.70** (2-pool) |
+| 401 long-trace | 768 → 1536 on hard tiers | 32 / 29 | **−1.65** |
+| 404 gsm coverage | 512 → 1536 on gsm8k | **45 / 46** | **−5.05** (2 pools significant) |
+
+**Every arm that lengthened traces lost, and the loss tracks the unclosed rate almost monotonically.
+Every arm that left length alone won.** §32's "termination pressure" rationale for the 768 cap is
+correct and survives the loader fix intact.
+
+**§38b's framing was a red herring and I should name it as such.** It is true that only ~2.3% of the
+available hard-reasoning signal reached the model, and it is true that the truncation was
+anti-correlated with difficulty. Both facts are real. The inference I drew from them — that hard
+reasoning was the binding constraint — is refuted by 401 and 404 together. This model's limiter is not
+a shortage of hard reasoning; it is that long derivations break its ability to finish, and an unfinished
+derivation scores zero no matter how good it was.
+
+That also resolves why §36's fix worked so well while §38's length experiments failed. §36 did not add
+length — it restored the *ends* of traces the loader had been cutting off, i.e. it gave the model back
+the concluding step. §38's arms added *middles*. The model was never short of reasoning; it was short
+of endings.
+
+**What this predicts, and it is testable:** the productive direction is more reasoning DENSITY inside
+the existing length budget — which is exactly what §33's verify tiers are (a solve plus a check, all
+under 768), and exactly the one data arm that gained. Not longer traces. Not more of the hard tail.
