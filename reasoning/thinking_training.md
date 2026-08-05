@@ -5927,3 +5927,71 @@ would confound the loader question.
 Termination is instrumented on every training arm (`no_answer`, against the shipped ~1–2%), because it
 is the axis all four length caps were introduced to protect. If it climbs, the caps were load-bearing
 and that is the finding.
+
+### 38f. 401 — RE-ADMITTING THE LONG TRACES IS A NULL, slightly negative. Hypothesis refuted.
+
+The headline experiment of this round, and the one I predicted would win. `cot_sft_mix_v12_long`
+(31,860 rows; `hard_strict` 600→2412, `med_openmath` 300→1048) at max_seq 1664, seed 46, everything
+else identical to `genfix46`. Loader audit clean at 0.0%, so the added rows genuinely reached the model.
+
+| pool (n=500 greedy, paired) | shipped `genfix46` | `longtr46` | delta | p |
+|---|---:|---:|---:|---:|
+| ASDiv | 74.40 | 73.20 | −1.20 | 0.56 |
+| GSM-Plus | 42.40 | 40.20 | −2.20 | 0.31 |
+| MATH-500 | 39.18 | 37.62 | −1.57 | 0.66 |
+| **3-pool mean** | **51.99** | **50.34** | **−1.65** | |
+
+All three negative, none individually significant, and termination degraded (unclosed 32/300 and
+29/300 versus the shipped 26/300 and 21/300).
+
+**So the 768-token cap is load-bearing after all, and §32's "termination pressure" rationale survives
+the loader fix.** §38b's framing — that hard reasoning was starved to ~2.3% of the available signal —
+is *true as an accounting statement* and *false as a diagnosis*: giving that signal back does not help.
+The under-representation of hard tiers is not what limits this model.
+
+**The instructive contrast is 402.** The verify tiers are also dense multi-step reasoning, they are also
+"more reasoning content", and they stay under 768 tokens — and they gained +4.2 ASDiv. So the useful
+variable is not how LONG a trace is, it is what the trace TEACHES. Length was a proxy I mistook for the
+mechanism.
+
+### 38g. 402 — §33's VERIFY TIER IS ALIVE. The arithmetic regression was the loader, not the tier.
+
+`cot_mix_robust` — §33's own mix, unchanged — retrained with only the loader fixed.
+
+| axis | §33's verify arm | shipped `genfix46` | **`vfyfix46`** |
+|---|---|---:|---:|
+| **one-step arithmetic** | **catastrophic**: `2+2`→6, −23.8pt, SHIP BLOCKED | 143/144 | **144/144** |
+| ASDiv greedy (n=500) | — | 74.40 | **78.60 (+4.20)** |
+| ASDiv greedy (n=300 judge) | — | 73.33 | **79.33 (+6.00)** |
+| GSM-Plus (n=500) | — | 42.40 | 40.00 (−2.40) |
+| MATH-500 (n=500) | — | 39.18 | 37.93 (−1.25) |
+| pass@8 (n=300) | — | 93.67 | 94.00 |
+
+**§33's blocker is gone and arithmetic is now perfect — better than the shipped model.** §33s wrote
+"any future round must gate on a one-step arithmetic probe"; the deeper lesson is that §33's *negative*
+result was an artifact, and a whole family was abandoned on it. **A negative result obtained through a
+broken pipeline is not a finding about the idea.**
+
+Overall accuracy is a wash at one seed (3-pool mean 52.18 vs 51.99). The shape — a large ASDiv gain
+partly returned on the other two pools — is the signature of a composition deficit, because
+`cot_mix_robust` still carries the pre-§36 general anchor (tulu 8000 / ultrachat 3000 vs 9600 / 3400)
+that §36 measured as worth the entire instruction axis. `405` restores exactly that and nothing else.
+
+### 38h. α=0.85 IS NOT THE KNEE — math is monotone in α, and the best arm needs no soup at all
+
+| α | ASDiv | GSM-Plus | 2-pool mean | arithmetic | vs shipped (GSM-Plus) |
+|---|---:|---:|---:|---:|---|
+| **0.85 (shipped)** | 74.40 | 42.40 | 58.40 | 144/144 | — |
+| 0.90 | 75.40 | 43.60 | 59.50 | 144/144 | +1.20 (p=0.49) |
+| 0.95 | 75.60 | 44.40 | 60.00 | 144/144 | +2.00 (p=0.30) |
+| **1.00 (pure CoT, no soup)** | **75.80** | **46.40** | **61.10** | 143/144 | **+4.00 (p=0.049)** |
+
+Monotone on both pools, 6 of 6 comparisons in the same direction, and **free** — it is a soup weight,
+not a retrain. §32 chose 0.85 when the DPO partner was repairing corrupted-data damage; with whole
+traces the CoT checkpoint stands on its own. Individually only α=1.00 on GSM-Plus clears p<0.05, so the
+monotonicity is doing more work here than any single comparison.
+
+⚠️**NOT believed yet.** α=1.00 discards the DPO/SFT partner that §32 credited with general ability and
+with fixing the one general-probe miss, and a 2-pool math screen cannot see instruction-following,
+termination, or general knowledge. That is exactly the §33s trap — a math gain invisible to the axis it
+damages. `403b` gates it on all three before this counts as an improvement.
