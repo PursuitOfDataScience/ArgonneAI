@@ -6420,3 +6420,67 @@ automatically the better seed.
 **The cheap decisive test, if the seed choice matters:** run the SAME CoT-SFT from both seeds and compare
 on `clean_eval`. That is ~1 GPU-hour per arm and it measures the thing the CE and gsm8k readings can only
 predict. Recorded as an OFFER, not run.
+
+### 39f. THE ANCHOR — a4's base is DOMINATED by Qwen3-0.6B-Base on every axis, and §39a's optimism is RETRACTED
+
+§39a-e measured phase C against phase B, which can say whether phase C was a good step but cannot say how
+far the recipe can go from it, because nothing in the a4 line has a post-recipe outcome yet. §15 does: the
+same recipe on Qwen1.5-0.5B beat the shipped 3.0-think v4 at 1/6 the params, and the recorded conclusion
+was *"base QUALITY not size was the ceiling."* So the anchor question is whether a4's base reads at
+real-base grade. Job 53074942, identical harness/tasks/few-shot to §39d so the tables merge.
+
+| task (acc_norm; acc for winogrande/mmlu) | a4 phase B | a4 phase C | Llama-3.2-1B | **Qwen3-0.6B-Base** |
+|---|---:|---:|---:|---:|
+| arc_challenge | 35.75 | 35.67 | 34.90 | **44.88** |
+| arc_easy | 54.88 | 55.89 | **59.93** | 57.87 |
+| hellaswag | 43.85 | 45.30 | **60.36** | 53.61 |
+| piqa | 67.08 | 68.01 | **73.50** | 69.80 |
+| sciq | 77.80 | 80.40 | 89.90 | **91.30** |
+| openbookqa | 32.20 | 31.60 | **36.20** | 34.60 |
+| winogrande | 56.35 | 56.67 | **61.96** | 60.22 |
+| **mmlu** | 24.73 | 25.95 | 31.41 | **52.49** |
+| **8-task mean** | 49.08 | 49.94 | 56.02 | **58.10** |
+| **gsm8k strict** | 9.70 | 8.11 | 1.82 | **49.28** |
+| gsm8k flexible | 10.16 | 8.57 | 2.27 | **50.04** |
+
+Params / tokens: a4 1.04B / **64.9B** · Llama-3.2-1B 1.24B / ~9T · Qwen3-0.6B **0.6B** / ~36T.
+
+**⚠️RETRACTION of §39a's framing.** §39a said a4 reads 17/20 · 15/15 against 3.5's gate-passing 14/20 ·
+14/15 "at 36% of the parameters," and §39d's ARC reading was called parity. Both statements are literally
+true — the first on the toy gate, the second against Llama only — but **the mean they implied is wrong.**
+Against Qwen3-0.6B-Base, a4 phase C is behind on **every** axis: −8.16 on the 8-task mean, **−26.54 on
+MMLU**, **−41.17 on gsm8k**, at 1.7× the parameter count. The "4.5× Llama on math" reading in §39d held
+only because Llama-3.2-1B is itself weak at math (1.82%); the honest math comparison is 8.11 vs 49.28.
+
+**This is precisely the failure mode §31 predicted and it is the methodological result of the round.** The
+two-axis gate saturates — 15/15 general on all three a4 arms, 17/20 math — so it certified "cleared, run
+the recipe" while blind to a 2× MMLU gap and a 6× gsm8k gap. **A saturating gate cannot rank bases. It can
+only reject very bad ones.** Every "a4 base looks strong" claim on this line traces to that instrument and
+must be re-read against §39f.
+
+**Caveats, stated so the conclusion is not over-read.** (1) Qwen3-0.6B's 49.28 gsm8k invites its own
+contamination question, and lm-eval strict-match rewards emitting `#### N`. But MMLU is much harder to game
+and shows −26.54, so discounting gsm8k entirely does not rescue the comparison. (2) Tokenizer is NOT a
+confound for the Qwen comparison — a4 pretrains with Qwen3's tokenizer, so the two share it exactly.
+(3) a4 phase C was mid-cooldown; the remaining ~140 steps (0.26B tokens) cannot close a 26-point MMLU gap.
+(4) The a4-vs-Llama gsm8k number carries the §-recorded Argonne GSM8K contamination asterisk; a4's anneal
+drew on openmath/GSM8K-style data and train-vs-test exposure was not audited here.
+
+**The strategic read, and it is the same conclusion §20/§25/§26/§38p reached from the other side.** This
+project's throughline #1 is *capability is set upstream*, and §38p closed post-training composition as
+exhausted, leaving "a better base or a serving-system change." §39f says the better base is **already on
+disk and is not ours**: applying the §15 recipe to `Qwen3-0.6B-Base` starts from +8.2 mean / +26.5 MMLU /
++41.2 gsm8k over a4 phase C at 58% of the parameters. §15 already ran this experiment one generation back
+(Qwen1.5-0.5B + recipe > shipped 3.0-think v4); Qwen3-0.6B is far stronger than Qwen1.5-0.5B.
+
+**What a4 phase C is still good for, stated plainly rather than dropped:** it is a genuine 65,536-context
+model with measured long-arXiv gains that no Qwen-0.6B checkpoint here has, it is fully ours end-to-end,
+and it clears the §15 gate so the recipe *will* run on it. Those are real. They are just not the same thing
+as being the best available starting point for a reasoner.
+
+**Recommendation (an OFFER — no training launched):** before committing the SFT + reasoning budget to
+phase C, run the §15 recipe head-to-head from BOTH seeds — a4 phase C and Qwen3-0.6B-Base — and gate on
+`clean_eval`. `reasoning/reason_control/` is already the base-agnostic harness for exactly this, and it is
+~1 GPU-hour per arm against a multi-day reasoning line. If a4 loses that head-to-head, the a4 pretraining
+result is still publishable as a data-efficiency finding; what changes is which base the *reasoner* is
+built on.
