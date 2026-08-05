@@ -5,6 +5,7 @@ and automatic checkpoint resume.
 """
 
 import os
+import re
 import sys
 import glob
 import time
@@ -479,6 +480,7 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+    prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
 
 
@@ -986,3 +988,46 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def prune_old_checkpoints(checkpoint_dir, keep_path):
+    """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).
+
+    Keep `keep_path` (the checkpoint just written) and delete every other checkpoint_step_*.pt in
+    THIS dir -- i.e. this run's own earlier checkpoints. At 12-35 GB apiece a non-rotating dir eats
+    hundreds of GB, and one checkpoint is all a resume needs.
+
+    HISTORY, because this spot previously said the opposite: a keep-last-3 prune added 2026-07-28
+    was removed 2026-07-29 after it silently deleted 14 of 17 checkpoints and read as data loss.
+    The owner reversed the policy on 2026-08-05: latest-only is now the default. What was actually
+    wrong then was silence and aggressiveness, so this version PRINTS every deletion.
+
+    Deliberately narrow, so it can only ever remove this run's superseded checkpoints:
+      * only `checkpoint_step_<int>.pt` directly in `checkpoint_dir` (glob, not a walk)
+      * never `keep_path`, never a symlink (so `checkpoint_last.pt` is untouched), never a `.tmp`
+      * never the numerically-highest step present, even if `keep_path` somehow is not it
+      * per-file try/except: a failed unlink must not abort training after a good save
+    """
+    try:
+        keep = {os.path.realpath(keep_path)}
+        found = []
+        for p in glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt")):
+            m = re.fullmatch(r"checkpoint_step_(\d+)\.pt", os.path.basename(p))
+            if m and not os.path.islink(p):
+                found.append((int(m.group(1)), p))
+        if len(found) <= 1:
+            return
+        # Belt and braces: whatever has the highest step number also stays.
+        keep.add(os.path.realpath(max(found)[1]))
+        for _, p in sorted(found):
+            if os.path.realpath(p) in keep:
+                continue
+            try:
+                gib = os.path.getsize(p) / 2**30
+                os.remove(p)
+                print(f"[retention] removed superseded checkpoint {os.path.basename(p)} "
+                      f"({gib:.1f} GiB freed); keeping {os.path.basename(keep_path)}", flush=True)
+            except OSError as e:
+                print(f"[retention] could not remove {p}: {e}", flush=True)
+    except Exception as e:  # retention must never take down a run that just saved successfully
+        print(f"[retention] prune skipped: {e}", flush=True)
