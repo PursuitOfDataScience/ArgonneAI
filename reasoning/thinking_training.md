@@ -6167,3 +6167,45 @@ removing it.
 next round should not simply re-run it at three seeds — it should first test whether the pathology can be
 targeted, e.g. verify rows conditioned on problem difficulty, or an explicit "trivial input → answer
 directly" tier. Without that, three seeds would just measure the same trade more precisely.
+
+### 38n. 408 — the verify tier on the FULL gate is NEGATIVE (−1.37), and it is a TEST-TIME lever
+
+`vfyfix46` measured on §36's exact release configuration (ASDiv/SVAMP n=1000, GSM-Plus/MAWPS n=500,
+MATH-500 n=319), merged against §36's recorded `genfix46` JSONs.
+
+| pool | shipped `genfix46` | `vfyfix46` | delta | p |
+|---|---:|---:|---:|---:|
+| ASDiv | 74.90 | **77.00** | +2.10 | 0.13 |
+| SVAMP | 69.60 | 67.70 | −1.90 | 0.21 |
+| MATH-500 | 39.18 | 37.93 | −1.25 | 0.74 |
+| GSM-Plus | 42.00 | 40.00 | −2.00 | 0.39 |
+| **MAWPS** | **61.20** | **57.40** | **−3.80** | **0.020** |
+| **5-set greedy mean** | **57.38** | **56.01** | **−1.37** | |
+
+`genfix46` reproduces 57.38 exactly, so the harness is measuring the same thing §36 did.
+
+**⚠️THIRD pool-subset over-claim of the round.** §38g/§38l scored this arm at **+0.19** on a 3-pool
+screen; the full gate says **−1.37**, and the reason is that the screen omitted SVAMP and MAWPS — both
+pools the verify tier loses, one significantly. §38k already recorded the rule after the α case; it
+applies here retroactively and §38l's table should be read as 3-pool-only, not as a proxy for the mean.
+**Three separate times this round a subset screen pointed the wrong way. Screen on all five.**
+
+**What the tier actually does, which the greedy column hides:**
+
+| | 5-set greedy | 5-set self-consistency@8 |
+|---|---:|---:|
+| shipped `genfix46` | **57.38** | 62.91 |
+| `vfyfix46` | 56.01 (**−1.37**) | **65.43 (+2.52)** |
+
+**The verify tier converts greedy accuracy into sampled accuracy.** Per-pool the sampled gains are
+large where the greedy losses are (`vfyfix46` self-cons: ASDiv 84.80, SVAMP 81.40, MATH-500 45.77 vs
+shipped's ~78/74/34), and its extension deltas are the significant ones in the table
+(SVAMP greedy→extend1 +2.40 p=0.002, GSM-Plus greedy→extend2 +3.80 p=0.013, MAWPS greedy→budget +2.00
+p=0.006) — i.e. it responds to test-time compute where the shipped model has stopped responding.
+
+That is a coherent mechanism, not a curiosity: a model trained to check its work benefits from being
+allowed to produce several attempts and reconcile them, and is penalised when forced to commit on the
+first pass. It also lands exactly where §26 left this line — *"real levers = serving-system OR better
+base"* — and it means the verify family belongs in a **best-of-N / self-consistency deployment**, not in
+a greedy single-pass release. §33's original framing as a greedy-accuracy lever was the wrong frame for
+it, independently of the loader defect.
