@@ -6121,3 +6121,49 @@ traces.
    recorded before §35 was measured through a loader that deleted 39% of think tokens, weighted toward
    the hardest tiers. §33's abandonment is the proof case. `reasoning/think_len_audit.py` tells you in
    one command whether a given arm's tiers were actually trained.
+
+### 38m. 405 — the anchor does NOT buy instruction-following back, and that reframes §38g
+
+`cot_mix_robust_gen` = §33's verify mix with §36's general anchor restored (tulu 8000→9598,
+ultrachat 3000→3400 — identical to `genfix46`), nothing else changed. Seed 46.
+
+| pool (n=500 greedy, paired) | shipped | `vfyfix46` (old anchor) | **`vfyanc46`** (anchor restored) |
+|---|---:|---:|---:|
+| ASDiv | 74.40 | 78.60 | 76.00 (+1.60, p=0.45) |
+| GSM-Plus | 42.40 | 40.00 | 39.60 (−2.80, p=0.19) |
+| MATH-500 | 39.18 | 37.93 | **41.38 (+2.19, p=0.53)** |
+| **3-pool mean** | **51.99** | 52.18 | **52.33 (+0.34)** |
+| one-step arithmetic | 144/144 | 144/144 | **144/144** |
+| unclosed /300 | 26 / 21 | 32 / 21 | 28 / 16 |
+| **instruction /14** | **13** | — | **11** |
+
+Best 3-pool mean of the round, and still inside the 1.68pt noise band. But the anchor **did not** fix
+instruction-following, and because `vfyanc46` carries the *identical* anchor to `genfix46`, the 2-item
+loss is attributable to the verify tiers themselves rather than to composition. §38g predicted the
+opposite; that prediction is wrong.
+
+**Why, from the actual failures:**
+
+```
+Correct the grammar: 'She don't like apples.'
+  -> **Answer: The sentence is grammatically correct.**  **Explanation:** 1. **Subje...
+Correct the grammar: 'They was happy.'
+  -> ## Solution  **Sentence:** They was happy.  ### Step-by-Step Analysis: 1. **Sub...
+```
+
+**The verify tier teaches the model to verify everything, including prompts that need no verification.**
+That is the identical pathology to §33's `2+2` → 6 — a checking step over-applied to a trivial input.
+Fixing the truncation did not eliminate it; it **RELOCATED** it, from one-step arithmetic to
+instruction-following. §38g's "the blocker is gone" is true only of the *arithmetic* blocker.
+
+This is the sharper version of §33t's finding that the gain and the damage were the same rows. The
+mechanism is not "the verify data was broken" but **"training a model to always check makes it check
+things that need no checking"** — and a 2.88B model has no reliable way to tell those apart. That is a
+property of the objective, not of the pipeline, which is why the loader fix moved it rather than
+removing it.
+
+**Revised verdict on the verify family:** safe on arithmetic (144/144, genuinely fixed), flat on math
+(+0.34, noise), and it costs 2 of 14 instruction items to over-analysis. **Not an improvement**, and the
+next round should not simply re-run it at three seeds — it should first test whether the pathology can be
+targeted, e.g. verify rows conditioned on problem difficulty, or an explicit "trivial input → answer
+directly" tier. Without that, three seeds would just measure the same trade more precisely.
