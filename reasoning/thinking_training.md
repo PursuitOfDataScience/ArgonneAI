@@ -6050,3 +6050,74 @@ of endings.
 **What this predicts, and it is testable:** the productive direction is more reasoning DENSITY inside
 the existing length budget — which is exactly what §33's verify tiers are (a solve plus a check, all
 under 768), and exactly the one data arm that gained. Not longer traces. Not more of the hard tail.
+
+### 38k. ⚠️THE α FINDING RETRACTED: it is a POOL TRADE, not a gain. 3 seeds, no training.
+
+α is a soup weight, so replicating it costs three EVALS rather than three trainings. All six
+checkpoints (genfix / genfix46 / genfix99, each with `_think` = α 1.00 and `_a085`) existed, so §33u's
+three-seed bar was reachable tonight. Per-seed delta, α 0.85 → 1.00, greedy n=500:
+
+| seed | ASDiv | GSM-Plus | **MATH-500** | 3-pool |
+|---|---:|---:|---:|---:|
+| s5150 | +2.80 | +4.60 | **−4.70** | +0.90 |
+| s46 | +1.40 | +4.00 | **−4.70** | +0.23 |
+| s99 | +2.60 | +3.80 | **−5.02** | +0.46 |
+| **3-seed mean** | **+2.27** | **+4.13** | **−4.81** | **+0.53** |
+
+Same sign on every pool at every seed; 3-pool spread 0.67.
+
+**§38h called this "free" and that was wrong.** The α screen in 403 used ASDiv + GSM-Plus only, and
+MATH-500 — omitted — is exactly where α=1.00 loses, by −4.81pt, replicated 3/3. The net is **+0.53pt**,
+inside the 1.68pt run-to-run variation §33p measured on this recipe, and it still costs an instruction
+item (12/14 vs 13/14). **Not adoptable. It is a characterised trade: competition-style math for
+word-problem math.**
+
+This is the second time in one round that a pool-subset screen produced an over-claim (the first being
+§38b's difficulty framing). **Rule: a screen that omits a pool cannot support a claim about the mean.**
+Either screen on all five, or state the claim only for the pools screened.
+
+**The levers also do not compose.** α=1.00 on top of the un-blocked verify tier:
+
+| arm | ASDiv | GSM-Plus | MATH-500 | 3-pool |
+|---|---:|---:|---:|---:|
+| `vfyfix46` α=0.85 | 78.60 | 40.00 | 37.93 | **52.18** |
+| `vfyfix46` α=1.00 | 78.40 | 37.80 | 35.11 | 50.44 |
+
+−1.74pt from stacking them, independently reproducing [[a35-think-effort-verify-tier]]'s recorded "the
+two scaling axes do NOT compose".
+
+### 38l — EVERY ARM, ONE TABLE. Nothing tested tonight improves the model.
+
+3-pool mean (ASDiv/GSM-Plus/MATH-500, greedy, n=500, paired on identical items):
+
+| arm | 3-pool mean | vs shipped | verdict |
+|---|---:|---:|---|
+| `s99_a100` (α=1.00, seed 99) | 52.31 | +0.32 | inside noise |
+| `s5150_a100` (α=1.00, seed 5150) | 52.26 | +0.27 | inside noise |
+| `s46_a100` (α=1.00, seed 46) | 52.23 | +0.24 | inside noise |
+| **`vfyfix46` verify tier** | **52.18** | **+0.19** | inside noise, but SAFE (arith 144/144) |
+| **shipped `genfix46`** | **51.99** | — | the released model |
+| `s99_a085` | 51.85 | −0.14 | seed noise |
+| `s5150_a085` | 51.36 | −0.63 | seed noise |
+| `vfyfix46` α=1.00 | 50.44 | −1.55 | levers do not compose |
+| `longtr46` long traces | 50.34 | −1.65 | REFUTED |
+| `gsmlong46` gsm coverage | 46.94 | **−5.05** | REFUTED, 2 pools significant |
+
+**The answer to "can we improve 3.5-think further": not by any lever tested here.** Everything that is
+not refuted sits in a 51.4–52.3 band against the shipped 51.99 — i.e. within the recipe's own
+run-to-run variation. The two arms that clearly move are both *negative*, and both moved by lengthening
+traces.
+
+**What the round is actually worth:**
+1. **The mechanism (§38j).** Termination is the binding constraint; the 768-token cap is load-bearing.
+   That closes off an entire family of "give it more/harder/longer reasoning" ideas cheaply, and it
+   predicts where to look instead: density inside the budget.
+2. **§33's verify family is un-blocked and is the only data arm that gained anything.** Its −23.8pt
+   arithmetic blocker was a loader artifact; it now scores 144/144, better than shipped. +4.20 ASDiv at
+   one seed, flat overall. That is the direction §38j predicts, and it deserves the proper 3-seed round
+   this session had no room for.
+3. **α is characterised** rather than unknown: a stable ±4-5pt pool trade, not a knob to turn.
+4. **A methodological result that outranks all of the above:** every negative result on this line
+   recorded before §35 was measured through a loader that deleted 39% of think tokens, weighted toward
+   the hardest tiers. §33's abandonment is the proof case. `reasoning/think_len_audit.py` tells you in
+   one command whether a given arm's tiers were actually trained.
