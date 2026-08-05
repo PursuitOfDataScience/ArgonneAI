@@ -6209,3 +6209,56 @@ first pass. It also lands exactly where §26 left this line — *"real levers = 
 base"* — and it means the verify family belongs in a **best-of-N / self-consistency deployment**, not in
 a greedy single-pass release. §33's original framing as a greedy-accuracy lever was the wrong frame for
 it, independently of the loader defect.
+
+### 38o. 409 — the greedy↔sampled trade REPRODUCES, and verify influence is a monotone dial
+
+`vfyanc46` on the full gate, merged with §36's `genfix46` and §38n's `vfyfix46`:
+
+| arm | verify influence | **5-set greedy** | **5-set self-cons@8** | best MATH-500 |
+|---|---|---:|---:|---:|
+| shipped `genfix46` | none | **57.38** | 62.91 | 39.18 |
+| `vfyanc46` (verify + §36 anchor) | diluted | 56.60 (−0.78) | 64.36 (+1.45) | **41.38** |
+| `vfyfix46` (verify, old anchor) | full | 56.01 (−1.37) | **65.43 (+2.52)** | 37.93 |
+
+**The §38n mechanism reproduces on a second mix and is monotone in verify influence: more verify → lower
+greedy, higher self-consistency.** The general anchor is the dial — it dilutes the verify tiers' share
+and moves BOTH metrics back toward the shipped model. That rules out "the anchor fixes the verify tier"
+(§38g/§38m) in favour of something simpler: the anchor just turns the dial down.
+
+`vfyanc46` is also the best MATH-500 of any arm measured tonight (41.38 vs the shipped 39.18) and ties
+the shipped model on best-single-pass (189.78 vs 189.61 on merge A), so the greedy deficit is
+concentrated in SVAMP/MAWPS/GSM-Plus — the easy, short, one-to-two-step pools, which is precisely where
+over-verification costs most. Consistent with §38m's grammar failures and with §33s's original
+one-step-arithmetic catastrophe: **verification training hurts exactly where verification is unnecessary,
+and helps where several attempts can be reconciled.**
+
+## §38p — FINAL: the recipe is at its ceiling; the remaining headroom is SELECTION, not data
+
+Thirteen arms. **No arm beats the shipped model on 5-set greedy, the deployable metric:**
+
+| arm | 5-set greedy | 5-set self-cons@8 |
+|---|---:|---:|
+| **shipped `genfix46`** | **57.38** | 62.91 |
+| `vfyanc46` | 56.60 | 64.36 |
+| `vfyfix46` | 56.01 | **65.43** |
+
+and on the 3-pool screen everything not refuted sits in 51.4–52.3 around the shipped 51.99 — a spread
+narrower than this recipe's own 1.68pt run-to-run variation. The two arms that clearly move are both
+negative and both lengthened traces (−1.65, −5.05).
+
+**Three findings worth carrying forward:**
+
+1. **Termination is the binding constraint** (§38j). The 768-token cap is load-bearing; the model was
+   short of *endings*, not reasoning. This closes off the whole "more/harder/longer reasoning data"
+   family cheaply and explains §36's +7.06pt as an endings fix.
+2. **The verify family is a test-time-compute lever, not a greedy one** (§38n/§38o), with verify share as
+   a dial. Its right home is a best-of-N or self-consistency deployment where +2.52 self-consistency is
+   the number that matters — not a greedy single-pass release. §33 framed it wrong independently of the
+   loader defect.
+3. **Every pre-§35 negative on this line is untrustworthy** and `think_len_audit.py` checks any of them
+   in one command. §33's abandoned verify family is the proof case: 71–100% of its rows were truncated.
+
+**The strategic read, unchanged from where §20/§26 left the 3.0 line:** the headroom is the greedy →
+pass@8 gap (57.38 → ~77.8), which is a SELECTION problem. The levers that have ever moved it here are a
+better base or a serving-system change. Post-training data composition on this recipe is exhausted, and
+tonight is the measurement that says so — thirteen arms, one mechanism, no gains.
