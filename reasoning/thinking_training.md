@@ -6484,3 +6484,101 @@ phase C, run the §15 recipe head-to-head from BOTH seeds — a4 phase C and Qwe
 ~1 GPU-hour per arm against a multi-day reasoning line. If a4 loses that head-to-head, the a4 pretraining
 result is still publishable as a data-efficiency finding; what changes is which base the *reasoner* is
 built on.
+
+---
+
+## §40 — CAN THE EXACT 3.5-THINK RECIPE BUILD A BETTER a4-THINK? NO: −16.79pt, every pool, p≤1e-5 (2026-08-06)
+
+Owner question: *"if we follow the exact recipe of training argonne3.5-think, can we train a better
+argonne4-think using the latest checkpoint?"* Answered by BUILDING it — the full four-stage recipe off
+argonne4.0 phase C (step 112,412), then gating it against the released 3.5-think **in one process on
+identical items**. Jobs 53090861 (stage A) + 53112991 (B/C/D) + 53119566 (gate), 1 GPU throughout.
+
+### 40a. The port was verbatim, and that was CHECKED rather than assumed
+
+| held identical | evidence |
+|---|---|
+| tokenizer + chat template | both 151,669; `<think>`=151667 `</think>`=151668 `<|im_end|>`=151645; template byte-identical, **md5 fb4eb61f6c** |
+| eos lineage | a4 phase C starts at eos=151643 exactly like 3.5's stage-A base; `sft.py` logged `EOS updated: '<|endoftext|>' -> '<|im_end|>' (id=151645) [detected from chat template]` — the recipe does it itself |
+| stage A | 10,393 optimizer steps = 3.5's documented figure (207,865 rows ÷ eff 20); 247,228,129 tokens |
+| stage B | 844 steps, β=0.03, lr 1e-6 |
+| stage C | 2,369 steps = 28,428 ÷ eff 12; **loader audit 0.0% discarded on all 12 tiers** with `max_think_tokens=0 preserve_raw_reasoning=1 allow_non_reasoning=1` |
+| effective batch | A=20, B=8, C=12 — all preserved |
+| seeds | 42 / 42 / 46 (46 = cot-sft.py's default AND the released arm's seed) |
+| data | ultrachat_200k/train_sft · argilla_dpo-mix-7k · cot_sft_mix_v6_gen (genfix, 28,428 rows) |
+| arch | all three trainers build ArgonneConfig from the input dir's config.json |
+
+**Only two things differed, both forced:** the base model (the experiment) and 1 GPU instead of 2, with
+batch×accum re-split to preserve BOTH effective batch and 3.5's per-device micro-batch of 10.
+
+⚠️Stage A **cannot run on an 80 GiB H100** at that micro-batch: the fp32 logit tensor is
+10×4096×151,680×4B ≈ 24.8 GB and `sft.py` has no chunked-CE option, so a probe OOM'd at step 6
+(`Tried to allocate 19.36 GiB`). 3.5 used H200s for this reason; 1×H200 keeps the recipe intact.
+
+### 40b. THE RESULT — worse on every pool, none of it close
+
+Paired, same items, one process. 3.5-think = the released `genfix46_a085`.
+
+| pool | n | **a4-think** | **3.5-think** | **Δ** | McNemar p | banked 3.5 (§38n) | drift |
+|---|---:|---:|---:|---:|---|---:|---:|
+| ASDiv | 1000 | 57.10 | 73.60 | **−16.50** | **1.8e-22** | 74.90 | −1.30 |
+| SVAMP | 1000 | 46.80 | 68.00 | **−21.20** | **6.2e-33** | 69.60 | −1.60 |
+| MAWPS | 500 | 48.20 | 60.60 | **−12.40** | **1.7e-10** | 61.20 | −0.60 |
+| GSM-Plus | 500 | 20.00 | 41.00 | **−21.00** | **1.4e-18** | 42.00 | −1.00 |
+| MATH-500 | 319 | 19.75 | 32.60 | **−12.85** | **9.8e-06** | 39.18 | −6.58 |
+| **5-SET GREEDY** | | **38.37** | **55.16** | **−16.79** | | 57.38 | −2.22 |
+| self-cons@8 | | 45.43 | 61.60 | −16.17 | | | |
+| pass@8 | | 62.50 | 75.22 | −12.72 | | | |
+
+Harness reproduces the banked 3.5 numbers to −0.6…−1.6pt on four pools (−2.22 on the 5-set mean), so
+it is measuring the same thing §36 did. MATH-500's −6.58 drift is larger and unexplained; it does not
+affect the paired contrast, since both models were scored on identical items in the same process.
+
+### 40c. WHY — it is CAPABILITY, and every alternative mechanism is ruled out by the same run
+
+Greedy failure-mode histograms, n=1000:
+
+| | ASDiv | SVAMP |
+|---|---|---|
+| unclosed + no_answer, a4 vs 3.5 | 138 vs 114 (**+24**) | 107 vs 104 (**+3**) |
+| **accuracy AMONG traces that answered** | **66.2% vs 83.1% (−16.8)** | **52.4% vs 75.9% (−23.5)** |
+| mean think tokens | 243 vs 218 | 256 vs 257 |
+| mean decoded tokens | 268 vs 251 | 268 vs 269 |
+
+**The recipe transferred; the capability did not.** a4-think writes traces of the same length, closes
+them at essentially the same rate, and emits the same format — it is simply WRONG far more often.
+Restricted to properly-terminated answered traces it is still 17–24pt behind. That eliminates, from
+this one run, every mechanism this line has previously invoked:
+
+- **not termination** — §38j's binding constraint for 3.5; the unclosed gap is +3 on SVAMP
+- **not trace length** — §38's refuted long-trace family; lengths match within ~25 tokens
+- **not selection** — §38p's remaining headroom; **pass@8 is also −12.72**, so the ceiling moved too
+- **not the loader defect** — §34/§35; audit was 0.0% across all 12 tiers
+
+### 40d. What it means
+
+This is throughline #1 holding under the cleanest test the project has run: with the recipe, data,
+seeds, effective batches, tokenizer and chat template all held byte-identical, **swapping only the base
+moves the deployable metric by −16.79pt.** Post-training calibrates; it does not create.
+
+It also confirms §39f prospectively rather than retrospectively. §39f measured a4 phase C's base at
+−26.5 MMLU and −41.2 gsm8k against Qwen3-0.6B-Base and predicted the recipe could not rescue it; §40
+is that prediction tested and upheld. The §15 gate said "licensed to run the recipe" — it was right
+that the recipe would RUN, and useless as a predictor of how well, exactly as §31 warned a saturating
+gate would be.
+
+**Consequences for the a4 line:**
+1. **Do not seed the reasoning line from phase C expecting a 3.5-class reasoner.** It is ~17pt short.
+2. The a4 pretrain result stands on its own as a DATA-EFFICIENCY finding (§39: gsm8k 8.11 vs
+   Llama-3.2-1B's 1.82 at 140× less data) — that is a real result and is not what §40 refutes.
+3. The lever remains the base. §39f's offer stands and is now better motivated: run this same recipe
+   from **Qwen3-0.6B-Base** and gate it the same way. `reason_control/` is the base-agnostic harness,
+   the pipeline in `reasoning/a4think.sh` is now proven end-to-end, and it is ~10 GPU-hours.
+
+**Artifacts:** `/project/rcc/youzhi/models/a4_think/{sft,dpo,think,think_a085}` (3.9G each).
+`report/a4think_gate_{n1000,n500,math500}.json` hold per-item `ok` arrays, so any later arm can be
+merged into this paired table via `effort_gate.py --report-from`.
+
+⚠️`think`/`think_a085` carry `max_position_embeddings=4096` inherited from CoT-SFT's save, so the
+model does NOT expose phase C's 65,536 window. Irrelevant to this gate (max_model_len 2560); it would
+have to be restored before any release.
