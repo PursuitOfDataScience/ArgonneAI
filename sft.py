@@ -424,6 +424,25 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
+
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) -------------------------------
+    # Everything below this branch is welded to the custom `argonne2` arch. To run the SAME
+    # recipe on a non-Argonne base (§15's control experiment, and §41's Qwen3-0.6B arm) we hand
+    # off to AutoModelForCausalLM and return early. Purely additive: an argonne2 config takes
+    # the original path unchanged, so every existing 3.5/a4 launcher is unaffected.
+    if config_dict.get("model_type", "argonne2") != "argonne2":
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base detected (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+        return model, tokenizer
+
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
     config.max_position_embeddings = max_seq_len
     config.block_size = max_seq_len

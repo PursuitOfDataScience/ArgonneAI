@@ -2005,50 +2005,75 @@ def main() -> None:
             )
         config_dict["vocab_size"] = vocab_size
 
-    config = ArgonneConfig(**config_dict)
-    model = ArgonneModel(config)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    print(
-        f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}",
-        flush=True,
-    )
-    model.tie_weights()
-    print("Weights tied (embed_tokens <-> lm_head).", flush=True)
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) vs the custom argonne2 arch ------------------
+    # Everything in the IS_ARGONNE branch is welded to ArgonneModel: manual construction to
+    # re-tie lm_head, `model.blocks[].attn`, and replace_rotary_embeddings(). None of it applies
+    # to a standard HF base, whose RoPE/tying/attention are already correct from_pretrained.
+    # Purely additive -- an argonne2 config takes the original path byte-for-byte, so the
+    # released 3.5 recipe and every a4 launcher are unaffected.
+    IS_ARGONNE = config_dict.get("model_type", "argonne2") == "argonne2"
+    if IS_ARGONNE:
+        config = ArgonneConfig(**config_dict)
+        model = ArgonneModel(config)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}",
+            flush=True,
+        )
+        model.tie_weights()
+        print("Weights tied (embed_tokens <-> lm_head).", flush=True)
 
-    print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters ({args.precision})")
-    print(f"Tied: embed_tokens == lm_head -> {model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()}")
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters ({args.precision})")
+        print(f"Tied: embed_tokens == lm_head -> {model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()}")
 
-    # ---- Extend RoPE / context ----
-    loaded_context_length = int(getattr(model.config, "max_position_embeddings", 0) or 0)
-    model_context_length = (
-        args.model_context_length
-        if args.model_context_length > 0
-        else max(args.max_seq_length, loaded_context_length)
-    )
-    model.config.rope_theta = args.rope_theta
-    model.config.max_position_embeddings = model_context_length
-    model.config.block_size = model_context_length
-    replace_rotary_embeddings(model, RotaryEmbedding, args.rope_theta, model_context_length)
-    print(
-        "Context setup: "
-        f"training max_seq_length={args.max_seq_length}, "
-        f"model max_position_embeddings={model_context_length}, "
-        f"loaded max_position_embeddings={loaded_context_length}, "
-        f"rope_theta={args.rope_theta}",
-        flush=True,
-    )
+        # ---- Extend RoPE / context ----
+        loaded_context_length = int(getattr(model.config, "max_position_embeddings", 0) or 0)
+        model_context_length = (
+            args.model_context_length
+            if args.model_context_length > 0
+            else max(args.max_seq_length, loaded_context_length)
+        )
+        model.config.rope_theta = args.rope_theta
+        model.config.max_position_embeddings = model_context_length
+        model.config.block_size = model_context_length
+        replace_rotary_embeddings(model, RotaryEmbedding, args.rope_theta, model_context_length)
+        print(
+            "Context setup: "
+            f"training max_seq_length={args.max_seq_length}, "
+            f"model max_position_embeddings={model_context_length}, "
+            f"loaded max_position_embeddings={loaded_context_length}, "
+            f"rope_theta={args.rope_theta}",
+            flush=True,
+        )
 
-    # ---- Flash attention + gradient checkpointing ----
-    model.config.use_flash_attention = True
-    if hasattr(model, "blocks"):
-        for blk in model.blocks:
-            if hasattr(blk, "attn") and hasattr(blk.attn, "use_flash_attention"):
-                blk.attn.use_flash_attention = True
-    model.config.use_cache = False
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    model.to(device)
-    model.train()
+        # ---- Flash attention + gradient checkpointing ----
+        model.config.use_flash_attention = True
+        if hasattr(model, "blocks"):
+            for blk in model.blocks:
+                if hasattr(blk, "attn") and hasattr(blk.attn, "use_flash_attention"):
+                    blk.attn.use_flash_attention = True
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        model.train()
+    else:
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM", flush=True)
+        dt = torch.bfloat16 if args.precision == "bf16" else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, dtype=dt, trust_remote_code=True)
+        # The recipe pins rope_theta; honour it if the base exposes one.
+        if hasattr(model.config, "rope_theta"):
+            model.config.rope_theta = args.rope_theta
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        model.train()
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters "
+              f"({args.precision}), rope_theta={getattr(model.config, 'rope_theta', None)}", flush=True)
 
     # ---- Data ----
     print(f"Loading dataset from: {args.data_path}", flush=True)

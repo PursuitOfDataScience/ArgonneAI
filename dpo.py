@@ -1000,6 +1000,22 @@ def build_model_and_tokenizer(
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
+
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) -------------------------------
+    # See sft.py for the rationale. Purely additive: argonne2 configs are untouched.
+    if config_dict.get("model_type", "argonne2") != "argonne2":
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base detected (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+        return model, tokenizer
+
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
     config.max_position_embeddings = max_seq_len
     config.use_flash_attention = True
