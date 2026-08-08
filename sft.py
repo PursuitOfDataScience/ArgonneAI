@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from datasets import load_from_disk
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -355,6 +355,90 @@ class UltraChatLastAssistantDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Length-grouped batching
+# ---------------------------------------------------------------------------
+
+
+class LengthGroupedBatchSampler(Sampler):
+    """Yield batches whose members have SIMILAR length, so dynamic padding wastes little.
+
+    The collator pads every sample in a batch up to that batch's longest member, so with
+    randomly-composed batches the padded width is the batch MAX, not the mean -- and on the
+    SDPA/math attention path (no flash-attn here) cost grows with seq^2, so that waste is the
+    dominant term. Measured on this model/dataset: random batches of 24 padded to a median
+    width of ~2,526 tokens against a true mean length of ~1,200, i.e. roughly half the compute
+    went to padding, which made batch 24 SLOWER per example than batch 8.
+
+    Standard HF-style megabatch scheme, which keeps epoch-to-epoch randomness:
+      shuffle -> cut into megabatches of batch_size*mult -> sort each megabatch by length
+      -> cut into batches -> shuffle the batch ORDER.
+    So batches are internally homogeneous but their composition and order still vary by seed.
+
+    Lengths use a CHARACTER-count proxy over the raw messages rather than true token counts:
+    tokenizing all ~208k records up front would cost more than it saves, and chars/token is
+    stable enough within a dataset for the grouping to work (only the ordering matters).
+    """
+
+    def __init__(self, lengths: List[int], batch_size: int, seed: int, mult: int = 50,
+                 drop_last: bool = True):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.seed = seed
+        self.megabatch_size = batch_size * mult
+        self.drop_last = drop_last
+        self.epoch = 0
+        # Batches already consumed in this epoch by an earlier slice. The batch order is a pure
+        # function of (seed, epoch), so a resumed slice rebuilds the IDENTICAL order and dropping
+        # the first `skip` batches lands exactly where the previous slice stopped. Without this the
+        # training loop restarts the epoch at batch 0 on every resume while keeping the step
+        # counter, so a chained run would re-train its first slice of data forever and never
+        # reach the end of the dataset.
+        self.skip = 0
+
+    def __len__(self) -> int:
+        n = len(self.lengths)
+        total = n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
+        return max(0, total - self.skip)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def set_skip(self, skip: int) -> None:
+        self.skip = max(0, int(skip))
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        order = list(range(len(self.lengths)))
+        rng.shuffle(order)
+
+        batches: List[List[int]] = []
+        for start in range(0, len(order), self.megabatch_size):
+            mega = order[start:start + self.megabatch_size]
+            mega.sort(key=lambda i: self.lengths[i], reverse=True)
+            for bstart in range(0, len(mega), self.batch_size):
+                batch = mega[bstart:bstart + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                batches.append(batch)
+
+        rng.shuffle(batches)
+        return iter(batches[self.skip:])
+
+
+def proxy_lengths(dataset) -> List[int]:
+    """Character length of each kept record's messages -- a cheap stand-in for token length."""
+    raw = dataset.raw
+    cols = raw.column_names
+    col = "messages" if "messages" in cols else cols[0]
+    all_msgs = raw[col]  # single columnar read; far faster than per-row __getitem__
+    out: List[int] = []
+    for i in dataset.indices:
+        msgs = all_msgs[i]
+        out.append(sum(len(str(m.get("content", ""))) for m in msgs))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Collator
 # ---------------------------------------------------------------------------
 
@@ -390,7 +474,8 @@ class CausalCollator:
 # Model + tokenizer
 # ---------------------------------------------------------------------------
 
-def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_path: str, max_seq_len: int):
+def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_path: str, max_seq_len: int,
+                              loss_chunk_size: int = 0):
     sys.path.insert(0, argonne_root)
     from model import ArgonneConfig, ArgonneModel
 
@@ -426,6 +511,11 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
     config.block_size = max_seq_len
     config.use_flash_attention = True
     config._keep_in_fp32_modules = []
+    # The exported config carries loss_chunk_size=0; the CLI flag is what turns chunked CE on for
+    # SFT (training-only path in ArgonneModel.forward, so generation/quality samples are unaffected).
+    config.loss_chunk_size = int(loss_chunk_size)
+    if config.loss_chunk_size > 0:
+        print(f"Chunked cross-entropy ON: loss_chunk_size={config.loss_chunk_size}")
 
     model = ArgonneModel(config)
 
@@ -524,8 +614,23 @@ def _ckpt_step(path: str) -> int:
     return int(m.group(1)) if m else -1
 
 
+# Every artifact save_checkpoint() writes. A directory missing any of them is a checkpoint that
+# was interrupted mid-write (a host-RAM OOM during the save will leave an EMPTY dir, since the
+# first thing save_checkpoint does is build a full CPU copy of the model state dict). Resuming
+# from one of those fails, or worse, half-restores -- so they must not be selectable.
+_CKPT_REQUIRED_FILES = ("model.safetensors", "optimizer.pt", "scheduler.pt", "metadata.json")
+
+
+def is_complete_checkpoint(path: str) -> bool:
+    return all(os.path.exists(os.path.join(path, f)) for f in _CKPT_REQUIRED_FILES)
+
+
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
-    """Return the path of the highest-step checkpoint under output_dir, or None."""
+    """Return the path of the highest-step COMPLETE checkpoint under output_dir, or None.
+
+    Incomplete directories are skipped rather than selected: picking by directory name alone
+    would hand a half-written (or empty) checkpoint to the resume path.
+    """
     if not os.path.isdir(output_dir):
         return None
     candidates: List[tuple[int, str]] = []
@@ -534,8 +639,12 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
         if not os.path.isdir(full):
             continue
         step = _ckpt_step(name)
-        if step >= 0:
-            candidates.append((step, full))
+        if step < 0:
+            continue
+        if not is_complete_checkpoint(full):
+            print(f"  skipping incomplete checkpoint (interrupted mid-save): {full}")
+            continue
+        candidates.append((step, full))
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0])
@@ -709,6 +818,17 @@ def main() -> None:
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--group_by_length", type=int, default=0, choices=[0, 1],
+                        help="Compose each batch from similarly-long samples so dynamic padding "
+                             "wastes little. Big win when batch_size>1 on the seq^2 SDPA path.")
+    parser.add_argument("--length_group_mult", type=int, default=50,
+                        help="Megabatch = batch_size * this. Larger = tighter length grouping but "
+                             "less shuffling entropy.")
+    parser.add_argument("--loss_chunk_size", type=int, default=0,
+                        help="Chunked cross-entropy: >0 bounds the fp32 logit transient to "
+                             "chunk_size*vocab instead of (batch*seq)*vocab, so the batch can be "
+                             "raised without the lm_head logits dominating HBM. Numerically "
+                             "identical (same knob as pretrain.py/continue_pretrain.py). 0 = off.")
     parser.add_argument("--quality_every", type=int, default=200, help="Run quality samples every N optimizer steps")
     parser.add_argument("--max_new_tokens_quality", type=int, default=160, help="Max new tokens for quality samples")
     parser.add_argument("--run_before_quality", type=int, default=1, choices=[0, 1], help="Run quality samples before SFT")
@@ -777,7 +897,8 @@ def main() -> None:
         print(f"Resume from checkpoint: {args.resume_from_checkpoint or '<none>'}")
     print(f"Final model save dir: {args.output_dir}")
 
-    model, tokenizer = build_model_and_tokenizer(device, args.argonne_root, args.model_path, MAX_SEQ_LEN)
+    model, tokenizer = build_model_and_tokenizer(device, args.argonne_root, args.model_path, MAX_SEQ_LEN,
+                                                 loss_chunk_size=args.loss_chunk_size)
 
     # Debug probe to ensure runtime tokenizer behavior matches local validation.
     probe_ds = load_from_disk(args.data_path)
@@ -796,15 +917,33 @@ def main() -> None:
 
     dataset = UltraChatLastAssistantDataset(args.data_path, tokenizer, MAX_SEQ_LEN)
     collator = CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
-        pin_memory=True,
-        collate_fn=collator,
-    )
+    if args.group_by_length:
+        lengths = proxy_lengths(dataset)
+        batch_sampler = LengthGroupedBatchSampler(
+            lengths, batch_size=BATCH_SIZE, seed=SEED, mult=args.length_group_mult,
+        )
+        print(
+            f"Length-grouped batching ON (megabatch = {BATCH_SIZE} x {args.length_group_mult} "
+            f"= {BATCH_SIZE * args.length_group_mult} samples)"
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
+            pin_memory=True,
+            collate_fn=collator,
+        )
+    else:
+        batch_sampler = None
+        loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
+            pin_memory=True,
+            collate_fn=collator,
+        )
 
     steps_per_epoch = len(loader) // GRAD_ACCUM_STEPS
     total_steps = max(1, steps_per_epoch * EPOCHS)
@@ -867,6 +1006,23 @@ def main() -> None:
             f"[resume] starting from global_step={global_step} "
             f"tokens_seen={tokens_seen:,} (resumed epoch index {resume_epoch})"
         )
+        # Fast-forward the data stream to match the optimizer state. The loop below always
+        # restarts an epoch at its first batch, so without this a resumed slice would re-train
+        # the batches the previous slice already did and the epoch would never reach its end.
+        if batch_sampler is not None:
+            batches_per_epoch = len(dataset) // BATCH_SIZE
+            consumed_this_epoch = micro_step - resume_epoch * batches_per_epoch
+            batch_sampler.set_skip(consumed_this_epoch)
+            print(
+                f"[resume] skipping {consumed_this_epoch:,} already-trained batches of "
+                f"{batches_per_epoch:,} in epoch {resume_epoch} "
+                f"({len(batch_sampler):,} batches left)"
+            )
+        else:
+            print(
+                "[resume] WARNING: --group_by_length is off, so the data stream cannot be "
+                "fast-forwarded; this slice will re-train batches the previous slice saw."
+            )
 
     # Tracking for time-based checkpointing + slice time limit.
     last_save_time = time.monotonic()
@@ -874,6 +1030,10 @@ def main() -> None:
     save_locked_out = False  # becomes True after the first save when --exit_after_checkpoint_save is set
 
     for epoch in range(resume_epoch, EPOCHS):
+        if batch_sampler is not None:
+            batch_sampler.set_epoch(epoch)
+            if epoch != resume_epoch:
+                batch_sampler.set_skip(0)  # the skip only applies to the epoch we resumed into
         print(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", unit="batch")
 

@@ -5,6 +5,7 @@ and automatic checkpoint resume.
 """
 
 import os
+import re
 import sys
 import glob
 import time
@@ -90,12 +91,16 @@ parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], he
 parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
 parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
 parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing. 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Requires --gradient_checkpointing 1.")
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
-parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
 parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 5 min before this limit. 0 = disabled.")
+parser.add_argument("--save_deadline_epoch", type=int, default=0, help="Absolute wall-clock deadline (unix epoch seconds): when time.time() reaches it, save ONE checkpoint and exit cleanly. SLURM-clock-relative (run_full_training.sh sets it = job_start + slice_seconds - lead), so it fires a FIXED time before the SLURM kill regardless of compile/startup drift -> the reliable save trigger. 0 = disabled.")
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
+parser.add_argument("--val_batch_size", type=int, default=16, help="Micro-batch for validation eval — small + independent of the train batch so the val logit tensor never OOMs at a large train batch.")
+parser.add_argument("--periodic_val_every", type=int, default=0, help="If >0, eval val every N optimizer steps during training (rank-0 + barrier), logging 'PERIODIC_VAL step=.. tokens=.. val_loss=..'. 0 = only the end-of-run eval (production default).")
 parser.add_argument("--final_model_dir", type=str, default=None, help="Optional directory for the final Hugging Face model export.")
 parser.add_argument("--completion_marker", type=str, default=None, help="Optional marker file written only after max_epochs is completed and the final model export succeeds.")
 parser.add_argument("--seed", type=int, default=444, help="Base random seed")
@@ -140,9 +145,9 @@ assert GRAD_ACCUM_STEPS >= 1, (
 ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
 # Wall time: save the checkpoint before the hard kill. argonne4.0 is ~1.04B (checkpoint
-# ~11 GB vs argonne3.5's ~32 GiB), so the flush is ~3x faster -> a 150s margin (down from
-# 3.5's 300s) is ample and hands ~150s/slice back to training (owner directive 2026-07-20).
-WALL_TIME_SAVE = args.wall_time - 150 if args.wall_time > 0 else 0
+# ~11 GB vs argonne3.5's ~32 GiB), so the flush is ~3x faster. This training-ELAPSED margin is now a
+# BACKUP; the PRIMARY save trigger is --save_deadline_epoch (absolute wall clock, startup-immune).
+WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
 
 # Autocast setup
 if args.precision == "bf16":
@@ -246,6 +251,14 @@ class WeightedMultiLoader:
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
         self.counts = [0] * self.n
+        # Progress is tracked in TOKENS, not draws. `counts` stays a per-source draw
+        # tally (mixture telemetry only); `drawn_base` holds tokens consumed BEFORE
+        # this process started and `draws` counts this process's own draws. Deriving
+        # progress from `counts * B` instead made it rescale by B_new/B_old whenever a
+        # resume changed the micro-batch, silently misreporting corpus consumption and
+        # breaking the epoch stop (regression test: scratchpad/test_wml_accounting.py).
+        self.drawn_base = 0
+        self.draws = 0
         self.epoch = 0
         total = sum(len(l.tokens) for l in self.loaders)
         # num_tokens sets the WSD schedule length (estimated_steps = num_tokens/eff_batch).
@@ -259,15 +272,22 @@ class WeightedMultiLoader:
     def next_batch(self):
         i = int(self.rng.choice(self.n, p=self.p)) if self.n > 1 else 0
         self.counts[i] += 1
+        self.draws += 1
         xy = self.loaders[i].next_batch()
         # Define an "epoch" as one full pass over the token BUDGET (num_tokens): total tokens
         # drawn across all ranks = (per-rank draws) * B * T * world_size. This makes
         # `train_loader.epoch >= max_epochs` fire in pretrain.py's stop check so the pretrain
         # stage TERMINATES at the budget and writes .pretrain_complete -- WITHOUT this an
         # infinite sampler never triggers the epoch-completion transition to continue_pretrain.
-        drawn = sum(self.counts) * self.B * self.T * self.world_size
+        # Only THIS process's draws are scaled by the current B; earlier progress is carried
+        # as a token count so a micro-batch change across a resume cannot rescale it.
+        drawn = self.drawn_tokens()
         self.epoch = int(drawn // self.num_tokens)
         return xy
+
+    def drawn_tokens(self):
+        """Total tokens consumed across all ranks, invariant to micro-batch changes."""
+        return int(self.drawn_base + self.draws * self.B * self.T * self.world_size)
 
     def get_position(self):
         # rank-0 aggregate state (save_checkpoint calls this on IS_MAIN only). Picklable
@@ -278,9 +298,14 @@ class WeightedMultiLoader:
             "positions": [int(l.current_position) for l in self.loaders],
             "counts": list(self.counts),
             "epoch": int(self.epoch),
+            # Persist progress in TOKENS (and the B that produced it) so a resume at a
+            # different micro-batch restores consumption exactly. Older checkpoints lack
+            # both keys; resume falls back to the authoritative tokens_processed instead.
+            "drawn_tokens": self.drawn_tokens(),
+            "B": int(self.B),
         }
 
-    def resume_from_checkpoint_position(self, state):
+    def resume_from_checkpoint_position(self, state, drawn_tokens=None):
         # Presence of this method routes the loader through the manifest-style resume
         # branch (pretrain.py passes the raw data_position, no external rank offset).
         if not isinstance(state, dict) or not state.get("wml"):
@@ -299,9 +324,22 @@ class WeightedMultiLoader:
                 newpos = l.start_token_offset + self.rank * self.B * self.T
             l.current_position = newpos
         self.counts = list(state.get("counts", self.counts))
+        # Restore token progress, most authoritative source first:
+        #   1. tokens_processed from the checkpoint (exact; passed by the caller)
+        #   2. drawn_tokens persisted by a post-fix checkpoint
+        #   3. legacy derivation counts * B, using the B that WROTE the state if recorded
+        # Never counts * self.B -- that is the rescaling bug this replaces.
+        if drawn_tokens is None:
+            drawn_tokens = state.get("drawn_tokens")
+        if drawn_tokens is None:
+            b_old = int(state.get("B", self.B))
+            drawn_tokens = sum(self.counts) * b_old * self.T * self.world_size
+        self.drawn_base = int(drawn_tokens)
+        self.draws = 0
         self.epoch = int(state.get("epoch", 0))
         if self.rank == 0:
-            print(f"WeightedMultiLoader: resumed {self.n} source cursors + rng (epoch {self.epoch})")
+            print(f"WeightedMultiLoader: resumed {self.n} source cursors + rng "
+                  f"(epoch {self.epoch}, {self.drawn_base:,} tok consumed, micro_batch={self.B})")
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -483,7 +521,9 @@ class DocManifestDataLoader:
     def start_from_beginning(self):
         self.current_position = self.rank * self.B
 
-    def resume_from_checkpoint_position(self, position):
+    def resume_from_checkpoint_position(self, position, drawn_tokens=None):
+        # drawn_tokens accepted for signature parity with WeightedMultiLoader; this
+        # loader derives its epoch from doc-order position, not a token tally.
         self.current_position = int(position) + self.rank * self.B
 
     def steps_from_position(self, position):
@@ -604,6 +644,7 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+    prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
 
 
@@ -697,6 +738,13 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        # Selective checkpointing: checkpoint every Nth layer (stride>1 => store more activations,
+        # recompute less => faster + more HBM). stride=1 keeps prior behavior (checkpoint all).
+        if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
+            model.checkpoint_stride = int(args.checkpoint_stride)
+            if IS_MAIN:
+                print(f"Selective activation checkpointing: stride={args.checkpoint_stride} "
+                      f"(checkpoint all EXCEPT store every {args.checkpoint_stride}th layer)")
 
     # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
     if args.fp8 == 1:
@@ -749,7 +797,7 @@ def main():
         # a contiguous slice via .tokens / .current_position); manifests are train-only.
         val_loader = DataLoader(
             args.val_data_path,
-            args.batch_size,
+            args.val_batch_size,
             args.block_size,
             rank=0,
             world_size=1,
@@ -848,7 +896,12 @@ def main():
                 # reproduces the original epoch) then place the per-rank cursor.
                 if hasattr(train_loader, "set_epoch"):
                     train_loader.set_epoch(resumed_epoch)
-                train_loader.resume_from_checkpoint_position(data_position)
+                # Pass the checkpoint's tokens_processed as the authoritative progress
+                # count: it is tracked independently of the loader and is exact, so the
+                # sampler's epoch survives a micro-batch change on resume.
+                train_loader.resume_from_checkpoint_position(
+                    data_position, drawn_tokens=tokens_processed
+                )
             else:
                 train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
                 train_loader.epoch = resumed_epoch
@@ -889,6 +942,30 @@ def main():
         tokens_processed = 0
     last_checkpoint_time = time.time()
     training_start_time = time.time()
+    def _eval_val():
+        # Val loss on the underlying (non-DDP) module at a SMALL fixed batch (val_batch_size) so the
+        # logit tensor never OOMs regardless of the train batch. Used for the end eval + periodic eval.
+        if val_loader is None:
+            return float("nan")
+        base_eval = get_base_model(model)
+        was_training = base_eval.training
+        base_eval.eval()
+        losses = []
+        with torch.no_grad():
+            orig = val_loader.current_position
+            val_loader.current_position = 0
+            nb = min(100, max(1, min(2_000_000, len(val_loader.tokens)) // (args.val_batch_size * args.block_size)))
+            for _ in range(nb):
+                vx, vy = val_loader.next_batch()
+                vx = vx.to(DEVICE, non_blocking=True); vy = vy.to(DEVICE, non_blocking=True)
+                with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                    vout = base_eval(vx, labels=vy)
+                losses.append(vout.loss.item())
+            val_loader.current_position = orig
+        if was_training:
+            base_eval.train()
+        return float(np.mean(losses)) if losses else float("nan")
+
     train_losses = []
     completed_max_epochs = train_loader.epoch >= args.max_epochs
 
@@ -956,6 +1033,15 @@ def main():
             if pbar:
                 pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
 
+        # Periodic validation (translate-test / learning curve). Gated (default off). All ranks reach
+        # here together (global_step is synced); rank 0 evals while the others wait at the barrier.
+        if args.periodic_val_every > 0 and global_step % args.periodic_val_every == 0:
+            if IS_MAIN and val_loader is not None:
+                _pv = _eval_val()
+                print(f"PERIODIC_VAL step={global_step} tokens={tokens_processed} val_loss={_pv:.4f} lr={current_lr:.3e}", flush=True)
+            if WORLD_SIZE > 1:
+                dist.barrier()
+
         # Synchronized checkpoint decision
         should_checkpoint = torch.tensor([0], device=DEVICE)
         if IS_MAIN:
@@ -982,19 +1068,25 @@ def main():
                 dist.barrier()
             last_checkpoint_time = time.time()
 
-        # Synchronized wall time check
-        if WALL_TIME_SAVE > 0:
+        # Synchronized wall-time / deadline check -- save ONE checkpoint, then exit cleanly (the
+        # weekend.sh chain resubmits on that clean exit = save-THEN-submit). Two triggers, whichever
+        # fires first: (1) --save_deadline_epoch = ABSOLUTE wall clock (job_start + slice - lead) =>
+        # fires a fixed time before the SLURM kill regardless of compile/startup drift = PRIMARY;
+        # (2) WALL_TIME_SAVE = training-ELAPSED margin = backup.
+        if WALL_TIME_SAVE > 0 or args.save_deadline_epoch > 0:
             should_wall_stop = torch.tensor([0], device=DEVICE)
             if IS_MAIN:
                 elapsed = time.time() - training_start_time
-                if elapsed >= WALL_TIME_SAVE:
+                if WALL_TIME_SAVE > 0 and elapsed >= WALL_TIME_SAVE:
+                    should_wall_stop[0] = 1
+                if args.save_deadline_epoch > 0 and time.time() >= args.save_deadline_epoch:
                     should_wall_stop[0] = 1
             if WORLD_SIZE > 1:
                 dist.broadcast(should_wall_stop, src=0)
 
             if should_wall_stop[0] == 1:
                 if IS_MAIN:
-                    print(f"\nApproaching wall time ({args.wall_time}s). Saving checkpoint and exiting...")
+                    print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
                     checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
@@ -1028,24 +1120,9 @@ def main():
         val_losses = []
         if val_loader is not None:
             print("\nEvaluating on validation...")
-            model.eval()
-            val_tokens = min(1_000_000, len(val_loader.tokens))
-            val_batches = val_tokens // (args.batch_size * args.block_size)
-
-            with torch.no_grad():
-                original_pos = val_loader.current_position
-                val_loader.current_position = 0
-
-                for _ in range(min(val_batches, 100)):
-                    x, y = val_loader.next_batch()
-                    x = x.to(DEVICE, non_blocking=True)
-                    y = y.to(DEVICE, non_blocking=True)
-
-                    with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                        outputs = model(x, labels=y)
-                    val_losses.append(outputs.loss.item())
-
-                val_loader.current_position = original_pos
+            _vl = _eval_val()
+            if not np.isnan(_vl):
+                val_losses = [_vl]
         else:
             print("\nValidation skipped: no held-out validation file was provided.")
 
@@ -1109,3 +1186,46 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def prune_old_checkpoints(checkpoint_dir, keep_path):
+    """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).
+
+    Keep `keep_path` (the checkpoint just written) and delete every other checkpoint_step_*.pt in
+    THIS dir -- i.e. this run's own earlier checkpoints. At 12-35 GB apiece a non-rotating dir eats
+    hundreds of GB, and one checkpoint is all a resume needs.
+
+    HISTORY, because this spot previously said the opposite: a keep-last-3 prune added 2026-07-28
+    was removed 2026-07-29 after it silently deleted 14 of 17 checkpoints and read as data loss.
+    The owner reversed the policy on 2026-08-05: latest-only is now the default. What was actually
+    wrong then was silence and aggressiveness, so this version PRINTS every deletion.
+
+    Deliberately narrow, so it can only ever remove this run's superseded checkpoints:
+      * only `checkpoint_step_<int>.pt` directly in `checkpoint_dir` (glob, not a walk)
+      * never `keep_path`, never a symlink (so `checkpoint_last.pt` is untouched), never a `.tmp`
+      * never the numerically-highest step present, even if `keep_path` somehow is not it
+      * per-file try/except: a failed unlink must not abort training after a good save
+    """
+    try:
+        keep = {os.path.realpath(keep_path)}
+        found = []
+        for p in glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt")):
+            m = re.fullmatch(r"checkpoint_step_(\d+)\.pt", os.path.basename(p))
+            if m and not os.path.islink(p):
+                found.append((int(m.group(1)), p))
+        if len(found) <= 1:
+            return
+        # Belt and braces: whatever has the highest step number also stays.
+        keep.add(os.path.realpath(max(found)[1]))
+        for _, p in sorted(found):
+            if os.path.realpath(p) in keep:
+                continue
+            try:
+                gib = os.path.getsize(p) / 2**30
+                os.remove(p)
+                print(f"[retention] removed superseded checkpoint {os.path.basename(p)} "
+                      f"({gib:.1f} GiB freed); keeping {os.path.basename(keep_path)}", flush=True)
+            except OSError as e:
+                print(f"[retention] could not remove {p}: {e}", flush=True)
+    except Exception as e:  # retention must never take down a run that just saved successfully
+        print(f"[retention] prune skipped: {e}", flush=True)

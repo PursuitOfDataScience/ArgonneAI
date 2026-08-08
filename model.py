@@ -424,6 +424,14 @@ class GroupedQueryAttention(nn.Module):
                         dropout_p=self.attention_dropout if self.training else 0.0,
                         is_causal=False,  # Mask already includes causal component
                     )
+            except torch.cuda.OutOfMemoryError:
+                # Do NOT degrade to math attention on OOM. torch.OutOfMemoryError subclasses
+                # RuntimeError, so the old blanket `except RuntimeError` turned a recoverable SDPA
+                # OOM into the seq^2 math path -- which needs strictly MORE memory and then dies
+                # for real. At phase-C ctx 65,536 that fallback asked for a single 48 GiB tensor
+                # and killed the slice. Surface the original OOM instead; the caller can retry
+                # smaller. The fallback below stays for genuine kernel-unavailability.
+                raise
             except RuntimeError:
                 # Fallback to math attention when kernels are unavailable
                 attn_output = None
@@ -563,6 +571,13 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
+        # Selective activation checkpointing (runtime-only; not in config/state_dict, so checkpoint
+        # compatibility is unaffected). checkpoint_stride S:
+        #   S == 1 : checkpoint ALL layers (default; == prior behavior, min HBM / max recompute).
+        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer -> store
+        #            ceil(n_layers/S) layers, recompute the rest. Smaller S stores MORE (more HBM,
+        #            less recompute, faster) but too-small S can OOM. Trades HBM for speed.
+        self.checkpoint_stride = 1
         self._nan_loss_count = 0
         self.post_init()
 
@@ -681,7 +696,8 @@ class ArgonneModel(PreTrainedModel):
 
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.blocks):
-            if self.gradient_checkpointing and self.training:
+            _skip_ckpt = (self.checkpoint_stride >= 2) and (i % self.checkpoint_stride == 0)
+            if self.gradient_checkpointing and self.training and not _skip_ckpt:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,

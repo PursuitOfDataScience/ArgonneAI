@@ -23,7 +23,7 @@ MAGIC = 20240801
 CHUNK = 64 << 20  # 64M tokens per write
 
 # docbin sources (override via env if they move)
-EDU_DIR  = os.environ.get("EDU_DOCBIN_DIR",  "/project/rcc/youzhi/data/reasoning_anneal/fineweb_edu")
+EDU_DIR  = os.environ.get("EDU_DOCBIN_DIR",  "/project/rcc/youzhi/data/reasoning_anneal/fineweb_edu_a4")
 MATH_DIR = os.environ.get("MATH_DOCBIN_DIR", "/project/rcc/youzhi/data/finemath/finemath-4plus_qwen3_docbin")
 CODE_DIR = os.environ.get("CODE_DOCBIN_DIR", "/project/rcc/youzhi/data/reasoning_anneal/github_code")
 
@@ -62,8 +62,11 @@ def write_flat(out_path, shard_paths, max_tokens=None, skip_head_tokens=0):
         f.seek(0)
         hdr[2] = written if written < 2**31 else -1
         f.write(hdr.tobytes())
-    assert written <= 2**31 - 1, f"{written} exceeds int32 header count"
-    print(f"  WROTE {os.path.basename(out_path)}: {written:,} tok from {len(shard_paths)} shards")
+    # >2^31 tokens overflow the int32 header count field, so we store -1 (above). The pretrain.py
+    # loader IGNORES the header count and derives length from the memmap file size, so a single
+    # large bin is fine -- this matches the existing 20.8B fineweb-binary-qwen3/train.bin. No cap.
+    ovf = " [>2^31: hdr count=-1, loader uses file length]" if written >= 2**31 else ""
+    print(f"  WROTE {os.path.basename(out_path)}: {written:,} tok{ovf} from {len(shard_paths)} shards")
     return written
 
 

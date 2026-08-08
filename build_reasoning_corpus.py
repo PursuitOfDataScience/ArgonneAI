@@ -161,6 +161,20 @@ SOURCES = {
         require_think_closure=False, decontam=False,  # general web; keep it fast
         dedup_key=None,
     ),
+    # ---- argonne4.0 PRETRAIN general source: the FULL FineWeb-Edu (all 218 arrow shards ~20B),
+    # SEPARATE from the 2.2B reasoning "replay anchor" above so the reasoning corpus is unchanged.
+    # enabled=False -> not swept into the reasoning corpus; tokenize explicitly:
+    #   python build_reasoning_corpus.py tokenize --source fineweb_edu_a4 --workers 46
+    # Outputs to $RC_OUT_ROOT/fineweb_edu_a4; build_a4_data.py reads it as the edu arm.
+    "fineweb_edu_a4": dict(
+        tier="general", fmt="arrow", renderer="text", enabled=False,
+        files=lambda: _g("/project/rcc/youzhi/data/fineweb-edu", "fineweb-edu-train-*-of-00218.arrow"),
+        columns=None, renderer_args=dict(text_col="text"),
+        budget_tokens=30_000_000_000, n_shards=218,  # cap/shard ~137M > natural ~94M => no binding
+        min_doc_tokens=32, max_doc_tokens=32768,
+        require_think_closure=False, decontam=False,
+        dedup_key=None,
+    ),
     # ---- Defined but OFF by default (medium quality, chatty; tangential to anneal) ---
     "instruct_chat": dict(
         tier="instruction", fmt="jsonl", renderer="chat", enabled=False,

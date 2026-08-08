@@ -30,18 +30,20 @@ Pinned on both axes at 300M tokens and passing the translate-test (advantage ove
 with scale). Realized by `pretrain.py --train_sources "EDU:50,MATH:30,CODE:20"`: it samples ONE
 source per micro-batch by weight (no pre-built blend bin; ratio decoupled from raw source sizes).
 
-**Data readiness (2026-07-20).** Raw docbin tokenized today (`build_a4_data.py` sources):
+**Data BUILT (2026-07-20)** at `/project/rcc/youzhi/data/argonne4_pretrain/` (the launcher default):
 
-| Source | docbin available | note |
+| Source | tokens | note |
 |---|---|---|
-| FineWeb-Edu | ~2.0B tok (24 shards) | **the gap** — highest weight (50%), smallest corpus |
-| FineMath-4plus | ~9.5B tok (64 shards) | ≈ all of FineMath-4plus; FineMath-3plus (~34B) can extend |
-| github_code | ~7.5B tok (16 shards) | |
+| FineWeb-Edu (`edu_flat.bin`) | **20.6B** | fully tokenized — all 218 arrow shards (was a 2.2B replay anchor) |
+| FineMath-4plus (`finemath_flat.bin`) | ~10B | ≈ all of FineMath-4plus; FineMath-3plus (~34B) can extend |
+| github_code (`code_flat.bin`) | ~8B | |
+| **combined** | **~38.6B** | + held-out `val_{edu,math,code}.bin` (3M each) |
 
-`build_a4_data.py` builds the full per-source flat bins (`--out`, all shards by default) + held-out
-val bins. For a large run, tokenize more FineWeb-Edu into `EDU_DOCBIN_DIR` (upstream ~1.3T) — at 50%
-weight, edu is the binding source. Multi-epoch repetition ≤~4× is ~free (Muennighoff), so ~19B
-combined supports a meaningful run today; a full 100B+ run wants more edu.
+Built by `build_reasoning_corpus.py tokenize --source fineweb_edu_a4` (46-core CPU job, 28 min) →
+`build_a4_data.py`. At 50/30/20 over ~38.6B, each source runs ~1× (edu is no longer the bottleneck;
+math is now first to repeat). ~38.6B is ~1.5× Chinchilla for a 1B; raise `A4_TRAIN_TOKENS` for a more
+overtrained run — ≤~4× per-source repetition is ~free (Muennighoff), i.e. up to ~130–150B before
+edu/math repeat past 4×.
 
 ## The pipeline (marker-gated, self-resubmitting — same as 3.5)
 
@@ -73,29 +75,18 @@ cd /home/youzhi/ArgonneAI-4.0
 ./night.sh
 ```
 
-**Before a REAL run** (defaults point at the campaign PROXY bins so the pipeline runs today for a
-smoke — the worker prints a loud warning if the corpus is small):
+The launcher defaults are now the BUILT scale bins + the probed batch, so `./weekend.sh` runs the
+real recipe with **no overrides needed**. Optional knobs (sensible defaults in `run_full_training.sh`):
+`A4_TRAIN_TOKENS` (schedule length; 0 = combined ~38.6B ≈ 1×/source), `A4_EDU/A4_MATH/A4_CODE` + `A4_W_*`
+(sources/weights), `A4_BATCH`/`A4_GRAD_ACCUM`/`A4_LR`, `A4_GRAD_CKPT`, `CKPT_DIR_OVERRIDE`. For a more
+overtrained run: `A4_TRAIN_TOKENS=100000000000 ./weekend.sh` (edu/math ~2.5–3×, ≤4× = ~free).
 
-```bash
-# 1) build the scale per-source bins (all shards):
-python build_a4_data.py --out /project/rcc/youzhi/data/argonne4_pretrain
-# 2) point the launcher at them + set a real token budget:
-A4_EDU=/project/rcc/youzhi/data/argonne4_pretrain/edu_flat.bin \
-A4_MATH=/project/rcc/youzhi/data/argonne4_pretrain/finemath_flat.bin \
-A4_CODE=/project/rcc/youzhi/data/argonne4_pretrain/code_flat.bin \
-A4_TRAIN_TOKENS=100000000000 \
-./weekend.sh
-```
-
-Key env overrides (all have sensible defaults in `run_full_training.sh`): `A4_EDU/A4_MATH/A4_CODE`,
-`A4_W_EDU/A4_W_MATH/A4_W_CODE` (weights), `A4_TRAIN_TOKENS` (schedule length), `A4_BATCH`,
-`A4_GRAD_ACCUM`, `A4_LR`, `A4_WARMUP`, `A4_GRAD_CKPT`, `CKPT_DIR_OVERRIDE`.
-
-**Batch sizing.** Default `A4_BATCH=64 A4_GRAD_ACCUM=3` → effective 589,824 tok/step (~ the
-campaign-validated 524,288; LR is flat over 6–8e-4). block-1024 is compute-bound, so a bigger batch
-buys ~0 throughput — check HBM on the first slice with `slurmwatch` and only lower `A4_BATCH` if it
-OOMs (chunked CE `loss_chunk_size 4096` frees the 151k-vocab fp32-logit transient). For max speed,
-`A4_GRAD_CKPT=0` (the 1B likely fits without checkpointing; recompute-free is faster).
+**Batch (probed on 3×H200, 2026-07-20).** Default `A4_BATCH=170 A4_GRAD_ACCUM=1` → effective
+**522,240 tok/step == the campaign-validated 524,288** (LR 6e-4 directly validated). The probe showed
+batch 170 already saturates the cards (**51% HBM @ 100% GPU util**) — block-1024 is compute-bound, so a
+bigger batch buys ~0 throughput. `A4_BATCH=288` fills ~76% HBM (effective ~885K → set `A4_LR≈7.8e-4`)
+if you insist on HBM fill, but there's no throughput reason to. Chunked CE (`loss_chunk_size 4096`) is
+what frees the 151k-vocab fp32-logit transient so the big single-pass batch fits (the 3.5 phase-2 trick).
 
 ## Honest bounds (per no-premature-optimism)
 

@@ -5,6 +5,7 @@ and automatic checkpoint resume.
 """
 
 import os
+import re
 import sys
 import glob
 import time
@@ -197,7 +198,52 @@ def save_checkpoint(
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+    prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
+
+
+def prune_old_checkpoints(checkpoint_dir, keep_path):
+    """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).
+
+    Keep `keep_path` (the checkpoint just written) and delete every other checkpoint_step_*.pt in
+    THIS dir -- i.e. this run's own earlier checkpoints. At 12-35 GB apiece a non-rotating dir eats
+    hundreds of GB, and one checkpoint is all a resume needs.
+
+    HISTORY, because this spot previously said the opposite: a keep-last-3 prune added 2026-07-28
+    was removed 2026-07-29 after it silently deleted 14 of 17 checkpoints and read as data loss.
+    The owner reversed the policy on 2026-08-05: latest-only is now the default. What was actually
+    wrong then was silence and aggressiveness, so this version PRINTS every deletion.
+
+    Deliberately narrow, so it can only ever remove this run's superseded checkpoints:
+      * only `checkpoint_step_<int>.pt` directly in `checkpoint_dir` (glob, not a walk)
+      * never `keep_path`, never a symlink (so `checkpoint_last.pt` is untouched), never a `.tmp`
+      * never the numerically-highest step present, even if `keep_path` somehow is not it
+      * per-file try/except: a failed unlink must not abort training after a good save
+    """
+    try:
+        keep = {os.path.realpath(keep_path)}
+        found = []
+        for p in glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt")):
+            m = re.fullmatch(r"checkpoint_step_(\d+)\.pt", os.path.basename(p))
+            if m and not os.path.islink(p):
+                found.append((int(m.group(1)), p))
+        if len(found) <= 1:
+            return
+        # Belt and braces: whatever has the highest step number also stays.
+        keep.add(os.path.realpath(max(found)[1]))
+        for _, p in sorted(found):
+            if os.path.realpath(p) in keep:
+                continue
+            try:
+                gib = os.path.getsize(p) / 2**30
+                os.remove(p)
+                print(f"[retention] removed superseded checkpoint {os.path.basename(p)} "
+                      f"({gib:.1f} GiB freed); keeping {os.path.basename(keep_path)}", flush=True)
+            except OSError as e:
+                print(f"[retention] could not remove {p}: {e}", flush=True)
+    except Exception as e:  # retention must never take down a run that just saved successfully
+        print(f"[retention] prune skipped: {e}", flush=True)
+
 
 
 def get_latest_checkpoint_path(checkpoint_dir):
@@ -309,6 +355,11 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
+            model.checkpoint_stride = int(args.checkpoint_stride)
+            if IS_MAIN:
+                print(f"Selective activation checkpointing: stride={args.checkpoint_stride} "
+                      f"(checkpoint all EXCEPT store every {args.checkpoint_stride}th layer)")
 
     # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
     if args.fp8 == 1:
@@ -590,19 +641,23 @@ def main():
                 dist.barrier()
             last_checkpoint_time = time.time()
 
-        # Synchronized wall time check
-        if WALL_TIME_SAVE > 0:
+        # Synchronized wall-time / deadline check -- save ONE checkpoint, then exit cleanly (the
+        # weekend.sh chain resubmits on that clean exit = save-THEN-submit). Primary trigger =
+        # --save_deadline_epoch (absolute wall clock, startup-immune); WALL_TIME_SAVE (elapsed) = backup.
+        if WALL_TIME_SAVE > 0 or args.save_deadline_epoch > 0:
             should_wall_stop = torch.tensor([0], device=DEVICE)
             if IS_MAIN:
                 elapsed = time.time() - training_start_time
-                if elapsed >= WALL_TIME_SAVE:
+                if WALL_TIME_SAVE > 0 and elapsed >= WALL_TIME_SAVE:
+                    should_wall_stop[0] = 1
+                if args.save_deadline_epoch > 0 and time.time() >= args.save_deadline_epoch:
                     should_wall_stop[0] = 1
             if WORLD_SIZE > 1:
                 dist.broadcast(should_wall_stop, src=0)
 
             if should_wall_stop[0] == 1:
                 if IS_MAIN:
-                    print(f"\nApproaching wall time ({args.wall_time}s). Saving checkpoint and exiting...")
+                    print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
                     checkpoint_path = save_checkpoint(
                         model,
@@ -657,20 +712,39 @@ def main():
             val_tokens = min(1_000_000, len(val_loader.tokens))
             val_batches = val_tokens // (args.batch_size * args.block_size)
 
-            with torch.no_grad():
-                original_pos = val_loader.current_position
-                val_loader.current_position = 0
+            # This block runs AFTER the wall-clock checkpoint is already on disk, so it must never
+            # be able to fail the slice: a non-zero exit makes the launcher refuse to auto-resubmit
+            # and the whole chain stalls. That is exactly what happened to the three 08-03 phase-C
+            # slices (52949059/52949900/52950396) -- each trained ~40 steps, saved cleanly, then
+            # OOMed here and broke the chain. Free the training-time allocator pools first (the
+            # eval forward is eager and uncompiled, so it needs headroom torch.compile did not),
+            # and treat any eval failure as "no val number this slice", not as a run failure.
+            torch.cuda.empty_cache()
+            try:
+                with torch.no_grad():
+                    original_pos = val_loader.current_position
+                    val_loader.current_position = 0
 
-                for _ in range(min(val_batches, 100)):
-                    x, y = val_loader.next_batch()
-                    x = x.to(DEVICE, non_blocking=True)
-                    y = y.to(DEVICE, non_blocking=True)
+                    for _ in range(min(val_batches, 100)):
+                        x, y = val_loader.next_batch()
+                        x = x.to(DEVICE, non_blocking=True)
+                        y = y.to(DEVICE, non_blocking=True)
 
-                    with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                        outputs = model(x, labels=y)
-                    val_losses.append(outputs.loss.item())
+                        with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                            # UNWRAPPED module, never the DDP wrapper. This block is rank-0-only, so a
+                            # forward through DDP makes rank 0 enter collectives that ranks 1..N-1 never
+                            # join -> NCCL desync -> SIGABRT. That killed slice 52938317 AFTER it had
+                            # trained 600 steps and saved, so the run limped instead of chaining. Phase B
+                            # never hit it because it ran with no --val_data_path.
+                            outputs = (model.module if hasattr(model, "module") else model)(x, labels=y)
+                        val_losses.append(outputs.loss.item())
 
-                val_loader.current_position = original_pos
+                    val_loader.current_position = original_pos
+            except Exception as exc:  # noqa: BLE001 - never fail a slice on post-save eval
+                val_losses = []
+                print(f"WARNING: validation eval failed and was skipped ({type(exc).__name__}: {exc})")
+                print("         Checkpoint is already saved; continuing so the slice chain resumes.")
+                torch.cuda.empty_cache()
         else:
             print("\nValidation skipped: no held-out validation file was provided.")
 
@@ -778,10 +852,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
     parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to train")
     parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
+    parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (model.py already supports it; this wires it to the anneal/midtrain stages). 1=checkpoint ALL layers (prior behavior). >=2=checkpoint every layer EXCEPT store every Sth (store ceil(n_layers/S)) -> more HBM, less recompute, faster. Numerically identical; requires --gradient_checkpointing 1.")
     parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help="Use torch.compile for speedup")
     parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
     parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
+    parser.add_argument("--save_deadline_epoch", type=int, default=0, help="Absolute wall-clock deadline (unix epoch seconds): when time.time() reaches it, save ONE checkpoint and exit cleanly. SLURM-clock-relative (run_full_training.sh sets it = job_start + slice_seconds - lead), so it fires a FIXED time before the SLURM kill regardless of compile/startup drift. 0 = disabled.")
     parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Restart the data position from the beginning of the current dataset when resuming, while preserving optimizer, scheduler, and cumulative step/token counters.")
     parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
     parser.add_argument("--final_model_dir", type=str, default=None, help="Optional directory for the final Hugging Face model export.")
@@ -801,8 +877,8 @@ if __name__ == "__main__":
     )
     ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-    # argonne4.0: ~1.04B checkpoint (~11 GB) flushes fast, so 150s margin (up-time for
-    # training) is ample; matches pretrain.py's argonne4.0 margin (owner directive 2026-07-20).
-    WALL_TIME_SAVE = args.wall_time - 150 if args.wall_time > 0 else 0
+    # argonne4.0: ~1.04B checkpoint (~11 GB) flushes fast. This training-ELAPSED margin is a BACKUP;
+    # the PRIMARY save trigger is --save_deadline_epoch (absolute wall clock, startup-immune).
+    WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
 
     main()
