@@ -571,12 +571,14 @@ class ArgonneModel(PreTrainedModel):
             self.lm_head.weight = self.embed_tokens.weight
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
-        # Selective activation checkpointing (runtime-only; not in config/state_dict, so checkpoint
-        # compatibility is unaffected). checkpoint_stride S:
-        #   S == 1 : checkpoint ALL layers (default; == prior behavior, min HBM / max recompute).
-        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer -> store
-        #            ceil(n_layers/S) layers, recompute the rest. Smaller S stores MORE (more HBM,
-        #            less recompute, faster) but too-small S can OOM. Trades HBM for speed.
+        # Selective activation checkpointing (ported from argonne4.0). Runtime-only --
+        # NOT part of config or state_dict, so checkpoint/resume compatibility with every
+        # existing argonne3.5 checkpoint is unaffected. checkpoint_stride S:
+        #   S == 1 : checkpoint ALL layers (default; identical to prior behavior).
+        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer
+        #            -> store ceil(n_layers/S), recompute the rest. Smaller S stores MORE
+        #            (more HBM, less recompute, faster); too-small S OOMs.
+        # Numerically identical either way: it only chooses store-vs-recompute.
         self.checkpoint_stride = 1
         self._nan_loss_count = 0
         self.post_init()
@@ -847,11 +849,24 @@ class ArgonneModel(PreTrainedModel):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         self.eval()
         device = self.embed_tokens.weight.device
         input_ids = input_ids.to(device)
         ctx = self.config.max_position_embeddings
+        # Stop at EOS (2026-08-02). This loop previously had NO eos check at all -- its only
+        # exit was `max_length`, so config.eos_token_id was inert and every caller following the
+        # model card's `.generate()` snippet ran to the token budget and then degenerated into
+        # repetition long after the answer was finished. Harmless-looking on a base model (which
+        # just continues text) but bad on a chat/think model, where the assistant turn must end
+        # at <|im_end|>. Longstanding across the whole Argonne line, including the published
+        # 3.0-think bundle -- not introduced by any recent change.
+        # Pass eos_token_id=-1 to explicitly opt out and restore run-to-max_length behavior.
+        if eos_token_id is None:
+            eos_token_id = getattr(self.config, "eos_token_id", None)
+        stop_id = None if eos_token_id is None or eos_token_id < 0 else int(eos_token_id)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=device)
         # KV-cache decode: prefill the prompt once, then feed a single token per
         # step reusing past_key_values. This yields identical logits to the
         # recompute-the-whole-prefix path (gated by verify_cache.py) but turns the
@@ -915,6 +930,12 @@ class ArgonneModel(PreTrainedModel):
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             if input_ids.shape[1] >= max_length:
                 break
+            # Batch-safe: only stop once EVERY row has emitted EOS, so a short sequence cannot
+            # truncate the others. (This arch has no padding support, so batch is normally 1.)
+            if stop_id is not None:
+                finished |= next_token.squeeze(-1).eq(stop_id)
+                if bool(finished.all()):
+                    break
             # Advance the cache by one token unless we must rebuild it next loop
             # (cache full); the top-of-loop guard re-prefills in that case.
             if past[0][0].shape[2] < ctx:

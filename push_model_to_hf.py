@@ -442,19 +442,45 @@ The published checkpoint is stored in {CHECKPOINT_DTYPE} and split across {shard
 """
 
 
-def build_ctx13568_instruct_model_card(repo_id, model_name, parameter_count, shard_count):
+def architecture_rows_from_config(config, parameter_count):
+    """Architecture facts read from the ACTUAL config, never hardcoded.
+
+    The hardcoded table this replaces described a 1.27B / 28-layer / 1,792-hidden / theta=10,000 model
+    and got reused verbatim for a 2.88B / 24-layer / 3,072-hidden / theta=1e6 one, yielding a card on
+    which every architectural figure was wrong and the parameter row read
+    "2,882,162,688 (~1.27B)". Deriving them eliminates the whole class of error.
+    """
+    c = config or {}
+    n_layer = c.get("num_hidden_layers") or c.get("n_layer")
+    hidden = c.get("hidden_size") or c.get("n_embd")
+    n_head = c.get("num_attention_heads") or c.get("n_head")
+    n_kv = c.get("num_key_value_heads")
+    ctx = c.get("max_position_embeddings") or c.get("block_size")
+    theta = c.get("rope_theta")
+    rows = [("**Parameters**", f"{parameter_count:,} (~{parameter_count / 1e9:.2f}B)")]
+    if n_layer:
+        rows.append(("**Layers**", f"{n_layer} transformer blocks"))
+    if hidden:
+        rows.append(("**Hidden size**", f"{hidden:,}"))
+    if n_head:
+        rows.append(("**Attention heads**",
+                     f"{n_head} query / {n_kv} key-value (GQA)" if n_kv else f"{n_head} query"))
+    if ctx:
+        rows.append(("**Context length**", f"{ctx:,} tokens"))
+    if c.get("vocab_size"):
+        rows.append(("**Vocabulary size**", f"{c['vocab_size']:,}"))
+    if theta:
+        rows.append(("**Position encoding**", f"RoPE (θ = {int(theta):,})"))
+    if c.get("tie_word_embeddings") is not None:
+        rows.append(("**Tied embeddings**", "Yes" if c["tie_word_embeddings"] else "No"))
+    return rows
+
+
+def build_ctx13568_instruct_model_card(repo_id, model_name, parameter_count, shard_count, config=None):
     base_model_link = f"[PursuitOfDataScience/Argonne-2.5-ctx13568]({CTX13568_BASE_MODEL_URL})"
     ultrachat_link = f"[HuggingFaceH4/ultrachat_200k]({ULTRACHAT_DATASET_URL})"
     chatbot_arena_link = f"[KatoHF/chatbot_arena_binarized]({CHATBOT_ARENA_DATASET_URL})"
-    architecture_rows = [
-        ("**Parameters**", f"{parameter_count:,} (~1.27B)"),
-        ("**Layers**", "28 transformer blocks"),
-        ("**Hidden size**", "1,792"),
-        ("**Attention heads**", "14 query / 7 key-value (GQA)"),
-        ("**Context length**", "13,568 tokens"),
-        ("**Vocabulary size**", "151,669"),
-        ("**Position encoding**", "RoPE (θ = 10,000)"),
-    ]
+    architecture_rows = architecture_rows_from_config(config, parameter_count)
     recommended_rows = markdown_table(CTX13568_INSTRUCT_RECOMMENDED_ROWS)
     source_section = f"""## Source code
 
@@ -657,7 +683,8 @@ pipeline_tag: text-generation
 """
 
 
-def build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_path, shard_count):
+def build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_path, shard_count,
+                     config=None):
     if profile == "base":
         return build_base_model_card(repo_id, model_name, parameter_count, plot_repo_path, shard_count)
     if profile == "instruct":
@@ -665,7 +692,8 @@ def build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_pa
     if profile == "midtraining":
         return build_midtraining_model_card(repo_id, model_name, parameter_count, plot_repo_path, shard_count)
     if profile == "ctx13568_instruct":
-        return build_ctx13568_instruct_model_card(repo_id, model_name, parameter_count, shard_count)
+        return build_ctx13568_instruct_model_card(repo_id, model_name, parameter_count, shard_count,
+                                                 config)
     raise ValueError(f"Unknown profile: {profile}")
 
 
@@ -684,12 +712,33 @@ def parse_args():
     parser.add_argument("--private", action="store_true", help="Create the HF repo as private.")
     parser.add_argument("--dry-run", action="store_true", help="Prepare files without uploading.")
     parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Keep the prepared upload folder here instead of deleting it. Without this, --dry-run "
+            "builds the release into a temp dir, prints a file listing, and then removes it in the "
+            "finally block -- so it can validate the BUILD but leaves nothing to inspect, smoke-test "
+            "or later push. With --out-dir the staged release persists and pushing it afterwards is "
+            "`huggingface-cli upload <repo-id> <out-dir>`."
+        ),
+    )
+    parser.add_argument(
         "--shard-count",
         type=int,
         default=DEFAULT_WEIGHT_SHARD_COUNT,
         help="Number of safetensor shards to write.",
     )
     parser.add_argument("--commit-message", default=None, help="Upload commit message.")
+    parser.add_argument(
+        "--card-file",
+        default=None,
+        help=(
+            "Use this file as README.md instead of generating a card from the profile template. "
+            "STRONGLY PREFERRED for anything but a fresh base release: the profile templates hardcode "
+            "prose and (historically) architecture figures for the model they were written for, so "
+            "reusing one silently publishes another model's description. See --help on --profile."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -767,7 +816,40 @@ def split_state_dict_into_shards(state_dict, shard_count, temp_path):
     return total_params
 
 
-def rewrite_config_dtype(temp_path, dtype_name):
+AUTO_MAP = {
+    "AutoConfig": "model.ArgonneConfig",
+    "AutoModel": "model.ArgonneModel",
+    "AutoModelForCausalLM": "model.ArgonneModel",
+}
+CHAT_EOS_TOKEN_ID = 151645          # <|im_end|> -- the turn terminator for the instruct/think chats
+CTX13568 = 13568
+
+
+def rewrite_config_dtype(temp_path, dtype_name, profile=None):
+    """Normalise the config for RELEASE, not for the local eval harness.
+
+    A checkpoint that came out of the reasoning campaign is configured for the LOCAL harness, which
+    registers ArgonneModel by hand, passes eos_token_id explicitly and evaluates through vLLM. Four of
+    those settings are wrong for a published artifact, and all four are silent -- measured 2026-08-04
+    by diffing a staged build against the live Argonne-3.5-think config:
+
+      auto_map      popped by the campaign's patch_cfg() -> `from_pretrained(trust_remote_code=True)`
+                    cannot find ArgonneModel, so a standalone load from the Hub FAILS OUTRIGHT.
+      block_size    written as 4096 -> ArgonneConfig.__init__ maps a `block_size` kwarg ONTO
+                    max_position_embeddings (model.py ~line 90), and it wins over an explicit
+                    max_position_embeddings, so the 13,568 context -- the headline feature of the
+                    3.5 line -- is silently capped at 4096.
+      eos_token_id  set to 151643 (<|endoftext|>) instead of 151645 (<|im_end|>) -> .generate()
+                    never stops at the end of a turn unless the caller passes eos_token_id itself.
+      use_cache     False. NOTE: this one is COSMETIC for this architecture -- ArgonneConfig never
+                    assigns self.use_cache (reading cfg.use_cache raises AttributeError) and
+                    ArgonneModel.generate() passes use_cache=True itself. It is normalised only so
+                    the published config matches the rest of the family and stays correct if
+                    transformers ever starts honouring it. The three above are the real defects.
+
+    So this normalises them and then ASSERTS, because "the release quietly had a 4096 context" is not
+    something to discover from a user's bug report.
+    """
     config_path = temp_path / "config.json"
     if not config_path.is_file():
         return
@@ -775,7 +857,33 @@ def rewrite_config_dtype(temp_path, dtype_name):
     config = json.loads(config_path.read_text())
     config["dtype"] = dtype_name
     config["torch_dtype"] = dtype_name
+    config["auto_map"] = AUTO_MAP
+    config["use_cache"] = True
+
+    if profile in ("instruct", "ctx13568_instruct"):
+        config["eos_token_id"] = CHAT_EOS_TOKEN_ID
+    if profile == "ctx13568_instruct":
+        config["block_size"] = CTX13568
+        config["max_position_embeddings"] = CTX13568
+
     config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+    problems = []
+    if config.get("auto_map") != AUTO_MAP:
+        problems.append("auto_map missing//wrong -> standalone trust_remote_code load will fail")
+    if not config.get("use_cache"):
+        problems.append("use_cache is false in the JSON (cosmetic for this arch, but keep the family consistent)")
+    if profile in ("instruct", "ctx13568_instruct") and config.get("eos_token_id") != CHAT_EOS_TOKEN_ID:
+        problems.append(f"eos_token_id {config.get('eos_token_id')} != {CHAT_EOS_TOKEN_ID} (<|im_end|>)")
+    if profile == "ctx13568_instruct":
+        for k in ("block_size", "max_position_embeddings"):
+            if config.get(k) != CTX13568:
+                problems.append(f"{k} {config.get(k)} != {CTX13568}")
+    if problems:
+        raise SystemExit("release config is wrong:\n  - " + "\n  - ".join(problems))
+    print(f"[config] normalised for release (profile={profile}): auto_map set, use_cache=True"
+          + (f", eos={CHAT_EOS_TOKEN_ID}" if profile in ("instruct", "ctx13568_instruct") else "")
+          + (f", ctx={CTX13568}" if profile == "ctx13568_instruct" else ""))
 
 
 def copy_plot(plot_path, temp_path):
@@ -793,12 +901,39 @@ def copy_plot(plot_path, temp_path):
     return str(repo_path).replace(os.sep, "/")
 
 
-def write_model_card(temp_path, profile, repo_id, model_name, parameter_count, plot_repo_path, shard_count):
-    readme = build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_path, shard_count)
+def write_model_card(temp_path, profile, repo_id, model_name, parameter_count, plot_repo_path,
+                     shard_count, card_file=None):
+    """Write README.md -- from --card-file if given, else from the profile template.
+
+    THE CARD IS A RELEASE ARTIFACT. The profile templates carry prose (base model, training data,
+    pipeline description) written for one specific model, and reusing a profile for a different model
+    publishes that other model's description. On 2026-08-04 the ctx13568_instruct template would have
+    described Argonne-3.5-think as a 1.27B UltraChat-SFT-then-DPO model built on Argonne-2.5, with no
+    mention of its reasoning traces. Architecture figures are now derived from the real config, but the
+    PROSE cannot be -- so pass --card-file for anything that is not the model the template was written
+    for, and read the result before uploading either way.
+    """
+    if card_file:
+        src = Path(card_file).expanduser()
+        if not src.is_file():
+            raise SystemExit(f"--card-file not found: {src}")
+        text = src.read_text()
+        if not text.lstrip().startswith("---"):
+            raise SystemExit("--card-file has no YAML front matter; HF needs it for metadata")
+        (temp_path / "README.md").write_text(text)
+        print(f"[card] using {src} verbatim ({len(text.splitlines())} lines)")
+        return
+    cfg_path = temp_path / "config.json"
+    config = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+    readme = build_model_card(profile, repo_id, model_name, parameter_count, plot_repo_path,
+                              shard_count, config)
     (temp_path / "README.md").write_text(readme)
+    print(f"[card] GENERATED from the '{profile}' template -- read it before uploading; the prose is "
+          f"whatever that profile was written for, not necessarily this model")
 
 
-def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, plot_path):
+def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, plot_path,
+                          card_file=None):
     model_path = Path(model_dir).expanduser()
     if not model_path.is_dir():
         raise SystemExit(f"Model directory not found: {model_path}")
@@ -821,14 +956,15 @@ def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, 
 
     state_dict = load_weight_tensors(model_path)
     parameter_count = split_state_dict_into_shards(state_dict, shard_count, temp_path)
-    rewrite_config_dtype(temp_path, CHECKPOINT_DTYPE)
+    rewrite_config_dtype(temp_path, CHECKPOINT_DTYPE, profile)
 
     model_py = SCRIPT_DIR / "model.py"
     if model_py.is_file():
         shutil.copy2(model_py, temp_path / "model.py")
 
     plot_repo_path = copy_plot(plot_path, temp_path)
-    write_model_card(temp_path, profile, repo_id, model_name, parameter_count, plot_repo_path, shard_count)
+    write_model_card(temp_path, profile, repo_id, model_name, parameter_count, plot_repo_path,
+                     shard_count, card_file)
     return temp_dir
 
 
@@ -905,12 +1041,21 @@ def main():
         args.model_name,
         args.shard_count,
         args.plot_path,
+        args.card_file,
     )
 
     try:
         push_to_hub(upload_folder, args.repo_id, args.private, args.commit_message, args.dry_run)
     finally:
-        shutil.rmtree(upload_folder, ignore_errors=True)
+        if args.out_dir:
+            dest = Path(args.out_dir).expanduser()
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(upload_folder), str(dest))
+            print(f"staged release kept at: {dest}")
+        else:
+            shutil.rmtree(upload_folder, ignore_errors=True)
 
 
 if __name__ == "__main__":

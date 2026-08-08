@@ -22,6 +22,9 @@ MIX = "/project/rcc/youzhi/data/cot_sft_mix_v2"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/project/rcc/youzhi/data/star_sft_v2")
+    ap.add_argument("--star-dirs", nargs="+", default=[STAR_V1, STAR_V2],
+                    help="one or more STaR correct-trace dirs to pool (deduped).")
+    ap.add_argument("--mix", default=MIX, help="anchor mix dir (keeps general/format competence).")
     ap.add_argument("--upsample", type=int, default=4)
     ap.add_argument("--anchor", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=42)
@@ -29,7 +32,7 @@ def main():
     rng = random.Random(args.seed)
 
     # --- STaR traces (cumulative, deduped on the assistant text) ---
-    star = concatenate_datasets([load_from_disk(STAR_V1), load_from_disk(STAR_V2)])
+    star = concatenate_datasets([load_from_disk(d) for d in args.star_dirs])
     seen, uniq = set(), []
     for r in star:
         key = r["messages"][-1]["content"]
@@ -44,8 +47,8 @@ def main():
         star_up += uniq
     print(f"STaR upsampled x{args.upsample}: {len(star_up)}")
 
-    # --- Anchor: stratified-proportional sample of cot_sft_mix_v2 ---
-    mix = load_from_disk(MIX)
+    # --- Anchor: stratified-proportional sample of the anchor mix ---
+    mix = load_from_disk(args.mix)
     by_tier = {}
     for i, t in enumerate(mix["tier"]):
         by_tier.setdefault(t, []).append(i)

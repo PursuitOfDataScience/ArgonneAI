@@ -26,6 +26,7 @@ Requirements implemented:
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -39,8 +40,10 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from datasets import load_from_disk
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -506,6 +509,25 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
+
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) -------------------------------
+    # Everything below this branch is welded to the custom `argonne2` arch. To run the SAME
+    # recipe on a non-Argonne base (§15's control experiment, and §41's Qwen3-0.6B arm) we hand
+    # off to AutoModelForCausalLM and return early. Purely additive: an argonne2 config takes
+    # the original path unchanged, so every existing 3.5/a4 launcher is unaffected.
+    if config_dict.get("model_type", "argonne2") != "argonne2":
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base detected (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+        return model, tokenizer
+
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
     config.max_position_embeddings = max_seq_len
     config.block_size = max_seq_len
@@ -876,7 +898,29 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this script.")
 
-    device = torch.device("cuda")
+    # --- Optional DDP (2026-08-01) -------------------------------------------------------
+    # Multi-GPU is OPT-IN and fully inert unless launched under torchrun: with WORLD_SIZE unset
+    # or 1, every branch below takes the original single-GPU path, so existing invocations are
+    # byte-identical in behavior. Mirrors the DDP + no_sync grad-accumulation pattern already
+    # proven in this repo's continue_pretrain.py on this same model.
+    # Effective batch becomes batch_size * grad_accum * world_size -- divide grad_accum by the
+    # world size to hold it constant when moving a recipe from 1 GPU to N.
+    DDP_ON = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if DDP_ON:
+        LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(LOCAL_RANK)
+        device = torch.device(f"cuda:{LOCAL_RANK}")
+        RANK, WORLD = dist.get_rank(), dist.get_world_size()
+    else:
+        LOCAL_RANK, RANK, WORLD = 0, 0, 1
+        device = torch.device("cuda")
+    IS_MAIN = RANK == 0
+
+    def rprint(*a, **kw):
+        """Print on rank 0 only, so N ranks don't interleave N copies of every line."""
+        if IS_MAIN:
+            print(*a, **kw)
     print("=" * 90)
     print("Argonne checkpoint SFT on UltraChat train_sft")
     print("=" * 90)
@@ -917,10 +961,40 @@ def main() -> None:
 
     dataset = UltraChatLastAssistantDataset(args.data_path, tokenizer, MAX_SEQ_LEN)
     collator = CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
-    if args.group_by_length:
-        lengths = proxy_lengths(dataset)
+    # Three sampling strategies. The plain `else` is the historical default and is what every
+    # existing single-GPU invocation still takes, byte-identical.
+    #   * DDP                -> DistributedSampler shards the dataset across ranks, so len(loader)
+    #                           is already the PER-RANK batch count and steps_per_epoch/total_steps
+    #                           below stay correct without change.
+    #   * --group_by_length  -> LengthGroupedBatchSampler (see its docstring): batches of similar
+    #                           length so dynamic padding wastes little.
+    # The two do NOT compose: LengthGroupedBatchSampler yields whole batches drawn from the FULL
+    # index set, so under DDP every rank would train the identical batches -- N GPUs doing one
+    # GPU's work while the effective batch silently grows N-fold. Refuse instead of duplicating.
+    if args.group_by_length and DDP_ON:
+        raise SystemExit(
+            "--group_by_length is single-process only: it composes batches from the full index "
+            "set and does not shard across DDP ranks. Run it on 1 GPU, or drop the flag."
+        )
+
+    sampler = None
+    batch_sampler = None
+    if DDP_ON:
+        sampler = DistributedSampler(dataset, num_replicas=WORLD, rank=RANK, shuffle=True,
+                                     drop_last=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
+            pin_memory=True,
+            collate_fn=collator,
+        )
+    elif args.group_by_length:
         batch_sampler = LengthGroupedBatchSampler(
-            lengths, batch_size=BATCH_SIZE, seed=SEED, mult=args.length_group_mult,
+            proxy_lengths(dataset), batch_size=BATCH_SIZE, seed=SEED, mult=args.length_group_mult,
         )
         print(
             f"Length-grouped batching ON (megabatch = {BATCH_SIZE} x {args.length_group_mult} "
@@ -934,7 +1008,6 @@ def main() -> None:
             collate_fn=collator,
         )
     else:
-        batch_sampler = None
         loader = DataLoader(
             dataset,
             batch_size=BATCH_SIZE,
@@ -947,9 +1020,12 @@ def main() -> None:
 
     steps_per_epoch = len(loader) // GRAD_ACCUM_STEPS
     total_steps = max(1, steps_per_epoch * EPOCHS)
-    print(f"DataLoader batches/epoch: {len(loader):,}")
-    print(f"Optimizer steps/epoch: {steps_per_epoch:,}")
-    print(f"Total optimizer steps: {total_steps:,}")
+    rprint(f"DataLoader batches/epoch (per rank): {len(loader):,}")
+    rprint(f"Optimizer steps/epoch: {steps_per_epoch:,}")
+    rprint(f"Total optimizer steps: {total_steps:,}")
+    if DDP_ON:
+        rprint(f"DDP: world_size={WORLD} | effective batch "
+               f"= {BATCH_SIZE} x {GRAD_ACCUM_STEPS} x {WORLD} = {BATCH_SIZE*GRAD_ACCUM_STEPS*WORLD}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -988,8 +1064,17 @@ def main() -> None:
         resume_metadata = load_checkpoint(resume_path, model, optimizer, scheduler, device)
 
     # Baseline quality before SFT.
-    if args.run_before_quality == 1:
+    if args.run_before_quality == 1 and IS_MAIN:
         answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="BEFORE_SFT", step=0)
+
+    # Wrap for DDP AFTER any checkpoint restore, so resumed weights land in the raw module.
+    # `model` stays the unwrapped module (what save_pretrained/save_checkpoint must see);
+    # `train_model` is what we run forward/backward through.
+    if DDP_ON:
+        train_model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
+                          find_unused_parameters=False)
+    else:
+        train_model = model
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1030,37 +1115,53 @@ def main() -> None:
     save_locked_out = False  # becomes True after the first save when --exit_after_checkpoint_save is set
 
     for epoch in range(resume_epoch, EPOCHS):
+        rprint(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
+        if sampler is not None:
+            sampler.set_epoch(epoch)  # required, else every epoch sees the same per-rank shard order
         if batch_sampler is not None:
             batch_sampler.set_epoch(epoch)
             if epoch != resume_epoch:
                 batch_sampler.set_skip(0)  # the skip only applies to the epoch we resumed into
-        print(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", unit="batch")
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}", unit="batch", disable=not IS_MAIN)
 
         for batch in pbar:
             # Slice time limit reached -> save and exit so SLURM can resubmit.
-            if (
+            # COLLECTIVE stop decision. Each rank has its own wall clock, so a bare per-rank
+            # check lets rank 0 leave the loop on iteration k while rank 1 keeps going -- the
+            # barrier below would then never be satisfied and the job hangs until the SLURM
+            # limit. all_reduce(MAX) makes every rank agree on the same iteration.
+            _stop = 1 if (
                 args.slice_time_limit > 0
                 and (time.monotonic() - job_start_time) >= args.slice_time_limit
-            ):
-                print(
+            ) else 0
+            if DDP_ON:
+                _t = torch.tensor([_stop], device=device)
+                dist.all_reduce(_t, op=dist.ReduceOp.MAX)
+                _stop = int(_t.item())
+            if _stop:
+                rprint(
                     f"[slice] wall time {args.slice_time_limit}s reached; "
                     f"saving checkpoint and exiting."
                 )
-                save_checkpoint(
-                    args.output_dir,
-                    global_step=global_step,
-                    tokens_seen=tokens_seen,
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                    last_save_time=last_save_time,
-                )
-                rotate_checkpoints(args.output_dir, args.save_total_limit)
+                if IS_MAIN:
+                    save_checkpoint(
+                        args.output_dir,
+                        global_step=global_step,
+                        tokens_seen=tokens_seen,
+                        epoch=epoch,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        last_save_time=last_save_time,
+                    )
+                    rotate_checkpoints(args.output_dir, args.save_total_limit)
                 pbar.close()
-                print("Exiting cleanly due to --slice_time_limit.")
+                # Every rank must reach here before any exits, or NCCL tears down mid-write.
+                if DDP_ON:
+                    dist.barrier()
+                    dist.destroy_process_group()
+                rprint("Exiting cleanly due to --slice_time_limit.")
                 return
 
             input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1069,16 +1170,22 @@ def main() -> None:
             # Count non-padding tokens in this micro-batch.
             tokens_seen += int((batch["attention_mask"].sum()).item())
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-                loss = compute_loss(model, input_ids=input_ids, labels=labels)
-                scaled_loss = loss / GRAD_ACCUM_STEPS
-
-            scaled_loss.backward()
+            # Suppress the gradient all-reduce on every micro-step except the last of each
+            # accumulation window: without this DDP syncs GRAD_ACCUM_STEPS times per optimizer
+            # step instead of once, which is pure wasted interconnect. Same pattern as
+            # continue_pretrain.py. Numerically identical either way.
+            _last_micro = ((micro_step + 1) % GRAD_ACCUM_STEPS == 0)
+            _sync_ctx = train_model.no_sync() if (DDP_ON and not _last_micro) else contextlib.nullcontext()
+            with _sync_ctx:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = compute_loss(train_model, input_ids=input_ids, labels=labels)
+                    scaled_loss = loss / GRAD_ACCUM_STEPS
+                scaled_loss.backward()
             running_loss += float(loss.detach().item())
             micro_step += 1
 
             if micro_step % GRAD_ACCUM_STEPS == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                torch.nn.utils.clip_grad_norm_(train_model.parameters(), GRAD_CLIP)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1089,14 +1196,22 @@ def main() -> None:
                     avg_loss = running_loss / (LOG_EVERY * GRAD_ACCUM_STEPS)
                     running_loss = 0.0
                     lr = optimizer.param_groups[0]["lr"]
-                    print(
+                    # tokens_seen is per-rank. Sum it for the log line too, not just at the
+                    # end -- otherwise an N-GPU run under-reports throughput by exactly N and
+                    # looks half as fast as the equivalent single-GPU run.
+                    _tok_disp = tokens_seen
+                    if DDP_ON:
+                        _d = torch.tensor([tokens_seen], dtype=torch.float64, device=device)
+                        dist.all_reduce(_d, op=dist.ReduceOp.SUM)
+                        _tok_disp = int(_d.item())
+                    rprint(
                         f"Step {global_step:>6} | "
                         f"loss {avg_loss:.4f} | "
-                        f"tokens {tokens_seen:,} | "
+                        f"tokens {_tok_disp:,} | "
                         f"lr {lr:.2e}"
                     )
 
-                if QUALITY_EVERY > 0 and global_step % QUALITY_EVERY == 0:
+                if QUALITY_EVERY > 0 and global_step % QUALITY_EVERY == 0 and IS_MAIN:
                     answer_questions(
                         model,
                         tokenizer,
@@ -1114,24 +1229,36 @@ def main() -> None:
                 elif not save_locked_out and args.save_strategy == "time" and args.save_seconds > 0:
                     if (time.monotonic() - last_save_time) >= args.save_seconds:
                         should_save = True
+                # Same wall-clock divergence hazard as the slice check: the time-based branch
+                # can fire on different iterations per rank. Agree collectively before saving,
+                # otherwise ranks that skip the save race ahead into the next allreduce.
+                if DDP_ON:
+                    _s = torch.tensor([1 if should_save else 0], device=device)
+                    dist.all_reduce(_s, op=dist.ReduceOp.MAX)
+                    should_save = bool(_s.item())
 
                 if should_save:
-                    save_checkpoint(
-                        args.output_dir,
-                        global_step=global_step,
-                        tokens_seen=tokens_seen,
-                        epoch=epoch,
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        args=args,
-                        last_save_time=last_save_time,
-                    )
+                    if IS_MAIN:
+                        save_checkpoint(
+                            args.output_dir,
+                            global_step=global_step,
+                            tokens_seen=tokens_seen,
+                            epoch=epoch,
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            args=args,
+                            last_save_time=last_save_time,
+                        )
+                        rotate_checkpoints(args.output_dir, args.save_total_limit)
                     last_save_time = time.monotonic()
-                    rotate_checkpoints(args.output_dir, args.save_total_limit)
+                    if DDP_ON:
+                        dist.barrier()
                     if args.exit_after_checkpoint_save:
-                        print("[exit] --exit_after_checkpoint_save set; exiting after first save.")
+                        rprint("[exit] --exit_after_checkpoint_save set; exiting after first save.")
                         pbar.close()
+                        if DDP_ON:
+                            dist.destroy_process_group()
                         return
 
                 if args.max_steps > 0 and global_step >= args.max_steps:
@@ -1141,39 +1268,57 @@ def main() -> None:
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-    print("\nTraining finished.")
-    print(f"Optimizer steps: {global_step:,}")
-    print(f"Total tokens seen: {tokens_seen:,}")
+    # tokens_seen is per-rank; sum it so the reported figure is the real corpus coverage.
+    if DDP_ON:
+        _tt = torch.tensor([tokens_seen], dtype=torch.float64, device=device)
+        dist.all_reduce(_tt, op=dist.ReduceOp.SUM)
+        tokens_seen = int(_tt.item())
 
-    if args.run_after_quality == 1:
+    rprint("\nTraining finished.")
+    rprint(f"Optimizer steps: {global_step:,}")
+    rprint(f"Total tokens seen: {tokens_seen:,}")
+
+    if args.run_after_quality == 1 and IS_MAIN:
         answer_questions(model, tokenizer, device, QUALITY_QUESTIONS, tag="AFTER_SFT", step=global_step)
 
     if args.skip_final_save:
-        print("Skipping final model/tokenizer save (--skip_final_save).")
+        rprint("Skipping final model/tokenizer save (--skip_final_save).")
+        if DDP_ON:
+            dist.barrier()
+            dist.destroy_process_group()
         return
 
-    # Save final model and tokenizer for downstream CoT SFT.
-    # Use save_pretrained for HF-compatible format (config.json + safetensors).
-    os.makedirs(args.output_dir, exist_ok=True)
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved model and tokenizer to: {args.output_dir}")
+    # Save final model and tokenizer for downstream CoT SFT. Rank 0 only -- `model` is the
+    # UNWRAPPED module (DDP wraps a reference, not a copy), so weights are identical on every
+    # rank and a single writer avoids N processes racing on the same files.
+    if IS_MAIN:
+        os.makedirs(args.output_dir, exist_ok=True)
+        model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        print(f"Saved model and tokenizer to: {args.output_dir}")
 
-    # Write a completion marker so wrapper scripts can detect end-of-training.
-    completion_path = os.path.join(args.output_dir, ".sft_complete")
-    try:
-        with open(completion_path, "w") as f:
-            json.dump(
-                {
-                    "global_step": global_step,
-                    "tokens_seen": tokens_seen,
-                    "finished_at_unix": time.time(),
-                },
-                f,
-            )
-        print(f"Wrote completion marker: {completion_path}")
-    except OSError as e:
-        print(f"  warn: could not write completion marker: {e}")
+        # Write a completion marker so wrapper scripts can detect end-of-training.
+        # Written LAST, after the weights land, so its presence always implies a usable dir.
+        completion_path = os.path.join(args.output_dir, ".sft_complete")
+        try:
+            with open(completion_path, "w") as f:
+                json.dump(
+                    {
+                        "global_step": global_step,
+                        "tokens_seen": tokens_seen,
+                        "world_size": WORLD,
+                        "effective_batch": BATCH_SIZE * GRAD_ACCUM_STEPS * WORLD,
+                        "finished_at_unix": time.time(),
+                    },
+                    f,
+                )
+            print(f"Wrote completion marker: {completion_path}")
+        except OSError as e:
+            print(f"  warn: could not write completion marker: {e}")
+
+    if DDP_ON:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
