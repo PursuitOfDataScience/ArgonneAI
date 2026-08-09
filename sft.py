@@ -525,6 +525,12 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
         model.to(device)
+        # ⚠️A stock HF CausalLM (Qwen3, Llama, ...) SHIFTS labels ITSELF inside forward(). This
+        # file's compute_loss() also shifts, because ArgonneModel does not -- so without this flag
+        # an HF base gets shifted TWICE and is asked to predict token t+2 from position t. The
+        # symptom is silent and looks like a bad base: loss pinned at ln(vocab)=11.93 (uniform)
+        # instead of ~1.5, with no error. Caught by an 8-step probe on Qwen3-0.6B-Base.
+        model._hf_internal_shift = True
         print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
         return model, tokenizer
 
@@ -555,6 +561,7 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
         model.gradient_checkpointing_enable()
 
     model.to(device)
+    model._hf_internal_shift = False   # ArgonneModel.forward does NOT shift; compute_loss does it
     print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
 
     return model, tokenizer
@@ -617,6 +624,16 @@ def answer_questions(
 # ---------------------------------------------------------------------------
 
 def compute_loss(model, input_ids: torch.Tensor, labels: torch.Tensor):
+    """Shift ONCE, wherever the shift happens to live.
+
+    ArgonneModel.forward computes cross_entropy(logits, labels) with no shift, so the caller must
+    align inputs and targets. A stock HF CausalLM does that alignment itself. Shifting here as
+    well for an HF base makes the model predict token t+2 from position t -- a silent corruption
+    that pins the loss at ln(vocab) and reads as "this base is bad".
+    """
+    base = getattr(model, "module", model)          # unwrap DDP
+    if getattr(base, "_hf_internal_shift", False):
+        return model(input_ids=input_ids, labels=labels).loss
     x = input_ids[:, :-1].contiguous()
     y = labels[:, 1:].contiguous()
     outputs = model(x, labels=y)

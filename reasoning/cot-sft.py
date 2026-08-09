@@ -1654,10 +1654,16 @@ class ShiftedLossTrainer(Trainer):
         attention_mask = inputs.get("attention_mask")
         labels = inputs["labels"]
 
-        x = input_ids[:, :-1].contiguous()
-        y = labels[:, 1:].contiguous()
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, :-1].contiguous()
+        # Shift ONCE, wherever the shift lives. ArgonneModel.forward does not shift, so this
+        # trainer must; a stock HF CausalLM already does, so shifting again would corrupt it.
+        base = getattr(model, "module", model)
+        if getattr(base, "_hf_internal_shift", False):
+            x, y = input_ids, labels
+        else:
+            x = input_ids[:, :-1].contiguous()
+            y = labels[:, 1:].contiguous()
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :-1].contiguous()
 
         if self.autocast_dtype is not None and torch.cuda.is_available():
             with torch.autocast("cuda", dtype=self.autocast_dtype):
@@ -2109,6 +2115,11 @@ def main() -> None:
             model.gradient_checkpointing_enable()
         model.to(device)
         model.train()
+        # ⚠️A stock HF CausalLM shifts labels ITSELF inside forward(); ShiftedLossTrainer also
+        # shifts, because ArgonneModel does not. Without this flag an HF base is shifted TWICE
+        # and predicts token t+2 from position t -- silent, and it reads as "bad base" (loss
+        # pinned at ln(vocab)). Same defect found in sft.py by an 8-step Qwen3-0.6B probe.
+        model._hf_internal_shift = True
         print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters "
               f"({args.precision}), rope_theta={getattr(model.config, 'rope_theta', None)}", flush=True)
 
