@@ -647,6 +647,46 @@ def is_complete_checkpoint(path: str) -> bool:
     return all(os.path.exists(os.path.join(path, f)) for f in _CKPT_REQUIRED_FILES)
 
 
+def prune_intermediate_checkpoints(output_dir: str) -> None:
+    """After a PHASE finishes, drop its resumable `checkpoint-*` dirs.
+
+    `--save_total_limit` already keeps only the newest checkpoint DURING training, but that
+    survivor is still on disk when the phase ends -- ~13 GB for this model, of which 8.3 GB is
+    AdamW state that exists solely to resume a stage that is now complete. The final
+    `save_pretrained` export in output_dir/ is the artifact every downstream stage consumes, and
+    it is strictly NEWER (last optimizer step) than the last intermediate, so the intermediate is
+    a superseded copy, not a second reference point.
+
+    Called only after the final export has landed, so the newest weights are never the thing
+    being deleted. Never fatal: a phase that trained successfully must not be failed by cleanup.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return
+        final_weights = os.path.join(output_dir, "model.safetensors")
+        if not os.path.exists(final_weights):
+            print("[retention] final export missing -- keeping intermediate checkpoints", flush=True)
+            return
+        freed = 0
+        for name in sorted(os.listdir(output_dir)):
+            full = os.path.join(output_dir, name)
+            if not os.path.isdir(full) or _ckpt_step(full) < 0:
+                continue
+            gib = sum(
+                os.path.getsize(os.path.join(full, f))
+                for f in os.listdir(full)
+                if os.path.isfile(os.path.join(full, f))
+            ) / 2**30
+            shutil.rmtree(full)
+            freed += gib
+            print(f"[retention] phase complete -- removed {name} ({gib:.1f} GiB); "
+                  f"the final export supersedes it", flush=True)
+        if freed:
+            print(f"[retention] freed {freed:.1f} GiB", flush=True)
+    except Exception as e:  # cleanup must never take down a phase that just finished
+        print(f"[retention] prune skipped: {e}", flush=True)
+
+
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     """Return the path of the highest-step COMPLETE checkpoint under output_dir, or None.
 
@@ -1315,6 +1355,10 @@ def main() -> None:
             print(f"Wrote completion marker: {completion_path}")
         except OSError as e:
             print(f"  warn: could not write completion marker: {e}")
+
+        # Phase is done and exported -- drop the resumable intermediates. Ordered AFTER the
+        # marker so nothing is deleted until the phase is provably complete on disk.
+        prune_intermediate_checkpoints(args.output_dir)
 
     if DDP_ON:
         dist.barrier()

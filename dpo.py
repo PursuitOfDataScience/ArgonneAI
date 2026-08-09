@@ -1410,6 +1410,42 @@ def load_checkpoint(
     return metadata
 
 
+def prune_intermediate_checkpoints(output_dir: str) -> None:
+    """After a PHASE finishes, drop its resumable `checkpoint-*` dirs.
+
+    `--save_total_limit` keeps only the newest checkpoint DURING training, but that survivor is
+    still on disk when the phase ends -- most of it AdamW state that exists solely to resume a
+    stage that is now complete. The final export in output_dir/ is what every downstream stage
+    consumes and is strictly NEWER than the last intermediate, so the intermediate is a
+    superseded copy, not a second reference point.
+
+    Called only after the final export has landed, so the newest weights are never the thing
+    being deleted. Never fatal: a phase that trained successfully must not be failed by cleanup.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return
+        if not os.path.exists(os.path.join(output_dir, "model.safetensors")):
+            print("[retention] final export missing -- keeping intermediate checkpoints", flush=True)
+            return
+        freed = 0.0
+        for name in sorted(os.listdir(output_dir)):
+            full = os.path.join(output_dir, name)
+            if not os.path.isdir(full) or not re.search(r"checkpoint-\d+$", name):
+                continue
+            gib = sum(os.path.getsize(os.path.join(full, f))
+                      for f in os.listdir(full)
+                      if os.path.isfile(os.path.join(full, f))) / 2**30
+            shutil.rmtree(full)
+            freed += gib
+            print(f"[retention] phase complete -- removed {name} ({gib:.1f} GiB); "
+                  f"the final export supersedes it", flush=True)
+        if freed:
+            print(f"[retention] freed {freed:.1f} GiB", flush=True)
+    except Exception as e:  # cleanup must never take down a phase that just finished
+        print(f"[retention] prune skipped: {e}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DPO training on local preference dataset")
     parser.add_argument("--argonne_root", type=str, required=True, help="Path to ArgonneAI directory")
@@ -1891,6 +1927,9 @@ def main() -> None:
         print(f"  warn: could not write completion marker: {e}")
 
     print("Training complete.")
+    # Phase is done and exported -- drop the resumable intermediates.
+    prune_intermediate_checkpoints(args.output_dir)
+
 
 
 if __name__ == "__main__":

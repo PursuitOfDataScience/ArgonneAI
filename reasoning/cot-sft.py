@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import time
 import random
 import re
@@ -1887,6 +1888,42 @@ def load_quality_questions_from_file(path: str) -> List[str]:
 # Main
 # ---------------------------------------------------------------------------
 
+def prune_intermediate_checkpoints(output_dir: str) -> None:
+    """After a PHASE finishes, drop its resumable `checkpoint-*` dirs.
+
+    HF Trainer writes `checkpoint-N/` under output_dir when --save_strategy=steps; each holds
+    optimizer + scheduler state that exists solely to resume a stage that is now complete. The
+    final export in output_dir/ is what downstream consumes and is strictly NEWER, so the
+    intermediate is a superseded copy, not a second reference point. (With this repo's default
+    --save_strategy=no there are none, and this is a no-op safeguard.)
+
+    Called only after the final export has landed, so the newest weights are never deleted.
+    Never fatal: a phase that trained successfully must not be failed by cleanup.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return
+        if not os.path.exists(os.path.join(output_dir, "model.safetensors")):
+            print("[retention] final export missing -- keeping intermediate checkpoints", flush=True)
+            return
+        freed = 0.0
+        for name in sorted(os.listdir(output_dir)):
+            full = os.path.join(output_dir, name)
+            if not os.path.isdir(full) or not re.search(r"checkpoint-\d+$", name):
+                continue
+            gib = sum(os.path.getsize(os.path.join(full, f))
+                      for f in os.listdir(full)
+                      if os.path.isfile(os.path.join(full, f))) / 2**30
+            shutil.rmtree(full)
+            freed += gib
+            print(f"[retention] phase complete -- removed {name} ({gib:.1f} GiB); "
+                  f"the final export supersedes it", flush=True)
+        if freed:
+            print(f"[retention] freed {freed:.1f} GiB", flush=True)
+    except Exception as e:  # cleanup must never take down a phase that just finished
+        print(f"[retention] prune skipped: {e}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -2188,6 +2225,9 @@ def main() -> None:
             print(f"Wrote completion marker: {completion_path}")
         except OSError as e:
             print(f"  warn: could not write completion marker: {e}")
+
+        # Phase is done and exported -- drop the resumable intermediates.
+        prune_intermediate_checkpoints(args.output_dir)
 
 
 if __name__ == "__main__":
