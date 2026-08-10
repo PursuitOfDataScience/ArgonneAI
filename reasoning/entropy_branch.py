@@ -52,7 +52,18 @@ CLOSE = "\n</think>\n\nThe answer is $\\boxed{"
 # continuing to improve as N grows. Self-certainty is KL(uniform || p) averaged over tokens, i.e.
 # log V - H(p) up to a constant, so ranking by MINIMUM mean entropy is ranking by maximum
 # self-certainty -- `ent` is that argmax pick, `borda` and `wvote` combine it with the vote.
-SELECTORS = ("vote", "ent", "lp", "borda", "wvote")
+SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb")
+
+# ⚠️`vtb` (vote-then-tie-break) is the selector with the strongest prior, and the reason is a
+# measurement, not taste. Over the 6,565 train problems where gold appears among the answered
+# candidates, the vote already picks gold in 66.5% and loses in 33.5% -- and among those losses
+# **78.2% are near-ties: 38.6% are EXACT ties (margin 0) and 39.6% are margin 1.** Gold carries just
+# 1 of 8 votes in 70.6% of the losses, but so does the wrong answer that beats it: a4's answer
+# distribution over 8 samples is FRAGMENTED, so plurality is close to arbitrary there -- an exact tie
+# is currently broken by Counter.most_common insertion order.
+# So a selector does not need to be a good verifier. It needs to be slightly better than a coin flip
+# on near-ties. `vtb` restricts the confidence signal to exactly that decision and never lets it
+# override a clear plurality, which makes it strictly lower-variance than `ent`/`borda`/`wvote`.
 
 # A sixth selector, behind --selfverify, and the last FREE one available. §41h killed every text
 # feature; self-certainty is a property of the generating distribution. This asks the model a
@@ -135,6 +146,9 @@ def main():
     ap.add_argument("--stride", type=int, default=0,
                     help="also allow a trigger every Nth token (0 = boundaries only)")
     ap.add_argument("--control-temp", type=float, default=0.8)
+    ap.add_argument("--tie-slack", type=int, default=1,
+                    help="vtb considers any answer within this many votes of the plurality. 1 covers "
+                         "78.2% of the vote's measured losses on a4's own rollouts.")
     ap.add_argument("--selfverify", type=int, default=0,
                     help="also score every candidate by the model's own zero-shot p(Yes) that the "
                          "answer is correct, and add the selfvfy / vfyvote selectors")
@@ -288,6 +302,21 @@ def main():
                     best = min(cs, key=lambda c: c[1])
                 elif key == "lp":
                     best = max(cs, key=lambda c: c[2])
+                elif key in ("vtb", "vtb_vfy"):
+                    votes = Counter(aa for aa in answers if aa is not None)
+                    if not votes:
+                        best = cs[0]
+                    else:
+                        tc = max(votes.values())
+                        near = [x for x, c in votes.items() if tc - c <= a.tie_slack]
+                        def strength(x):
+                            js = [j for j, aa in enumerate(answers) if aa == x]
+                            if key == "vtb_vfy":
+                                return max(vscore.get((setname, i, j), -1.0) for j in js)
+                            return -min(cs[j][1] for j in js)     # -min entropy = max certainty
+                        top = max(near, key=strength)
+                        best = min((c for c, aa in zip(cs, answers) if aa == top),
+                                   key=lambda c: c[1])
                 elif key == "selfvfy":
                     # highest p(Yes) wins; candidates the verifier could not score fall back to
                     # their self-certainty so the arm is never decided by a missing score
@@ -336,7 +365,8 @@ def main():
             return ok, fm, picks
 
         cfgs = {}
-        keys = list(SELECTORS) + (["selfvfy", "vfyvote"] if a.selfverify and vscore else [])
+        keys = list(SELECTORS) + (["selfvfy", "vfyvote", "vtb_vfy"]
+                                  if a.selfverify and vscore else [])
         for name, src in (("branch", cands), ("control", ctrl)):
             for key in keys:
                 for fc, sfx in ((False, ""), (True, "+bud")):

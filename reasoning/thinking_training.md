@@ -6987,3 +6987,47 @@ ladder (capability lever ≤ +1.24, selection lever up to +25.50).
 * **Self-consistency at K=32** rather than 8. Not a separate job: `a4_extverify.sh`'s generate phase
   samples K=32 and prints self-consistency and pass@K for free, so the K=8→32 voting curve arrives
   with the reranking result.
+
+### §41l — The selector does not have to be a good verifier: 78.2% of the vote's losses are NEAR-TIES
+
+The obstacle to §41j's +25.50 looked like "we need a verifier good enough to overrule a majority". It
+is not. Over the 6,565 train problems where gold appears among the answered candidates:
+
+| | count | share |
+|---|---:|---:|
+| the vote already picks gold | 4,367 | 66.5% |
+| **the vote picks a WRONG mode** | **2,198** | **33.5%** ← the selector's whole target |
+
+and among those 2,198 losses, how far behind gold is:
+
+| margin (top votes − gold votes) | count | share | cumulative |
+|---|---:|---:|---:|
+| **0 (an EXACT tie)** | 849 | **38.6%** | 38.6% |
+| 1 | 870 | 39.6% | **78.2%** |
+| 2 | 298 | 13.6% | 91.8% |
+| 3 | 113 | 5.1% | 96.9% |
+| ≥4 | 68 | 3.1% | 100.0% |
+
+**78.2% of the losses are decided by one vote or fewer, and 38.6% are exact ties** — currently broken
+by `Counter.most_common` insertion order, i.e. arbitrarily. Gold carries just 1 of 8 votes in 70.6% of
+the losses, but so does the wrong answer beating it: a4's answer distribution over 8 samples is
+**fragmented**, many distinct answers with 1-2 votes each, which is precisely the regime where
+plurality is near-arbitrary and where the self-certainty line reports Borda helping most.
+
+**Consequence: a selector needs to be slightly better than a coin flip on near-ties, not a good
+verifier.** Rough arithmetic on the recoverable pool: perfect near-tie breaking takes the vote's hit
+rate 66.5% → 92.7%; a selector merely 60% accurate on near-ties (against ~50% now) is worth ~+1.8pt of
+five-pool greedy-equivalent, and 75% is worth ~+4.5pt. That is more than the entire remaining
+capability lever (+1.24) for zero training.
+
+So `entropy_branch.py` gains a seventh selector, **`vtb` (vote-then-tie-break)**: take the plurality,
+but among answers within `--tie-slack` (default 1) votes of the top, choose the one whose most-certain
+candidate has the highest self-certainty. It never lets confidence override a clear plurality, which
+makes it strictly lower-variance than `ent`/`borda`/`wvote` — those can lose points a fragile
+confidence signal would otherwise have kept. `vtb_vfy` is the same rule with zero-shot p(Yes) as the
+tie-break instead.
+
+⚠️These margins are measured on the TRAIN pools (K=8, T=0.9). The eval pools are easier — the vote's
+hit rate on the recoverable pool there is 50.94/68.94 = 73.9% against 66.5% here — so the loss count is
+smaller, and whether the margin distribution is equally tie-heavy is an assumption until
+`a4_entbranch.sh` reports it on the gate pools.
