@@ -7072,11 +7072,18 @@ second time in one session that the cheap end-to-end check beat the clever in-tr
   tokens where knowing the answer matters. Most tokens in a 200-token trace are near-deterministic
   given the prefix, so a small average is what a well-targeted signal looks like. An external teacher's
   23% disagreement is mostly style.
-* *Pessimistic:* a gradient ~10x smaller at the same LR moves the weights ~10x less, so a null result
-  would be uninformative about the method — it would only say the step size was too small.
+* *Pessimistic (and WRONG — corrected below):* a gradient ~10x smaller moves the weights ~10x less, so
+  a null would only say the step size was too small.
 
-Which it is will be visible in the loss curve (does JSD fall toward 0, i.e. is the signal absorbed?)
-and in the gate. **If `gasd_*` lands as an exact null, the first follow-up is not a new idea, it is
-`LR=5e-5 ARMS=gasd_full sbatch reasoning/a4_kd2.sh`** — the launcher already takes `LR` from the
-environment, so no code change. Recording this now so a null is not misread later as "hindsight
-distillation does not work here".
+⚠️**The pessimistic reading is wrong, and the reason matters for reading every KD arm here: AdamW is
+scale-invariant in the loss.** Its update is `lr · m̂/(√v̂+ε)`, so multiplying the loss by 20 leaves the
+update unchanged; the step size is set by `lr`, not by the gradient magnitude. The only way a small
+gradient would shrink the update is if `ε` dominated `√v̂`, and it does not come close here — `gnorm`
+0.14 over 1.04B parameters puts per-parameter gradients around 1e-5 and `√v̂` around 1e-5 against
+`eps=1e-8`, three orders clear. So `gasd_full` at `lr 1e-5` is a FAIR test of the method, a null is a
+null about the method, and raising the LR is not the automatic follow-up I was about to write down.
+
+What the small divergence does mean is that the signal is SPARSE — concentrated on ~5% of tokens — so
+the update direction is determined by few positions per sequence. That is a variance argument (more
+data or more epochs), not a step-size one. The thing to watch in the curve is whether JSD falls toward
+zero, i.e. whether the student absorbs the hint-conditioned distribution at all.
