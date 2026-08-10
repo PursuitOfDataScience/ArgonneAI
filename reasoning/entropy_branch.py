@@ -54,6 +54,17 @@ CLOSE = "\n</think>\n\nThe answer is $\\boxed{"
 # self-certainty -- `ent` is that argmax pick, `borda` and `wvote` combine it with the vote.
 SELECTORS = ("vote", "ent", "lp", "borda", "wvote")
 
+# A sixth selector, behind --selfverify, and the last FREE one available. §41h killed every text
+# feature; self-certainty is a property of the generating distribution. This asks the model a
+# different question instead: shown a problem and a candidate's answer, how much mass does it put on
+# "Yes" vs "No"? No training, no second model. The prior is mixed -- §22i measured a LEARNED verifier
+# failing on this line, and the 2026 process-verification result reports meta-cognition "amplifying
+# confusion without sufficient model capacity" at small scale -- but zero-shot p(Yes) as a RERANKER
+# has never been measured here, and it is the difference between "no free selector exists" and "we
+# did not look".
+VERIFY_TMPL = ("Problem: {q}\n\nProposed answer: {a}\n\n"
+               "Is the proposed answer correct? Reply with exactly one word, Yes or No.")
+
 
 def entropy_from_logprobs(d):
     """Shannon entropy of the top-k slice, renormalised. vLLM only returns the top-k, so this is
@@ -124,6 +135,9 @@ def main():
     ap.add_argument("--stride", type=int, default=0,
                     help="also allow a trigger every Nth token (0 = boundaries only)")
     ap.add_argument("--control-temp", type=float, default=0.8)
+    ap.add_argument("--selfverify", type=int, default=0,
+                    help="also score every candidate by the model's own zero-shot p(Yes) that the "
+                         "answer is correct, and add the selfvfy / vfyvote selectors")
     ap.add_argument("--control-n", type=int, default=0,
                     help="0 = compute-match the branch arm; >0 for the selector study (e.g. 8)")
     ap.add_argument("--gpu-util", type=float, default=0.90)
@@ -207,8 +221,63 @@ def main():
                 ctrl[i].append((c.text, mean_ent(c.logprobs),
                                 mean_lp(c.logprobs, list(c.token_ids)), f"samp{j}"))
 
+        # ---- optional: zero-shot self-verification score per candidate --------------------
+        # Exact, not top-k: build the verification prompt twice, once ending in "Yes" and once in
+        # "No", and read the logprob vLLM reports for that final PROMPT token. Reading a generated
+        # top-20 instead would silently score nothing on candidates where neither word makes the
+        # cut, which is exactly the case a weak verifier produces.
+        # ⚠️Scored for BOTH candidate sets and keyed by (set, item, candidate). Keying by
+        # (item, candidate) alone silently reuses the branch arm's scores for the control arm, whose
+        # candidate j is a different trace entirely -- which would have made the control's selfvfy
+        # column meaningless while looking perfectly plausible.
+        vscore = {}
+        if a.selfverify:
+            def vprompt(q, ans, word):
+                msg = [{"role": "user", "content": VERIFY_TMPL.format(q=q, a=ans)}]
+                ids = tok.apply_chat_template(msg, tokenize=True, add_generation_prompt=True,
+                                              enable_thinking=False)
+                if hasattr(ids, "keys"):
+                    ids = ids["input_ids"]
+                if len(ids) and isinstance(ids[0], (list, tuple)):
+                    ids = ids[0]
+                return [int(x) for x in ids] + tok.encode(word, add_special_tokens=False)
+
+            vreqs, vmeta = [], []
+            for name, src in (("branch", cands), ("control", ctrl)):
+                for i in range(len(probs)):
+                    for ci, (t, _, _, _) in enumerate(src[i]):
+                        ans = extract_boxed(t)
+                        if ans is None:
+                            continue
+                        for w in ("Yes", "No"):
+                            vreqs.append(TokensPrompt(
+                                prompt_token_ids=vprompt(probs[i][0], ans, w)))
+                            vmeta.append((name, i, ci, w))
+            if vreqs:
+                vouts = llm.generate(vreqs, SamplingParams(n=1, temperature=0.0, max_tokens=1,
+                                                           prompt_logprobs=0))
+                raw = {}
+                for (name, i, ci, w), o in zip(vmeta, vouts):
+                    pl = o.prompt_logprobs
+                    lp = -20.0
+                    if pl and pl[-1]:
+                        e = pl[-1].get(o.prompt_token_ids[-1])
+                        if e is not None:
+                            lp = e.logprob
+                    raw[(name, i, ci, w)] = lp
+                for (name, i, ci, w) in list(raw):
+                    if w != "Yes":
+                        continue
+                    y, n_ = raw[(name, i, ci, "Yes")], raw.get((name, i, ci, "No"))
+                    if n_ is None:
+                        continue
+                    vscore[(name, i, ci)] = math.exp(y) / (math.exp(y) + math.exp(n_) + 1e-12)
+                got = len(vscore)
+                print(f"[eb/{pool}] self-verification scored {got} candidates over both arms; "
+                      f"mean p(Yes) {sum(vscore.values()) / max(1, got):.3f}", flush=True)
+
         # ---- selectors -------------------------------------------------------------------
-        def score(pool_cands, key, force_close):
+        def score(pool_cands, key, force_close, setname="branch"):
             ok, fm, picks = [], Counter(), Counter()
             for i in range(len(probs)):
                 cs = pool_cands[i]
@@ -219,6 +288,22 @@ def main():
                     best = min(cs, key=lambda c: c[1])
                 elif key == "lp":
                     best = max(cs, key=lambda c: c[2])
+                elif key == "selfvfy":
+                    # highest p(Yes) wins; candidates the verifier could not score fall back to
+                    # their self-certainty so the arm is never decided by a missing score
+                    best = cs[max(range(len(cs)),
+                                  key=lambda j: (vscore.get((setname, i, j), -1.0), -cs[j][1]))]
+                elif key == "vfyvote":
+                    tally = Counter()
+                    for j, aa in enumerate(answers):
+                        if aa is not None:
+                            tally[aa] += vscore.get((setname, i, j), 0.0)
+                    if tally and max(tally.values()) > 0:
+                        top = tally.most_common(1)[0][0]
+                        best = min((c for c, bb in zip(cs, answers) if bb == top),
+                                   key=lambda c: c[1])
+                    else:
+                        best = cs[0]
                 elif key in ("borda", "wvote"):
                     # aggregate over ANSWERS, weighting each candidate by its self-certainty:
                     # Borda by rank (robust to the scale of the confidence metric), wvote by the
@@ -251,10 +336,11 @@ def main():
             return ok, fm, picks
 
         cfgs = {}
+        keys = list(SELECTORS) + (["selfvfy", "vfyvote"] if a.selfverify and vscore else [])
         for name, src in (("branch", cands), ("control", ctrl)):
-            for key in SELECTORS:
+            for key in keys:
                 for fc, sfx in ((False, ""), (True, "+bud")):
-                    ok, fm, picks = score(src, key, fc)
+                    ok, fm, picks = score(src, key, fc, name)
                     cfgs[f"{name}_{key}{sfx}"] = {"ok": ok, "fm": dict(fm), "picks": dict(picks)}
         cfgs["greedy"] = {"ok": greedy_ok, "fm": dict(greedy_fm), "picks": {}}
         # the pass@ceiling of the branch set: does ANY branch reach gold?
