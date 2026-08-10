@@ -6582,3 +6582,174 @@ merged into this paired table via `effort_gate.py --report-from`.
 ⚠️`think`/`think_a085` carry `max_position_embeddings=4096` inherited from CoT-SFT's save, so the
 model does NOT expose phase C's 65,536 window. Irrelevant to this gate (max_model_len 2560); it would
 have to be restored before any release.
+
+## §41 — WHAT a4-THINK'S WRONG ANSWERS CONTAIN, and the three levers that follow from it (2026-08-10)
+
+§40 closed the "transfer the 3.5 recipe" question (−16.79pt) and the arms that followed it closed
+nine more. This section is about the twelve-arm total, one measurement that reorganised the problem,
+and the mechanism class that had never been tried on this base.
+
+### §41a — The twelve-arm table, and two conclusions that were the opposite of the standing note
+
+Pool-mean greedy over asdiv/svamp (n=1000) + gsmplus/mawps (n=500) + math500 (n=319), paired inside
+each gate call, decomposed with `gate_report.py`:
+
+| arm | greedy | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.10 | 61.58 | 75.12 | 70.1% | 16.90 | 247.6 |
+| **a4combo_a100** | **43.44** | 50.94 | 68.94 | 50.1% | 13.66 | 229.8 |
+| a4dist_a100 | 42.42 | 49.70 | 67.23 | 50.3% | 15.74 | 236.4 |
+| a4rft_a100 | 41.91 | 50.19 | 66.11 | 49.1% | 14.65 | 237.1 |
+| a4rlvrwu_a100 | 41.93 | 52.89 | 69.97 | 50.9% | 19.11 | 293.1 |
+| a4rlvr_a100 | 41.30 | 53.00 | 69.22 | **52.6%** | 22.37 | 311.7 |
+| a4llama_a100 | 39.24 | 47.17 | 65.08 | 46.1% | 15.54 | 240.3 |
+| a4e1_a085 (baseline) | 39.21 | 45.10 | 62.41 | 50.5% | 20.60 | 278.3 |
+| a4llamall_a100 | 38.51 | 48.39 | 65.95 | 46.0% | 19.21 | 254.5 |
+
+**1. The "stronger teacher" lever is a NULL, and it is the MECHANISM that is wrong, not the teacher.**
+The standing note said the one untested lever was a teacher genuinely stronger than 3.5-think, now
+unblocked. It was run. Llama-3.1-8B-Instruct solves 45.7% of the same train problems against a4's
+14.9% — 3x the correctness — and distilling its text scored **39.24 against a 39.21 baseline**, with
+`acc|ANSWERED` **down** to 46.1%; covering all three train pools instead of gsm8k alone made it worse
+still (38.51, 46.0%). A 1.04B student acquires a style it cannot execute. This is the cleanest
+available refutation of "find a better teacher" as the fix, and it is what motivated §41c.
+
+**2. RLVR-DPO produced the best `acc|ANSWERED` on this base and lost anyway, to length.** 52.6% vs
+the 50.1% baseline — the only lever in twelve that moved the number every other arm left frozen —
+while unclosed went 13.66% → 22.37% and `t_len` 230 → 312. Unregularised DPO learned "longer"
+alongside "better". Arithmetic on the decomposition: greedy = acc|ANS x answered-rate, so at combo's
+86.7% answered-rate a 52.6% acc|ANS is **~45.6 greedy**, +2.2 over the best arm. The contrastive
+objective works; the length preference eats it. That is a fixable pathology, not a dead lever.
+
+**3. The gap SHRINKS with sampling: greedy −11.7, sc@8 −8.6, pass@8 −5.2.** a4's knowledge is much
+closer to 3.5-think's than its greedy suggests. Budget-forcing and `extend` are worth only +0.5-0.7
+here against +1.8-3.8 on 3.5-think, so the deployable ceiling today is **44.17** vs **58.85**.
+
+### §41b — `fail_taxonomy.py`: the "wrong" bucket, split into buckets that name a lever
+
+`gate_report.py` localises the deficit to one number and stops. "Wrong" is one bucket, and the fixes
+for its contents are mutually exclusive — training on more traces cannot fix a readout bug and a
+decode change cannot fix an execution bug. New tool, 21 s, no GPU, run on the 93,912 on-policy
+rollouts of `think_combo` itself (`/project/rcc/youzhi/data/a4_dpo/a4_dpo_all.jsonl`):
+
+| bucket | share of wrong | lever named |
+|---|---:|---|
+| gold never appears AND every stated equation checks out | **67.9%** | **PLAN** — it derived the wrong thing, correctly |
+| gold appears in the trace, something else is boxed | 15.3% | readout (upper bound; coincidental numbers inflate it) |
+| a stated `a op b = c` is false | 16.7% | execution — **and this is a false lead, see below** |
+
+⚠️**Arithmetic is NOT the differentiator; do not build a drill or tool arm off the 16.7%.**
+`has_bad_arith` fires on 20.1% of wrong traces and **18.7% of CORRECT ones**. The matcher reads
+`1/3 = 5` out of `1/2 + 1/3 = 5/6`, so on MATH it false-positives constantly. True signal: **+1.4pp**.
+This also deflates the "~35% of gold-reaching traces pass through wrong arithmetic" figure that
+`rft_generate`'s step-verify was built on, and it corroborates §38's arithmetic 144/144.
+
+**The failure starts at the FIRST step.** Comparing each wrong trace's equation sequence against the
+most explicit correct trace for the same problem (10,896 pairs, 6,260 problems): **79.0% already
+differ at equation index 0**, median shared-equation prefix **0%**. Honest caveat: these are T=0.9
+samples and the test needs exact equation-string equality, so "differs" conflates "different plan"
+with "same plan, no explicit equation" (69.8% of wrong traces state no equation at all). Direction
+safe, magnitude not.
+
+**Per problem (K=8, 11,738 train problems):** 44.1% never solved once; only 2.1% solved 8/8; 53.8%
+solvable-but-unreliable. **Gold is the plurality answer in only 65.2% of those** — the hard cap on
+self-consistency, and why sc@8 recovers just 7.5 of the 25.5-point pass@8 gap. The other 34.8% need a
+verifier, not a vote. It is also why RFT/STaR saturated after one round: only 23.3% of rollouts are
+correct, so a likelihood objective has nothing to say about the other 77%.
+
+⚠️**A scale argument worth reusing.** The 2026 failure-dynamics result (arXiv 2604.14528) reports
+>85% of failure onsets in the first 30% of a trajectory, exactly one invalid segment in 43.5% of
+wrong traces, a local entropy spike at onset, >20% of failures recoverable from the same prefix, and
++8.5pt Pass@1 from entropy-triggered branching on R1-Distill-Qwen-7B. It was validated on ~6,700-token
+trajectories. **a4's traces are ~230 tokens with 1.1 equations — the whole trace IS the first 30%**,
+so there are no "late" transitions to rescue, and §41b's own divergence measurement says the same
+thing more directly. `entropy_branch.py` was built anyway (with a compute-matched control and the
+per-candidate-set oracle, because "3 branches beat 1 greedy pass" is a statement about compute) but
+DEPRIORITISED to the free-selector question it also answers: does self-confidence beat plurality
+voting on this model? Do not assume a long-CoT inference-time method transfers to a short-CoT model.
+
+### §41c — ON-POLICY DISTILLATION: the one mechanism class never tried here
+
+Every one of the twelve arms is a likelihood objective over a set of sequences someone else picked.
+Per-token reverse KL evaluated at the states the student itself visits is a different object, and it
+answers both structural problems §41b found:
+
+* **The discarded 77% becomes the signal.** The teacher grades every token of a wrong trace, so
+  "you can only imitate successes you already produce" — `gen_teacher.py`'s own stated ceiling —
+  stops binding.
+* **No distribution shift.** The trajectories are the student's, which is precisely what §41a's
+  Llama null says off-policy imitation gets wrong.
+* **Mode-seeking is the right direction.** Reverse KL asks the student to put mass where the teacher
+  has mass, not to cover every mode a 4B teacher has. A diffuse argmax (greedy 43 under pass@8 69) is
+  this model's defect; forward KL and more imitation spread mass, which is what the twelve arms did.
+
+**It is possible here only because argonne4 kept the Qwen3 tokenizer.** Verified before writing a
+line of trainer, not assumed: `think_combo` and `Qwen3-4B-Thinking-2507` share the 151,643-entry
+vocab, the merge list, all 26 added tokens, the `<think>`/`</think>`/`<|im_end|>` ids, and a real
+329-token trace tokenises to the identical id sequence under both. `opd_train.py` re-checks it at
+startup and refuses to run otherwise — a single id mismatch would compare distributions for
+different tokens and produce a silently meaningless run. The teacher is only ever run FORWARD, so
+**vLLM arch support is irrelevant to a teacher** — a model vLLM 0.11.2 cannot serve is still usable.
+
+Two engineering points worth carrying forward:
+* **Batch by PADDED TOKEN COUNT, not row count.** The KD term materialises several
+  [tokens, 151669] fp32 tensors, so with a row-count batch the peak is a lottery over which long
+  traces land together. A token budget makes the peak a constant a probe can settle: measured
+  16384 OOMs (needed 9.14 GiB more), **8192 = 65.1 GiB of 79.1 = 86% HBM**, 7.6% padding waste.
+* **Instrument the known failure mode, don't hope.** Qwen3-4B-Thinking is a long-CoT model and every
+  arm on this line that lengthened traces lost. The trainer logs p(`</think>`) under BOTH models at
+  the positions where the student closed. Measured mild: teacher 0.72-0.88 against the student's
+  ~1.00, and the student converges to ~0.80 rather than collapsing. Reverse KL is conservative here
+  by construction — it only pulls where the teacher assigns near-zero mass.
+
+Training behaviour: revKL 0.85 → ~0.32 with argmax agreement 76% → 84.7%, i.e. the teacher picks a
+different next token at ~15% of the student's own tokens even after training. The curve FLATTENS
+by ~step 100 of 1,719 on unseen traces each step, which is the argument for §41e: a flat KL on
+held-out traces from the OLD policy does not mean nothing is left to learn, it means the student has
+absorbed what it can about the states the old policy visited.
+
+### §41d — GOLD-ANCHORED SELF-DISTILLATION: remove the teacher gap instead of widening it
+
+§41a says a stronger external teacher makes the model worse. The alternative is a teacher that is
+better informed rather than bigger: freeze a copy of the STUDENT, give the frozen copy the verified
+answer (plus a reference derivation when one of its own rollouts found one), and train the unhinted
+model to match the hinted model's next-token distribution on the unhinted model's own traces. Zero
+capacity gap, zero style gap, and the student's prompt is never touched.
+
+Why this base specifically: the consensus-self-distillation literature (arXiv 2607.13643) reports
+gains tracking "consensus accuracy meaningfully exceeds pass@1" and near-zero where the base is
+saturated. a4 is sc@8 50.94 vs greedy 43.44 with 2.1% of problems solved 8/8 — nothing is saturated.
+Using GOLD rather than consensus also removes that method's one measured failure mode (negative
+transfer where every sample agrees on a wrong answer). Measured on the built corpus: 6,565 problems
+get answer+derivation and **5,173 get the answer alone — those 5,173 are the never-solved problems
+no imitative arm could touch at all.** Divergence is JSD, following that literature, because teacher
+and student start from identical weights and differ only by context.
+
+⚠️**The honest caveat, recorded before the result:** the student is trained to behave as if it knew
+the answer and at inference it will not. That is the standing risk of any hindsight objective. What
+makes it worth running is that the states are the student's own, so the target is "what a model that
+knows the answer would say next GIVEN this partial reasoning" — steering, not an answer leak. Read
+`acc|ANSWERED`: if it finally moves off ~50% the mechanism worked; if greedy rises while it does not,
+be suspicious.
+
+### §41e — What is queued, and why in this order
+
+1. **Iterative on-policy distillation** (`a4_opd_iter.sh`) — re-sample from the improved policy each
+   round, which is the actual algorithm rather than the one-shot approximation. ~30 min generation +
+   ~35 min training per round.
+2. **Prefix-local preference optimisation** (`build_step_pairs.py` + `rlvr_dpo.py --no-append-eos`) —
+   §41a's +2.2pt sitting behind DPO length drift, and §41b's 79%-differ-at-the-first-equation, give
+   the same prescription: contrast the OPENING and nothing else. 5,897 pairs, VALUED rather than
+   outcome-labelled (openings grouped by their equation, each group scored by the fraction of its
+   K=8 rollouts that reached gold; chosen rate typically 1.00, rejected 0.00, mean gap 0.98).
+   Length-neutral **measured**: chosen 63.2 tokens vs rejected 62.2, delta +1.0, against the
+   whole-trace arm's +82. `--no-append-eos` is not optional — a prefix-local pair ending in
+   `<|im_end|>` teaches the policy to stop after one reasoning step.
+3. **The free-selector question** (`entropy_branch.py`'s control arm) — plurality voting caps at
+   65.2% of the recoverable headroom (§41b). Whether min-entropy or max-logprob selection beats
+   voting on this model decides whether a verifier needs training at all, and it costs one
+   inference job and no training.
+
+**New tools:** `reasoning/fail_taxonomy.py`, `reasoning/opd_train.py`, `reasoning/build_step_pairs.py`,
+`reasoning/entropy_branch.py`; `rlvr_dpo.py --no-append-eos`; `gen_teacher.py --pools` + the
+vLLM tokenizer shim without which no external teacher loads at all.
