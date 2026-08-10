@@ -73,7 +73,7 @@ def has_bad_arith(text):
     return False
 
 
-def build_pairs(tok, data_path, max_len, neg_kinds, step_verify, log):
+def build_pairs(tok, data_path, max_len, neg_kinds, step_verify, log, append_eos=True):
     from datasets import load_from_disk
     ds = load_from_disk(data_path)
     ds = ds["train"] if hasattr(ds, "keys") and "train" in ds else ds
@@ -93,6 +93,7 @@ def build_pairs(tok, data_path, max_len, neg_kinds, step_verify, log):
         if step_verify and has_bad_arith(c_txt):
             n_lucky_drop += 1          # gold reached THROUGH a wrong arithmetic step
             continue
+        tail = [eos] if append_eos else []
         p_ids = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=True,
                                         add_generation_prompt=True, enable_thinking=True)
         if hasattr(p_ids, "keys"):
@@ -100,8 +101,8 @@ def build_pairs(tok, data_path, max_len, neg_kinds, step_verify, log):
         if len(p_ids) > 0 and isinstance(p_ids[0], (list, tuple)):
             p_ids = p_ids[0]
         p_ids = [int(x) for x in p_ids]
-        c_ids = p_ids + tok.encode(c_txt, add_special_tokens=False) + [eos]
-        r_ids = p_ids + tok.encode(r_txt, add_special_tokens=False) + [eos]
+        c_ids = p_ids + tok.encode(c_txt, add_special_tokens=False) + tail
+        r_ids = p_ids + tok.encode(r_txt, add_special_tokens=False) + tail
         if len(c_ids) > max_len or len(r_ids) > max_len:
             n_len_drop += 1
             continue
@@ -147,6 +148,10 @@ def main():
     ap.add_argument("--neg-kinds", nargs="+", default=["wrong"],
                     help="'wrong' only by default; add 'unclosed' to include closure pairs (NOT advised)")
     ap.add_argument("--no-step-verify", dest="step_verify", action="store_false", default=True)
+    ap.add_argument("--no-append-eos", dest="append_eos", action="store_false", default=True,
+                    help="REQUIRED for prefix-local pairs (build_step_pairs.py). A pair whose "
+                         "completion is only the first reasoning step must not end in <|im_end|>, "
+                         "or DPO teaches the policy to STOP after one step.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log", default=None)
     args = ap.parse_args()
@@ -170,7 +175,8 @@ def main():
         f"eff_batch={args.micro_bs*args.grad_accum} step_verify={args.step_verify}")
     log("=" * 72)
 
-    pairs = build_pairs(tok, args.data, args.max_len, set(args.neg_kinds), args.step_verify, log)
+    pairs = build_pairs(tok, args.data, args.max_len, set(args.neg_kinds), args.step_verify, log,
+                        append_eos=args.append_eos)
     if not pairs:
         log("ERROR: no pairs after filtering"); sys.exit(1)
 
