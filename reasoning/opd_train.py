@@ -88,7 +88,7 @@ LABEL_ORDER = ["correct", "wrong", "unclosed", "no_answer"]
 
 
 def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
-               eos_id, seed, hint_template=""):
+               eos_id, seed, hint_template="", solve_band=None):
     """One row per rollout: prompt ids + the trace the STUDENT actually generated.
 
     Stratified by label so a batch contains both states the student got right and states it got
@@ -112,6 +112,17 @@ def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
     rng = random.Random(seed)
     rows, stat = [], Counter()
     for (pool, q), rs in sorted(by_q.items()):
+        if solve_band is not None:
+            # ZONE-OF-PROXIMAL-DEVELOPMENT filter. 44.1% of these problems are never solved in K
+            # samples and 67% of the math_train_hard ones are; on those a teacher holding the answer
+            # produces a distribution the student has no route to, so the divergence is large and the
+            # gradient is spent on something unlearnable. The mirror risk is real too -- a problem
+            # solved 8/8 has nothing to teach. Off by default because it is a hypothesis, not a
+            # finding: the arms that ran first deliberately included everything.
+            nc = sum(1 for r in rs if r["label"] == "correct")
+            if not (solve_band[0] <= nc <= solve_band[1]):
+                stat["drop_outside_solve_band"] += 1
+                continue
         buckets = defaultdict(list)
         for r in rs:
             if r["label"] in labels_keep:
@@ -313,6 +324,9 @@ def main():
                          "{solution}. Turns a frozen copy of the student into a better-informed "
                          "teacher with no capacity or style gap.")
     ap.add_argument("--div", default="revkl", choices=["revkl", "jsd", "fwdkl"])
+    ap.add_argument("--solve-band", nargs=2, type=int, default=None, metavar=("LO", "HI"),
+                    help="keep only problems whose rollouts contain LO..HI correct ones, e.g. 1 7 "
+                         "to drop both the never-solved and the already-mastered")
     ap.add_argument("--exclude-terminators", type=int, default=0,
                     help="drop the </think> and eos COLUMNS from the divergence, so the teacher has "
                          "no influence on trace length. Required for a teacher whose trace-length "
@@ -453,7 +467,8 @@ def main():
 
     # ---- data ------------------------------------------------------------------------
     rows, dstat = build_rows(a.rollouts, tok, build_ids, a.max_seq_len, a.per_problem,
-                             set(a.labels), eos_id, a.seed, a.hint_template)
+                             set(a.labels), eos_id, a.seed, a.hint_template,
+                             tuple(a.solve_band) if a.solve_band else None)
     print(f"[opd] rows={len(rows):,}  " + "  ".join(f"{k}={v:,}" for k, v in sorted(dstat.items())),
           flush=True)
     if not rows:
