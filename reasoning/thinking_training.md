@@ -6819,3 +6819,40 @@ that question properly.
 itself (2.0 GB) was deleted after the four-question audit — no live writer, no symlinks into it, no
 script or result depends on it (the one stale reference, in `a4_entbranch.sh`, was repointed), and it
 reproduces in 33 minutes from `reasoning/a4_opd.sh`.
+
+### §41h — No surface feature of a trace predicts its correctness. If a free selector exists it lives in the PROBABILITIES
+
+Zero GPU, on the same 93,912-rollout dump. Over 11,738 problems with K=8, how well does each
+candidate-selection rule do? (Train pools, so absolute numbers are not comparable to the eval gate —
+the comparison between rows is the point.)
+
+| selector | acc | vs plurality |
+|---|---:|---:|
+| oracle (any of the 8 correct) | 55.93 | +18.73 |
+| **plurality vote** | **37.20** | — |
+| length-weighted vote | 34.42 | −2.79 |
+| plurality over the shortest half | 29.35 | −7.85 |
+| most explicit equations | 27.35 | −9.86 |
+| one rollout (the pass@1 analogue) | 26.54 | −10.67 |
+| longest answered trace | 24.16 | −13.04 |
+| shortest answered trace | 22.93 | −14.27 |
+| fewest hedge words ("wait", "however", …) | 22.92 | −14.29 |
+
+**Every text-derived heuristic is 10-14 points WORSE than simply voting**, and re-weighting the vote by
+length makes it worse too. Voting recovers 10.7 of the 29.4-point headroom (36%); a perfect selector
+would add 18.7 more.
+
+⚠️**And note the trap this kills.** §41b reports correct traces averaging 524 characters against
+wrong ones at 632 — which reads like "shorter is better" and would license a shortest-of-K selector.
+That correlation is entirely BETWEEN problems (easy problems get short correct traces) and vanishes
+WITHIN a problem: picking the shortest of 8 candidates for the same question is 14 points worse than
+voting, and picking the longest is *better* than picking the shortest. Same class of error as §41f's
+closure-hazard mistake — a statistic measured under the wrong conditioning.
+
+**Consequence:** the cheap selectors are dead, so a free selector must come from the model's own
+next-token distributions rather than from its text. That is exactly what `entropy_branch.py`'s control
+arm now measures (self-certainty = KL(uniform‖p) averaged over tokens, plus Borda and
+certainty-weighted vote over self-certainty ranks, at N=8, on identical items). If those also fail,
+the remaining route to the other 18.7 points is a TRAINED verifier, and the honest prior for that is
+poor — §22i measured a learned verifier failing on this line, and the 2026 process-verification result
+reports that meta-cognition "amplifies confusion without sufficient model capacity" at small scale.
