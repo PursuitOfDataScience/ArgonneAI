@@ -364,6 +364,31 @@ def main():
                 picks[best[3]] += 1
             return ok, fm, picks
 
+        # §41l's premise, re-measured on THESE pools rather than assumed from the train pools:
+        # among the problems where the vote loses but gold is present, how far behind is gold? If the
+        # losses are not tie-heavy here, `vtb` has little to work with and that must be visible in
+        # the same report as its score.
+        marg = Counter()
+        n_recov = n_votewin = 0
+        for i in range(len(probs)):
+            answers = [extract_boxed(t) for t, _, _, _ in ctrl[i]]
+            v = Counter(x for x in answers if x is not None)
+            if not v or golds[i] not in v:
+                continue
+            n_recov += 1
+            tc = max(v.values())
+            if v.most_common(1)[0][0] == golds[i]:
+                n_votewin += 1
+            else:
+                marg[min(tc - v[golds[i]], 4)] += 1
+        nl = sum(marg.values())
+        if nl:
+            near = marg[0] + marg[1]
+            print(f"[eb/{pool}] vote-loss margins over {n_recov} recoverable items: "
+                  f"vote wins {n_votewin} ({n_votewin / n_recov * 100:.1f}%), loses {nl}; "
+                  f"of the losses margin0 {marg[0] / nl * 100:.1f}% margin1 {marg[1] / nl * 100:.1f}% "
+                  f"-> near-ties {near / nl * 100:.1f}% (train pools measured 78.2%)", flush=True)
+
         cfgs = {}
         keys = list(SELECTORS) + (["selfvfy", "vfyvote", "vtb_vfy"]
                                   if a.selfverify and vscore else [])
