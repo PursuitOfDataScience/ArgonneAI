@@ -6950,3 +6950,40 @@ the only capability number that matters here.
    harness prints `solver_solo`/`solver_cov`.
 3. The capability arms (`a4_kd3.sh`, `a4_steppref.sh`) — worth at most the +1.24 row, and after §41f's
    correction the prior on strong-teacher KD got worse, not better.
+
+### §41k — Ideas considered and deliberately NOT run, with the reason
+
+Recorded so they are not re-derived from scratch, and so the ranking is auditable against §41j's
+ladder (capability lever ≤ +1.24, selection lever up to +25.50).
+
+* **Plan-first / "Given: … Find: …" structured opening.** The one place off-policy data is the RIGHT
+  tool: §40 and the Llama arm together show off-policy imitation transfers FORMAT reliably (same
+  length, same termination, same format) and CAPABILITY not at all. So a format change that is itself
+  worth accuracy should be learnable from off-policy data. And the mechanism fits §41b — a model that
+  misreads the problem and derives the wrong thing from equation 0 might benefit from being made to
+  restate the quantities first. It could even be built with zero generation cost by extracting the
+  numeric quantities and the question sentence mechanically. **Not run** because §38j says every arm
+  that lengthened traces lost and a header costs 30-50 tokens, and because §41j caps the whole
+  capability lever at +1.24 while two capability arms are already queued.
+* **Inverting RFT's difficulty weighting** (it keeps 3 traces from hard problems and 1 from easy, on
+  the standard "a problem solved 15/16 teaches nothing" argument, which may be wrong for a model this
+  weak). **Measured and dropped, cheaply:** hard problems are only 15.3% of the kept fuel and their
+  traces are 184 median think-tokens against 116-168 for the rest — far too small a share to move the
+  model's trace length, and combo's `t_len` (229.8) is in fact SHORTER than the baseline's (278.3).
+  The hypothesis is refuted by the data without an experiment.
+* **A trained single-model verifier (V-STaR / GenRM).** The data exists — 93,912 rollouts with gold
+  labels, both positives and negatives, which is exactly V-STaR's input. Held behind the two selector
+  jobs on purpose: if a FREE selector (`a4_entbranch.sh`) captures the gap, no verifier is needed; if
+  the external ceiling (`a4_extverify.sh`) turns out low, a trained verifier cannot beat it either. Run
+  it only when those two say a verifier is both necessary and sufficient. ⚠️And the prior is poor at
+  this scale — §22i measured a learned verifier failing on this line, and the 2026 process-verification
+  result reports meta-cognition "amplifying confusion without sufficient model capacity".
+* **A zone-of-proximal-development curriculum for the hinted arms.** Implemented but off by default
+  (`opd_train.py --solve-band 1 7`): 44.1% of problems are never solved in 8 samples and 67% of the
+  math_train_hard ones are, so a teacher holding the answer produces a target the student has no route
+  to. The band keeps 18,952 rows from 6,319 problems — exactly the "solvable-but-unreliable" count
+  §41b reports independently. Left off for the first arms so the unfiltered result exists to compare
+  against; it is the obvious follow-up if the hinted arms underperform.
+* **Self-consistency at K=32** rather than 8. Not a separate job: `a4_extverify.sh`'s generate phase
+  samples K=32 and prints self-consistency and pass@K for free, so the K=8→32 voting curve arrives
+  with the reranking result.
