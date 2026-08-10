@@ -2158,6 +2158,15 @@ def main() -> None:
     # Trainer for GradScaler support.
     train_args = TrainingArguments(
         output_dir=args.output_dir,
+        # ⚠️`seed` MUST be passed here, not just to seed_everything(). HF Trainer builds its data
+        # sampler from TrainingArguments.seed and defaults to 42 -- so without this, --seed was a
+        # NO-OP for every CoT-SFT run: the model loads from a checkpoint (no random init), the
+        # sampler order is fixed, and two runs at different --seed are BIT-IDENTICAL. Verified
+        # 2026-08-10: seeds 46 and 47 produced the same loss at every logged step (3.403, 2.889,
+        # 3.173, ...) and the same train_loss 2.388. That silently turned a seed-replicate into a
+        # rerun, and made the "reshuffled epochs" of the dose-response replays of one fixed order.
+        seed=args.seed,
+        data_seed=args.seed,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
