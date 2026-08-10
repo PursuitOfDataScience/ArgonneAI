@@ -52,7 +52,7 @@ CLOSE = "\n</think>\n\nThe answer is $\\boxed{"
 # continuing to improve as N grows. Self-certainty is KL(uniform || p) averaged over tokens, i.e.
 # log V - H(p) up to a constant, so ranking by MINIMUM mean entropy is ranking by maximum
 # self-certainty -- `ent` is that argmax pick, `borda` and `wvote` combine it with the vote.
-SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb")
+SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb0", "vtb1")
 
 # ⚠️`vtb` (vote-then-tie-break) is the selector with the strongest prior, and the reason is a
 # measurement, not taste. Over the 6,565 train problems where gold appears among the answered
@@ -64,6 +64,16 @@ SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb")
 # So a selector does not need to be a good verifier. It needs to be slightly better than a coin flip
 # on near-ties. `vtb` restricts the confidence signal to exactly that decision and never lets it
 # override a clear plurality, which makes it strictly lower-variance than `ent`/`borda`/`wvote`.
+#
+# `vtb0` vs `vtb1` separates two different claims, and the difference matters:
+#   vtb0 (slack 0) touches ONLY exact ties. `effort_gate.py` -- and therefore every self-consistency
+#     number ever reported on this line -- resolves those with `Counter.most_common`, i.e. by
+#     insertion order, i.e. arbitrarily. Replacing an arbitrary choice with an informed one cannot
+#     lose anything a principled voter was entitled to, so vtb0 is the strictly-safe version and, if
+#     it works, an unconditional improvement to the deployed decode recipe.
+#   vtb1 (slack 1) also overrules a one-vote plurality. That is where most of the measured headroom
+#     is (39.6% of losses on top of the 38.6% exact ties) but it can now lose items the vote had
+#     right, so it has to earn its keep against vtb0.
 
 # A sixth selector, behind --selfverify, and the last FREE one available. §41h killed every text
 # feature; self-certainty is a property of the generating distribution. This asks the model a
@@ -302,16 +312,17 @@ def main():
                     best = min(cs, key=lambda c: c[1])
                 elif key == "lp":
                     best = max(cs, key=lambda c: c[2])
-                elif key in ("vtb", "vtb_vfy"):
+                elif key.startswith("vtb"):
+                    slack = 0 if key.endswith("0") else a.tie_slack
                     votes = Counter(aa for aa in answers if aa is not None)
                     if not votes:
                         best = cs[0]
                     else:
                         tc = max(votes.values())
-                        near = [x for x, c in votes.items() if tc - c <= a.tie_slack]
+                        near = [x for x, c in votes.items() if tc - c <= slack]
                         def strength(x):
                             js = [j for j, aa in enumerate(answers) if aa == x]
-                            if key == "vtb_vfy":
+                            if key.endswith("_vfy"):
                                 return max(vscore.get((setname, i, j), -1.0) for j in js)
                             return -min(cs[j][1] for j in js)     # -min entropy = max certainty
                         top = max(near, key=strength)
@@ -390,7 +401,7 @@ def main():
                   f"-> near-ties {near / nl * 100:.1f}% (train pools measured 78.2%)", flush=True)
 
         cfgs = {}
-        keys = list(SELECTORS) + (["selfvfy", "vfyvote", "vtb_vfy"]
+        keys = list(SELECTORS) + (["selfvfy", "vfyvote", "vtb1_vfy"]
                                   if a.selfverify and vscore else [])
         for name, src in (("branch", cands), ("control", ctrl)):
             for key in keys:

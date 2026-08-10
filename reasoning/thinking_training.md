@@ -7020,12 +7020,28 @@ rate 66.5% → 92.7%; a selector merely 60% accurate on near-ties (against ~50% 
 five-pool greedy-equivalent, and 75% is worth ~+4.5pt. That is more than the entire remaining
 capability lever (+1.24) for zero training.
 
-So `entropy_branch.py` gains a seventh selector, **`vtb` (vote-then-tie-break)**: take the plurality,
-but among answers within `--tie-slack` (default 1) votes of the top, choose the one whose most-certain
-candidate has the highest self-certainty. It never lets confidence override a clear plurality, which
-makes it strictly lower-variance than `ent`/`borda`/`wvote` — those can lose points a fragile
-confidence signal would otherwise have kept. `vtb_vfy` is the same rule with zero-shot p(Yes) as the
-tie-break instead.
+So `entropy_branch.py` gains **vote-then-tie-break**: take the plurality, but among answers within a
+vote-slack of the top, choose the one whose most-certain candidate has the highest self-certainty. It
+never lets confidence override a clear plurality, which makes it strictly lower-variance than
+`ent`/`borda`/`wvote` — those can lose points a fragile confidence signal would otherwise have kept.
+It ships as two selectors because they make different claims:
+
+* **`vtb0`** touches ONLY exact ties — and here is the specific finding about the EXISTING code:
+  `effort_gate.py:183` resolves the vote with `votes.most_common(1)[0][0]`, and Python's
+  `Counter.most_common` breaks ties by **insertion order**. So every self-consistency number ever
+  reported on this line, for every model including the released 3.5-think, resolves ~38.6% of its vote
+  losses by which candidate vLLM happened to sample first. Replacing an arbitrary choice with an
+  informed one cannot lose anything a principled voter was entitled to, so if `vtb0` works it is an
+  unconditional improvement to the deployed decode recipe — and it also means the reported `sc@8`
+  carries a variance term nobody has been accounting for.
+  Rough size: sc@8 50.94 against pass@8 68.94 leaves 18.00 points in vote losses; if 38.6% of those
+  are exact ties, ~6.9 points are currently decided by sampling order.
+* **`vtb1`** also overrules a one-vote plurality — where most of the headroom is (another 39.6% of
+  losses) but it can now lose items the vote had right, so it must earn its keep against `vtb0`.
+
+Both were unit-tested on synthetic candidate sets before the GPU run: an exact 2-2 tie moves to the
+lower-entropy group, a clear 3-1 plurality is untouched by both, and a 2-1 margin moves under `vtb1`
+and not under `vtb0`. `vtb1_vfy` is the same rule with zero-shot p(Yes) as the tie-break.
 
 ⚠️These margins are measured on the TRAIN pools (K=8, T=0.9). The eval pools are easier — the vote's
 hit rate on the recoverable pool there is 50.94/68.94 = 73.9% against 66.5% here — so the loss count is
