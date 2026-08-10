@@ -7047,3 +7047,36 @@ and not under `vtb0`. `vtb1_vfy` is the same rule with zero-shot p(Yes) as the t
 hit rate on the recoverable pool there is 50.94/68.94 = 73.9% against 66.5% here — so the loss count is
 smaller, and whether the margin distribution is equally tie-heavy is an assumption until
 `a4_entbranch.sh` reports it on the gate pools.
+
+### §41m — Two early reads from §41g's arms, both worth keeping whatever the gate says
+
+**1. `opd35` PASSED the closure check and still showed the losing signature.** The length-matched
+teacher (released 3.5-think: same arch, same tokenizer, same CoT mix, `t_len` 248 vs a4's 230) trained
+cleanly — revKL 0.198 → 0.148, argmax agreement 88.4% → 89.8%, and the new marginal-hazard diagnostic
+read student 0.0065 against teacher 0.0065, matched to four decimals, all 2,241 steps. Then
+`closure_smoke.py` on 200 asdiv items: **unclosed 14.5% against combo's 6.9%, mean decoded 280 tokens
+against 212.** Inside the 45% failure bar, so it goes to the gate — and exactly the drift §38j says
+loses.
+
+⚠️**Matching the AVERAGE hazard does not mean matching it pointwise.** A teacher can hold less closing
+mass early and more late; reverse KL then redistributes the student's closure later without changing
+the mean. The training-time statistic cannot see that and a 90-second generation can, which is the
+second time in one session that the cheap end-to-end check beat the clever in-training one.
+`closure_smoke.py` now also warns on token-count drift (`--warn-decoded`, 300 in the kd launchers).
+
+**2. Telling a4 the answer barely changes its own distribution.** `gasd_full`'s first step: **JSD
+0.0113 with 95.0% argmax agreement and `gnorm` 0.14**, against `opd35`'s 1.5 and the Qwen arm's
+0.85-nat reverse KL. Two readings, and they have opposite implications:
+
+* *Optimistic:* the 5% is the PURE effect of the privileged information, concentrated at exactly the
+  tokens where knowing the answer matters. Most tokens in a 200-token trace are near-deterministic
+  given the prefix, so a small average is what a well-targeted signal looks like. An external teacher's
+  23% disagreement is mostly style.
+* *Pessimistic:* a gradient ~10x smaller at the same LR moves the weights ~10x less, so a null result
+  would be uninformative about the method — it would only say the step size was too small.
+
+Which it is will be visible in the loss curve (does JSD fall toward 0, i.e. is the signal absorbed?)
+and in the gate. **If `gasd_*` lands as an exact null, the first follow-up is not a new idea, it is
+`LR=5e-5 ARMS=gasd_full sbatch reasoning/a4_kd2.sh`** — the launcher already takes `LR` from the
+environment, so no code change. Recording this now so a null is not misread later as "hindsight
+distillation does not work here".
