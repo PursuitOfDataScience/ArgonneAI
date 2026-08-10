@@ -246,7 +246,7 @@ def gather_completion(logits, tgt_mask, V):
     return logits[:, :-1, :V][pred]              # [n, V], row-major = per-sequence order
 
 
-def kd_loss(s_flat, t_flat, teacher_temp, div):
+def kd_loss(s_flat, t_flat, teacher_temp, div, keep_idx=None):
     """Per-token divergence between the student's and the teacher's next-token distributions.
 
     `revkl` = KL(student || teacher) is the default and is mode-SEEKING: it asks the student to put
@@ -256,10 +256,24 @@ def kd_loss(s_flat, t_flat, teacher_temp, div):
     consensus-self-distillation literature uses when teacher and student are the same model
     conditioned differently and the two distributions are already close.
     """
-    tl = t_flat.float()
+    sf = s_flat
+    tf = t_flat
+    if keep_idx is not None:
+        # ⚠️THE SURGICAL FIX FOR §41f. Dropping the `</think>` and eos COLUMNS from the divergence --
+        # not just the positions whose target IS a terminator -- is what protects termination. The
+        # damage in arm 1 came from the ~200 positions per trace where the target is ordinary text
+        # and a long-CoT teacher assigns near-zero mass to closing: reverse KL pushes the student's
+        # closing mass down at every one of them, and closure is the integral of that hazard. With
+        # the columns removed, both distributions are renormalised over content tokens only, the
+        # loss measures the SHAPE OF THE REASONING, and the terminator logits receive no gradient
+        # from it at all -- so the student keeps its own trace-length prior while still learning
+        # what to say next from a much stronger teacher.
+        sf = sf.index_select(1, keep_idx)
+        tf = tf.index_select(1, keep_idx)
+    tl = tf.float()
     if teacher_temp != 1.0:
         tl = tl / teacher_temp
-    log_ps = F.log_softmax(s_flat.float(), dim=-1)
+    log_ps = F.log_softmax(sf.float(), dim=-1)
     log_pt = F.log_softmax(tl, dim=-1)           # renormalised over the SHARED vocab
     if div == "fwdkl":
         pt = log_pt.exp()
@@ -299,6 +313,11 @@ def main():
                          "{solution}. Turns a frozen copy of the student into a better-informed "
                          "teacher with no capacity or style gap.")
     ap.add_argument("--div", default="revkl", choices=["revkl", "jsd", "fwdkl"])
+    ap.add_argument("--exclude-terminators", type=int, default=0,
+                    help="drop the </think> and eos COLUMNS from the divergence, so the teacher has "
+                         "no influence on trace length. Required for a teacher whose trace-length "
+                         "distribution differs from the student's -- see the closure-hazard note in "
+                         "the training loop.")
     ap.add_argument("--rollouts", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-problem", type=int, default=3)
@@ -464,6 +483,15 @@ def main():
         prog = (s - a.warmup) / max(1, total_steps - a.warmup)
         return a.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
 
+    keep_idx = None
+    if a.exclude_terminators:
+        term = {tok.convert_tokens_to_ids("</think>"), int(eos_id)}
+        keep_idx = torch.tensor([i for i in range(V) if i not in term],
+                                dtype=torch.long, device=dev)
+        print(f"[opd] terminator columns excluded from the divergence: {sorted(term)} "
+              f"({V} -> {keep_idx.numel()} columns). The teacher cannot move trace length.",
+              flush=True)
+
     pad_id = eos_id
     hist = []
     step = 0
@@ -501,7 +529,7 @@ def main():
                 raise RuntimeError(f"completion-token count mismatch student {s_flat.shape[0]} vs "
                                    f"teacher {t_flat.shape[0]} -- the two prompts must share the "
                                    "completion exactly")
-            L_kd = kd_loss(s_flat, t_flat, a.teacher_temp, a.div)
+            L_kd = kd_loss(s_flat, t_flat, a.teacher_temp, a.div, keep_idx)
             L = a.kd_weight * L_kd
             L_ce = torch.zeros((), device=dev)
             if a.ce_weight > 0:
