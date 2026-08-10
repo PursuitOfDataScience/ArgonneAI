@@ -6797,10 +6797,29 @@ Two fixes, both now in the tree:
   sit at 7-12%, the worst gated arm at 22%). `a4_kd2.sh` gates only the arms that pass it. The cost of
   not having this was one cancelled gate; the cost of having it is 90 seconds per arm.
 
+**⚠️CORRECTION to the first reading of this arm.** The remaining gate stages had in fact completed
+before the cancel landed, so the full five-pool picture exists — and it says the damage was not only to
+format. Force-closing the think block recovers a lot but nowhere near the baseline:
+
+| config | a4opd_a100 | a4combo_a100 |
+|---|---:|---:|
+| greedy | 0.82 | 43.44 |
+| +budget (s1 force-close at 256) | 28.73 | 43.96 |
+| +extend3 | 33.74 | 44.17 |
+
+Per pool the force-closed numbers are asdiv 47.90 (combo 64.40), svamp 37.90, mawps 35.80, gsmplus
+9.20, math500 12.85 — so even when closure is imposed from outside, the arm is ~10pt short pool-mean and
+catastrophically short on the two pools needing the longest derivations. I had written that it "failed
+on format before capability could be read"; that is too generous. **Both were damaged.** Two caveats
+keep this from being a clean capability measurement in the other direction: a 256-token think budget
+truncates a model that now wants 510, and a model trained never to stop puts mass on continuation
+phrases everywhere, so the content degradation may be a CONSEQUENCE of the termination collapse rather
+than independent of it.
+
 **What arm 1 establishes:** a teacher whose trace-length distribution is 20-30x the student's is
-disqualified for per-token KD however strong it is. **What it does not establish:** anything about
-whether per-token KD helps a4 reason — it failed on format before capability could be read. §41g asks
-that question properly.
+disqualified for per-token KD however strong it is, and the collapse is not repairable at decode time.
+**What it still does not establish:** whether that teacher's per-token signal would help a4 reason if it
+were prevented from touching trace length in the first place. §41g and §41i ask that.
 
 ### §41g — Three arms, one paired gate (job 53239042, `reasoning/a4_kd2.sh`)
 
