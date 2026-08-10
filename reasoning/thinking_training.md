@@ -6856,3 +6856,32 @@ certainty-weighted vote over self-certainty ranks, at N=8, on identical items). 
 the remaining route to the other 18.7 points is a TRAINED verifier, and the honest prior for that is
 poor — §22i measured a learned verifier failing on this line, and the 2026 process-verification result
 reports that meta-cognition "amplifies confusion without sufficient model capacity" at small scale.
+
+### §41i — The strong teacher, with termination surgically removed from the objective (`a4_kd3.sh`)
+
+Qwen3-4B-Thinking-2507 carries **4.5x more per-token signal** for a4-think than the released 3.5-think
+does: reverse KL 0.85 nats against 0.20 at step 1, and argmax disagreement on 23% of a4's own tokens
+against 12%. Under the shared Qwen3 tokenizer it is by far the most informative teacher available, and
+§41f threw all of it away. Two independent ways to keep it and drop only the part that broke:
+
+* **`opdq_notail` — surgical.** The `</think>` and eos COLUMNS are removed from the divergence and both
+  distributions renormalised over content tokens only. Verified numerically, not argued: the excluded
+  logits receive exactly zero gradient from the KD term, kept columns receive nonzero gradient, and the
+  loss differs from the full-vocab value so the mask is live.
+  ⚠️It must be the COLUMNS, not the positions whose target is a terminator. The damage came from the
+  ~200 positions per trace whose target is ordinary text and where the teacher still assigns near-zero
+  closing mass; masking terminator-target positions would have fixed nothing at all.
+* **`opdq_anchor` — standard.** Full-vocab reverse KL plus `--ce-weight 0.5` on gold-verified rows, so a
+  likelihood term pins the model's own verified format while KD injects capability.
+
+Reading the two together is the point: if only the surgical arm works the protection has to be
+structural; if both work the effect is robust; **if neither works, per-token KD from a much stronger
+teacher does not help this model** — which, given §41f's corrected reading (content damaged too), is
+now the outcome to expect rather than the surprise.
+
+**New tool:** `reasoning/arms_table.py` — every arm ever gated, ranked, all decode configs plus the
+diagnosis columns, largest-n record per (pool, model), arms missing a pool excluded from the ranking
+rather than averaged over fewer pools. `gate_report.py` answers "how does this arm compare to its
+baseline inside this gate call", which is the right question inside one experiment and the wrong one
+after twenty; hand-answering the cross-arm question is how the standing note came to say the
+stronger-teacher lever was untested after it had been run and refuted.
