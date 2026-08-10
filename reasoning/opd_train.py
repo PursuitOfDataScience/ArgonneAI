@@ -390,6 +390,16 @@ def main():
         teacher, _, _ = load_argonne(a.student, False)
         teacher.to(torch.bfloat16)
         ttok = tok
+    elif json.load(open(os.path.join(a.teacher, "config.json"))).get("model_type") == "argonne2":
+        # An Argonne-arch teacher (e.g. the released 3.5-think) must go through the same manual
+        # construction as the student: AutoModelForCausalLM does not re-tie lm_head for this arch and
+        # would load a teacher whose head is random -- a silently meaningless target distribution.
+        teacher, tmiss, _ = load_argonne(a.teacher, False)
+        teacher.to(torch.bfloat16)
+        ttok = AutoTokenizer.from_pretrained(a.teacher, trust_remote_code=True)
+        print(f"[opd] argonne-arch teacher, missing={len(tmiss)} "
+              f"tied={teacher.embed_tokens.weight.data_ptr() == teacher.lm_head.weight.data_ptr()}",
+              flush=True)
     else:
         teacher = AutoModelForCausalLM.from_pretrained(
             a.teacher, dtype=torch.bfloat16, attn_implementation="sdpa", trust_remote_code=True)
@@ -464,7 +474,8 @@ def main():
     # exactly that factor -- which is what made the 6-step probe read 38% agreement against the
     # real run's 77% on the same models.
     accum = {"kd": 0.0, "ce": 0.0, "n": 0, "diag_n": 0, "argmax_agree": 0.0, "close_ps": 0.0,
-             "close_pt": 0.0, "close_n": 0}
+             "close_pt": 0.0, "close_n": 0, "haz_ps": 0.0, "haz_pt": 0.0}
+    warned_hazard = False
 
     for ep in range(a.epochs):
         epoch_mb = mb if ep == 0 else make_micro_batches(rows, a.max_batch_tokens, a.seed + ep)
@@ -509,18 +520,30 @@ def main():
                         accum["diag_n"] += 1
                         sl = s_flat.detach()
                         accum["argmax_agree"] += float((sl.argmax(-1) == t_flat.argmax(-1)).sum()) / n_tok
-                        # THE LENGTH RISK, measured rather than hoped: at the position where the
-                        # student actually closed its think block, does the teacher agree it should
-                        # close? Every arm on this line that lengthened traces LOST, so a teacher
-                        # that systematically demotes `</think>` is a run to kill early.
+                        # ⚠️THE CLOSURE HAZARD, and read this comment before changing it.
+                        # The first version of this diagnostic reported p(`</think>`) only at
+                        # positions where the student's trace ALREADY closed. That is a biased
+                        # sample of exactly the states where teacher and student agree: it read a
+                        # comfortable 0.72-0.88 against the student's ~1.00 all the way through a run
+                        # that came out of the oven with a 96.95% UNCLOSED rate and greedy 1.75.
+                        # What actually matters is the MARGINAL hazard -- the mean closing mass over
+                        # EVERY completion position, because closure is what that hazard integrates
+                        # to over a 200-token trace. A long-CoT teacher can hold reasonable mass on
+                        # `</think>` at a finished derivation while holding essentially none of it
+                        # mid-trace, and reverse KL then drives the student's per-position hazard to
+                        # zero and it never terminates at all.
                         ci = tok.convert_tokens_to_ids("</think>")
+                        ei = eos_id
+                        s_lse, t_lse = sl.logsumexp(-1), t_flat.logsumexp(-1)
+                        haz_s = ((sl[:, ci] - s_lse).exp() + (sl[:, ei] - s_lse).exp()).mean()
+                        haz_t = ((t_flat[:, ci] - t_lse).exp() + (t_flat[:, ei] - t_lse).exp()).mean()
+                        accum["haz_ps"] += float(haz_s)
+                        accum["haz_pt"] += float(haz_t)
                         tgt_flat = ids[:, 1:][cmask[:, 1:]]
                         close_pos = tgt_flat == ci
                         if bool(close_pos.any()):
-                            accum["close_ps"] += float(
-                                (sl[:, ci] - sl.logsumexp(-1))[close_pos].exp().mean())
-                            accum["close_pt"] += float(
-                                (t_flat[:, ci] - t_flat.logsumexp(-1))[close_pos].exp().mean())
+                            accum["close_ps"] += float((sl[:, ci] - s_lse)[close_pos].exp().mean())
+                            accum["close_pt"] += float((t_flat[:, ci] - t_lse)[close_pos].exp().mean())
                             accum["close_n"] += 1
             accum["kd"] += float(L_kd)
             accum["ce"] += float(L_ce)
@@ -540,15 +563,28 @@ def main():
                     cn = max(1, accum["close_n"])
                     print(f"[opd] step {step}/{total_steps}  revKL {accum['kd'] / n:.4f}  "
                           f"ce {accum['ce'] / n:.4f}  agree {accum['argmax_agree'] / dn * 100:.1f}%  "
-                          f"p(</think>) student {accum['close_ps'] / cn:.3f} teacher "
-                          f"{accum['close_pt'] / cn:.3f}  gnorm {float(gn):.2f}  "
+                          f"haz s {accum['haz_ps'] / dn:.4f} t {accum['haz_pt'] / dn:.4f}  "
+                          f"p(</think>|closed) s {accum['close_ps'] / cn:.2f} t "
+                          f"{accum['close_pt'] / cn:.2f}  gnorm {float(gn):.2f}  "
                           f"lr {lr_at(step):.2e}  "
                           f"HBM {torch.cuda.max_memory_allocated() / 2**30:.1f}G  "
                           f"{(time.time() - t_start) / 60:.1f}min", flush=True)
                     hist.append({"step": step, "revKL": accum["kd"] / n, "ce": accum["ce"] / n,
                                  "agree": accum["argmax_agree"] / dn,
                                  "p_close_student": accum["close_ps"] / cn,
-                                 "p_close_teacher": accum["close_pt"] / cn})
+                                 "p_close_teacher": accum["close_pt"] / cn,
+                                 "hazard_student": accum["haz_ps"] / dn,
+                                 "hazard_teacher": accum["haz_pt"] / dn})
+                    # THE kill signal. A teacher holding <1/5 of the student's per-position closing
+                    # mass will drive termination to zero over a 200-token trace, whatever the
+                    # conditional p(</think>|already closed) says. Loud, and early.
+                    if (not warned_hazard and accum["haz_pt"] / dn < 0.2 * accum["haz_ps"] / dn):
+                        warned_hazard = True
+                        print(f"WARNING closure-hazard collapse risk: teacher "
+                              f"{accum['haz_pt'] / dn:.5f} vs student {accum['haz_ps'] / dn:.5f} "
+                              f"per position. This is how a run ends at 97% unclosed. Consider "
+                              f"--ce-weight > 0 or a teacher with a matching trace-length "
+                              f"distribution.", flush=True)
                     accum = {k: (0.0 if isinstance(v, float) else 0) for k, v in accum.items()}
                 if step >= total_steps:
                     break

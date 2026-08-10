@@ -6753,3 +6753,69 @@ be suspicious.
 **New tools:** `reasoning/fail_taxonomy.py`, `reasoning/opd_train.py`, `reasoning/build_step_pairs.py`,
 `reasoning/entropy_branch.py`; `rlvr_dpo.py --no-append-eos`; `gen_teacher.py --pools` + the
 vLLM tokenizer shim without which no external teacher loads at all.
+
+### §41f — ARM 1'S RESULT: greedy 1.75. A long-CoT teacher destroyed termination, and the instrument built to catch that said it was fine
+
+Reverse-KL on-policy distillation from Qwen3-4B-Thinking-2507 into `think_combo`, 1,719 steps,
+33.2 min, job 53237295. Paired gate on asdiv+svamp n=1000:
+
+| | greedy | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 80.70 | 92.00 | 79.5% | 8.60 | 237.5 |
+| a4combo_a100 | 56.70 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 |
+| **a4opd_a100** | **1.75** | 7.15 | 7.15 | 96.2% | **96.95** | **509.5** |
+
+`t_len` 509.5 against a 512-token cap and 96.95% unclosed: **the model no longer terminates.** The
+remaining gate stages were cancelled — 40 GPU-minutes of self-consistency and pass@8 on a model that
+cannot finish a sentence buys nothing.
+
+⚠️**The 96.2% `acc|ANSWERED` is not a capability signal.** It is the 2-3% of items the model managed
+to finish, i.e. the easiest ones, and reading it as "the reasoning improved" would be exactly the kind
+of selected-subsample error §41b was written to prevent.
+
+**Why the instrument missed it, which is the transferable part.** The run was built with this precise
+failure mode in mind — §38j established that every arm on this line which lengthened traces lost — and
+it logged p(`</think>`) under both models every step. It read teacher 0.72-0.88 against the student's
+~1.00 for all 1,719 steps and never once looked alarming. The bug is in *where* it looked: **only at
+positions where the student's trace had already emitted `</think>`.** That is a biased sample of
+exactly the states in which a long-CoT teacher and a short-CoT student agree.
+
+Termination is not a property of the closing position; it is **the integral of a per-position closing
+hazard over ~200 tokens.** Qwen3-4B-Thinking can hold reasonable mass on `</think>` at a finished
+derivation while holding essentially none of it mid-derivation, and reverse KL — mode-seeking, which
+is what recommended it — then drives the student's per-position hazard toward zero, at which point it
+never reaches a closing state at all. A per-position hazard of 2% closes reliably inside 200 tokens; at
+0.01% it never closes. Both are consistent with a comfortable-looking conditional.
+
+**Rule worth carrying past this project: when you instrument a failure mode, check that the statistic
+is not conditioned on the failure being absent.**
+
+Two fixes, both now in the tree:
+* `opd_train.py` logs `haz s/t` — mean p(`</think>`)+p(eos) over EVERY completion position for both
+  models — and prints a loud WARNING when the teacher's hazard drops below 1/5 of the student's.
+* `reasoning/closure_smoke.py`: 200 greedy items, ~90 s, exit 3 above 45% unclosed (healthy arms here
+  sit at 7-12%, the worst gated arm at 22%). `a4_kd2.sh` gates only the arms that pass it. The cost of
+  not having this was one cancelled gate; the cost of having it is 90 seconds per arm.
+
+**What arm 1 establishes:** a teacher whose trace-length distribution is 20-30x the student's is
+disqualified for per-token KD however strong it is. **What it does not establish:** anything about
+whether per-token KD helps a4 reason — it failed on format before capability could be read. §41g asks
+that question properly.
+
+### §41g — Three arms, one paired gate (job 53239042, `reasoning/a4_kd2.sh`)
+
+* **opd35** — identical mechanism, teacher swapped for the released **argonne-3.5-think**: same arch,
+  same tokenizer, trained on the same CoT mix so `t_len` is 248 against a4's 230 rather than 6,000+,
+  and 11.7pt stronger. If §41f was the length mismatch, this works; if per-token KD is simply harmful
+  here, it fails too. ⚠️An Argonne-arch teacher must go through manual construction —
+  `AutoModelForCausalLM` does not re-tie `lm_head` for this arch and would hand back a random-head
+  target distribution, silently. `opd_train.py` now detects `model_type == argonne2`.
+  ⚠️Off-policy distillation from this same teacher was already measured at +1.11, inside the ±0.87
+  seed noise. Same teacher, different channel — that is the experiment, not an oversight.
+* **gasd_full / gasd_ansonly** — §41d's gold-anchored self-distillation. A self-teacher cannot have a
+  length mismatch, which makes it structurally immune to §41f.
+
+**Artifacts:** `report/a4opd_gate_n1000.json` keeps arm 1's per-item `ok` arrays. The checkpoint
+itself (2.0 GB) was deleted after the four-question audit — no live writer, no symlinks into it, no
+script or result depends on it (the one stale reference, in `a4_entbranch.sh`, was repointed), and it
+reproduces in 33 minutes from `reasoning/a4_opd.sh`.
