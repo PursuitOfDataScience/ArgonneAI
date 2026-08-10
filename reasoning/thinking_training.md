@@ -6904,3 +6904,49 @@ rather than averaged over fewer pools. `gate_report.py` answers "how does this a
 baseline inside this gate call", which is the right question inside one experiment and the wrong one
 after twenty; hand-answering the cross-arm question is how the standing note came to say the
 stronger-teacher lever was untested after it had been run and refuted.
+
+### §41j — WHERE THE POINTS ACTUALLY ARE: selection is worth +25.5, capability +1.2
+
+Everything measured on this base, arranged as a reachability ladder. Five-pool means, largest-n record
+per (pool, model), from the gate JSONs:
+
+| | greedy-equivalent | Δ vs best a4 today |
+|---|---:|---:|
+| best a4 today, single pass (`a4combo_a100`) | 43.44 | — |
+| + hold the best `acc\|ANSWERED` any a4 arm ever reached (52.6%, RLVR) at combo's answered rate | 44.68 | **+1.24** |
+| + plurality vote over 8 samples (measured `sc@8`) | 50.94 | +7.50 |
+| + a PERFECT selector over the same 8 samples (`pass@8`) | 68.94 | **+25.50** |
+| released 3.5-think, single pass | 55.10 | +11.66 |
+| released 3.5-think, vote over 8 | 61.58 | +18.14 |
+| released 3.5-think, perfect selector over 8 | 75.12 | +31.68 |
+
+Three consequences, and they reorder the whole queue:
+
+**1. `a4`'s pass@8 (68.94) ALREADY EXCEEDS 3.5-think's single pass (55.10), by +13.84.** The knowledge
+needed to beat the released model is in a4's distribution today. It is not being selected.
+
+**2. A selector recovering 23% of a4's remaining vote→oracle gap matches 3.5-think's greedy; 59%
+matches 3.5-think's own vote@8.** Those are the two thresholds worth quoting.
+
+**3. Beating 3.5-think single-pass-to-single-pass needs `acc|ANSWERED` = 64.8%** at a4's current
+answered rate. It has 50.1%; its best across thirteen arms is 52.6%; 3.5-think has 70.1%. That is
+~13 points of capability on a base measured at −16.79pt against 3.5's (§40). **Post-training will not
+get there**, and the +1.24 row is the honest size of the whole remaining capability lever.
+
+⚠️Also note a4's answered rate is 85.0% against 3.5-think's 77.0% — a4 answers MORE often and is right
+less often when it does. Its higher answered rate is not an advantage to protect; `acc|ANSWERED` is
+the only capability number that matters here.
+
+**So the queue is reordered by expected points, not by novelty:**
+1. `a4_entbranch.sh` — the FREE end of the selection lever: self-certainty, Borda over self-certainty
+   ranks, certainty-weighted vote, and zero-shot p(Yes) self-verification, at N=8, on identical items.
+   No training, no second model. §41h already killed the text-feature end of this.
+2. `a4_extverify.sh` — the CEILING: the §24/§25 harness unmodified, with `--policy` pointed at a4 and
+   Qwen3-4B as the external judge. That configuration reached roughly pass@32 on the 3.0 line
+   (+35/+25pt). ⚠️A two-model serving result, and the owner has already judged that class as not a
+   single-card ship — it is run to bound every cheaper selector and to say whether a trained
+   single-model verifier is worth building. ⚠️And its `solver` lens is an upper reference, not a
+   capture: a high solver-bon can just mean the 4B model solved the problem itself, which is why the
+   harness prints `solver_solo`/`solver_cov`.
+3. The capability arms (`a4_kd3.sh`, `a4_steppref.sh`) — worth at most the +1.24 row, and after §41f's
+   correction the prior on strong-teacher KD got worse, not better.
