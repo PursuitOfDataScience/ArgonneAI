@@ -181,14 +181,18 @@ def make_micro_batches(rows, max_batch_tokens, seed, window=256):
     the resulting micro-batches are shuffled again so step order stays random.
     """
     rng = random.Random(seed)
+    # the budget must bound the LONGER of the two packs: with a privileged hint the teacher's
+    # sequence is up to ~285 tokens longer than the student's, and it is the teacher's forward that
+    # would OOM first if the budget only counted the student.
+    rowlen = lambda i: max(len(rows[i]["ids"]), len(rows[i].get("t_ids") or ()))
     idx = list(range(len(rows)))
     rng.shuffle(idx)
     batches = []
     for w in range(0, len(idx), window):
-        chunk = sorted(idx[w:w + window], key=lambda i: len(rows[i]["ids"]))
+        chunk = sorted(idx[w:w + window], key=rowlen)
         cur, cur_max = [], 0
         for i in chunk:
-            L = len(rows[i]["ids"])
+            L = rowlen(i)
             m = max(cur_max, L)
             if cur and (len(cur) + 1) * m > max_batch_tokens:
                 batches.append(cur)
@@ -431,8 +435,9 @@ def main():
 
     mb = make_micro_batches(rows, a.max_batch_tokens, a.seed)
     seq_per_mb = sum(len(b) for b in mb) / len(mb)
-    pad_frac = 1.0 - sum(sum(len(rows[i]["ids"]) for i in b) for b in mb) / \
-        sum(len(b) * max(len(rows[i]["ids"]) for i in b) for b in mb)
+    _rl = lambda i: max(len(rows[i]["ids"]), len(rows[i].get("t_ids") or ()))
+    pad_frac = 1.0 - sum(sum(_rl(i) for i in b) for b in mb) / \
+        sum(len(b) * max(_rl(i) for i in b) for b in mb)
     steps_per_epoch = len(mb) // a.grad_accum
     total_steps = a.max_steps if a.max_steps > 0 else steps_per_epoch * a.epochs
     print(f"[opd] micro-batches={len(mb):,}  {seq_per_mb:.1f} seq/micro  "

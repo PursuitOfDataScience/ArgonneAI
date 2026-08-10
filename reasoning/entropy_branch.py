@@ -159,10 +159,11 @@ def main():
                 reqs.append(TokensPrompt(prompt_token_ids=pids[i] + pre + cue_ids))
                 meta.append((i, ci, len(pre), len(cue_ids)))
         n_trig = sum(1 for b in trig if b is not None)
+        fracs = sorted(b / max(1, len(g_ids[i])) for i, b in enumerate(trig) if b is not None)
+        med = fracs[len(fracs) // 2] * 100 if fracs else 0.0
         print(f"[eb/{pool}] triggered on {n_trig}/{len(probs)} "
-              f"({n_trig / len(probs) * 100:.1f}%); median trigger at "
-              f"{sorted(b / max(1, len(g_ids[i])) for i, b in enumerate(trig) if b is not None)[max(0, n_trig // 2)] * 100 if n_trig else 0:.0f}% "
-              f"of the trace", flush=True)
+              f"({n_trig / len(probs) * 100:.1f}%); median trigger at {med:.0f}% of the trace",
+              flush=True)
 
         spb = SamplingParams(n=1, temperature=0.0, max_tokens=a.branch_tokens,
                              logprobs=a.n_logprobs)
