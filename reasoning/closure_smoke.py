@@ -37,6 +37,11 @@ def main():
     ap.add_argument("--max-unclosed", type=float, default=0.45,
                     help="fail above this. The healthy checkpoints on this line sit at 0.07-0.12 "
                          "and the worst gated arm at 0.22, so 0.45 fails only a real collapse.")
+    ap.add_argument("--warn-decoded", type=float, default=0.0,
+                    help="WARN (not fail) above this mean decoded-token count. Termination is not "
+                         "binary: the first arm this guarded passed the unclosed bar at 14.5% while "
+                         "its traces grew 212 -> 280 tokens, and on this line every arm that "
+                         "lengthened traces has lost. Absolute closure and DRIFT are two questions.")
     ap.add_argument("--gpu-util", type=float, default=0.90)
     ap.add_argument("--max-model-len", type=int, default=2560)
     ap.add_argument("--json-out", default="")
@@ -49,7 +54,7 @@ def main():
     from star_generate import extract_boxed, norm
 
     llm, tok = make_llm(a.model, gpu_util=a.gpu_util, max_model_len=a.max_model_len, seed=0)
-    out, worst = {}, 0.0
+    out, worst, worst_dec = {}, 0.0, 0.0
     for pool in a.pools:
         probs = load_pool(pool, a.n, seed=0)
         ids = [prompt_ids(tok, q) for q, _ in probs]
@@ -64,6 +69,7 @@ def main():
         n = len(probs)
         unc = fm["unclosed"] / n
         worst = max(worst, unc)
+        worst_dec = max(worst_dec, dec / n)
         out[pool] = {"n": n, "fm": dict(fm), "unclosed": unc,
                      "greedy": fm["correct"] / n, "mean_decoded": dec / n}
         print(f"[smoke/{pool}] greedy {fm['correct'] / n * 100:5.2f}%  unclosed "
@@ -73,6 +79,10 @@ def main():
     if a.json_out:
         json.dump({"model": a.model, "res": out, "max_unclosed": a.max_unclosed},
                   open(a.json_out, "w"), indent=1)
+    if a.warn_decoded and worst_dec > a.warn_decoded:
+        print(f"WARNING trace-length drift: mean decoded {worst_dec:.0f} tok > {a.warn_decoded:.0f}. "
+              f"Not a failure, but §38j/§41f: every arm on this line that lengthened traces lost. "
+              f"Read t_len and unclosed in the gate before believing any greedy gain.", flush=True)
     if worst > a.max_unclosed:
         print(f"FAIL closure collapse: unclosed {worst * 100:.1f}% > "
               f"{a.max_unclosed * 100:.0f}% -- this checkpoint does not terminate, skip the gate",
