@@ -45,6 +45,15 @@ for _p in (RDIR, REPO):
 CUES = ["", "Wait, ", "Let me reconsider: "]     # branch 0 is a plain continuation
 CLOSE = "\n</think>\n\nThe answer is $\\boxed{"
 
+# THE SELECTORS. `vote` is what self-consistency does today and what caps this model: on a4's own
+# rollouts gold is the plurality answer in only 65.2% of the problems it can solve at all. The other
+# three are reward-model-free alternatives from the self-certainty line (arXiv 2502.18581), which
+# reports self-certainty + Borda beating self-consistency on GSM8K/MATH and, unlike perplexity,
+# continuing to improve as N grows. Self-certainty is KL(uniform || p) averaged over tokens, i.e.
+# log V - H(p) up to a constant, so ranking by MINIMUM mean entropy is ranking by maximum
+# self-certainty -- `ent` is that argmax pick, `borda` and `wvote` combine it with the vote.
+SELECTORS = ("vote", "ent", "lp", "borda", "wvote")
+
 
 def entropy_from_logprobs(d):
     """Shannon entropy of the top-k slice, renormalised. vLLM only returns the top-k, so this is
@@ -115,6 +124,8 @@ def main():
     ap.add_argument("--stride", type=int, default=0,
                     help="also allow a trigger every Nth token (0 = boundaries only)")
     ap.add_argument("--control-temp", type=float, default=0.8)
+    ap.add_argument("--control-n", type=int, default=0,
+                    help="0 = compute-match the branch arm; >0 for the selector study (e.g. 8)")
     ap.add_argument("--gpu-util", type=float, default=0.90)
     ap.add_argument("--max-model-len", type=int, default=2560)
     ap.add_argument("--json-out", default="")
@@ -180,8 +191,13 @@ def main():
             cands[i].append((full, mean_ent(lp), mean_lp(lp, list(o.outputs[0].token_ids)),
                              f"branch{ci}"))
 
-        # ---- COMPUTE-MATCHED control: len(CUES) independent full samples ------------------
-        spc = SamplingParams(n=len(CUES), temperature=a.control_temp, top_p=0.95,
+        # ---- control: independent full samples ------------------------------------------
+        # At --control-n = len(CUES) this is COMPUTE-MATCHED to the branch arm, which is what makes
+        # "branching beat greedy" mean anything. Raising it turns the same run into the selector
+        # study: self-certainty's reported advantage over plurality voting GROWS with N, and a4's
+        # vote is the thing that caps at 65.2% of its recoverable headroom.
+        n_ctrl = a.control_n or len(CUES)
+        spc = SamplingParams(n=n_ctrl, temperature=a.control_temp, top_p=0.95,
                              max_tokens=a.max_tokens, logprobs=a.n_logprobs)
         couts = llm.generate([TokensPrompt(prompt_token_ids=p) for p in pids], spc)
         ctrl = defaultdict(list)
@@ -198,19 +214,34 @@ def main():
                 cs = pool_cands[i]
                 if force_close:
                     cs = [(t if "</think>" in t else t + CLOSE + "}$.", e, l, g) for t, e, l, g in cs]
+                answers = [extract_boxed(t) for t, _, _, _ in cs]
                 if key == "ent":
                     best = min(cs, key=lambda c: c[1])
                 elif key == "lp":
                     best = max(cs, key=lambda c: c[2])
+                elif key in ("borda", "wvote"):
+                    # aggregate over ANSWERS, weighting each candidate by its self-certainty:
+                    # Borda by rank (robust to the scale of the confidence metric), wvote by the
+                    # raw certainty value. Both fall back to the plurality when no candidate
+                    # produced an answer at all.
+                    order = sorted(range(len(cs)), key=lambda j: cs[j][1])   # most certain first
+                    tally = Counter()
+                    for rank, j in enumerate(order):
+                        if answers[j] is None:
+                            continue
+                        w = (len(cs) - rank) if key == "borda" else max(0.0, 10.0 - cs[j][1])
+                        tally[answers[j]] += w
+                    if tally:
+                        top = tally.most_common(1)[0][0]
+                        best = min((c for c, aa in zip(cs, answers) if aa == top),
+                                   key=lambda c: c[1])
+                    else:
+                        best = cs[0]
                 else:                                  # plurality of the candidates' answers
-                    votes = Counter()
-                    for t, _, _, _ in cs:
-                        p = extract_boxed(t)
-                        if p is not None:
-                            votes[p] += 1
+                    votes = Counter(aa for aa in answers if aa is not None)
                     if votes:
                         top = votes.most_common(1)[0][0]
-                        best = next(c for c in cs if extract_boxed(c[0]) == top)
+                        best = next(c for c, aa in zip(cs, answers) if aa == top)
                     else:
                         best = cs[0]
                 lab, _ = grade_one(best[0], golds[i], extract_boxed)
@@ -221,7 +252,7 @@ def main():
 
         cfgs = {}
         for name, src in (("branch", cands), ("control", ctrl)):
-            for key in ("ent", "lp", "vote"):
+            for key in SELECTORS:
                 for fc, sfx in ((False, ""), (True, "+bud")):
                     ok, fm, picks = score(src, key, fc)
                     cfgs[f"{name}_{key}{sfx}"] = {"ok": ok, "fm": dict(fm), "picks": dict(picks)}
