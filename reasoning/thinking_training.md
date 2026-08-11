@@ -8913,3 +8913,100 @@ for round 6, times the 9.5% of them the fallback rescues = **+0.18pp**. Below th
 provably identical to `sum(ok)` here), and no historical number needs recomputing — which is also the reason
 the fallback was written as an opt-in rather than a patch to `extract_boxed`. **Silently changing a grading
 primitive would have re-based every number in §41 for +0.18pp.**
+
+### §41bf — ⭐79% OF THE REMAINING GAP IS COVERAGE, NOT SELECTION. The sharpening lever is nearly exhausted BY CONSTRUCTION.
+
+`greedy` decomposes exactly into three additive gaps, and every term is already in the gate JSONs:
+`pass@8` is coverage (can the model reach gold at all in 8 samples), `sc@8 − pass@8` is selection (can it pick
+the right one), `greedy − sc@8` is the floor (does a single greedy decode realise the vote). Five-pool means,
+largest-n record per (model, pool):
+
+| model | greedy | best-decode | sc@8 | pass@8 | never-solved | selection gap |
+|---|---:|---:|---:|---:|---:|---:|
+| a4combo (pre-KD) | 43.44 | 44.17 | 50.94 | 68.94 | 31.06 | 18.00 |
+| **a4 round 6** | 47.01 | 50.73 | 54.11 | 68.76 | 31.24 | **14.65** |
+| 3.5-think (target) | 55.10 | 58.85 | 61.58 | 75.12 | 24.88 | 13.54 |
+
+**Decomposition of the +8.09 greedy gap that remains:**
+
+| component | gap | what targets it |
+|---|---:|---|
+| **COVERAGE** (pass@8) | **+6.36** | new solutions the model cannot currently produce |
+| SELECTION (sc@8 given pass@8) | +1.11 | sharpening / mode-seeking KD |
+| FLOOR (greedy vs sc@8) | +0.62 | closure, termination, the repair pass |
+
+⚠️(Absolute values differ by ~2pt from §41az's five-pool table because this takes the largest-n record per
+cell across every gate JSON rather than one matched run; the *decomposition* is a within-table contrast and is
+unaffected. Do not quote these as the headline — §41az's matched numbers are the headline.)
+
+**✅THIS EXPLAINS §41aw AND RE-ORDERS EVERYTHING LEFT.** Six rounds of on-policy KD took the selection gap
+from **18.00 to 14.65** against the target's 13.54 — i.e. a4's ability to pick among what it can reach is now
+within **1.11pt** of 3.5-think's. That is why the deployed metric saturated at round 3 and why every
+sharpening arm since has returned ~1pt: **the lever is nearly exhausted because the quantity it moves is
+nearly closed.** Mode-seeking reverse KL was the right objective and it did its job.
+
+**What remains is that a4 never solves 31.24% of problems in 8 samples against the target's 24.88%.** The
+lever with the big number on it is now COVERAGE, and that reframes the audition running right now: a stronger
+teacher is worth having not mainly because it sharpens, but because §41ai already measured per-token KD moving
+coverage (never-solved 44.6% → 42.0% in one round). Both remaining ideas point the same direction —
+* **per-token KD from a stronger same-tokenizer teacher** (auditioning: `Qwen3-1.7B-Base`, `Qwen3-0.6B-Base`,
+  brevity-conditioned `Qwen3-4B`), and
+* **prefix + expert completion** — let a stronger same-tokenizer model *complete* a4's own partial traces,
+  keep the splices that reach gold, and SFT on them. Distinct from both refuted arms: unlike off-policy
+  imitation of Llama-3.1-8B (§41c, a null) the prefix is a4's own, so style and length stay a4's; unlike
+  gold-anchored self-distillation (§41m, refuted) the completion comes from a genuinely better model rather
+  than from a4 with privileged context. It attacks the 31.24% directly, which nothing else here does.
+
+⚠️And the honest caveat on that +6.36: a 1.04B model reaching a 2.88B model's coverage may simply not be
+available at this parameter count. §39 measured a4's phase-C base at −26.5 mmlu / −41.2 gsm8k against
+Qwen3-0.6B-Base, so the coverage deficit is inherited from pretraining, which is the one thing post-training
+cannot rewrite. Coverage is the biggest target left; it is not therefore an achievable one.
+
+### §41bg — THE FULL AUDITION TABLE. Six candidates, one survivor, and a base model fails for a reason no instruct model does.
+
+Job 53285354, six candidates × 6 steps against the round-6 student on its own dump, ~3 min each. `haz_s` /
+`haz_t` are the marginal closure hazards over every completion position; the ratio is what predicts survival.
+
+| candidate | revKL | agree | `haz_s` | `haz_t` | **ratio** | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `a35ref` released 3.5-think | 0.1057 | 92.7% | 0.0052 | 0.0052 | **1.000** | ✅the arm that worked (+7.73) |
+| `plain` Qwen3-4B | 0.9793 | 78.3% | 0.0052 | 0.0044 | 0.846 | ⛔§41bb: 88–97% unclosed |
+| `nothink` Qwen3-4B + `/no_think` | 1.1754 | 73.4% | 0.0038 | 0.0031 | 0.816 | ⛔worse than plain |
+| `brief` Qwen3-4B + brevity hint | 0.9809 | 76.0% | 0.0074 | 0.0046 | 0.622 | ⛔worse than plain |
+| `q3_17b_base` Qwen3-1.7B-Base | 0.7458 | 78.7% | 0.0052 | **0.0000** | **0.000** | see below |
+| `q3_06b_base` Qwen3-0.6B-Base | 0.8164 | 78.6% | 0.0052 | **0.0000** | **0.000** | see below |
+
+The 3.5-think anchor reproduced to four decimals across two independent jobs, so the instrument is stable and
+the ratios are comparable. ⚠️One caveat: a hint lengthens the teacher's sequences, which changes micro-batch
+packing, so `haz_s` is not constant between hinted and unhinted rows (0.0074 / 0.0038 vs 0.0052). The *ratio*
+is paired within the same rows and stays valid; the absolute hazards are not comparable across that boundary.
+
+⛔**"MAKE THE TEACHER SHORT BY CONDITIONING ITS CONTEXT" IS REFUTED.** §41bb's one remaining repair was to put
+a brevity instruction in the teacher's context. Both forms made it **worse**: the explicit instruction
+dropped the ratio 0.846 → 0.622, and Qwen3's own `/no_think` control token dropped it to 0.816 while
+agreement fell 78.3% → 73.4%. Conditioning did not shorten the teacher, it degraded it — the same failure
+§41n found when a4-derived context was added to a hinted self-teacher. **Doing nothing to Qwen3-4B is the
+best version of Qwen3-4B for this purpose, and it is still fatal.**
+
+⭐**THE BASE MODELS FAIL FOR A COMPLETELY DIFFERENT REASON, AND IT IS THE ONLY ONE THAT IS FIXABLE.** Their
+teacher hazard is not merely low, it is **exactly 0.0000**, with p(`</think>` | closed) = **0.00**. `</think>`
+and `<|im_end|>` are instruct-only control tokens; a base model was never trained to emit them, so it assigns
+them ~no mass anywhere. Under reverse KL that is not a mismatch but a divergence — `p_s log(p_s/p_t)` blows
+up wherever the student wants to close and the teacher assigns ≈0 — which would drive closure to zero *harder*
+than any long-CoT teacher managed. **But the pathology is confined to two columns of 151,669**, and
+`--exclude-terminators` removes exactly those two, leaving revKL 0.75/0.82 at 78.7% agreement — as much signal
+as Qwen3-4B carries — in the columns that remain.
+
+⚠️**WHY §41w's NULL DOES NOT LICENSE SKIPPING THIS.** `--exclude-terminators` was measured as a null, but
+with the 3.5-think teacher, whose hazard already *matched* the student's at ratio 1.00. Masking a column the
+teacher is not abusing changes nothing — correctly. **That null was measured in the regime where the mask is
+unnecessary; this is the regime where it is the entire mechanism.** A null does not generalise outside the
+regime it was measured in, and treating it as though it did is how §41bb wasted a job on prefix-masking.
+
+**The falsifiable prediction, stated before the result:** a base model has no think-length *policy* to
+transfer — conditioned on a4's own partial trace it continues that trace's style, because in-context
+imitation is what base-model next-token prediction is. So the body-level lengthening that killed §41bb's
+arms should NOT appear once the two terminator columns are masked. `closure_smoke.py` is the arbiter.
+Job 53286497 runs `q17base` (Qwen3-1.7B-Base, ~1.7× a4's params) and `q06base` (Qwen3-0.6B-Base) as an
+explicit **capability control**: if the 0.6B teacher moves the gate as much as the 1.7B one, the gain is not
+teacher capability and must not be attributed to it. `repairlo` rides along to bank §41bc's one useful arm.
