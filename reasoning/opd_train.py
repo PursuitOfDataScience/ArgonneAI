@@ -332,7 +332,7 @@ def main():
     ap.add_argument("--student", required=True)
     ap.add_argument("--model_def", default="model.py")
     ap.add_argument("--tokenizer_path", default="")
-    ap.add_argument("--teacher", required=True,
+    ap.add_argument("--teacher", default="",
                     help="a model dir, or 'self' to freeze a copy of the student as the teacher "
                          "(only meaningful together with --hint-template)")
     ap.add_argument("--hint-template", default="",
@@ -435,9 +435,20 @@ def main():
     model.train()
 
     # ---- teacher: forward-only, bf16, frozen -------------------------------------------
+    # A pure-CE pass (--kd-weight 0) needs NO teacher: §41ap's repair pass trains on the model's own
+    # verified-correct traces to pull in the unclosed tail and the empty-think mode, and loading a 2.88B
+    # teacher to multiply its output by zero would cost a forward pass per micro-batch for nothing.
     t0 = time.time()
+    if a.kd_weight == 0.0:
+        if a.ce_weight <= 0.0:
+            raise SystemExit("--kd-weight 0 with --ce-weight 0 has no loss at all")
+        teacher = None
+        print(f"[opd] NO teacher: pure-CE pass (kd_weight=0, ce_weight={a.ce_weight}) on rows "
+              f"labelled {sorted(a.labels)}", flush=True)
     self_teacher = (a.teacher == "self")
-    if self_teacher:
+    if a.kd_weight == 0.0:
+        pass
+    elif self_teacher:
         if not a.hint_template:
             raise SystemExit("--teacher self without --hint-template is a no-op: the teacher would "
                              "be the student's own initial distribution and every KL term is 0")
@@ -458,14 +469,16 @@ def main():
         teacher = AutoModelForCausalLM.from_pretrained(
             a.teacher, dtype=torch.bfloat16, attn_implementation="sdpa", trust_remote_code=True)
         ttok = AutoTokenizer.from_pretrained(a.teacher)
-    teacher.config.use_cache = False
-    teacher.to(dev).eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    print(f"[opd] teacher {'self (frozen copy of the student)' if self_teacher else os.path.basename(a.teacher)}  "
-          f"{sum(p.numel() for p in teacher.parameters()) / 1e9:.2f}B  "
-          f"vocab={teacher.config.vocab_size}  div={a.div}  loaded in {time.time() - t0:.0f}s",
-          flush=True)
+    if teacher is not None:
+        teacher.config.use_cache = False
+        teacher.to(dev).eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+    if teacher is not None:
+        print(f"[opd] teacher {'self (frozen copy of the student)' if self_teacher else os.path.basename(a.teacher)}  "
+              f"{sum(p.numel() for p in teacher.parameters()) / 1e9:.2f}B  "
+              f"vocab={teacher.config.vocab_size}  div={a.div}  loaded in {time.time() - t0:.0f}s",
+              flush=True)
     if a.hint_template:
         print(f"[opd] teacher hint template: {a.hint_template!r}", flush=True)
 
@@ -476,12 +489,12 @@ def main():
              "clips in May. How many clips did Natalia sell altogether?\n"
              "<think>\n48 / 2 = 24, so 48 + 24 = 72.\n</think>\n\nThe answer is $\\boxed{72}$.")
     ia = tok.encode(probe, add_special_tokens=False)
-    ib = ttok.encode(probe, add_special_tokens=False)
+    ib = ia if teacher is None else ttok.encode(probe, add_special_tokens=False)
     if ia != ib:
         raise SystemExit(f"FATAL tokenizer mismatch: student {len(ia)} ids vs teacher {len(ib)} "
                          "-- per-token KD is only defined under identical tokenisation")
     for t in ("<think>", "</think>", "<|im_end|>"):
-        if tok.convert_tokens_to_ids(t) != ttok.convert_tokens_to_ids(t):
+        if teacher is not None and tok.convert_tokens_to_ids(t) != ttok.convert_tokens_to_ids(t):
             raise SystemExit(f"FATAL special-token id mismatch on {t!r}")
     print(f"[opd] tokenizer identity verified on a {len(ia)}-token probe "
           f"(+ <think>/</think>/<|im_end|> ids)", flush=True)
@@ -551,8 +564,10 @@ def main():
             t_ids, t_cmask = t_ids.to(dev), t_cmask.to(dev)
             kmask, t_kmask = kmask.to(dev), t_kmask.to(dev)
 
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                t_logits = teacher(input_ids=t_ids).logits
+            t_logits = None
+            if teacher is not None:
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    t_logits = teacher(input_ids=t_ids).logits
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s_out = model(input_ids=ids)
             s_logits = s_out.logits
@@ -562,12 +577,13 @@ def main():
             # positions. Both gathers walk their own sequence in order, so row k of each flat
             # tensor is the same completion token under both models.
             s_flat = gather_completion(s_logits, kmask, V)
-            t_flat = gather_completion(t_logits, t_kmask, V)
-            if s_flat.shape[0] != t_flat.shape[0]:
+            t_flat = None if t_logits is None else gather_completion(t_logits, t_kmask, V)
+            if t_flat is not None and s_flat.shape[0] != t_flat.shape[0]:
                 raise RuntimeError(f"completion-token count mismatch student {s_flat.shape[0]} vs "
                                    f"teacher {t_flat.shape[0]} -- the two prompts must share the "
                                    "completion exactly")
-            L_kd = kd_loss(s_flat, t_flat, a.teacher_temp, a.div, keep_idx)
+            L_kd = (torch.zeros((), device=dev) if t_flat is None
+                    else kd_loss(s_flat, t_flat, a.teacher_temp, a.div, keep_idx))
             L = a.kd_weight * L_kd
             L_ce = torch.zeros((), device=dev)
             if a.ce_weight > 0:
@@ -581,7 +597,7 @@ def main():
             # pre-increment here, so this fires exactly once per optimizer step): they need
             # another pass over a [n_tokens, 151669] tensor and paying that every micro-step would
             # slow the run for numbers only read in the log.
-            if micro_i % a.grad_accum == 0:
+            if micro_i % a.grad_accum == 0 and t_flat is not None:
                 with torch.no_grad():
                     n_tok = s_flat.shape[0]
                     if n_tok:
