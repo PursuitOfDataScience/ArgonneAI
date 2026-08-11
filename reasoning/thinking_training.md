@@ -7900,3 +7900,46 @@ context both "amplify confusion without sufficient model capacity".
 separate model and the only channel is a per-token distribution at states the student itself chose. That is
 precisely the one channel this base can still use — which is now a measured property rather than a lucky
 design choice.
+
+### §41ag — WHAT THE GAIN ACTUALLY IS: mostly learned abstention, partly real selection, and coverage untouched
+
+Round 2's generation pass re-sampled 93,912 rollouts from `think_opd35anchor` on the same train pools with
+the same settings as the baseline's, so the two rollout distributions are directly comparable. This is the
+sharpest available look at what the objective did, and it qualifies the headline:
+
+| | combo | opd35anchor | Δ |
+|---|---:|---:|---:|
+| correct | 23.31% | 25.37% | **+2.05** |
+| **wrong** | 59.39% | 44.87% | **−14.52** |
+| unclosed | 15.90% | 21.48% | +5.58 |
+| no_answer | 1.40% | 8.29% | +6.89 |
+| `acc\|ANSWERED` (train pools) | 28.2% | **36.1%** | **+7.9pp** |
+
+**14.52pp of confidently-wrong rollouts were converted — and 12.47pp of that went to ABSTENTION
+(unclosed + no_answer), only 2.05pp to correct.** So a large share of the `acc|ANSWERED` gain is precision
+bought by declining to answer, not by getting more answers right. The train-pool `acc|ANS` gain (+7.9pp)
+matches the eval pools' +7.8pp exactly, so this is the same effect seen from the other side.
+
+**Three reasons it is nonetheless not ONLY abstention:**
+1. **Greedy accuracy ROSE** (+3.40 five-pool, +2.78 four-pool). An abstention-only change must LOWER greedy,
+   because an abstained answer scores zero. Real answers got better.
+2. **Selection among covered answers improved independently:** gold is the plurality answer in **65.2% →
+   69.5%** of solvable-but-unreliable problems (+4.3pp), and problems solved 8/8 went **2.1% → 3.5%**. Those
+   are properties of the answer distribution, not of the abstention rate.
+3. `correct` itself rose +2.05pp.
+
+**And coverage is untouched, which is the third independent confirmation of §41r's central claim:**
+never-solved-in-8 went **44.1% → 44.6%** and solved-at-least-once **55.9% → 55.4%** — flat. The eval pools
+said `pass@8` −0.93 (n.s.); the train pools say the same thing in a completely different measurement. **The
+objective moved selection and commitment, and added no new coverage whatsoever.**
+
+⚠️**This also explains why force-closing gains MORE than plain greedy** (+4.85 vs +3.40 four-pool): the
+abstentions are recoverable. Force-closing converts a refusal back into the model's best guess, and those
+guesses are drawn from a distribution whose precision improved — so the wrapper harvests exactly the 12.5pp
+that abstention parked.
+
+⚠️**And where there is no coverage, there is no gain.** On `math_train_hard` the correct rate went **7.71% →
+7.38%** while unclosed went **28.47% → 35.65%**: pure abstention, no improvement. That is the train-pool
+mirror of math500's eval behaviour (§41ad) and the same limitation stated twice — **on problems the model
+cannot solve, this objective teaches it to stop pretending, which is worth nothing on an accuracy metric and
+would be worth something on a calibration one.**
