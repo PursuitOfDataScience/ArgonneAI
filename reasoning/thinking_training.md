@@ -8215,3 +8215,44 @@ remains worth +3.7 to the artifact and the deployed configuration should use it.
 Rounds 4-6 are now running from round 3 (job 53255641) to find where the trend saturates. Each round prints
 `fail_taxonomy.py` on its own fresh rollouts before training, so saturation will be visible round by round
 from behaviour rather than from the divergence (§41ai).
+
+### §41ao — ⚠️A FOURTH NAME COLLISION, and this one silently corrupted a running job
+
+`a4_opd_iter.sh`'s round counter restarts at 2 in **every** invocation, so per-round artifact names are
+unique within a job and collide across jobs. Submitting a second chain from `think_opd_r3` therefore:
+
+1. **overwrote** `report/a4_opd_r2_taxonomy.json` — the anchor-round rollout distribution, which now survives
+   only in §41ag/§41ai's write-ups (the numbers are recorded, the JSON is gone);
+2. and then hit `if [ ! -f "$OUT/.opd_complete" ]` on `$ROOT/think_opd_r2`, **which already existed from the
+   previous job**, printed `>>> round 2 already trained`, and **skipped training entirely** — followed by
+   `>>> round 3 rollouts already present`, reusing a stale dump generated from a different policy.
+
+So the job generated 94k fresh rollouts, threw them away, re-smoke-tested two old checkpoints, and would
+have gated them as if they were new. **Cancelled and resubmitted after fixing the naming** (`TAG` derived
+from `$START`, so paths carry the chain they belong to: `a4_opd_opd_r3_r2`, `think_opd_opd_r3_r2`, …).
+
+⚠️**This is the FOURTH instance of one defect in a single session**, and it is worth stating as a rule
+because the four look superficially unrelated:
+
+| where | the name | what it would have cost |
+|---|---|---|
+| `a4_entbranch.sh` | model list globbed from disk | 4x the job, on three known regressions |
+| `a4_opd_iter.sh` | retention exempted `think_opd` **by name** | **deleting the session's best artifact** |
+| `a4_opd_iter.sh` | gate baseline hardcoded to a non-ancestor | a McNemar measuring two differences as one |
+| `a4_opd_iter.sh` | per-round artifacts unique only *within* a job | a job silently training nothing |
+
+> **A name that is unique within the scope you were thinking about is not unique within the scope that
+> matters.** Every one of these was correct when written, and became wrong when a checkpoint was deleted,
+> repointed, or re-run. None was caught by a test; all four were caught by reading the launcher against the
+> current on-disk inventory.
+
+⚠️And the specific trap in the last one is worth its own line: **an idempotence guard (`skip if
+.opd_complete exists`) turns a name collision from an overwrite into a SILENT NO-OP.** Resume-safety and
+unique naming are the same requirement, not two; a launcher that can skip completed work must key that skip
+on something that identifies the work, not merely its position in a loop.
+
+**The one real measurement the cancelled job produced** — a fresh rollout distribution from `think_opd_r3` —
+is preserved as `report/a4_opd_r3policy_taxonomy.json`: **never-solved 40.8%** (round 2's was 42.0%),
+`acc|ANSWERED` **42.6%** (41.5%), correct rollouts **29.50%** (29.10%), gold-appears-somewhere **74.3%**
+(73.6%). The trend is still improving and clearly flattening: `acc|ANSWERED` per round is **+14.4pp → +5.4pp
+→ +1.1pp**, never-solved **−0.5 → −2.6 → −1.2pp**. That is what the resubmitted chain is measuring.
