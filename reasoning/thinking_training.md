@@ -7952,9 +7952,13 @@ round 1's 0.1872 — the student is already much closer to the teacher on the st
 visits. And it does not fall over the epoch (0.1326 → 0.1385 at step 1900, argmax agreement 90.9% → 89.9%).
 Round 1's fell 0.1872 → 0.1512.
 
-That is the honest read on iteration: **one round captures most of what this teacher can transfer.** The
-residual 0.13 nats / ~10% argmax disagreement is presumably the irreducible 1.04B-vs-2.88B gap, and pushing
-on it is the same shape of mistake as §41n's irreducible-divergence drift.
+~~That is the honest read on iteration: **one round captures most of what this teacher can transfer.**~~
+⚠️⚠️**WRONG — REFUTED BY §41ai, and the error is methodological, not arithmetic.** Round 2's own rollouts
+show large improvements on every measure, including coverage. A flat per-token divergence does NOT imply a
+flat policy: **the divergence is measured AT THE STUDENT'S OWN STATES, so it is a moving target by
+construction.** As the student improves, the states it visits improve, and the distance to the teacher at
+those *better* states can stay constant while the policy gets substantially better. **On-policy divergence
+is not a progress metric.** See §41ai.
 
 Closure smoke, 200 asdiv items: greedy **65.00%**, unclosed 15.5%, mean decoded **267** — against its own
 starting point's 62.50% / 13.5% / **241**. So round 2 is +2.50 on a subset whose noise band is ±3.4pp
@@ -7975,3 +7979,49 @@ its referent moves.** The repo has recorded this failure mode before for untrack
 worktree path. Every one of these was caught by reading the launcher against the current checkpoint
 inventory rather than by any test, which is an argument for doing that read every time a checkpoint is
 deleted or repointed.
+
+### §41ai — ⭐ITERATION WORKS, AND IT MOVES COVERAGE. On-policy divergence is not a progress metric.
+
+Round 3's generation pass re-sampled 93,912 rollouts from round 2's checkpoint, giving three directly
+comparable rollout distributions on identical problems and settings:
+
+| metric | combo | round 1 (`anchor`) | **round 2** |
+|---|---:|---:|---:|
+| rollouts correct | 23.31% | 25.37% | **29.10%** |
+| rollouts wrong | 59.39% | 44.87% | **40.98%** |
+| rollouts unclosed | 15.90% | 21.48% | 24.15% |
+| rollouts no_answer | 1.40% | 8.29% | 5.77% |
+| **`acc\|ANSWERED`** | 28.2% | 36.1% | **41.5%** |
+| **never solved in 8** | 44.1% | 44.6% | **42.0%** |
+| solved ALL 8 | 2.1% | 3.5% | **5.9%** |
+| gold is the PLURALITY (solvable) | 65.2% | 69.5% | **72.9%** |
+| **gold appears in SOME trace** | 70.0% | 71.9% | **73.6%** |
+| gsm8k_train correct rate | 30.86% | 35.33% | **41.88%** |
+| math_train_hard correct rate | 7.71% | 7.38% | **8.28%** |
+
+**1. Round 2 improved everything, including the things round 1 did not.** `acc|ANSWERED` +5.4pp on top of
+round 1's +7.9pp (cumulative **+13.3pp**), correct rollouts +3.73pp (round 1: +2.06pp), and — the important
+one — **never-solved-in-8 fell 44.6% → 42.0% and gold-appears-somewhere rose 71.9% → 73.6%.** Round 1 left
+coverage exactly where it found it (§41ag, and `pass@8` −0.93 n.s. at the gate). **Round 2 moved it.** The
+model is now finding answers it had never found in 8 samples before. Even `math_train_hard`, which round 1
+made *worse* (7.71% → 7.38%), improved to 8.28%.
+
+**2. ⚠️SO §41ah's "the signal is exhausted" READ WAS WRONG, and the mistake is worth more than the result.**
+I inferred exhaustion from the reverse KL starting at 0.1326 (vs round 1's 0.1872) and staying flat across
+the epoch. But:
+
+> **On-policy divergence is measured AT THE STUDENT'S OWN STATES, so it is a moving target by construction.**
+> As the student improves, the states it visits improve, and its distance to the teacher *at those better
+> states* can hold constant while the policy gets substantially better. A flat KL means "the student is as
+> close to the teacher as before, on harder-won ground" — not "nothing was learned."
+
+**On-policy divergence is not a progress metric and must not be read as one.** The only honest progress
+metrics here are the ones measured on the policy's own behaviour: the rollout distribution above, and the
+gate. This is the same species of error as §41f (a statistic conditioned on the failure being absent) and
+§41j (pricing a lever by an exhausted family's best) — **three times this session, the mistake was trusting
+a convenient proxy over a direct measurement of the thing itself.**
+
+**3. Consequence: iterate further.** Round 3 is already training as part of the same job (`ROUNDS=2` runs
+R=2 and R=3). The trend across two rounds is monotone on nine of ten measures, so the run to make next is
+another round, not a new mechanism — and the earlier plan to "stop at one round because the KL flattened"
+would have thrown that away on the basis of a metric that cannot see it.
