@@ -8129,3 +8129,47 @@ and the force-closed gap **16.35 → 8.80**, with `acc|ANSWERED` **18.5pp → 8.
 ⚠️Four-pool and five-pool means for round 3 are pending the gate's second stage. The four-pool figures for
 round 1 (§41ac) were consistently ~6pt below the two-pool ones, so expect the same offset rather than the
 numbers above.
+
+### §41am — ⭐⭐⭐DEFINITIVE: four clean pools, 3,000 items. Deployable +7.30, `pass@8` untouched.
+
+| model | greedy | +budget | +extend1 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.75 | 62.15 | **63.12** | 68.88 | 80.60 | 73.3% | 12.33 |
+| **a4opdi_a100 (round 3)** | **52.17** | 55.20 | **55.87** | **60.42** | 74.35 | **64.6%** | 17.55 |
+| a4opd35_a100 (round 1) | 50.62 | 53.17 | 53.25 | 59.43 | 73.42 | 62.2% | 16.68 |
+| a4combo_a100 (session start) | 48.02 | 48.40 | 48.20 | 56.70 | 74.03 | 53.2% | 9.12 |
+
+Pooled paired McNemar over all 3,000 items, round 3 against the session's starting checkpoint:
+
+| config | round 3 | start | Δ | p |
+|---|---:|---:|---:|---:|
+| greedy | 54.93 | 50.93 | **+4.00** | 3.66e-06 |
+| +budget | 58.33 | 51.47 | +6.87 | 6.31e-16 |
+| **+extend1** | 58.97 | 51.30 | **+7.67** | **7.35e-20** |
+| +extend2 | 58.80 | 51.53 | +7.27 | 1.36e-17 |
+| self-cons@8 | 63.77 | 60.50 | +3.27 | 3.27e-06 |
+| **pass@8** | 78.03 | 77.83 | **+0.20** | **7.90e-01 (unchanged)** |
+
+**THE SESSION, four clean pools:**
+
+| | start | end | Δ |
+|---|---:|---:|---:|
+| greedy (pool-mean) | 48.02 | **52.17** | **+4.15** |
+| **best decode** | 48.58 | **55.87** | **+7.30** |
+| self-cons@8 | 56.70 | **60.42** | +3.72 |
+| **`acc\|ANSWERED`** | 53.2% | **64.6%** | **+11.4pp** |
+| pass@8 | 74.03 | 74.35 | +0.32 |
+
+**Gap to the released argonne-3.5-think: greedy 12.73 → 8.58, best-decode 14.74 → 7.45, `acc|ANSWERED`
+20.1pp → 8.7pp.** On a base measured at −16.79pt against 3.5's (§40), a 1.04B model against a 2.88B one.
+
+**For scale against everything that came before:** the thirteen arms preceding this session moved the
+five-pool deployable number 39.21 → 44.17, **+4.96 in total across ~10 GPU-days**. This session's
+**+7.30** came from one objective in three iterations, and `extend1`'s p = 7.35e-20 makes it the most
+significant result the line has produced.
+
+**And the shape of it is the point.** `pass@8` moved +0.20 (p=0.79) — the model knows exactly what it knew
+at the start of the session. Everything gained was in *committing to what it already knew*: `acc|ANSWERED`
++11.4pp, self-consistency +3.72, greedy +4.15, best-decode +7.30. §41j opened this session by measuring
+that a4 "reaches answers it cannot select" and pricing the fix at +1.24. The fix was worth +7.30, and it
+worked by changing which answer the argmax lands on rather than by teaching the model anything new.
