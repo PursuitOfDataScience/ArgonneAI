@@ -7197,3 +7197,50 @@ for logprobs and handles that case. Neither ever overrides a clear plurality. Wh
 empirical question about how often greedy is right on a near-tie, which is what `a4_entbranch.sh`
 measures — nine selectors on identical candidate sets with per-item `ok` arrays, plus the eval-pool
 margin distribution that §41l could only measure on the train pools.
+
+### §41p — ⭐PER-TOKEN ON-POLICY KD MOVES `acc|ANSWERED` FOR THE FIRST TIME: +7.6pp
+
+Five-model paired gate, asdiv + svamp at n=1000, identical items, one call:
+
+| model | greedy | sc@8 | pass@8 | **acc\|ANS** | uncl% | t_len | Δgreedy | McNemar p |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 80.70 | 92.00 | 79.5% | 8.60 | 237.5 | +14.15 | — |
+| **a4opd35_a100** | **58.40** | 68.95 | 83.95 | **68.8%** | 14.35 | 265.6 | **+1.70** | asdiv 0.11 / svamp 1.3e-4 |
+| a4combo_a100 | 56.70 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 | — | — |
+| a4gasd_ansonly_a100 | 35.10 | 49.85 | 73.55 | 52.0% | 21.45 | 219.5 | −21.60 | 1.6e-56 / 1.3e-14 |
+| a4gasd_full_a100 | 34.80 | 38.15 | 71.90 | 50.7% | 30.30 | 280.7 | −21.90 | 2.1e-49 / 6.5e-15 |
+
+**`acc|ANSWERED` rose 61.2% → 68.8%, +7.6pp, and the sign is consistent on both pools** (asdiv 69.3 →
+74.4, svamp 53.0 → 63.2). That is the number thirteen previous arms left frozen — the best any of them
+reached was +2.5pp (RLVR-DPO), and this closes **41% of the remaining gap to 3.5-think's 79.5%**.
+
+**Why greedy only moved +1.70.** `greedy = acc|ANSWERED × answered-rate`, and the answered rate fell
+92.7% → 85.1% as unclosed doubled (7.15% → 14.35%) and `t_len` went 200 → 266. The capability gain is
+real and is being spent on the termination regression. The arithmetic:
+
+> **68.8% `acc|ANSWERED` at combo's 92.7% answered rate is greedy 63.8 — +7.1 over the baseline**, more
+> than the entire thirteen-arm campaign produced (39.21 → 43.44 = +4.2 five-pool).
+
+⚠️**Honest caveats, stated before the follow-up:** the pool-mean greedy gain of +1.70 is ~2σ against the
+measured ±0.87 seed noise and the two pools DISAGREE IN SIGN on greedy (asdiv −2.50 at p=0.11, svamp
++5.90 at p=1.3e-4); with ~17 arms on this base the Bonferroni threshold is p<0.003, which svamp clears
+and the pool-mean has no p for. What is robust is `acc|ANSWERED`: +5.1pp and +10.2pp, same sign, far
+outside noise, and mechanistically coherent with the trace-shape numbers. **Read this as "the mechanism
+works and the shape regression is eating it", not as "+1.70 greedy".** A seed replicate is required
+before any of it is quoted as a headline.
+
+**And it retro-explains §41f.** The Qwen3-4B arm produced greedy 1.75 because reverse KL from a long-CoT
+teacher destroyed termination — but the same objective from a length-matched teacher moves capability.
+The channel was never the problem; the teacher's trace-length distribution was. That is now measured
+twice from opposite directions.
+
+**The follow-up is already built and numerically verified.** `--exclude-terminators` drops the
+`</think>` and eos columns from the divergence so the teacher cannot touch trace length (the excluded
+logits receive exactly zero gradient, checked), and `--ce-weight` anchors format with a likelihood term
+on gold-verified rows. `a4_kd3.sh` runs both, and its teacher is now pointed at **3.5-think** rather than
+Qwen3-4B, because 3.5-think is the teacher that actually produced the +7.6pp.
+
+**GASD is refuted with two independent p-values under 1e-14 per pool**, at −21.6/−21.9 pool-mean, and
+the failure channels are exactly as §41n's calibration-destruction account predicts: `ansonly` pushes
+no_answer to 162/1000 on asdiv (the hint's advantage is all at the answer position), `full` pushes
+unclosed to 316/1000 (the reference derivation makes the teacher confident throughout the body).
