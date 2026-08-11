@@ -112,6 +112,17 @@ def main():
     ap.add_argument("--select", choices=["never", "rare", "all"], default="never",
                     help="never = 0/K rollouts correct (the 31.24% coverage hole, the point of this "
                          "file); rare = 1..floor(K/4); all = every problem")
+    ap.add_argument("--pools", nargs="*", default=None,
+                    help="restrict to these TRAIN pools. ⚠️MATTERS FOR MEASUREMENT INTEGRITY, not just "
+                         "transfer: the coverage hole is 57.1%% math_train_hard (2,586 of 4,531 "
+                         "never-solved problems, a 67.5%% never-solved rate there vs 24.8%% on "
+                         "gsm8k_train), and MATH-train near-dups MATH-500 in every self-generated mix "
+                         "on this line. Training on math_train_hard completions therefore makes the "
+                         "math500 column uninterpretable while leaving the four CLEAN grade-school "
+                         "pools (asdiv/svamp/mawps/gsmplus) unaffected -- so it is allowed, but the "
+                         "headline must be the four-pool number and math500 must be flagged. Pass "
+                         "`--pools gsm8k_train math_train_easy` to avoid the issue entirely at the "
+                         "cost of 57%% of the fuel.")
     ap.add_argument("--prefixes-per-problem", type=int, default=2)
     ap.add_argument("--prefix-tokens", type=int, default=96,
                     help="tokens of a4's own trace to keep. §41b: 79% of wrong traces already differ "
@@ -153,6 +164,9 @@ def main():
     stat = Counter()
     chosen = []
     for (pool, q), rs in sorted(by_q.items()):
+        if a.pools and pool not in a.pools:
+            stat["skip_pool_filtered"] += 1
+            continue
         n_ok = sum(1 for r in rs if r["label"] == "correct")
         K = len(rs)
         if a.select == "never" and n_ok != 0:

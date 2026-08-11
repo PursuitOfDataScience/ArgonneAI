@@ -9010,3 +9010,35 @@ arms should NOT appear once the two terminator columns are masked. `closure_smok
 Job 53286497 runs `q17base` (Qwen3-1.7B-Base, ~1.7× a4's params) and `q06base` (Qwen3-0.6B-Base) as an
 explicit **capability control**: if the 0.6B teacher moves the gate as much as the 1.7B one, the gain is not
 teacher capability and must not be attributed to it. `repairlo` rides along to bank §41bc's one useful arm.
+
+### §41bh — THE COVERAGE HOLE IS 57% COMPETITION MATH, which makes the pool filter a DECONTAMINATION decision
+
+Before building coverage data, where the hole actually lives. Round 6's own dump, 11,738 train problems,
+a problem counted "never-solved" when 0 of its 8 rollouts grade correct:
+
+| train pool | problems | never-solved | rate | share of the hole |
+|---|---:|---:|---:|---:|
+| gsm8k_train | 4,000 | 991 | 24.8% | 21.9% |
+| math_train_easy | 3,908 | 954 | 24.4% | 21.1% |
+| **math_train_hard** | 3,830 | **2,586** | **67.5%** | **57.1%** |
+| TOTAL | 11,738 | 4,531 | 38.6% | |
+
+**57.1% of the coverage hole is competition MATH**, and **MATH-train near-dups MATH-500 in every
+self-generated mix on this line** (a standing warning in the a4 memory, and invisible to exact-match
+decontamination). So generating verified completions on `math_train_hard` and training on them would leave
+the four CLEAN grade-school pools (asdiv/svamp/mawps/gsmplus) unaffected while making the **math500 column
+uninterpretable** — one of the five pools in the headline. That is a measurement-integrity question, not a
+transfer question, and it has to be decided before the data is built rather than caveated afterwards.
+
+**Decided: `--pools gsm8k_train math_train_easy`, 1,945 problems instead of 4,531.** Three reasons, and the
+first is the one that would stand alone:
+1. It keeps math500 interpretable. Training on near-dups of an eval pool is not a trade to make for fuel.
+2. **The four clean pools are grade-school word problems**, so gsm8k_train + math_train_easy is the
+   better-*matched* signal, not merely the safer one. Improving grade-school arithmetic reasoning by
+   training on competition MATH is an indirect bet; the matched version is a direct one.
+3. A 1.04B model is least likely to absorb the hardest traces anyway — 67.5% never-solved on that pool says
+   those problems are far outside its reach, so the yield would be lowest exactly where the risk is highest.
+
+The hard half stays available as an explicit follow-up (`POOLS=` in `reasoning/a4_pfxcomp.sh`) if the matched
+version works. ⚠️It must never be *mixed in silently*: `build_prefix_completions.py --pools` exists so the
+decision is recorded in the command line and in the stats JSON, rather than living in a comment.
