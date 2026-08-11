@@ -7792,3 +7792,65 @@ On long-derivation problems it can cost more than it buys unless the length is c
 prediction for anything with longer traces than these five pools, and it is the strongest argument for
 shipping `anchor` rather than the unprotected arm — not the 1.4pt of five-pool greedy between them, but the
 fact that one is positive everywhere and the other is not.
+
+### §41ae — THE FREE SELECTOR: self-certainty Borda beats voting by +1.60, and that is the whole answer
+
+`a4_entbranch.sh` on `think_opd35anchor`, nine selectors on identical candidate sets, N=8 independent
+samples. asdiv+svamp pool-mean (greedy 43.10, oracle 65.70):
+
+| selector | acc | vs `vote` |
+|---|---:|---:|
+| oracle (any of the 8) | 65.70 | +15.70 |
+| **borda** — Borda over self-certainty ranks | **51.60** | **+1.60** |
+| wvote — vote weighted by raw self-certainty | 51.30 | +1.30 |
+| vtb0 — vote, exact ties broken by self-certainty | 51.20 | +1.20 |
+| gtb0 / vtb1 | 50.70 | +0.70 |
+| vfyvote — vote weighted by zero-shot p(Yes) | 50.60 | +0.60 |
+| **vote** (the baseline, i.e. self-consistency) | **50.00** | — |
+| gtb1 | 49.20 | −0.80 |
+| ent — pure self-certainty argmax | 47.00 | −3.00 |
+| lp — pure max-mean-logprob argmax | 43.70 | −6.30 |
+| **selfvfy — pure zero-shot p(Yes) argmax** | **32.60** | **−17.40** |
+
+**1. The literature's claim reproduces, modestly.** Self-certainty + Borda does beat self-consistency, by
+**+1.60**. Voting captures 6.90 of the 22.60 points of oracle headroom; Borda captures 8.50 — **38% of the
+headroom against voting's 31%**. Real, free, and nowhere near closing the gap: **15.70pt remains
+unreachable by any selector tested.**
+
+**2. Every rule that lets confidence OVERRIDE the vote loses; every rule that lets it MODIFY the vote
+wins.** `ent`/`lp`/`selfvfy` as argmax pickers are −3.0/−6.3/−17.4. The same signals as a vote weight or a
+tie-break are +1.6/+1.3/+1.2/+0.6. That is the §41o/§41l prediction confirmed: the vote carries most of the
+information and confidence is a refinement, not a replacement.
+
+**3. Zero-shot self-verification is refuted as a reranker (−17.40)** and mildly useful as a vote weight
+(+0.60). Mean p(Yes) is 0.753-0.755 across all three pools against ~60% actual accuracy, so the verifier is
+both over-confident and weakly discriminative — exactly the 2026 process-verification finding that
+meta-cognition "amplifies confusion without sufficient model capacity" at small scale, and consistent with
+§22i's learned-verifier failure on this line.
+
+**4. §41l's near-tie premise was measured on train pools and is WEAKER on the eval pools** — this is why the
+tool re-measured it rather than assuming:
+
+| pool | vote wins on recoverable | margin-0 (exact ties) | near-ties (≤1) |
+|---|---:|---:|---:|
+| train pools (§41l) | 66.5% | 38.6% | 78.2% |
+| asdiv | 86.2% | 14.0% | 57.0% |
+| gsmplus | 64.4% | 27.8% | 60.2% |
+| mawps | 82.1% | 16.2% | 39.7% |
+
+So the "free accuracy sitting in sampling-order tie-breaks" is 14-28% of the vote's losses on the eval
+pools, not 38.6%, and `vtb0`'s measured +1.20 is the honest size of that lever — not the ~6.9pt the train
+pools implied. **§41l's estimate is corrected downward by its own follow-up.**
+
+**5. The BRANCHING premise is refuted, exactly as §41b predicted from trace length.** `branch_oracle`
+49.10 against `control_oracle` 65.70: four candidates sharing a prefix explore **16.6 points less** than
+nine independent samples. On 230-token traces there is no long shared prefix worth rescuing, so
+entropy-triggered branching has nothing to work with — even though the trigger fired on 87-93% of items at
+a median 27-32% through the trace, i.e. exactly where the literature says failures onset. **The trigger
+works; the premise does not transfer.**
+
+⚠️**Process note:** the n=1000 stage was SIGKILLed (exit 137) by the host OOM killer at `--mem=16G` AFTER
+printing its results but BEFORE writing its JSON, so the per-item `ok` arrays for asdiv/svamp are lost and
+only the log survives. `--selfverify` is the hog: ~11,500 candidate scores plus `prompt_logprobs` dicts per
+pool on top of two full candidate sets with per-token logprobs. Raised to 48G. Nothing analytical was lost,
+but the paired McNemar for those two pools cannot be recomputed without a re-run.
