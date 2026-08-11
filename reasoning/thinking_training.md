@@ -8256,3 +8256,46 @@ is preserved as `report/a4_opd_r3policy_taxonomy.json`: **never-solved 40.8%** (
 `acc|ANSWERED` **42.6%** (41.5%), correct rollouts **29.50%** (29.10%), gold-appears-somewhere **74.3%**
 (73.6%). The trend is still improving and clearly flattening: `acc|ANSWERED` per round is **+14.4pp → +5.4pp
 → +1.1pp**, never-solved **−0.5 → −2.6 → −1.2pp**. That is what the resubmitted chain is measuring.
+
+### §41ap — The length residual is a TAIL, and the objective is growing an EMPTY-THINK mode (1.4% → 9.2%)
+
+Think-token lengths by label, 40,000 rollouts from `think_opd_r3` at T=0.9:
+
+| label | n | median | mean | p90 |
+|---|---:|---:|---:|---:|
+| correct | 16,416 | **183** | 185.8 | 330 |
+| wrong | 16,568 | **184** | 183.0 | 384 |
+| unclosed | 4,908 | **512** (= the cap) | 506.5 | 512 |
+| **no_answer** | 2,108 | **2** | 22.2 | 2 |
+
+**1. Correct and wrong traces are the same length (183 vs 184).** Length does not discriminate correctness —
+a third independent confirmation of §41h, which found every text-derived selector 10-14pt worse than voting.
+Anyone tempted to filter or rerank by length on this model has now been told three times.
+
+**2. The unclosed 24% is a TAIL, not a shift.** Those traces sit at the 512-token cap; the body of the
+distribution has not moved much (median 198 across all rollouts). So the residual gap between plain greedy
+and force-closed (five-pool **+3.70 vs +6.58**, a 2.88pt spread) is bought entirely by traces that run to the
+cap. A CE anchor on the model's OWN correct traces targets median 183 / p90 **330** against the unclosed
+tail's 512 — the pull is in the tail, which is where it needs to be, and the targets are the model's current
+style rather than a stale checkpoint's.
+
+**3. ⚠️A REGRESSION NOT PREVIOUSLY NOTED: the empty-think mode is growing.** `no_answer` traces have a
+**2-token** think block — the model emits `<think>\n\n</think>` and then fails to produce a `\boxed{}`. That
+is the degenerate mode the 3.5 line already had to filter (§33's "empty-think-guess filter mandatory"), and
+across rounds it goes **1.40% (combo) → 8.29% (r1) → 5.77% (r2) → 9.20% (r3)** of sampled rollouts.
+
+⚠️This is the same failure §41n predicted for hindsight distillation — "trained to match a distribution sharp
+on digits it cannot predict, it learns to commit to no digit" — appearing at ~6x the baseline rate in the
+arms that WORKED. It is mild at greedy (`no_answer` 0.5-1.5% in the smoke tests) and shows up mainly under
+temperature, so it costs self-consistency rather than greedy: roughly 9% of the K=8 candidates are wasted on
+empty traces, which is a direct tax on the `sc@8` and `pass@8` columns.
+
+**Consequences, ranked:**
+* The next repair is a **CE pass on the model's own current verified-correct traces** (`--kd-weight 0
+  --ce-weight 1`, targets from the round-3 rollout dump, which has 16,416 of them). It attacks the unclosed
+  tail *and* the empty-think mode at once, because a verified-correct trace is neither 512 tokens long nor
+  empty. `opd_train.py` already supports it with no new code.
+* `--kd-prefix-frac` remains the other candidate, but §41ap says the problem is the tail of the length
+  distribution rather than the body, and prefix-only KD acts on the body.
+* Any future gate on this artifact should read the `no_answer` column, not just `unclosed` — they are
+  different defects with different fixes and this session's tooling only warns about one of them.
