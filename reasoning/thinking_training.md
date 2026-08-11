@@ -7476,3 +7476,36 @@ per-token signal now that the termination fix exists.
 where the baseline is strongest** (combo 64.30). Combined with the flat difficulty profile, that points at
 the termination regression rather than a capability regression — a uniform format cost hurts most where
 there is most to lose. The `notail`/`anchor` arms test exactly that.
+
+### §41w — `notail` FAILS, as pre-registered: masking the terminator columns does not shorten traces
+
+`think_opd35notail` — the same objective with the `</think>` and eos COLUMNS removed from the divergence
+(confirmed live in the log: ids 151645 and 151668 dropped, 151669 → 151667 columns, and the excluded
+logits verified to receive exactly zero gradient) — closure smoke test on 200 asdiv items:
+
+| | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| think_combo (baseline, full pool) | 64.30 | 6.9% | 212 |
+| think_opd35 (unmasked) | 60.00 | 14.5% | 280 |
+| **think_opd35notail (columns masked)** | 62.50 | **16.0%** | **279** |
+
+**No protection at all.** Unclosed is if anything slightly worse and the trace length is identical to the
+unmasked arm. This was written into `a4_kd3.sh`'s header before the run, for the reason it failed:
+
+> "One reason to expect `notail` to only partly work: 3.5-think genuinely writes longer traces (t_len 248
+> vs a4's 200), and length is encoded in *what to say next* as much as in *when to stop*, so masking the
+> terminator COLUMNS removes the direct pressure and not the body pressure."
+
+So the mechanism is now pinned from both sides. Removing all gradient from the closure logits changes
+nothing, which means **the lengthening is not a closure-probability effect at all** — it is the student
+learning to produce the teacher's longer derivations, and the terminator only ever gets reached later as a
+consequence. §41f's Qwen catastrophe is the same effect at 20-30x the magnitude.
+
+**What this leaves:** the `anchor` arm (`--ce-weight 0.5` on a4's own gold-verified traces) is now the only
+protection with a mechanism that can work, because it pulls the BODY toward a4's own shorter derivations
+rather than pulling on the terminator. It is training next. If it also fails, the honest conclusion is that
+per-token KD from a longer-trace teacher buys capability at a fixed length cost that has to be paid at
+decode time — which §41q already showed is affordable (+5.20 pooled, p=4.2e-10, force-closed).
+
+⚠️Also note what `notail` did NOT cost: greedy 62.50 against the unmasked arm's 60.00 on the same
+200-item subset. That is inside the n=200 noise band (±3.4pp) and must not be read as an improvement.
