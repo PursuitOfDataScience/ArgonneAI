@@ -217,18 +217,28 @@ def make_micro_batches(rows, max_batch_tokens, seed, window=256):
     return batches
 
 
-def _pack(batch, pad_id, id_key, plen_key):
+def _pack(batch, pad_id, id_key, plen_key, prefix_frac=1.0):
     T = max(len(b[id_key]) for b in batch)
     ids = torch.full((len(batch), T), pad_id, dtype=torch.long)
     mask = torch.zeros((len(batch), T), dtype=torch.bool)     # True = a completion token
     for i, b in enumerate(batch):
         n = len(b[id_key])
         ids[i, :n] = torch.tensor(b[id_key], dtype=torch.long)
-        mask[i, b[plen_key]:n] = True
+        p = b[plen_key]
+        if prefix_frac < 1.0:
+            # KD ON THE TRACE PREFIX ONLY. Two independent findings point here:
+            #   * the failure is at the OPENING -- 79% of wrong traces differ from a correct derivation
+            #     at equation index 0, median shared-equation prefix 0% (§41b);
+            #   * the trace-lengthening is BODY IMITATION, not a closure-probability effect -- removing
+            #     all gradient from the terminator logits changed trace length by one token (§41w).
+            # So take the teacher's early decisions, where the information is, and stop before learning
+            # its verbosity in the tail. The student's own tail is left entirely alone.
+            n = p + max(8, int(round((n - p) * prefix_frac)))
+        mask[i, p:min(n, len(b[id_key]))] = True
     return ids, mask
 
 
-def collate(batch, pad_id):
+def collate(batch, pad_id, kd_prefix_frac=1.0):
     """Two packed batches over the SAME completions: the student's prompt and the teacher's.
 
     They are separate tensors because a privileged hint makes the teacher's prompt longer, so the
@@ -239,7 +249,14 @@ def collate(batch, pad_id):
     ids, mask = _pack(batch, pad_id, "ids", "n_prompt")
     t_ids, t_mask = _pack(batch, pad_id, "t_ids", "t_n_prompt")
     is_corr = torch.tensor([b["label"] == "correct" for b in batch], dtype=torch.bool)
-    return ids, mask, t_ids, t_mask, is_corr
+    if kd_prefix_frac >= 1.0:
+        return ids, mask, t_ids, t_mask, is_corr, mask, t_mask
+    # separate, SHORTER masks for the KD term only; CE and the diagnostics keep the full completion.
+    # Both sides are cut by the same fraction of the same completion, so the two gathers still line up
+    # token-for-token -- asserted at the call site rather than trusted.
+    _, kmask = _pack(batch, pad_id, "ids", "n_prompt", kd_prefix_frac)
+    _, t_kmask = _pack(batch, pad_id, "t_ids", "t_n_prompt", kd_prefix_frac)
+    return ids, mask, t_ids, t_mask, is_corr, kmask, t_kmask
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +344,10 @@ def main():
     ap.add_argument("--solve-band", nargs=2, type=int, default=None, metavar=("LO", "HI"),
                     help="keep only problems whose rollouts contain LO..HI correct ones, e.g. 1 7 "
                          "to drop both the never-solved and the already-mastered")
+    ap.add_argument("--kd-prefix-frac", type=float, default=1.0,
+                    help="apply the KD loss only to the first FRAC of each trace's completion tokens "
+                         "(1.0 = all). Mechanism-matched to §41b (the failure is at the opening) and "
+                         "§41w (the lengthening is body imitation, not a closure effect).")
     ap.add_argument("--exclude-terminators", type=int, default=0,
                     help="drop the </think> and eos COLUMNS from the divergence, so the teacher has "
                          "no influence on trace length. Required for a teacher whose trace-length "
@@ -524,9 +545,11 @@ def main():
         epoch_mb = mb if ep == 0 else make_micro_batches(rows, a.max_batch_tokens, a.seed + ep)
         for group in epoch_mb:
             batch = [rows[i] for i in group]
-            ids, cmask, t_ids, t_cmask, is_corr = collate(batch, pad_id)
+            ids, cmask, t_ids, t_cmask, is_corr, kmask, t_kmask = collate(
+                batch, pad_id, a.kd_prefix_frac)
             ids, cmask, is_corr = ids.to(dev), cmask.to(dev), is_corr.to(dev)
             t_ids, t_cmask = t_ids.to(dev), t_cmask.to(dev)
+            kmask, t_kmask = kmask.to(dev), t_kmask.to(dev)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 t_logits = teacher(input_ids=t_ids).logits
@@ -538,8 +561,8 @@ def main():
             # (a privileged hint), so the same completion token sits at different absolute
             # positions. Both gathers walk their own sequence in order, so row k of each flat
             # tensor is the same completion token under both models.
-            s_flat = gather_completion(s_logits, cmask, V)
-            t_flat = gather_completion(t_logits, t_cmask, V)
+            s_flat = gather_completion(s_logits, kmask, V)
+            t_flat = gather_completion(t_logits, t_kmask, V)
             if s_flat.shape[0] != t_flat.shape[0]:
                 raise RuntimeError(f"completion-token count mismatch student {s_flat.shape[0]} vs "
                                    f"teacher {t_flat.shape[0]} -- the two prompts must share the "
@@ -548,7 +571,9 @@ def main():
             L = a.kd_weight * L_kd
             L_ce = torch.zeros((), device=dev)
             if a.ce_weight > 0:
-                L_ce = ce_loss(s_flat, ids, cmask, is_corr)
+                # CE keeps the FULL completion even when KD is prefix-only: the anchor's whole job is
+                # to hold the model's own tail behaviour in place.
+                L_ce = ce_loss(gather_completion(s_logits, cmask, V), ids, cmask, is_corr)
                 L = L + a.ce_weight * L_ce
             (L / a.grad_accum).backward()
 
