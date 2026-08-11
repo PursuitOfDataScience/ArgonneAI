@@ -132,6 +132,18 @@ def main():
     ap.add_argument("--include-empty-prefix", type=int, default=1,
                     help="also emit a prefix-free variant per problem: the CONTROL that decides "
                          "whether prefix conditioning matters at all")
+    ap.add_argument("--completer-instruction",
+                    default="\n\nKeep the remaining reasoning brief: at most 5 short steps, then give the "
+                            "final answer as \\boxed{}.",
+                    help="appended to the question in the COMPLETER's prompt only. Needed because "
+                         "--max-trace-tokens drops any splice longer than the student's own p90, so an "
+                         "unprompted long-form completer would have most of its output discarded rather "
+                         "than merely truncated -- the cap silently becomes a yield problem. "
+                         "⚠️This does NOT contradict §41bg, where brevity conditioning degraded Qwen3-4B: "
+                         "that measured per-token AGREEMENT with a4's tokens under a divergence loss. This "
+                         "is generation quality, a different quantity, and `gen_teacher.py` already "
+                         "conditions for concision the same way. The student never sees this text -- only "
+                         "the resulting trace is kept -- so it cannot repeat §41m's context-poisoning.")
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--max-completion-tokens", type=int, default=256)
@@ -189,7 +201,8 @@ def main():
     # tokenizers are id-identical (verified: len(tok)=151,669, <think>=151667), so a4's prefix tokens
     # are valid tokens here -- that identity is the whole reason a cross-model splice is even defined.
     def prompt_for(q, prefix):
-        enc = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=True,
+        enc = tok.apply_chat_template([{"role": "user", "content": q + a.completer_instruction}],
+                                      tokenize=True,
                                       add_generation_prompt=True, enable_thinking=True)
         if hasattr(enc, "keys"):
             enc = enc["input_ids"]
