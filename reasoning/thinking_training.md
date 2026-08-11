@@ -8299,3 +8299,35 @@ empty traces, which is a direct tax on the `sc@8` and `pass@8` columns.
   distribution rather than the body, and prefix-only KD acts on the body.
 * Any future gate on this artifact should read the `no_answer` column, not just `unclosed` — they are
   different defects with different fixes and this session's tooling only warns about one of them.
+
+### §41aq — Round 4 looks like the turn, and the length tail is the reason
+
+Closure smoke, same 200 asdiv items, across the whole chain:
+
+| round | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| session start (combo, full pool) | 64.30 | 6.9% | 212 |
+| r1 (`think_opd35anchor`) | 62.50 | 13.5% | **241** |
+| r2 | 65.00 | 15.5% | **267** |
+| **r3** | **65.50** | 13.0% | **277** |
+| r4 | 62.50 | 15.0% | **288** |
+
+⚠️**62.50 against r3's 65.50 is inside the n=200 noise band (±3.4pp), so this is not yet a measured decline.**
+What IS monotone and outside noise is the trace length: **241 → 267 → 277 → 288**, +47 tokens over three
+rounds, ~16 per round, while the baseline sits at 212. Every round buys capability and pays in length, and
+§41ap showed the payment comes out of the tail — traces pinned at the 512 cap, which is where the unclosed
+rate lives.
+
+**So the saturation the chain was run to find is arriving, and it is arriving as a length problem rather than
+a capability one.** The acc|ANSWERED trend was already flattening (+14.4pp → +5.4pp → +1.1pp per round) while
+`t_len` kept climbing linearly. Two more rounds are running; if r5/r6 confirm the turn, the artifact is r3 and
+the next move is not another round.
+
+**The prepared next move is the §41ap repair pass, and it is now runnable with no teacher at all:**
+
+    --student think_opd_r3 --rollouts <r3's own dump> --labels correct --kd-weight 0 --ce-weight 1
+
+`opd_train.py` no longer requires `--teacher` when `--kd-weight 0`, so it does not load a 2.88B model to
+multiply its output by zero. That pass targets median 183 / p90 330 traces drawn from the model's own current
+behaviour, so it should cut the 512-token tail and the empty-think mode together without pulling toward a
+stale checkpoint — the two defects §41ap identified, in one pass, with no new data and no teacher.
