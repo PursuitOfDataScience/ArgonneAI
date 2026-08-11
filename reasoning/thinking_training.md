@@ -8476,3 +8476,42 @@ best-decode, p=7.35e-20). The taxonomy says **round 4 is better than round 3 on 
 The chain's own final gate compares round 6 against round 3, so **round 4 needs its own paired gate against
 round 3 to settle which is the artifact** — one job, three models, and the last measurement this line needs
 before it has a final answer.
+
+### §41av — ⚠️THE RETENTION RULE DELETED THE PEAK. "Latest-only" assumes later is better; saturation is the case where it isn't.
+
+Thirty minutes after §41au identified **round 4** as the chain's peak on 93,912 rollouts per policy, and while
+a gate for it was being written, `a4_opd_iter.sh`'s retention step printed:
+
+    [retention] dropping superseded /project/rcc/youzhi/models/a4_think_final/think_opd_opd_r3_r2
+
+and deleted it. The rule did exactly what it was told. **The rule is what was wrong.**
+
+> **"Keep the newest, delete the previous" encodes the assumption that LATER IS BETTER. A saturating chain
+> violates precisely that assumption — and finding where a process stops improving is the entire purpose of
+> running it.**
+
+Cost: ~1.2 GPU-hours to reproduce (regenerate the rollouts, retrain), recoverable **only** because
+`rft_generate` is deterministic given model + seed. A non-deterministic generator would have made the peak of
+a six-round chain unrecoverable. Disk saved: **2 GB.**
+
+**Fixed by disabling CHECKPOINT rotation in this launcher specifically, and saying why in the code:**
+* **Rollout dumps are still rotated** — 120 MB each, genuinely regenerable, never a result.
+* **Checkpoints are kept**, and pruned by hand *after* the gate says which one matters, under the
+  four-question audit. On this chain that is at most 6 x 2 GB against a 1.9 PB filesystem with 70% free.
+
+⚠️**This is the seventh defect of the session's recurring family, and the most instructive**, because unlike
+the six name/flag collisions it was not a mistake in the code at all — the code was correct, the *policy* it
+implemented was correct in general, and it was wrong for this one job because of something the job had just
+measured. **A correct rule applied outside its assumptions is indistinguishable from a bug, and cheaper to
+cause.** The retention rule's own stated exception — "a checkpoint that IS a result" — did apply to round 4 the
+moment §41au was written; nothing propagated that fact into the running job.
+
+**Practical consequence, and the reason this is logged rather than quietly fixed:** any chain-style launcher on
+this line that rotates checkpoints should be assumed to be able to delete its own best result. The other two
+chain launchers (`a4_kd2.sh`, `a4_kd3.sh`) do not rotate at all, so they are fine; `a4_opd_iter.sh` was the
+only one, and it is now fixed.
+
+`a4_pick.sh` — written to gate round 4 against round 3 — is repointed at what survives (**round 6, round 5,
+round 3, baseline**) and takes `R4=` so it can be pointed at a regenerated round 4 later. Round 6's smoke was
+the best of the whole chain (greedy 66.50, unclosed 13.5%, 282 tok), but §41ar forbids ranking on that, so the
+gate decides.
