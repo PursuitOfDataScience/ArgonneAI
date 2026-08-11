@@ -8639,3 +8639,46 @@ the same sample-size lesson as §41ar, one rung up.
 For scale one last time: the thirteen arms preceding this session moved the deployable number **+4.96 in total**
 across ~10 GPU-days. This session moved it **+7.69** on the same basis, and **+2.35 of `pass@8`** which no
 previous arm had moved at all.
+
+### §41az — ⭐⭐⭐FIVE-POOL FINAL. Positive on every pool, on both metrics. Gap closed 54%.
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.25 | 56.43 | 57.90 | **58.37** | 61.49 | 75.20 | 69.7% | 16.76 |
+| **a4opdi_a100 (round 6) ← ARTIFACT** | **49.48** | 50.83 | 51.13 | **51.73** | **56.62** | **71.07** | **63.8%** | 21.13 |
+| a4start_a100 (round 3) | 47.01 | 49.49 | 50.59 | 50.73 | 54.11 | 68.76 | 62.0% | 22.75 |
+| a4combo_a100 (session start) | 43.31 | 43.92 | 43.64 | 44.00 | 51.13 | 68.94 | 49.6% | 13.32 |
+
+**Per-pool, round 6 against the session start — positive everywhere, on both metrics:**
+
+| pool | greedy Δ | best-decode Δ |
+|---|---:|---:|
+| asdiv | +2.00 | +5.70 |
+| svamp | +7.00 | +8.50 |
+| mawps | +7.80 | +8.00 |
+| gsmplus | +8.40 | +8.60 |
+| math500 (contaminated) | +5.64 | +7.52 |
+
+**⭐THE SESSION, five-pool — the campaign's historical basis:**
+
+| | start | round 6 | Δ | 3.5-think | gap closed |
+|---|---:|---:|---:|---:|---:|
+| greedy | 43.31 | **49.48** | **+6.17** | 55.25 | 11.94 → **5.77** (52%) |
+| **best decode** | 44.00 | **51.73** | **+7.73** | 58.37 | 14.37 → **6.64** (54%) |
+| self-cons@8 | 51.13 | **56.62** | **+5.49** | 61.49 | 10.36 → 4.87 (53%) |
+| pass@8 | 68.94 | **71.07** | +2.13 | 75.20 | 6.26 → 4.13 (34%) |
+| **`acc\|ANSWERED`** | 49.6% | **63.8%** | **+14.2pp** | 69.7% | 20.1 → **5.9pp** (71%) |
+
+**Round 6 (`think_opd_opd_r3_r4`) is the artifact.** It is better than round 3 on greedy (+2.47), sc@8 (+2.51),
+pass@8 (+2.31) and best-decode (+1.00), with a lower unclosed rate (21.13% vs 22.75%).
+
+⚠️**And note the one remaining structural cost, unchanged all session:** unclosed is **21.13% against the
+baseline's 13.32%**, which is why `+extend3` is worth +2.25 to the artifact and the deployed configuration must
+use force-closing. That is the residual §41ap diagnosed as a 512-token TAIL and the prepared CE repair pass
+targets. It is the last identified opportunity on this artifact and it is one job.
+
+**Where the line stands.** Post-training on this base moved the deployable number **44.00 → 51.73** in one
+session — against **+4.96 total** from the thirteen arms that preceded it across ~10 GPU-days — and closed
+**52-54%** of the distance to a 2.88B model from a 1.04B one whose base measures −16.79pt with the identical
+recipe. `acc|ANSWERED` closed **71%**, which was §41j's whole diagnosis. It is still **6.6 points short** of the
+released argonne-3.5-think on best-decode, and §41ax's audition is the next thing that could move that.
