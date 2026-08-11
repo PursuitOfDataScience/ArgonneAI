@@ -8086,3 +8086,46 @@ anything in the student's context and does not add data — it re-weights the mo
 distribution at states it chose itself. Every arm that tried to *inform* the model failed (long-CoT teacher,
 Llama text, gold hints, reference derivations, verification prompts), and every arm that tried to *sharpen*
 it worked. On this base, sharpening is the channel that is open.
+
+### §41al — ⭐⭐SESSION RESULT: round 3 is the artifact. Gap to released 3.5-think 14.25 → 10.55.
+
+Paired gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend1 | +extend2 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 71.00 | 73.40 | 73.25 | 73.65 | 80.65 | 92.00 | 79.6% | 8.45 | 236.4 |
+| **a4opdi_a100 (round 3)** | **60.45** | 64.60 | **65.15** | 65.00 | **70.45** | **85.40** | **71.2%** | 14.60 | 271.4 |
+| a4opd35_a100 (round 1) | 58.45 | 62.65 | 63.10 | 63.20 | 68.95 | 83.95 | 68.6% | 14.05 | 265.6 |
+| a4combo_a100 (session start) | 56.75 | 57.60 | 57.50 | 57.55 | 68.10 | 85.45 | 61.1% | 6.95 | 199.9 |
+
+Pooled paired McNemar over 2,000 items:
+
+| comparison | greedy | +extend2 | sc@8 | pass@8 |
+|---|---|---|---|---|
+| **r3 vs session start** | **+3.70** (p=6.85e-04) | **+7.45** (p=2.55e-12) | +2.35 (p=9.67e-03) | **−0.05** (p=1.00) |
+| r3 vs round 1 | +2.00 (p=4.99e-02) | +1.80 (p=6.49e-02) | +1.50 (p=7.96e-02) | **+1.45** (p=4.69e-02) |
+
+**1. `pass@8` is EXACTLY where it started** — 85.40 against 85.45, p=1.00 — **while greedy rose 3.70 and
+`acc|ANSWERED` rose 10.1pp.** That is the cleanest available statement of the whole result: the ceiling did
+not move and the floor came up to meet it. The thirteen arms before this session did the reverse.
+
+**2. Iteration recovered what round 1 cost.** Round 1 gave up 1.5pt of `pass@8` for its capability gain;
+round 3 got it back (+1.45 vs round 1, p=0.047) and is better than round 1 on every single column.
+
+**3. Where the a4 line now stands against the released 3.5-think:** the greedy gap closes **14.25 → 10.55**
+and the force-closed gap **16.35 → 8.80**, with `acc|ANSWERED` **18.5pp → 8.4pp**. On a base measured at
+−16.79pt against 3.5's (§40).
+
+**THE SESSION, on asdiv+svamp:**
+
+| | start (`a4combo_a100`) | end (`think_opd_r3`) | Δ |
+|---|---:|---:|---:|
+| greedy | 56.75 | **60.45** | **+3.70** |
+| best decode | 57.60 | **65.15** | **+7.55** |
+| self-cons@8 | 68.10 | **70.45** | +2.35 |
+| `acc\|ANSWERED` | 61.1% | **71.2%** | **+10.1pp** |
+| pass@8 | 85.45 | 85.40 | −0.05 |
+
+⚠️Four-pool and five-pool means for round 3 are pending the gate's second stage. The four-pool figures for
+round 1 (§41ac) were consistently ~6pt below the two-pool ones, so expect the same offset rather than the
+numbers above.
