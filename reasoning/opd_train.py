@@ -455,7 +455,8 @@ def main():
         teacher, _, _ = load_argonne(a.student, False)
         teacher.to(torch.bfloat16)
         ttok = tok
-    elif json.load(open(os.path.join(a.teacher, "config.json"))).get("model_type") == "argonne2":
+    elif (os.path.isdir(a.teacher)
+          and json.load(open(os.path.join(a.teacher, "config.json"))).get("model_type") == "argonne2"):
         # An Argonne-arch teacher (e.g. the released 3.5-think) must go through the same manual
         # construction as the student: AutoModelForCausalLM does not re-tie lm_head for this arch and
         # would load a teacher whose head is random -- a silently meaningless target distribution.
