@@ -7440,3 +7440,39 @@ the soup could only ever help plain greedy, and even there the arithmetic says i
 separated by a whole stage rather than one epoch) but **dropped from the queue**. Cost of the analysis:
 one weight-norm pass and four lines of calculus. Cost of running it instead: a GPU slot, three
 checkpoints, and two gate stages to rediscover α=1.00.
+
+### §41v — The gain has NO structure, and that is the finding
+
+`load_pool` is deterministic, so the per-item `ok` arrays realign with the actual problems on CPU. Over
+all 3,000 items of the four clean pools, opd35 won 356 and lost 289 against combo. Profiles:
+
+| | n | words (median) | numbers in Q | \|gold\| (median) |
+|---|---:|---:|---:|---:|
+| opd35 won | 356 | 30 | 3 | 25 |
+| opd35 lost | 289 | 30 | 2 | 27 |
+| both right | 1237 | 25 | 2 | 30 |
+| both wrong | 1118 | 34 | 3 | 39 |
+
+Won and lost items are indistinguishable. And the net gain by question-length quartile is flat —
+**+2.11 / +2.76 / +2.42 / +1.63 pt** — across quartiles whose baseline accuracy spans **67.0% → 29.4%**.
+The "both wrong" bucket is the one with real structure (longer, more quantities, larger answers), i.e.
+difficulty is legible in the data; the *gain* is not aligned with it.
+
+**So the improvement is a uniform, diffuse recalibration, not a new capability on a problem class.** Three
+independent measurements now say the same thing:
+* the weight change is 0.914% and uniform across depth (§41u: every block 0.77-0.96%);
+* `pass@8` did not move (§41r: −0.93, n.s.) — no new knowledge entered the model;
+* the item-level gain is flat in difficulty (here).
+
+That is what mode-seeking sharpening is supposed to look like, and it is the exact opposite of what a
+data-composition arm looks like — those move specific problem classes and show up as structure here.
+
+**Consequence for the follow-ups:** targeted data arms ("add more multi-step problems", "drill large-number
+arithmetic") are not indicated by this result and should not be inferred from it. What IS indicated is more
+of the same mechanism — another round on freshly-sampled states (`a4_opd_iter.sh`), or a teacher with more
+per-token signal now that the termination fix exists.
+
+⚠️One asymmetry worth keeping: **asdiv is the only pool with a net loss (−25 items) and it is also the pool
+where the baseline is strongest** (combo 64.30). Combined with the flat difficulty profile, that points at
+the termination regression rather than a capability regression — a uniform format cost hurts most where
+there is most to lose. The `notail`/`anchor` arms test exactly that.
