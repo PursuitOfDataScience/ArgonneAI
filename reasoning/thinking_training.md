@@ -8438,3 +8438,41 @@ weight space (0.747% vs 0.914%).
 * And the chain should keep running in parallel with that reasoning, because §41ar established the policy is
   still improving and §41at now shows it has not converged. **Neither the repair pass nor another round is the
   obvious single next move; they address different costs and both are cheap.**
+
+### §41au — SATURATION FOUND: round 4 is the peak. Round 5 is flat-to-negative on answer quality.
+
+Policy rollout distributions, 93,912 per checkpoint on identical problems — the ranking instrument §41ar
+established:
+
+| metric | combo | r2 | r3 | **r4** | r5 |
+|---|---:|---:|---:|---:|---:|
+| correct rollouts | 23.31% | 29.10% | 29.50% | **32.32%** | 32.32% |
+| wrong | 59.39% | 40.98% | 39.81% | **38.09%** | 39.66% |
+| unclosed | 15.90% | 24.15% | 21.50% | 23.60% | 22.02% |
+| no_answer | 1.40% | 5.77% | 9.20% | 5.99% | 6.01% |
+| **`acc\|ANSWERED`** | 28.2% | 41.5% | 42.6% | **45.9%** | 44.9% |
+| never solved in 8 | 44.1% | 42.0% | 40.8% | 39.1% | **38.6%** |
+| solved ALL 8 | 2.1% | 5.9% | 5.2% | **7.4%** | 7.4% |
+| gold is the PLURALITY | 65.2% | 72.9% | 72.7% | **75.7%** | 75.7% |
+
+Per-round deltas — `acc|ANSWERED` **+13.3 / +1.0 / +3.3 / −1.0**, `correct` **+5.8 / +0.4 / +2.8 / −0.0**,
+never-solved **−2.1 / −1.2 / −1.7 / −0.5**.
+
+**Round 4 is the peak.** Round 5 is the first round to fail to improve answer quality: flat on `correct`,
+`solved-8/8` and gold-is-plurality, **−1.0pp on `acc|ANSWERED`**, and +1.6pp *worse* on `wrong`. Only coverage
+still moved, and only by −0.5pp against the previous round's −1.7pp. **This is the saturation point the chain
+was run to find**, and it is four rounds in, measured on 93,912 rollouts rather than inferred.
+
+⚠️**An honest note on how I got here, because it is not flattering and it matters.** §41aq claimed the turn at
+round 4 from a 200-item greedy read; §41ar retracted that, correctly, because round 4's taxonomy was better on
+every line. §41au now finds the turn one round later on proper evidence. So the *instinct* that a turn was
+near was right, the *claim* was wrong, and **the retraction was correct on the evidence available at the
+time.** Being right for the wrong reason is still wrong; had I not retracted, I would have stopped the chain
+before round 4 — the peak — on the strength of noise.
+
+**Consequence for the artifact.** The gated checkpoint is round 3 (`think_opd_r3`, +7.30 four-pool
+best-decode, p=7.35e-20). The taxonomy says **round 4 is better than round 3 on every answer-quality measure**
+(`acc|ANS` 45.9% vs 42.6%, correct 32.32% vs 29.50%, plurality 75.7% vs 72.7%, never-solved 39.1% vs 40.8%).
+The chain's own final gate compares round 6 against round 3, so **round 4 needs its own paired gate against
+round 3 to settle which is the artifact** — one job, three models, and the last measurement this line needs
+before it has a final answer.
