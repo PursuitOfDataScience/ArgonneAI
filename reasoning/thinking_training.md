@@ -8728,3 +8728,188 @@ real, it is on the current policy's own states, and the ONLY thing standing betw
   `0`; capturing `rc=$?` first prints `1`. Every audition would have reported success. Fixed, and a non-zero
   status now prints "FAILED to audition — NOT a verdict about the teacher", because a broken probe and a bad
   teacher must never read the same.
+
+### §41bb — ⛔THE STRONG-TEACHER LEVER IS CLOSED. Prefix-masking is the WORST possible protection, and my own §41w null said so.
+
+§41ba ended with the strong-teacher question sharp: `Qwen3-4B` (plain) carries 9.3× the per-token signal
+3.5-think has left (revKL 0.979 vs 0.106, argmax agreement 78.3% vs 92.7%) but sits at hazard ratio 0.85,
+outside the band the audition had just calibrated. The protection was `--kd-prefix-frac 0.5` — apply the KD
+loss only over the first half of each completion — on the theory that closure mass lives at the *end* of a
+trace, so masking the tail removes the closure pressure while keeping the early decisions where §41b located
+the failure (79% of wrong traces diverge at equation index 0). Job 53274157, both arms, from the round-6
+artifact on its own rollout dump:
+
+| arm | prefix | CE anchor | greedy | unclosed | mean decoded | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| round-6 student (baseline) | — | — | **66.50** | **13.50%** | 282 | — |
+| `pre50a` | 0.5 | 0.5 | 9.50 | 88.50% | 505 | ⛔FAIL closure |
+| `pre50` | 0.5 | 0.0 | 3.00 | 96.50% | 511 | ⛔FAIL closure |
+
+**Both protections worked in the predicted direction and were nowhere near enough.** The CE anchor bought
+8.0pp of unclosed (96.5 → 88.5); prefix-masking bought ~0.5pp over §41f's unmasked long-CoT arm (96.95%).
+Against a 6× gap, those are rounding errors. And the KD itself fit *beautifully* — argmax agreement
+76.2% → 85.7%, revKL 1.148 → 0.339 over 1,942 steps. The student learned the teacher extremely well. What it
+learned was to be Qwen3-4B, which writes 500+ tokens inside a `<think>` block.
+
+**⚠️THE SELF-CORRECTION, AND IT IS THE WHOLE LESSON. I had already measured that prefix-masking was the wrong
+protection and did not connect it.** §41w tested `--exclude-terminators`, which strips every scrap of gradient
+from the `</think>`/eos logit columns, and it was a NULL: trace length moved by *one token* (212 → 280 became
+212 → 279) while the body-level CE anchor moved 39. The conclusion recorded there was **"trace length on this
+line is BODY-level, not a closure-probability phenomenon."** Prefix-KD transfers exactly the body — a prefix
+*is* body tokens. So masking to the prefix deletes the region where closure mass lives while *preserving*
+the region that sets how long the body wants to run. Of all the maskings available it is the one that keeps
+100% of the harmful signal and discards the part that was harmless. I reasoned about it as "removing closure
+pressure" when my own prior measurement had already said closure pressure is not the mechanism.
+
+**The hazard ratio is a PROXY for body-style mismatch, not a cause.** That is why `haz_t/haz_s` at step 1
+predicted the outcome (1.00 worked, 0.85 and 0.75 fatal) while *intervening on* the hazard changed nothing:
+the ratio is a cheap readout of "does this teacher want to write traces the length of the student's," and the
+only way to fix it is to change the teacher's trace-length distribution, not to hide part of the loss.
+
+**Three points on the axis, all from the same step-1 instrument, now with outcomes:**
+
+| teacher | revKL | agree | `haz_t/haz_s` | protection | outcome |
+|---|---:|---:|---:|---|---|
+| 3.5-think (length-matched) | 0.106 | 92.7% | **1.00** | CE 0.5 | ✅ +7.73 five-pool best-decode |
+| Qwen3-4B plain | 0.979 | 78.3% | 0.85 | prefix 0.5 + CE 0.5 | ⛔88.5% unclosed |
+| Qwen3-4B plain | 0.979 | 78.3% | 0.85 | prefix 0.5 | ⛔96.5% unclosed |
+| Qwen3-4B-Thinking-2507 | 0.943 | 78.4% | 0.75 | none | ⛔96.95% unclosed |
+
+⛔**VERDICT: a stronger same-tokenizer teacher cannot be used by per-token on-policy KD at any masking
+fraction, because the quantity being transferred and the quantity that must not transfer are the same
+tokens.** This closes the lever §41ax opened. It is 0-for-3 and the three failures span both Qwen3-4B
+variants and both protections. Downloading Qwen3-8B/14B/32B is now pointless *by this channel* — they are
+larger models with the same long-form think style, i.e. further outside the band, not closer to it.
+
+**What is NOT ruled out, and the one thing that would reopen it:** make the teacher's think-block style
+short. The teacher is only ever run forward on the student's own tokens, so the intervention has to be in
+the teacher's *context* — and `opd_train.py --hint-template` already puts arbitrary text there (it was built
+for §41m's gold-anchored arm). A brevity instruction is a *style* constraint rather than privileged
+information, so it does not repeat §41n's failure mode of making the teacher a worse model. It is a
+3-minute audition: condition Qwen3-4B on a brevity instruction and read `haz_t/haz_s`. If it lands ≥0.95 the
+strong teacher becomes usable; if it does not, the lever is dead by every means available here and should be
+recorded that way.
+
+### §41bc — ⛔THE REPAIR PASS TRAINS ON EXACTLY THE SUBSET THAT DOES NOT NEED REPAIRING. Its own loss curve says so.
+
+The largest number left on the board was never capability, it was the **answered rate**. `greedy =
+acc|ANSWERED × answered-rate`, and at round 6 the five-pool split is 49.48 = 63.8% × 77.6%. That 22.4% of
+items producing no extractable answer is worth, if recovered to the pre-KD 90%, `0.638 × 0.90 = 57.4` —
+which is *above* released 3.5-think's 55.25, from a mechanism that needs no teacher at all. So the prepared
+repair pass (`--kd-weight 0 --ce-weight 1 --labels correct`, pure CE on the model's own verified-correct
+traces, 17,898 rows from round 6's own dump) ran as a two-LR dose-response, job 53283716.
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | **66.50** | **13.50%** | 1.50% | 282 |
+| `repair` (lr 1e-5) | 62.50 | 15.00% | **0.00%** | 291 |
+
+It killed the empty-think mode outright (1.50% → 0.00%) and did nothing else — greedy −4.00 and unclosed
+*worse*, both inside the n=200 smoke's ±3.4pp but pointing the wrong way.
+
+**The training curve is the diagnosis, and it is unambiguous: CE went 0.1964 → 0.1884 over 800 steps.** A 4%
+drop. There is no gradient signal in the model's own correct traces because *the model already assigns them
+high likelihood* — they are its own samples. Pure rejection-sampling SFT on own output asks the policy to do
+more of what it already does, and "it already does it" is exactly why the loss is flat.
+
+**⚠️THE STRUCTURAL FLAW, which was predictable from the label filter alone and which I did not predict.**
+`--labels correct` selects traces that are, by construction, **closed** — a trace cannot be graded correct
+without producing an answer. The 22.4% of items that fail to close produce *no correct trace*, so they
+contribute **zero rows** to the repair set. The arm trains on the closed subset in order to fix the unclosed
+one, and the two sets are disjoint by definition. Any gain would have had to arrive by generalization from
+the wrong population.
+
+**What actually attacks the unclosed tail: the target has to CLOSE, and the model does not produce one.** So
+construct it — truncate an unclosed trace at a natural boundary inside the budget and append `</think>` plus
+a gold-verified answer, restricted to problems where the model has demonstrated it can reach that answer
+(≥1 of its 8 rollouts graded correct). Two reasons this is principled rather than a hack:
+* **It internalizes a gain that is already measured.** `clean_eval.py`'s force-closing decoders
+  (`budget`/`extend1-3`) do precisely this at inference and are worth +2.25 five-pool (best-decode 51.73 vs
+  greedy 49.48). Training the behavior the decode wrapper simulates converts a serving-time trick into a
+  model property.
+* **Converting unclosed → guess is free in expectation.** An unclosed trace scores 0 and a wrong answer
+  scores 0, so there is no accuracy downside to committing; the only cost is `acc|ANSWERED` as a *reported*
+  statistic, which is why both must be read together.
+⚠️The failure mode to instrument is hallucinated confidence: teaching "emit an answer after N tokens"
+generalizes to problems where the model has derived nothing. Restricting construction to demonstrated-solvable
+problems bounds it on the train side; the gate's `acc|ANSWERED` column is what detects it on the test side.
+
+### §41bd — ⚠️RETRACTION OF §41bc's PRICING. The answered-rate lever is worth ≤2pt, not ≈8, and the TARGET MODEL is the reason.
+
+§41bc opened by pricing the repair lever at `0.638 × 0.90 = 57.4` greedy, "above released 3.5-think's 55.25."
+That 0.90 came from `a4combo`, the pre-KD baseline. **It should have come from the model being chased.**
+Pooling the `fm` (failure-mode) dicts every gate JSON already stores, over the same 3,319 items:
+
+| model | greedy | `acc\|ANS` | answered% | unanswered% |
+|---|---:|---:|---:|---:|
+| a35think_a085 (**target**) | 61.07 | 74.74 | **81.71** | 18.29 |
+| a4start_a100 (round 6) | 52.18 | 66.13 | **78.91** | 21.09 |
+| a4combo_a100 (pre-KD) | 48.42 | 54.92 | 88.16 | 11.84 |
+
+**The model I am chasing has an 18.29% unanswered rate of its own.** The answered-rate gap between round 6
+and 3.5-think is **2.8pp**; the `acc|ANSWERED` gap is **8.6pp**. Recovering the answered rate to the target's
+own value at unchanged acc|ANS gives greedy 54.0 — **+1.8, not +7.9.** Per pool, round 6 vs 3.5-think
+unanswered: asdiv 15.5 vs 11.4, svamp 14.5 vs 10.3, mawps 24.0 vs 22.8, gsmplus 24.8 vs **28.2** (round 6 is
+*better*), math500 48.9 vs 42.3.
+
+**⚠️THE ERROR HAS A NAME AND I HAVE MADE IT BEFORE: I priced a lever against a WORSE model's value on that
+axis.** `a4combo`'s 88.16% answered rate is not a target to aspire to — it is what a model looks like when it
+gives up early, and it came packaged with `acc|ANS` 54.92 against round 6's 66.13. Six rounds of KD *bought*
+11.2pp of acc|ANS by *spending* 9.2pp of answered rate, and that trade was strongly positive (+3.76 greedy).
+Reading the spent side as a defect to be refunded, at the pre-trade price, double-counts it. This is the same
+shape as §41j's withdrawn "+1.2 capability" row (priced by an exhausted family's best) — **a lever's value is
+set by the gap to the reference model on that axis, and by nothing else.**
+
+⛔**So the repair line is closed as a headline**, and its flat CE curve was telling the truth. `no_answer` is
+worth a real but small amount (round 6 loses 39/500 on gsmplus and 17/319 on math500 to it, ~1.7% pooled, and
+the repair arm did drive it to 0.00% on the asdiv smoke). Everything else is `unclosed`, and the target model
+is unclosed at nearly the same rate.
+
+✅**THE BINDING CONSTRAINT IS CONFIRMED AS `acc|ANSWERED` — 8.6pp of it — and that is capability.** Which puts
+the whole remaining question back on the one channel §41bb just closed, and therefore on the one repair to
+that channel that has not been tried: making a strong teacher's think-block style short enough to use.
+
+**A secondary free-ish gain, now measured and sized rather than guessed:** the eval path extracts answers with
+`extract_boxed` ONLY (`clean_eval.py:44`), while `--max-new-tokens` is 512. Over the 93,912 round-6 rollouts,
+a fallback chain (`\boxed{}` → "answer is N" → `#### N`) recovers gold from **9.47% of `no_answer`** and
+**5.35% of `unclosed`** rows — 1,640 rollouts, 1.75pp. The false-positive control is what makes this usable:
+on the 37,242 rows the strict parser already graded WRONG, the permissive chain flips only **17 (0.05%)** to
+gold, and it agrees with the strict parser on 98.76% of correct rows. Implemented as a *fallback* (strict
+first, permissive only when strict returns nothing) it cannot touch an already-graded row at all. Applied to
+asdiv's eval `fm` split that is ≈+0.9pp. Worth doing, not worth calling a result.
+
+⚠️And one hypothesis died on inspection: the first `unclosed` trace I read was a degenerate loop repeating
+"Thus answer: 12 minutes before 2:00" eight times to the cap, and I started designing a cut-before-the-loop
+target around it. Over all 20,681 unclosed rows, **93.18% contain no repeated line at all** (median loop
+fraction 0.000). It is a truncated derivation, not a loop. **n=1 is not a failure mode.**
+
+### §41be — ⛔THE EXTRACTION FALLBACK IS WORTH +0.18pp AT EVAL TIME. Measured, dropped, and closed.
+
+§41bd sized a parser fallback at "≈+0.9pp, worth doing." Two code facts kill it, and both were free to check.
+
+**1. `extract_boxed` already has an "answer is" fallback** (`star_generate.py:99`), so the earlier 1.75pp was
+not incremental. Re-measured with the real function over all 93,912 round-6 rollouts, adding only what it
+genuinely lacks (`#### N`, `answer: N`, fraction/`$`-wrapped forms) and only on rows it returns `None` for:
+
+| label | n | boxed parses | boxed NONE | fallback→**gold** | fallback→wrong |
+|---|---:|---:|---:|---:|---:|
+| correct | 30,348 | 30,348 | 0 | — | — |
+| wrong | 37,242 | 37,242 | 0 | — | — |
+| unclosed | 20,681 | 3,709 | 16,972 | 306 | 1,187 |
+| no_answer | 5,641 | 0 | 5,641 | **535** | 638 |
+
+Incremental: **+841 / 93,912 = +0.90pp**, with zero exposure on already-graded rows by construction.
+
+**2. But `clean_eval.grade()` credits an unclosed trace whose pred matches gold** — `fm` is an `elif` chain
+that classifies (closure checked first, line 171) while `corr` is computed independently at line 180. So the
+`unclosed` half of the recovery is already banked at eval time. Verified empirically rather than by reading:
+across 15 (model, pool) rows, **`sum(ok) == fm["correct"]` exactly, every time**, i.e. no unclosed *eval* item
+ever carries a recoverable gold answer (unlike the sampled train dump, where 3,709 unclosed rows do — greedy
+at temperature 0 is a different distribution). That leaves only `no_answer`, which is **1.93%** of eval items
+for round 6, times the 9.5% of them the fallback rescues = **+0.18pp**. Below the ±0.87 seed-noise floor.
+
+✅**Two things this settles as a side effect, both of which I could have gotten wrong:** the §41bd
+`greedy / acc|ANSWERED / answered%` decomposition is exact (it was derived from `fm`, and `fm["correct"]` is
+provably identical to `sum(ok)` here), and no historical number needs recomputing — which is also the reason
+the fallback was written as an opt-in rather than a patch to `extract_boxed`. **Silently changing a grading
+primitive would have re-based every number in §41 for +0.18pp.**
