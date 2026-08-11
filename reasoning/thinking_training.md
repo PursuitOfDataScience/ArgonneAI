@@ -9177,3 +9177,30 @@ re-opening it for.
 
 **→ The line moves to COVERAGE (§41bf: +6.36 of the +8.09 gap), job 53287082**, which computes no divergence
 at all and is therefore unaffected by every constraint in this table.
+
+### §41bl — ⚠️I VERIFIED OFFLINE MODEL RESOLUTION THROUGH THE WRONG RESOLVER, and it cost a job launch
+
+Job 53287082 died at engine init: `IncompleteSnapshotError: The cached snapshot for 'Qwen/Qwen3-14B' is
+incomplete: 3 file(s) are missing (.gitattributes, LICENSE, README.md)`.
+
+**The cause is not the missing files, it is how I checked for them.** I downloaded the new teachers with
+`allow_patterns=["*.json","*.safetensors","*.txt","*.model"]` — weights and configs only, no LICENSE or
+README. I then hit this exact error once, on a manual `snapshot_download(..., local_files_only=True)`, and
+reasoned: *"Not a weight problem — `from_pretrained` requests specific files, not the whole snapshot, so it
+should work."* To confirm, I ran `AutoConfig.from_pretrained` and `AutoTokenizer.from_pretrained` offline for
+both models and got ✅ on both. That check was real, it passed, and **it exercised a resolver nothing in this
+job uses.** vLLM goes `LLM(model=...)` → `EngineArgs.__post_init__` → `get_model_path` →
+**`snapshot_download`**, which validates the *entire* snapshot and is exactly the strict path whose error I
+had just explained away.
+
+⚠️**THE GENERALISABLE MISTAKE: I diagnosed a failure, formed a hypothesis about which code path mattered, and
+then tested the path my hypothesis named instead of the path the consumer actually calls.** The tell was
+available and I walked past it — the failing call and my verification call were *different functions*, and I
+never asked which one vLLM invokes. Worse, the evidence looked strong from both directions: the 8B/14B
+**audition had already run successfully** on these same incomplete snapshots, because `opd_train.py` loads a
+teacher with `from_pretrained`. So the model demonstrably worked in one job and could not load in another, and
+I read the working case as general.
+✅**Rule: when a dependency resolves a resource, verify through the resolver the CONSUMER calls, by name.** Here
+that is one line — `snapshot_download(repo_id=m, local_files_only=True)` — and it now passes for both models
+after a re-download with no `allow_patterns`. Cost: one job launch and ~4 minutes; it would have been ~40
+minutes had it failed after the data build instead of before it.
