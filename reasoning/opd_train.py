@@ -104,10 +104,14 @@ def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
     -- the failure mode that made off-policy imitation of Llama-3.1-8B a null here.
     """
     by_q = defaultdict(list)
-    with open(rollouts) as f:
-        for line in f:
-            r = json.loads(line)
-            by_q[(r["pool"], r["question"])].append(r)
+    # accepts one path or several: a coverage arm trains on the UNION of newly-built verified traces and
+    # the model's own correct rollouts, and grouping them by problem here is what lets --per-problem
+    # sample across both sources instead of one dump winning by row count
+    for path in ([rollouts] if isinstance(rollouts, str) else list(rollouts)):
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line)
+                by_q[(r["pool"], r["question"])].append(r)
 
     rng = random.Random(seed)
     rows, stat = [], Counter()
@@ -353,7 +357,9 @@ def main():
                          "no influence on trace length. Required for a teacher whose trace-length "
                          "distribution differs from the student's -- see the closure-hazard note in "
                          "the training loop.")
-    ap.add_argument("--rollouts", required=True)
+    ap.add_argument("--rollouts", nargs="+", required=True,
+                    help="one or more rollout dumps, merged and grouped by problem. Several is how a "
+                         "coverage arm trains on new verified traces UNION the model's own correct ones.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-problem", type=int, default=3)
     ap.add_argument("--labels", nargs="*", default=["correct", "wrong", "unclosed", "no_answer"])
