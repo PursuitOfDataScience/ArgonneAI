@@ -297,6 +297,12 @@ def main():
             kept_by_kind[kind] += 1
             solved_problems.add((pool, q))
 
+    # `texts` is a FLAT list built by iterating (prompt, candidate) and consumed in the same nested order.
+    # If those two orders ever desync -- a prompt returning fewer than --samples candidates would do it --
+    # every trace after that point would be paired with the WRONG problem's gold and silently graded against
+    # it, producing a corrupt training set that looks fine. Cheap to assert, invisible to debug otherwise.
+    assert ti == len(texts), f"text/candidate desync: consumed {ti} of {len(texts)}"
+
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w") as f:
         for r in rows:
