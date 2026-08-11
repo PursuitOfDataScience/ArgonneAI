@@ -7404,3 +7404,39 @@ Greedy tells the same story more quietly: the entire prior campaign spans **4.6p
 ⚠️Read `a4opd_a100`'s row as the cautionary one: greedy 1.02 with 98.02% unclosed, yet best-decode 38.02
 because force-closing rescues a third of it. A single number would have called that arm "broken" or
 "mediocre" depending on which column was quoted, and neither is what happened.
+
+### §41u — The soup arm was built and then DROPPED on a free measurement plus arithmetic
+
+`||opd35 − combo||₂ / ||combo||₂ = **0.914%**`, and strikingly uniform: every block between 0.77% and
+0.96% (only the last two rise, L30 0.85 / L31 0.96), every parameter group between 0.130%
+(`norm.weight`) and 1.180% (`embed_tokens`, which is also the tied `lm_head`). A full epoch of per-token
+reverse KL at lr 1e-5 moved the model by under one percent of its own norm — and produced +8.8pp
+`acc|ANSWERED`.
+
+That kills the premise of §41s's soup arm in two steps, neither of which needs a GPU:
+
+**1. At 0.9% separation the two checkpoints are in the same basin,** so interpolating them is
+essentially linear in function space — there is no barrier to cross and no reason to expect a
+non-monotone curve. The 3.5 line's soup sweep found a knee at α=0.85 for a pair separated by an entire
+CoT-SFT stage; this pair is not that.
+
+**2. Even granting perfectly linear interpolation of the two component metrics, the arithmetic puts the
+optimum at the endpoint.** `greedy = acc|ANSWERED × answered-rate` is a PRODUCT, so it is quadratic in α
+and *could* peak in the interior — that was the actual hope. Taking the endpoints,
+`acc|ANS(α) ≈ 53.5 + 8.8α` and `answered(α) ≈ 90.5 − 7.5α`:
+
+> `d/dα [ (53.5+8.8α)(90.5−7.5α) ] = 8.8·90.5 − 7.5·53.5 − 2·8.8·7.5·α = 395.15 − 132α`, zero at
+> **α = 2.99**, i.e. outside [0,1] — so greedy is increasing across the whole interval and **α=1 wins.**
+
+The reason is a ratio: opd35's capability gain is **+16% relative** (53.5→62.3) while its answered-rate
+loss is only **−8% relative** (90.5→85.1). The product cannot peak inside unless one curve is strongly
+non-monotone, which 0.9% separation makes unlikely.
+
+**3. And the deployable metric removes the trade entirely.** Force-closing eliminates the answered-rate
+penalty by construction — at best-decode opd35 is +4.85 over combo with nothing left to interpolate. So
+the soup could only ever help plain greedy, and even there the arithmetic says it will not.
+
+`reasoning/a4_opdsoup.sh` is kept (it is correct, and it becomes relevant the moment two checkpoints are
+separated by a whole stage rather than one epoch) but **dropped from the queue**. Cost of the analysis:
+one weight-norm pass and four lines of calculus. Cost of running it instead: a GPU slot, three
+checkpoints, and two gate stages to rediscover α=1.00.
