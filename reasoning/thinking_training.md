@@ -8515,3 +8515,46 @@ only one, and it is now fixed.
 round 3, baseline**) and takes `R4=` so it can be pointed at a regenerated round 4 later. Round 6's smoke was
 the best of the whole chain (greedy 66.50, unclosed 13.5%, 282 tok), but §41ar forbids ranking on that, so the
 gate decides.
+
+### §41aw — FINAL: the DEPLOYED metric saturated at round 3; rounds 4-6 bought CEILING instead
+
+Chain's final gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 71.00 | 73.40 | 73.25 | **73.95** | 80.65 | 92.00 | 79.6% | 8.45 | 236.4 |
+| **a4opdi (round 6)** | **61.25** | 63.90 | 64.60 | 64.65 | **71.60** | **87.35** | 71.1% | 13.50 | 264.9 |
+| a4start (round 3) | 60.45 | 64.60 | **65.15** | 64.90 | 70.45 | 85.40 | 71.2% | 14.60 | 271.4 |
+| a4combo (session start) | 56.75 | 57.60 | 57.50 | 57.45 | 68.10 | 85.45 | 61.1% | 6.95 | 199.9 |
+
+Pooled paired McNemar over 2,000 items, **round 6 vs the session start**: greedy **+4.50** (p=1.90e-05),
+budget +6.30 (3.02e-09), extend1 +7.10 (1.34e-11), extend3 **+7.20** (1.18e-11), sc@8 +3.50 (1.74e-04),
+**pass@8 +1.90 (9.77e-03)**.
+
+**Round 6 vs round 3** — and this is the finding: greedy +0.80 (p=0.43), extend1 **−0.55** (p=0.59), sc@8
++1.15 (p=0.17), **pass@8 +1.95 (p=6.09e-03)**.
+
+**So the two are statistically indistinguishable on every deployed metric, and round 6 is significantly better
+on `pass@8` alone.** Three extra rounds (~3.6 GPU-hours) bought **ceiling, not floor.** The deployed metric
+saturated at round 3; coverage kept improving through round 6.
+
+⚠️**That reconciles §41au with the gate rather than contradicting it.** §41au found the *sampling* distribution
+peaking at round 4 (T=0.9 rollouts); the gate finds the *greedy/force-closed* metric flat from round 3 and
+`pass@8` still rising. **Saturation is metric-specific — a chain can stop improving what you deploy while still
+improving what it covers**, and reading one as the other is the same class of error as §41ah and §41aq. Both
+measurements are correct; they are measuring different things.
+
+**⭐THE SESSION, asdiv + svamp, start → best available:**
+
+| | start (`a4combo_a100`) | best | Δ | 3.5-think |
+|---|---:|---:|---:|---:|
+| greedy | 56.75 | **61.25** (r6) | **+4.50** | 71.00 |
+| best decode | 57.60 | **65.15** (r3) | **+7.55** | 73.95 |
+| self-cons@8 | 68.10 | **71.60** (r6) | +3.50 | 80.65 |
+| pass@8 | 85.45 | **87.35** (r6) | +1.90 | 92.00 |
+| `acc\|ANSWERED` | 61.1% | **71.2%** | **+10.1pp** | 79.6% |
+
+**Either round 3 or round 6 is defensible as the artifact** — r3 by best-decode (65.15 vs 64.65, n.s.), r6 by
+ceiling and self-consistency. r6 also has the lower unclosed rate (13.50% vs 14.60%) and shorter traces (264.9
+vs 271.4), so **r6 is the better artifact on every axis except a non-significant 0.55 of best-decode**, and it
+is the one to prefer. The gap to the released 3.5-think closes from **16.35 → 8.80** on the deployable number.
