@@ -7509,3 +7509,35 @@ decode time — which §41q already showed is affordable (+5.20 pooled, p=4.2e-1
 
 ⚠️Also note what `notail` did NOT cost: greedy 62.50 against the unmasked arm's 60.00 on the same
 200-item subset. That is inside the n=200 noise band (±3.4pp) and must not be read as an improvement.
+
+### §41x — `--kd-prefix-frac`: the protection that matches the mechanism, queued as `pre50`/`pre33`
+
+§41w's refutation was informative rather than merely negative: removing **all** gradient from the closure
+logits moved trace length by one token, so lengthening is not a closure-probability effect at all. The
+student is learning to produce the teacher's longer **derivations**, and the terminator simply arrives
+later. Neither protection in flight addresses that — `notail` pulls on the terminator (refuted), `anchor`
+pulls on the whole trace.
+
+**Prefix-only KD does.** Apply the divergence to the first FRAC of each trace's completion tokens and
+nothing after. Two independent findings converge on it:
+* **§41b** — the failure is at the OPENING: 79% of wrong traces differ from a correct derivation at
+  equation index 0, median shared-equation prefix 0%. The information the teacher has is concentrated
+  early.
+* **§41w** — the cost is in the tail: the body imitation that lengthens traces happens throughout, and the
+  student's own tail behaviour is exactly what should be left alone.
+
+Take the teacher's early decisions; leave the student's tail untouched. Arms `pre50` (half the completion),
+`pre33` (a third), and `pre50a` (half, plus the CE anchor) are wired into `a4_kd3.sh`, so the next
+submission is `ARMS="pre50 pre33" sbatch reasoning/a4_kd3.sh`.
+
+Verified before any GPU time, because a masking bug here would silently compare misaligned tokens: the KD
+mask is a strict subset of the completion mask, and both sides are cut by the same fraction of the same
+completion so the student and teacher gathers still line up token-for-token (49/49 → 28/28 at frac 0.5,
+18/18 at 0.33). The runtime count assertion in the training loop still holds. CE deliberately keeps the
+FULL completion when KD is prefix-only — holding the model's own tail in place is the anchor's entire job.
+
+**Why this ranks where it does.** §41q showed the length cost is already affordable at decode time (+5.20
+pooled, p=4.2e-10, force-closed). So prefix-KD is not needed to bank the gain — it is needed to bank it in
+PLAIN GREEDY, which is a strictly better artifact than one that depends on a decode wrapper. That makes it
+worth one slot but not worth pre-empting the selector study, which is still the largest untested number on
+the board (~23.8pt of floor-to-ceiling headroom).
