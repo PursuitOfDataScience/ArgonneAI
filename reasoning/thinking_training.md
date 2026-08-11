@@ -6585,6 +6585,36 @@ have to be restored before any release.
 
 ## §41 — WHAT a4-THINK'S WRONG ANSWERS CONTAIN, and the three levers that follow from it (2026-08-10)
 
+**READ THIS FIRST.** §41 ran 24 arms and a dozen zero-GPU analyses in one session. The result:
+
+> **Per-token on-policy reverse-KL distillation from a LENGTH-MATCHED teacher is the best arm of the
+> whole a4 campaign** — `acc|ANSWERED` 53.5% → 62.3% (+8.8pp, positive on all four clean pools),
+> best-decode 48.63 → 53.48 (+4.85), pooled `extend2` **+5.20 at p=4.2e-10** over 3,000 items — and
+> **it raised the FLOOR while leaving the CEILING untouched** (pass@8 −0.93, n.s.), which is the exact
+> inversion of the thirteen imitative arms before it. ⚠️One seed; the replicate is in flight.
+
+The map, so the subsections can be read out of order:
+
+| § | what it establishes |
+|---|---|
+| a | the 12-arm table; a 3x-stronger external teacher is a NULL; RLVR-DPO's gain was eaten by length drift |
+| b | **the wrong answers are PLAN failures, not arithmetic**; arithmetic is a false lead (the checker fires on 18.7% of CORRECT traces) |
+| f, n | two whole families REFUTED — long-CoT teachers (greedy 1.75) and hindsight/gold-anchored self-distillation (−21.6) |
+| h, l, o | the selector: text features are dead; 78.2% of the vote's losses are near-ties; the vote discards 4.0pt greedy already had; **`effort_gate` breaks ties by SAMPLING ORDER** |
+| j, u, v | three of my own estimates CORRECTED by measurement — the "+1.2 capability ceiling", the soup's premise, and the gain's supposed structure |
+| p, q, r | **the result**, its decode-time recovery, and the pooled significance |
+| w, y | the mechanism pinned from both sides: **trace length is body-level**, so a terminator mask does nothing (1 token) and a body anchor works (39 tokens) |
+| s, t, x | the queue, the 24-arm record, and the protection that matches the mechanism |
+
+Two process lessons worth more than any single number:
+* ⚠️**Never instrument a failure with a statistic conditioned on the failure being absent.** The
+  closure diagnostic read healthy for 1,719 steps of a run that ended at 96.95% unclosed, because it
+  only sampled positions where the trace had already closed. Fixing it to the marginal hazard was
+  *still* not enough; only a 90-second end-to-end generation caught the drift.
+* ⚠️**Never price a lever by the best value an exhausted family of methods reached.** §41j put the whole
+  remaining capability lever at +1.24 on exactly that reasoning, and the next arm returned +4.85.
+
+
 §40 closed the "transfer the 3.5 recipe" question (−16.79pt) and the arms that followed it closed
 nine more. This section is about the twelve-arm total, one measurement that reorganised the problem,
 and the mechanism class that had never been tried on this base.
