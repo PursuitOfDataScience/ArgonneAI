@@ -8025,3 +8025,29 @@ a convenient proxy over a direct measurement of the thing itself.**
 R=2 and R=3). The trend across two rounds is monotone on nine of ten measures, so the run to make next is
 another round, not a new mechanism — and the earlier plan to "stop at one round because the KL flattened"
 would have thrown that away on the basis of a metric that cannot see it.
+
+### §41aj — Round 3, and the retention fix paying off in the very next job
+
+Round 3's smoke test on the same 200 asdiv items completes a monotone progression:
+
+| | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| think_combo (baseline, full pool) | 64.30 | 6.9% | 212 |
+| round 1 (`think_opd35anchor`) | 62.50 | 13.5% | 241 |
+| round 2 (`think_opd_r2`) | 65.00 | 15.5% | 267 |
+| **round 3 (`think_opd_r3`)** | **65.50** | **13.0%** | 277 |
+
+Unclosed came back DOWN in round 3 (15.5% → 13.0%) while accuracy kept rising, so the trace-length cost is
+not compounding monotonically — the CE anchor is holding, even though `t_len` drifts up 10 tokens per round.
+Round 3's reverse KL also fell again (0.1676 → 0.1305, agreement 87.7% → 90.4%), which after §41ai should be
+read as "the new states are further from the teacher and it closed most of that", not as a progress number.
+
+✅**And the retention fix from earlier this session fired in the very next job and protected the artifact.**
+`a4_opd_iter.sh`'s guard originally exempted `"$ROOT/think_opd"` from deletion **by name** — a checkpoint
+that no longer exists — which with `START` repointed at `think_opd35anchor` would have deleted the session's
+best result at the end of round 2. I changed it to compare against `$START` *before* submitting, and the log
+confirms the outcome: only `[retention] dropping consumed rollouts .../a4_opd_r2` fired, and
+`think_opd35anchor` is still on disk. The bug and its fix were separated by about an hour and one job.
+
+⚠️`think_opd_r2` survives because the loop ends before it can rotate — it is a rotation candidate once
+round 3's gate has recorded its successor's numbers, and it has no published number of its own.
