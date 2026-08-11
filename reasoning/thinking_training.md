@@ -8558,3 +8558,44 @@ measurements are correct; they are measuring different things.
 ceiling and self-consistency. r6 also has the lower unclosed rate (13.50% vs 14.60%) and shorter traces (264.9
 vs 271.4), so **r6 is the better artifact on every axis except a non-significant 0.55 of best-decode**, and it
 is the one to prefer. The gap to the released 3.5-think closes from **16.35 → 8.80** on the deployable number.
+
+### §41ax — Can a better Qwen3 teacher help? The candidate set, verified, and why STRENGTH is not the constraint
+
+Checked rather than assumed, because the whole method rests on token-identical tokenisation:
+
+| candidate | params | tokenizer matches a4 | verdict |
+|---|---:|:---:|---|
+| **`Qwen/Qwen3-4B` (plain hybrid, in the HF cache)** | 4.0B | ✅ len 151,669; `<think>`=151667 | **untested; best structural bet** |
+| `Qwen3-4B-Thinking-2507` (on disk) | 4.0B | ✅ | tested: 4.5x signal, **collapsed termination** (§41f) |
+| Qwen3-8B / 14B / 32B / 30B-A3B | 8-32B | ✅ (same Qwen3 vocab) | not on disk; downloadable |
+| ⛔ `Qwen3.5-9B` | 9.7B | ❌ **`<think>`=248068**, vocab ~248k | disqualified |
+| ⛔ `Qwen3.5-0.8B-Base` | 0.9B | ❌ same break | disqualified |
+| ⛔ `Qwen2.5-7B-Instruct` | 7B | ❌ 151,665 entries, **no `<think>` at all** | disqualified |
+| ⛔ Qwen3-0.6B/1.7B-Base | <2B | ✅ | weaker than the current teacher |
+
+**Qwen3.5 broke the tokenizer.** The vocabulary grew to ~248k between Qwen3 and Qwen3.5, so `<think>` moved
+151667 → 248068 and a real trace no longer round-trips. Per-token KD is undefined across different
+tokenisations; `opd_train.py` refuses to start. That rules out the strongest same-family model on disk on
+grounds that have nothing to do with its quality. ⚠️Worth remembering as a planning constraint for this line:
+**the Qwen3 → Qwen3.5 boundary is a hard wall for any method requiring token alignment**, and argonne4's whole
+KD story depends on staying on the Qwen3 side of it.
+
+**And the reframe, which is the substantive answer.** §41f already measured a teacher with **4.5x more
+per-token signal** than the current one (revKL 0.85 vs 0.20; argmax disagreement 23% vs 12%) producing greedy
+**1.75** with a 96.95% unclosed rate — because its trace-length distribution is 20-30x the student's. So
+"get a stronger teacher" is not the open lever; **"decouple a strong teacher's content signal from its length
+signal" is.** Two candidates for that now exist, neither tested:
+* **`Qwen3-4B` plain** — the hybrid rather than the long-CoT-specialised variant, same size class, same
+  tokenizer, natively supports non-thinking mode. Structurally the better bet on exactly the variable that
+  killed the last attempt.
+* **`--kd-prefix-frac`** — built after §41w pinned trace length as body-level, verified numerically, never run.
+
+**`reasoning/a4_teacher_audition.sh`** scores candidates in ~3 minutes each instead of ~4 GPU-hours each, on
+the two axes that decide it, both already printed by `opd_train.py` at step 1:
+* `revKL` / `agree` — how much the teacher has to say about a4's own tokens;
+* **`haz s` vs `haz t`** — the marginal closure hazard of student and teacher, the statistic whose absence cost
+  §41f its entire run.
+
+Read it as: **prefer the highest `revKL` among teachers whose `haz t` is within ~2x of `haz s`.** A
+high-signal teacher with a collapsed hazard is not usable as-is and becomes a `--kd-prefix-frac` question
+instead. Six steps at lr 1e-6 barely moves the student, so the audition is a measurement, not a training run.
