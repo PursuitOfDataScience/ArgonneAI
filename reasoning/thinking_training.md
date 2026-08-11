@@ -9136,3 +9136,44 @@ matched (`haz_t/haz_s = 1.00`). ⚠️`q06base` was CANCELLED rather than run: i
 `teacher 0.00000 vs student 0.00665` warning, so as a capability control it could only distinguish
 "weaker teacher fails identically" from "weaker teacher fails slightly less", neither of which changes a
 decision. That is 35 GPU-minutes not spent on a foregone conclusion.
+
+### §41bk — ⛔SCALE IS MEASURED FLAT ON THE HAZARD AXIS, and the "more signal from a bigger teacher" premise is FALSE TOO
+
+§41bi recorded that I had asserted bigger Qwen3 was pointless rather than measuring it. Measured now, same
+instrument, same student, same rows (job 53286878, 8 candidates):
+
+| teacher | params | revKL | agree | `haz_t` | **ratio** | `p(</think>`\|closed) t |
+|---|---:|---:|---:|---:|---:|---:|
+| **3.5-think** (the one that worked) | 2.88B | 0.1057 | **92.7%** | 0.0052 | **1.000** | 1.00 |
+| Qwen3-4B plain | 4.02B | 0.9793 | 78.3% | 0.0044 | 0.846 | 0.98 |
+| **Qwen3-8B** | 8.19B | 0.9024 | 78.6% | 0.0044 | **0.846** | 0.92 |
+| **Qwen3-14B** | 14.8B | 0.8766 | 78.5% | 0.0043 | **0.827** | **0.73** |
+| Qwen3-4B + brevity | 4.02B | 0.9809 | 76.0% | 0.0046 | 0.622 | 1.00 |
+| Qwen3-4B `/no_think` | 4.02B | 1.1754 | 73.4% | 0.0031 | 0.816 | 0.98 |
+| Qwen3-1.7B-Base | 1.72B | 0.7458 | 78.7% | **0.0000** | 0.000 | 0.00 |
+| Qwen3-0.6B-Base | 0.60B | 0.8164 | 78.6% | **0.0000** | 0.000 | 0.00 |
+
+⛔**SCALE DOES NOTHING TO THE HAZARD RATIO: 0.846 → 0.846 → 0.827 across 4B → 8B → 14B.** Flat, faintly
+declining, and all three sit in the zone already measured fatal twice (0.85 gave 88.5%/96.5% unclosed, 0.75
+gave 96.95%). `p(</think>` | closed) for the teacher falls **0.98 → 0.92 → 0.73** with size — the long-form
+habit *strengthens* with scale, exactly the mechanism §41bb proposed. **The argument was right; it is now a
+measurement, which is what it needed to be.** 3.5B–15B is not a knob that reaches 0.95.
+
+⭐**AND THE PREMISE BEHIND WANTING A BIGGER TEACHER IS ALSO FALSE.** revKL *falls* with teacher scale —
+**0.979 (4B) → 0.902 (8B) → 0.877 (14B)** — while argmax agreement holds flat at ~78.5%. A bigger teacher has
+**less** to say about a4's own tokens, not more. Plausibly because a larger model is better calibrated and so
+less confidently different on the tokens a4 emits. Either way it kills the framing this whole line of arms
+came from: §41ax priced the strong-teacher lever by "Qwen3-4B carries 9.3× the signal 3.5-think has left," and
+the natural extrapolation — that 14B carries more still — is simply not true. **Per-token divergence is not
+monotone in teacher capability, so it cannot be used as a proxy for how much a teacher can teach.**
+
+✅**THE CHANNEL IS CLOSED, WITH DATA RATHER THAN REASONING.** Per-token on-policy KD from a stronger
+same-tokenizer teacher: **0-for-7 arms**, four distinct protections (column masking, prefix masking, CE
+anchoring, context conditioning), and the scale axis now measured flat across 4B/8B/14B with 32B and 30B-A3B
+ruled out by the same trend. The only teacher that ever worked is the one whose trace-length distribution
+already matched the student's. Nothing further should be spent here; `reasoning/a4_teacher_audition.sh` will
+say in 3 minutes if a genuinely length-matched candidate ever appears, and that is the only condition worth
+re-opening it for.
+
+**→ The line moves to COVERAGE (§41bf: +6.36 of the +8.09 gap), job 53287082**, which computes no divergence
+at all and is therefore unaffected by every constraint in this table.
