@@ -7630,3 +7630,39 @@ NO-OP in `cot-sft.py` until 255dff1 — it seeded python/numpy/torch while HF Tr
 directly, and the step counts prove it took: **1,719 / 1,719 / 1,713 micro-batches** for seeds 46 / 46 /
 47. The two seed-46 arms agree exactly and the seed-47 arm differs, which is what a live seed looks like
 and what a dead one cannot fake.
+
+### §41aa — Weight space triangulates the whole story, for free, and finds the soup that arithmetic does not rule out
+
+`||combo|| = 1235.9`. Relative distances, all computed on CPU from the safetensors:
+
+| checkpoint | distance to combo | distance to opd35 |
+|---|---:|---:|
+| think_opd35 (seed 46) | 0.914% | — |
+| think_opd35s47 (seed 47) | 0.817% | 0.680% |
+| think_opd35notail | 0.946% | 0.769% |
+| **think_opd35anchor** | **0.747%** | 0.661% |
+
+**1. Reproducibility, measured without the gate.** If the two seeds' updates were orthogonal,
+`||u−v||` would be `sqrt(0.914² + 0.817²) = 1.226%`. It is **0.680%**, so
+`cos(update₄₆, update₄₇) = +0.693`: **69.3% of the update DIRECTION is shared across seeds.** The objective
+drives the weights the same way regardless of data order. That is an independent line of evidence for
+§41p-r, arriving before the replicate's gate and unable to be confounded by it.
+
+**2. The `notail`/`anchor` mechanism is visible in the weights.** §41y showed the CE anchor recovers 39
+tokens of trace length and the terminator mask recovers one. In weight space the anchor is **closer to the
+baseline** (0.747% vs the unprotected 0.914%) and the terminator mask is **farther** (0.946%). The CE term
+literally pulls the model back toward combo; masking the terminator columns does not pull at all. Three
+independent readouts — trace length, unclosed rate, weight distance — agree on which intervention does
+something.
+
+**3. And the 31% seed-specific residual is the soup that §41u's arithmetic does NOT rule out.** §41u killed
+`combo ⊗ opd35` because interpolating two *recipes* has its optimum at α=2.99. Averaging two runs of the
+*same* recipe at different seeds is a different claim entirely: it cancels the ~31% that is seed-specific
+and keeps the 69% that is systematic, which is what model souping was invented for. `a4_opdsoup.sh` is
+repointed at `think_opd35 ⊗ think_opd35s47` at a flat 0.5 — no sweep, because there is no trade to tune —
+and `a4_kd3.sh` gains an `s48` arm so a third seed is available if two is not enough.
+
+⚠️**The prediction, recorded so it can be wrong:** the soup should land at or slightly above the better
+endpoint on every metric with no new failure mode. The two endpoints already agree to within 1pt greedy and
+0.5pp unclosed (§41z), so a soup landing BELOW both would mean the 31% residual is not noise but something
+each seed needs internally consistent — which would be a more interesting result than the soup working.
