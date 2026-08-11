@@ -7133,3 +7133,40 @@ WRONG answer. The wrong-answer control is what makes it a measurement —
 **`gasd_ansonly` is the informative contrast** and is training now: its teacher gets strictly less
 privileged information (the answer, no derivation). If it is less damaging, the damage scales with the
 unattainable information content, which is exactly what the irreducible-divergence account predicts.
+
+### §41o — Self-consistency ACTIVELY DESTROYS 4.0pt of items that a single greedy pass already had
+
+From the gate JSONs' per-item `ok` arrays, over all five pools (3,319 items), for `a4combo_a100`:
+
+| | count | |
+|---|---:|---|
+| recoverable (pass@8 = 1) | 2,490 | 75.0% of items |
+| the vote wins on those | 1,903 | 76.4% of recoverable |
+| the vote LOSES on those | 587 | 23.6% of recoverable |
+| **…of which greedy ALREADY had it right** | **133** | **22.7% of the vote's losses = 4.0pt** |
+| net exchange | vote gains 480, loses 184 | **net +296 = +8.92pt** |
+
+Self-consistency is a large net win (+8.92pt) that is paying for itself by **throwing away 184 items
+greedy had right, 133 of them recoverable**. The released 3.5-think shows the same pattern — 128 of its
+413 vote losses (31.0%) were greedy hits — so this is a property of majority voting on these models,
+not something peculiar to a4. A `greedy ∪ vote` oracle would be +5.5pt over the vote.
+
+That makes the cheapest possible informed tie-break worth testing, and it needs nothing computed:
+**`gtb0`/`gtb1` — take the plurality, but among answers within the vote-slack, prefer the answer the
+GREEDY pass gave.** No logprobs, no entropy, no extra generation, one line in a decode wrapper.
+
+All five selectors were unit-tested against four hand-built candidate sets before any GPU time, and the
+table below is the honest discrimination — including the case where the cheap rule loses:
+
+| case | vote | vtb0 | vtb1 | gtb0 | gtb1 |
+|---|---|---|---|---|---|
+| 2-2 tie, greedy right | ok (by luck) | ok | ok | ok | ok |
+| **2-2 tie, greedy WRONG** | bad | **ok** | **ok** | **bad** | **bad** |
+| 2-1 plurality wrong, greedy right | bad | bad | **ok** | bad | **ok** |
+| 3-1 plurality right, greedy wrong | ok | ok | ok | ok | ok |
+
+So `gtb` is free but blindly trusts greedy and loses exactly where greedy is wrong on a tie; `vtb` pays
+for logprobs and handles that case. Neither ever overrides a clear plurality. Which one wins is an
+empirical question about how often greedy is right on a near-tie, which is what `a4_entbranch.sh`
+measures — nine selectors on identical candidate sets with per-item `ok` arrays, plus the eval-pool
+margin distribution that §41l could only measure on the train pools.

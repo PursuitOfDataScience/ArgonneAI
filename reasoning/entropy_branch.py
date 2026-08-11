@@ -52,7 +52,7 @@ CLOSE = "\n</think>\n\nThe answer is $\\boxed{"
 # continuing to improve as N grows. Self-certainty is KL(uniform || p) averaged over tokens, i.e.
 # log V - H(p) up to a constant, so ranking by MINIMUM mean entropy is ranking by maximum
 # self-certainty -- `ent` is that argmax pick, `borda` and `wvote` combine it with the vote.
-SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb0", "vtb1")
+SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb0", "vtb1", "gtb0", "gtb1")
 
 # ⚠️`vtb` (vote-then-tie-break) is the selector with the strongest prior, and the reason is a
 # measurement, not taste. Over the 6,565 train problems where gold appears among the answered
@@ -74,6 +74,14 @@ SELECTORS = ("vote", "ent", "lp", "borda", "wvote", "vtb0", "vtb1")
 #   vtb1 (slack 1) also overrules a one-vote plurality. That is where most of the measured headroom
 #     is (39.6% of losses on top of the 38.6% exact ties) but it can now lose items the vote had
 #     right, so it has to earn its keep against vtb0.
+#
+# `gtb0`/`gtb1` are the same rule with the CHEAPEST possible tie-break: prefer the GREEDY answer.
+# No logprobs, no entropy, no second pass -- and the upside is measured. Over the five gate pools
+# (3,319 items) the vote loses 587 recoverable items, and **133 of them (22.7%) are items the single
+# greedy pass ALREADY GOT RIGHT** -- 4.0pt of a4 that self-consistency actively throws away. The
+# released 3.5-think shows the same pattern (31.0% of its vote losses), so this is a property of
+# self-consistency on these models rather than of a4. If `gtb0` works, the fix to the deployed decode
+# recipe is one line and needs nothing computed.
 
 # A sixth selector, behind --selfverify, and the last FREE one available. §41h killed every text
 # feature; self-certainty is a property of the generating distribution. This asks the model a
@@ -312,16 +320,23 @@ def main():
                     best = min(cs, key=lambda c: c[1])
                 elif key == "lp":
                     best = max(cs, key=lambda c: c[2])
-                elif key.startswith("vtb"):
-                    slack = 0 if key.endswith("0") else a.tie_slack
+                elif key.startswith("vtb") or key.startswith("gtb"):
+                    slack = 0 if key[3] == "0" else a.tie_slack
+                    greedy_tb = key.startswith("gtb")
                     votes = Counter(aa for aa in answers if aa is not None)
                     if not votes:
                         best = cs[0]
                     else:
                         tc = max(votes.values())
                         near = [x for x, c in votes.items() if tc - c <= slack]
+                        g_ans = answers[0] if cs and cs[0][3] == "greedy" else None
+
                         def strength(x):
                             js = [j for j, aa in enumerate(answers) if aa == x]
+                            if greedy_tb:
+                                # 1 if this is what the greedy pass said, else 0; ties inside each
+                                # group fall back to certainty so the rule stays deterministic
+                                return (1 if x == g_ans else 0, -min(cs[j][1] for j in js))
                             if key.endswith("_vfy"):
                                 return max(vscore.get((setname, i, j), -1.0) for j in js)
                             return -min(cs[j][1] for j in js)     # -min entropy = max certainty
