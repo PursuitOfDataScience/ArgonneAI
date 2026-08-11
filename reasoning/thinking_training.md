@@ -8051,3 +8051,38 @@ confirms the outcome: only `[retention] dropping consumed rollouts .../a4_opd_r2
 
 ⚠️`think_opd_r2` survives because the loop ends before it can rotate — it is a rotation candidate once
 round 3's gate has recorded its successor's numbers, and it has no published number of its own.
+
+### §41ak — What to run next, and why it is "more rounds" rather than a new idea
+
+The queue is reordered one last time by what §41ai measured. Iteration is the working lever, so the next job
+is **more of it**, and the question it answers is where the trend saturates:
+
+    START=/project/rcc/youzhi/models/a4_think_final/think_opd_r3 ROUNDS=3 sbatch reasoning/a4_opd_iter.sh
+
+Three more rounds at ~1.2 h each (30 min generation + 38 min distillation) plus one gate ≈ 4.6 h, inside the
+10 h limit. Each round prints `fail_taxonomy.py` on its own fresh rollouts before training, so the
+saturation point is visible round by round from a direct behavioural measurement rather than from the
+divergence — which §41ai established cannot see it.
+
+**Why not the other queued arms first:**
+* `pre50`/`pre33` (prefix-only KD) — targets the residual `t_len` drift of ~10 tokens per round. Worth
+  running, but the drift is not currently costing anything: round 3's unclosed came DOWN to 13.0% while
+  accuracy rose. Fix a problem when it starts costing.
+* `a4_opdsoup.sh` (averaging `opd35 ⊗ opd35s47`, the two same-recipe seeds) — still well-motivated by the
+  +0.693 update correlation, and nearly free, but it averages two ROUND-1 checkpoints and round 3 has since
+  moved well past both. Re-point it at two seeds of the *current* round before spending a slot.
+* Qwen3-4B-Thinking with the terminator mask — the 4.5x-more-informative teacher. ⚠️Now known to be a worse
+  bet than it looked: §41w showed the terminator mask does NOT control trace length (that is body-level), so
+  the protection that would let a 20-30x-longer-trace teacher in **does not exist yet**. `--kd-prefix-frac`
+  is the candidate, and it should be validated on the SAFE teacher first (`pre50`) before being trusted with
+  the dangerous one.
+* A trained verifier (V-STaR) — §41ae measured the free selectors at +1.60 over voting with 15.7pt of oracle
+  headroom left, so a verifier is the only route to the rest. But it is also the arm this base is least
+  likely to support: §41af showed the model is *damaged* by information placed in its context, and a
+  verifier prompt is exactly that. Rank it last until something contradicts §41af.
+
+⚠️**And the one thing that should NOT be inferred from this session.** The mechanism that worked does not put
+anything in the student's context and does not add data — it re-weights the model's own next-token
+distribution at states it chose itself. Every arm that tried to *inform* the model failed (long-CoT teacher,
+Llama text, gold hints, reference derivations, verification prompts), and every arm that tried to *sharpen*
+it worked. On this base, sharpening is the channel that is open.
