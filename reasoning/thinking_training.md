@@ -7750,3 +7750,45 @@ cleanest possible statement of §41w: an intervention aimed at the wrong mechani
 **The gap to the released 3.5-think closes from 14.75 to 9.90 on the deployable number**, and from 20.0pp
 to 13.1pp on `acc|ANSWERED` — achieved on a base measured at −16.79pt against 3.5's (§40), by a method that
 moved the weights 0.9% and left `pass@8` untouched.
+
+### §41ad — Five-pool means, and the per-pool caveat that decides which artifact to ship
+
+The campaign has always reported five-pool means, so here they are alongside the four-pool numbers of §41ac
+(math500 included, and it remains near-duplicate-contaminated for every model on this line):
+
+| model | greedy | +budget | +extend2 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **a4opd35anchor_a100** | **46.22** | 47.55 | 48.24 | **48.36** | **53.06** | 68.76 | 57.9% | 19.36 |
+| a4opd35_a100 | 44.81 | 47.77 | 48.11 | 47.70 | 52.12 | 66.60 | 59.7% | 23.78 |
+| a4opd35s47_a100 | 44.77 | 47.63 | 47.33 | 47.41 | 51.14 | 67.60 | 59.3% | 23.14 |
+| a4opd35notail_a100 | 44.36 | 47.16 | 47.34 | 47.38 | 51.04 | 66.63 | 59.2% | 23.34 |
+| a4combo_a100 (old best) | 43.44 | 43.96 | 44.15 | 44.17 | 50.94 | 68.94 | 50.1% | 13.66 |
+
+**Five-pool: greedy 43.44 → 46.22 (+2.78), best-decode 44.17 → 48.36 (+4.19), `acc|ANSWERED` 50.1% →
+57.9% (+7.8pp).** For the campaign's own scale: thirteen arms moved the five-pool deployable number
+39.21 → 44.17 (+4.96) in total; this is +4.19 more from one objective.
+
+**And the per-pool breakdown is the caveat that picks the artifact:**
+
+| pool | baseline t_len / uncl | opd35 Δgreedy | anchor Δgreedy |
+|---|---|---:|---:|
+| asdiv | 199.0 / 6.9% | **−2.50** | **+0.80** |
+| svamp | 201.1 / 7.4% | +5.90 | +5.00 |
+| mawps | 213.0 / 12.8% | +3.60 | **+5.40** |
+| gsmplus | 240.1 / 10.8% | +3.00 | +2.40 |
+| math500 | 295.8 / 30.4% | **−3.13** | **+0.31** |
+
+**`anchor` is positive on all five pools. The unprotected arm is negative on two, for two different
+reasons, and both are about the trace-length cost rather than the capability:**
+* **asdiv** is where the baseline is strongest (64.30) — least room to gain, most to lose from any format
+  cost. `anchor` turns −2.50 into +0.80.
+* **math500** is where the traces already sit nearest the 512-token cap (295.8 tokens with 30.4% already
+  unclosed). The lengthening pushes derivations past the cap, so `unclosed` goes 30.4% → 50.8% and the
+  capability gain (`acc|ANS` 36.5% → 49.3%, the largest on any pool) is entirely swallowed. `anchor` halves
+  the excess and lands +0.31.
+
+⚠️**So the honest limitation is: this method's benefit is bounded by the pool's headroom to the token cap.**
+On long-derivation problems it can cost more than it buys unless the length is controlled. That is a
+prediction for anything with longer traces than these five pools, and it is the strongest argument for
+shipping `anchor` rather than the unprotected arm — not the 1.4pt of five-pool greedy between them, but the
+fact that one is positive everywhere and the other is not.
