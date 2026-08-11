@@ -7087,3 +7087,49 @@ What the small divergence does mean is that the signal is SPARSE — concentrate
 the update direction is determined by few positions per sequence. That is a variance argument (more
 data or more epochs), not a step-size one. The thing to watch in the curve is whether JSD falls toward
 zero, i.e. whether the student absorbs the hint-conditioned distribution at all.
+
+### §41n — GOLD-ANCHORED SELF-DISTILLATION IS REFUTED, and the mechanism generalises to any hindsight objective
+
+`gasd_full`'s closure smoke test, 200 asdiv items, greedy: **32.00% correct, 30.00% unclosed, mean
+decoded 292 tokens.** The baseline on the same pool is 64.30% correct, 6.9% unclosed, 212 tokens. It
+passed the 45% failure bar so it goes to the gate, but a ~32-point regression is not a subtlety.
+
+**The mechanism, and it is the interesting part.** The objective looked almost inert: JSD 0.0113 at
+step 1 with 95.0% argmax agreement, and 2,811 steps reduced it only to **0.0098** — a 13% reduction
+after a full epoch. Put that together with §41m's correction (AdamW is scale-invariant in the loss, so
+every one of those 2,811 steps was full-size regardless of how small the gradient was) and the picture
+is complete:
+
+> **A hindsight teacher conditions on information the student's input does not contain, so most of the
+> divergence is IRREDUCIBLE. Optimising an irreducible divergence with a scale-invariant optimiser is
+> not slow learning — it is 2,811 full-size steps of drift in a direction that cannot reduce the loss.**
+
+The 13%-reduction curve is the signature: if the target had been attainable the loss would have fallen.
+Instead the weights moved, the loss did not, and what moved is trace shape (unclosed 6.9% → 30.0%) and
+accuracy (−32pt). This is the risk the launcher header recorded before the run — "the student is being
+trained to behave as if it knew the answer, and at inference it will not" — realised in full.
+
+**Scope of the refutation.** It applies to the family, not just this arm: STaR-style rationalisation,
+HDPO's reference hints, and consensus-anchored self-distillation all condition the teacher on
+privileged information. Whether they work depends entirely on how much of that information the student
+can RECOVER from its own input, and nothing in those methods measures that. On a 1.04B base with
+230-token traces the recoverable fraction appears to be small.
+
+⚠️**But there is a second explanation that must be ruled out before the refutation is clean**, and it is
+cheaper to test than to argue: **the model may not be able to exploit in-context information at all.**
+The teacher's argmax changed on only 5% of tokens when it was handed the answer *and* a correct
+derivation. If a4 simply does not read its context, the hindsight objective never had a signal to give,
+the refutation is about the model rather than the method, and the same deficit caps every hint-,
+retrieval- and few-shot-based approach on this base — a far more fundamental finding than any reasoning
+gap. That has never been tested on this line.
+
+**`reasoning/hint_probe.py`** (new, ~2 min, folded into `a4_entbranch.sh`) tests it directly: the same
+items under the plain prompt, the prompt plus the correct answer, and the prompt plus a DELIBERATELY
+WRONG answer. The wrong-answer control is what makes it a measurement —
+* `answer ≫ plain` and `wrong ≈ plain` → it reasons WITH the hint;
+* `answer ≫ plain` and `wrong ≪ plain` → it COPIES the hint (in-context use, but not reasoning);
+* neither moves → it ignores its context, and that is the fundamental finding.
+
+**`gasd_ansonly` is the informative contrast** and is training now: its teacher gets strictly less
+privileged information (the answer, no derivation). If it is less damaging, the damage scales with the
+unattainable information content, which is exactly what the irreducible-divergence account predicts.
