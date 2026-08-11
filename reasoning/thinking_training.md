@@ -7666,3 +7666,41 @@ and `a4_kd3.sh` gains an `s48` arm so a third seed is available if two is not en
 endpoint on every metric with no new failure mode. The two endpoints already agree to within 1pt greedy and
 0.5pp unclosed (§41z), so a soup landing BELOW both would mean the 31% residual is not noise but something
 each seed needs internally consistent — which would be a more interesting result than the soup working.
+
+### §41ab — ⭐THE REPLICATE CONFIRMS, AND `anchor` BANKS THE GAIN IN PLAIN GREEDY
+
+Five-model paired gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend2 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a4combo_a100 (baseline) | 56.70 | 57.60 | 57.65 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 |
+| a4opd35_a100 (seed 46) | 58.40 | 62.65 | **63.35** | 68.95 | 83.95 | 68.8% | 14.35 | 265.6 |
+| a4opd35s47_a100 (seed 47) | 58.30 | 62.10 | 62.45 | 67.20 | 84.80 | **69.0%** | 14.55 | 266.8 |
+| a4opd35notail_a100 | 57.10 | 61.60 | 61.90 | 67.75 | 84.95 | 68.0% | 15.30 | 270.8 |
+| **a4opd35anchor_a100** | **59.60** | 62.00 | 62.30 | 68.30 | 84.85 | 68.2% | **12.15** | **228.4** |
+
+**1. THE REPLICATE CONFIRMS. The one-seed caveat is withdrawn.** Seed 46 against seed 47 on identical
+items: greedy 58.40 vs 58.30 (**+0.10, p=0.96**), `acc|ANSWERED` 68.8% vs **69.0%**, unclosed 14.35% vs
+14.55%, `t_len` 265.6 vs 266.8, extend2 63.35 vs 62.45 (p=0.33). Only `sc@8` differs at all (68.95 vs
+67.20, p=0.04). Two independent runs of the objective produce the same model to within a tenth of a point
+on the headline metric — corroborating §41aa's weight-space finding that 69.3% of the update direction is
+shared across seeds. **This is the check that produced two retractions on this line, and it passed.**
+
+**2. `anchor` IS THE BEST ARTIFACT ON PLAIN GREEDY: 59.60, +2.90 over baseline at p=6.03e-03.** It keeps
+**7.0pp of opd35's 7.6pp** capability gain (68.2% vs 68.8%) while giving back 37 tokens of trace length
+(228.4 vs 265.6) and 2.2pp of unclosed. And note which gain is statistically solid: `anchor`'s +2.90 plain
+greedy is significant, while the unprotected arm's +1.70 on these two pools is **not** (p=0.12). The
+protection did not merely preserve the result, it made the headline metric the one that carries it.
+
+**3. So there are two defensible artifacts and the choice is a deployment question, not a science one:**
+* **best plain greedy — `anchor` at 59.60** (+2.90). No decode wrapper, shortest traces of the three KD
+  arms, and the significant p-value.
+* **best force-closed — `opd35` at 63.35** (+5.70, p=5.67e-08). Needs `clean_eval`'s budget/extend wrapper,
+  which ships already.
+Against released 3.5-think (greedy 70.85, best-decode 74.15) the gap closes from 14.15 → **11.25** on plain
+greedy and from 16.50 → **10.80** force-closed.
+
+**4. `notail` is confirmed a null on protection**, exactly as pre-registered in §41w: +0.40 greedy
+(p=0.75), unclosed 15.30% — *worse* than the unprotected arm — and `t_len` 270.8, the longest of any arm
+here. Removing all gradient from the terminator logits protects nothing, because trace length was never a
+closure-probability phenomenon.
