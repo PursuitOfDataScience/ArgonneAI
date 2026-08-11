@@ -716,7 +716,21 @@ def main():
         print(f"[opd] tensor key set identical to the source checkpoint ({len(new_keys)} tensors)",
               flush=True)
     print(f"[opd] saved -> {a.out}  eos={c['eos_token_id']}", flush=True)
-    open(os.path.join(a.out, ".opd_complete"), "w").write(str(step))
+    # ⚠️PROVENANCE, not just a step count. This marker doubles as an idempotence guard in every launcher
+    # (`if [ ! -f "$OUT/.opd_complete" ]`), and for most of this campaign it held the bare integer `1719` --
+    # which means reusing an arm NAME with a different teacher printed ">>> already trained", skipped
+    # training, and then gated the OLD checkpoint under the NEW arm's label with no error anywhere. That is
+    # the same silent-null shape as the round-counter collision, and it produces a confident wrong
+    # conclusion rather than a failure. Recording what produced the checkpoint lets a launcher refuse.
+    # Still starts with the step count on line 1 so anything that parsed the old format keeps working.
+    prov = {"steps": step, "student": a.student, "teacher": a.teacher,
+            "rollouts": a.rollouts, "labels": sorted(a.labels), "div": a.div,
+            "kd_weight": a.kd_weight, "ce_weight": a.ce_weight, "lr": a.lr, "seed": a.seed,
+            "hint_template": a.hint_template, "kd_prefix_frac": getattr(a, "kd_prefix_frac", 1.0),
+            "exclude_terminators": getattr(a, "exclude_terminators", 0)}
+    with open(os.path.join(a.out, ".opd_complete"), "w") as fh:
+        fh.write(str(step) + "\n" + json.dumps(prov, indent=1) + "\n")
+    print(f"[opd] provenance recorded in {a.out}/.opd_complete", flush=True)
 
     if a.stats_out:
         json.dump({"rows": len(rows), "data_stat": dstat, "steps": step,
