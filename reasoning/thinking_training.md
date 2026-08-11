@@ -7147,6 +7147,12 @@ can RECOVER from its own input, and nothing in those methods measures that. On a
 
 ⚠️**But there is a second explanation that must be ruled out before the refutation is clean**, and it is
 cheaper to test than to argue: **the model may not be able to exploit in-context information at all.**
+
+⚠️⚠️**SUPERSEDED — READ §41af.** That test was run and the answer is neither option offered here. The model
+DOES read the hint and is DAMAGED by it in both directions: told the correct answer it scores 5 points BELOW
+the plain prompt. So the "better-informed teacher" was a WORSE teacher, and this section's
+irreducible-divergence account is not so much wrong as beside the point — GASD was distilling the student
+toward a degraded version of itself.
 The teacher's argmax changed on only 5% of tokens when it was handed the answer *and* a correct
 derivation. If a4 simply does not read its context, the hindsight objective never had a signal to give,
 the refutation is about the model rather than the method, and the same deficit caps every hint-,
