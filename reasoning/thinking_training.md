@@ -9042,3 +9042,43 @@ first is the one that would stand alone:
 The hard half stays available as an explicit follow-up (`POOLS=` in `reasoning/a4_pfxcomp.sh`) if the matched
 version works. ⚠️It must never be *mixed in silently*: `build_prefix_completions.py --pools` exists so the
 decision is recorded in the command line and in the stats JSON, rather than living in a comment.
+
+### §41bi — THE COMPLETE TEACHER-ELIGIBILITY AUDIT, and a correction: I ASSERTED where a 3-minute measurement existed
+
+Asked why the base-teacher arm used Qwen3-1.7B-Base when stronger models are on disk. The answer is a hard
+constraint plus a mistake, and both are worth recording so the candidate set is never re-derived from memory.
+
+**THE CONSTRAINT.** Per-token reverse KL compares two distributions over the same vocabulary at the same
+token positions, so it is undefined unless teacher and student assign **identical ids**. Every local model,
+tested by `len(tok)`, `<think>`/`</think>`/`<|im_end|>` ids, and a real 44-token trace round-trip:
+
+| ✅tokenizer-identical (151,669, `<think>`=151667) | ⛔ineligible, and why |
+|---|---|
+| Qwen3-4B, Qwen3-4B-Thinking-2507 | Qwen3.5-9B / 3.5-0.8B-Base — **248,077**, `<think>`=248068 |
+| Qwen3-1.7B-Base, Qwen3-0.6B-Base | gemma-4-31B-it — 262,144 |
+| **Qwen3-8B, Qwen3-14B, Qwen3-32B, Qwen3-30B-A3B** (verified, then downloaded 8B+14B) | Llama-3.3-70B / 3.1-8B / 3.2-3B — 128,256, no `<think>` |
+| argonne-3.0-think / 2.5-think / 3.0-base (own line) | Mistral-Small-24B / 3.2-24B — 131,072, no `<think>` |
+| Qwen3-0.6b-thinking (own line) | Nemotron-3-Nano-30B / 3.5-Lightning-30B — 131,072 |
+| | gpt-oss-20b — 200,019 · Muse-Glimmer-30B — 202,048 · Qwen2.5-* — 151,665, **no `<think>` at all** |
+
+So the entire 20-70B tier on disk is ineligible **for this channel**, and among tokenizer-identical models
+that were already local the largest was Qwen3-4B — whose both variants were already measured fatal (0.85 and
+0.75). 1.7B-Base was not picked as "the strongest available"; it was picked for a structural property (a base
+model has no think-length policy), with 0.6B-Base as the explicit control for whether capability matters.
+
+⚠️**THE MISTAKE.** §41bb concluded "downloading Qwen3-8B/14B/32B is now pointless *by this channel*" —
+reasoning from mechanism that scale cannot change the long-form `<think>` habit per-token KD transfers. That
+argument may be right, but **it is an argument, and the audition that would settle it costs 3 minutes per
+candidate.** Substituting a mechanism story for a cheap measurement is the same error as §41bb's own
+prefix-masking decision and §41ah's "signal exhausted" read. Qwen3-8B (16.4 GB) and Qwen3-14B (29.6 GB) are
+now local, tokenizer-verified, and first in the next audition's `SPECS`.
+
+⭐**THE BIGGER CORRECTION IS THE COMPLETER, NOT THE TEACHER.** The coverage arm carries **+6.36 of the +8.09
+gap** and it never computes a divergence — it takes generated TEXT, filters by gold, and trains plain CE. **No
+hazard ratio, no terminator columns, no length-distribution constraint applies to it at all**, so the only
+property of the completer that matters is how often it solves a problem a4 cannot. There, capability is the
+whole point and `a4_pfxcomp.sh` had been left defaulting to Qwen3-4B for no reason; it now uses **Qwen3-14B**.
+And because that channel needs only text, the ineligible 20-70B tier above is *not* ineligible for it — a
+non-Qwen completer would just need its prefix passed as text rather than spliced as ids. Tokenizer identity
+is a convenience there, not a requirement. **The constraint that shaped six arms does not extend to the arm
+with the largest number on it, and I had been carrying it over by habit.**
