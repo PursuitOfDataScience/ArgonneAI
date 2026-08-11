@@ -7704,3 +7704,49 @@ greedy and from 16.50 → **10.80** force-closed.
 (p=0.75), unclosed 15.30% — *worse* than the unprotected arm — and `t_len` 270.8, the longest of any arm
 here. Removing all gradient from the terminator logits protects nothing, because trace length was never a
 closure-probability phenomenon.
+
+### §41ac — FINAL, four clean pools: `anchor` is the artifact, and the replicate is airtight
+
+Pool-mean over asdiv/svamp (n=1000) + gsmplus/mawps (n=500); math500 excluded as contaminated:
+
+| model | greedy | +budget | +extend2 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.72 | 62.23 | 62.65 | **63.38** | 68.90 | 80.50 | 73.5% | 12.35 | 239.4 |
+| **a4opd35anchor_a100** | **51.35** | 52.85 | 53.40 | **53.48** | 58.80 | 74.28 | 60.4% | 13.62 | 239.1 |
+| a4opd35_a100 (seed 46) | 50.45 | 53.12 | **53.48** | 53.20 | 59.43 | 73.38 | 62.3% | 17.02 | 272.5 |
+| a4opd35s47_a100 (seed 47) | 50.55 | 53.35 | 52.97 | 53.23 | 58.05 | 74.15 | 62.3% | 16.62 | 271.3 |
+| a4opd35notail_a100 | 49.50 | 52.60 | 52.75 | 52.80 | 58.08 | 73.02 | 61.4% | 17.10 | 275.7 |
+| a4combo_a100 (old best) | 47.95 | 48.45 | 48.52 | 48.63 | 56.62 | 74.02 | 53.5% | 9.48 | 213.3 |
+
+Pooled paired McNemar over all 3,000 items, against `a4combo_a100`:
+
+| arm | greedy | p | extend2 | p |
+|---|---:|---:|---:|---:|
+| **a4opd35anchor** | **54.10 (+3.23)** | **8.48e-05** | 56.37 (+4.80) | 4.76e-09 |
+| a4opd35s47 | 53.13 (+2.27) | 8.74e-03 | 56.13 (+4.57) | 5.49e-08 |
+| a4opd35 | 53.10 (+2.23) | 9.30e-03 | **56.77 (+5.20)** | **4.18e-10** |
+| a4opd35notail | 52.03 (+1.17) | 1.83e-01 (n.s.) | 55.80 (+4.23) | 3.91e-07 |
+
+**1. The replication is as clean as this measurement gets.** Pooled over 3,000 items, seed 46 and seed 47
+give greedy **53.10 vs 53.13 — a difference of −0.03 at p=1.00** — and extend2 56.77 vs 56.13 (p=0.38),
+`acc|ANSWERED` 62.3% vs 62.3%. Two independent runs of the objective are statistically the same model.
+
+**2. `anchor` is the artifact.** It wins plain greedy outright (+1.00 over the unprotected arm, and the
+only KD arm whose plain-greedy p-value clears Bonferroni for ~20 arms) and trails on extend2 by 0.40. It
+holds **6.9pp of the 8.8pp** capability gain, and it does so at `t_len` **239.1 — the same trace length as
+released 3.5-think (239.4)**, having started 59 tokens longer.
+
+**3. `notail` is the one arm that fails to clear significance on plain greedy** (p=0.18), which is the
+cleanest possible statement of §41w: an intervention aimed at the wrong mechanism buys nothing.
+
+**THE HEADLINE FOR THE a4 LINE:**
+
+| | old best (combo) | new best (anchor) | Δ | released 3.5-think |
+|---|---:|---:|---:|---:|
+| pool-mean greedy | 47.95 | **51.35** | **+3.40** | 60.72 |
+| pool-mean best-decode | 48.63 | **53.48** | **+4.85** | 63.38 |
+| `acc\|ANSWERED` | 53.5% | **60.4%** | **+6.9pp** | 73.5% |
+
+**The gap to the released 3.5-think closes from 14.75 to 9.90 on the deployable number**, and from 20.0pp
+to 13.1pp on `acc|ANSWERED` — achieved on a base measured at −16.79pt against 3.5's (§40), by a method that
+moved the weights 0.9% and left `pass@8` untouched.
