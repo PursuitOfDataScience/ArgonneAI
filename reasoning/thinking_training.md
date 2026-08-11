@@ -7605,3 +7605,28 @@ noise band is ±3.4pp, so **those three are not separable here** and the smoke t
 was only ever asked whether they terminate. The paired five-model gate is what decides whether `anchor`
 kept the `acc|ANSWERED` gain while giving back the length, which is the whole question: if it did, plain
 greedy banks the gain and the artifact no longer depends on a decode wrapper.
+
+### §41z — The seed replicate reproduces the signature, and the seed is verifiably LIVE
+
+All three `a4_kd3` arms passed the closure check, so all three reach the gate. The replicate's preliminary
+read, on the same 200 asdiv items:
+
+| arm | seed | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|---:|
+| think_opd35 | 46 | 60.00 | 14.5% | 280 |
+| **think_opd35s47** | **47** | **61.00** | **15.0%** | **280** |
+| think_opd35notail | 46 | 62.50 | 16.0% | 279 |
+| think_opd35anchor | 46 | 62.50 | 13.5% | 241 |
+
+**Identical trace length, unclosed within 0.5pp, greedy within 1pt.** The arm's whole signature — the
+capability/length trade that §41p-y describe — reproduces at a different seed. That is not yet the
+replicate (the gate's `acc|ANSWERED` is), but it is the first evidence that this is not the kind of
+single-seed artefact that produced two retractions on this line.
+
+⚠️**And the seed is verifiably live, which had to be checked rather than assumed.** `--seed` was a silent
+NO-OP in `cot-sft.py` until 255dff1 — it seeded python/numpy/torch while HF Trainer built its sampler from
+`TrainingArguments.seed`, so two runs at different seeds were bit-identical at every logged step and a
+"replicate" was really a rerun. `opd_train.py` runs its own loop and seeds the length-bucketed batching
+directly, and the step counts prove it took: **1,719 / 1,719 / 1,713 micro-batches** for seeds 46 / 46 /
+47. The two seed-46 arms agree exactly and the seed-47 arm differs, which is what a live seed looks like
+and what a dead one cannot fake.
