@@ -7854,3 +7854,43 @@ printing its results but BEFORE writing its JSON, so the per-item `ok` arrays fo
 only the log survives. `--selfverify` is the hog: ~11,500 candidate scores plus `prompt_logprobs` dicts per
 pool on top of two full candidate sets with per-token logprobs. Raised to 48G. Nothing analytical was lost,
 but the paired McNemar for those two pools cannot be recomputed without a re-run.
+
+### §41af — ⛔THE REAL REASON GOLD-ANCHORED DISTILLATION FAILED: the hinted teacher was WORSE, not better
+
+`reasoning/hint_probe.py` on `think_opd35anchor`, asdiv + svamp at n=200 each, greedy:
+
+| condition | acc | echoed the hinted number |
+|---|---:|---:|
+| plain prompt | **61.25%** | — |
+| + the CORRECT final answer stated in the prompt | **56.25% (−5.00)** | 59.5% |
+| + a DELIBERATELY WRONG answer stated in the prompt | **30.00% (−31.25)** | 30.2% |
+
+Both pools agree tightly (asdiv −4.50/−32.00, svamp −5.50/−30.50).
+
+**The pre-registered decision rule enumerated three outcomes and reality produced a fourth.** The rule was:
+`answer≫plain` + `wrong≈plain` → reasons with the hint; `answer≫plain` + `wrong≪plain` → copies it; neither
+moves → ignores its context. What actually happens is **`answer<plain` and `wrong≪plain`**: the model
+demonstrably READS the hint (a model ignoring its context could not lose 31 points to a wrong one) and is
+**damaged by it in both directions**. Told the correct answer it does *worse than being told nothing*, and
+emits that answer only 59.5% of the time.
+
+**This replaces §41n's explanation of the GASD refutation, and the replacement is both simpler and more
+damning.** §41n reasoned that the divergence was irreducible because the teacher conditioned on information
+the student could not infer. The truth is that **the "better-informed teacher" was a 5-point WORSE model.**
+Gold-anchored self-distillation trained the student toward a degraded version of itself. Of course it lost
+21.6 points — every link in that chain was pointing the wrong way, and no amount of masking, curriculum
+filtering or divergence-choice could have fixed it.
+
+⚠️**Generalise carefully, because the scope is large.** This is a statement about the BASE, not about one
+objective: a 1.04B model that is *hurt* by having the correct answer placed in its context cannot benefit
+from anything whose mechanism is "put useful information in the context." That caps hindsight distillation
+(measured), STaR rationalisation, HDPO-style reference hints, consensus anchoring, retrieval augmentation
+and few-shot prompting on this base — all of them, for the same reason, before any of them is built. It also
+makes the 2026 process-verification result's phrasing look exactly right: meta-cognition and privileged
+context both "amplify confusion without sufficient model capacity".
+
+⚠️**And it is the strongest available argument for why the arm that WORKED, worked.** Per-token on-policy KD
+(§41p-ac) never puts anything in the student's context. The student's prompt is untouched; the teacher is a
+separate model and the only channel is a per-token distribution at states the student itself chose. That is
+precisely the one channel this base can still use — which is now a measured property rather than a lucky
+design choice.
