@@ -624,7 +624,14 @@ def main():
                         haz_t = ((t_flat[:, ci] - t_lse).exp() + (t_flat[:, ei] - t_lse).exp()).mean()
                         accum["haz_ps"] += float(haz_s)
                         accum["haz_pt"] += float(haz_t)
-                        tgt_flat = ids[:, 1:][cmask[:, 1:]]
+                        # ⚠️kmask, NOT cmask. `sl`/`t_flat` are gathered with the KD mask, which
+                        # --kd-prefix-frac makes a strict SUBSET of the completion mask. Indexing a
+                        # prefix-length tensor with a full-completion boolean is an IndexError that can
+                        # only appear when the two differ -- i.e. only in the prefix path, on its first
+                        # run, after every earlier run had kmask == cmask and passed.
+                        tgt_flat = ids[:, 1:][kmask[:, 1:]]
+                        assert tgt_flat.shape[0] == sl.shape[0], (
+                            f"diagnostic mask mismatch {tgt_flat.shape[0]} vs {sl.shape[0]}")
                         close_pos = tgt_flat == ci
                         if bool(close_pos.any()):
                             accum["close_ps"] += float((sl[:, ci] - s_lse)[close_pos].exp().mean())
