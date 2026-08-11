@@ -7541,3 +7541,37 @@ pooled, p=4.2e-10, force-closed). So prefix-KD is not needed to bank the gain �
 PLAIN GREEDY, which is a strictly better artifact than one that depends on a decode wrapper. That makes it
 worth one slot but not worth pre-empting the selector study, which is still the largest untested number on
 the board (~23.8pt of floor-to-ceiling headroom).
+
+### §41y — `anchor` recovers the trace length, and the notail/anchor contrast pins the mechanism from both sides
+
+Closure smoke tests, 200 asdiv items, all three arms against the same baseline:
+
+| arm | what it pulls on | greedy | unclosed | mean decoded |
+|---|---|---:|---:|---:|
+| think_combo (baseline, full pool) | — | 64.30 | 6.9% | **212** |
+| think_opd35 | nothing (unprotected) | 60.00 | 14.5% | **280** |
+| think_opd35notail | the TERMINATOR (columns dropped) | 62.50 | 16.0% | **279** |
+| **think_opd35anchor** | the BODY (CE 0.5 on a4's own verified traces) | 62.50 | **13.5%** | **241** |
+
+**39 tokens recovered by the body intervention; one token by the terminator intervention.** `anchor` closes
+about 60% of the gap back to the baseline's 212 and brings unclosed below the unprotected arm (13.5% vs
+14.5%). The two arms were designed as independent protections and they turned out to be a clean
+discrimination instead:
+
+> **Trace length is body-level. Only a body-level intervention moves it.** Removing every scrap of
+> gradient from the closure logits (verified: exactly zero) does nothing, because the model was never
+> being taught *when* to stop — it was being taught *what to say*, and the terminator arrives when the
+> derivation it learned to write runs out.
+
+That completes the mechanistic chain for §41p-r, every link measured rather than argued:
+1. per-token reverse KL from a length-matched teacher raises `acc|ANSWERED` +8.8pp (§41r);
+2. the capability arrives with the teacher's longer derivations, costing the answered rate (§41p);
+3. the cost is body imitation, not closure probability (§41w — the notail null);
+4. a body-level anchor recovers most of the length (§41y — here);
+5. and the residual cost is payable at decode time anyway (§41q — +5.20 pooled, p=4.2e-10).
+
+⚠️`notail` and `anchor` both read greedy 62.50 on this 200-item subset against opd35's 60.00. The n=200
+noise band is ±3.4pp, so **those three are not separable here** and the smoke test cannot rank them — it
+was only ever asked whether they terminate. The paired five-model gate is what decides whether `anchor`
+kept the `acc|ANSWERED` gain while giving back the length, which is the whole question: if it did, plain
+greedy banks the gain and the artifact no longer depends on a decode wrapper.
