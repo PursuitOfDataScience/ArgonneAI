@@ -7376,3 +7376,31 @@ after a checkpoint was deleted:**
   session's one positive result** at the end of round 2. It now compares against `$START`.
 Both are the failure mode the repo has hit before (§ untracked `.sh` carrying a hardcoded path from a
 deleted worktree): a name that was correct when written and is not checked again when its referent moves.
+
+### §41t — The campaign record, four clean pools, 24 arms
+
+`reasoning/arms_table.py --prefix a4 --pools asdiv svamp mawps gsmplus`, sorted by greedy:
+
+| arm | greedy | best-decode | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.72 | 63.38 | 68.90 | 80.50 | 73.5% | 12.35 | 239.4 |
+| **a4opd35_a100** | **50.45** | **53.48** | 59.43 | 73.38 | **62.3%** | 17.02 | 272.5 |
+| a4combo_a100 (previous best) | 47.95 | 48.63 | 56.62 | 74.02 | 53.5% | 9.48 | 213.3 |
+| a4dist_a100 | 47.30 | 48.52 | 56.40 | 73.22 | 53.7% | 10.50 | 218.8 |
+| a4rft_s99_a100 | 47.23 | 48.30 | 55.80 | 71.95 | 53.0% | 10.30 | 215.2 |
+| … 15 further arms … | 43.32-47.12 | 44.80-48.60 | 51.00-57.80 | 68.62-74.45 | 50.5-54.3% | 8.03-17.30 | 204.9-302.3 |
+| a4gasd_full_a100 | 30.50 | 35.98 | 33.52 | 61.75 | 44.1% | 25.90 | 254.1 |
+| a4gasd_ansonly_a100 | 28.45 | 35.05 | 41.23 | 61.98 | 45.2% | 22.48 | 216.4 |
+| a4opd_a100 (Qwen teacher) | 1.02 | 38.02 | 4.42 | 4.42 | — | 98.02 | 510.4 |
+
+**The `acc|ANSWERED` column is the finding.** Twenty-one arms — every data mix, every RFT round, every
+verify tier, both soup alphas, both external-teacher doses, both RLVR variants — landed inside
+**50.5-54.3%**, a 3.8pp band. `a4opd35_a100` is at **62.3%**, eight points clear of the field's maximum.
+That is not an increment on a saturating curve; the objective class changed.
+
+Greedy tells the same story more quietly: the entire prior campaign spans **4.6pt across 21 arms**
+(43.32-47.95), and one arm is 2.50 clear of the top on greedy and **4.85 clear on best-decode**.
+
+⚠️Read `a4opd_a100`'s row as the cautionary one: greedy 1.02 with 98.02% unclosed, yet best-decode 38.02
+because force-closing rescues a third of it. A single number would have called that arm "broken" or
+"mediocre" depending on which column was quoted, and neither is what happened.
