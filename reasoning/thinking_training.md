@@ -8300,7 +8300,7 @@ empty traces, which is a direct tax on the `sc@8` and `pass@8` columns.
 * Any future gate on this artifact should read the `no_answer` column, not just `unclosed` — they are
   different defects with different fixes and this session's tooling only warns about one of them.
 
-### §41aq — Round 4 looks like the turn, and the length tail is the reason
+### §41aq — ⚠️"Round 4 looks like the turn" — WRONG, see §41ar. I ranked checkpoints with a guardrail.
 
 Closure smoke, same 200 asdiv items, across the whole chain:
 
@@ -8331,3 +8331,42 @@ the next move is not another round.
 multiply its output by zero. That pass targets median 183 / p90 330 traces drawn from the model's own current
 behaviour, so it should cut the 512-token tail and the empty-think mode together without pulling toward a
 stale checkpoint — the two defects §41ap identified, in one pass, with no new data and no teacher.
+
+### §41ar — ⚠️§41aq RETRACTED: round 4 improved on EVERY policy metric, and `no_answer` self-corrected
+
+Round 4's own rollouts, 93,912 from each policy on identical problems:
+
+| metric | combo | r2 | r3 | **r4** |
+|---|---:|---:|---:|---:|
+| correct rollouts | 23.31% | 29.10% | 29.50% | **32.32%** |
+| wrong | 59.39% | 40.98% | 39.81% | **38.09%** |
+| unclosed | 15.90% | 24.15% | 21.50% | 23.60% |
+| **no_answer** | 1.40% | 5.77% | **9.20%** | **5.99%** |
+| **`acc\|ANSWERED`** | 28.2% | 41.5% | 42.6% | **45.9%** |
+| **never solved in 8** | 44.1% | 42.0% | 40.8% | **39.1%** |
+| solved ALL 8 | 2.1% | 5.9% | 5.2% | **7.4%** |
+| gold is the PLURALITY | 65.2% | 72.9% | 72.7% | **75.7%** |
+| gold appears somewhere | 70.0% | 73.6% | 74.3% | **75.0%** |
+
+**Round 4 is better than round 3 on every single line.** `acc|ANSWERED` +3.3pp, correct rollouts +2.8pp,
+never-solved −1.7pp, solved-8/8 +2.2pp, gold-is-plurality +3.0pp. And the per-round `acc|ANSWERED` deltas are
+**+13.3 / +1.0 / +3.3** — not the monotone flattening §41aq asserted; the trend *re-accelerated*.
+
+**Two claims in §41aq are withdrawn:**
+1. **"Round 4 looks like the turn."** It is not. The 200-item smoke greedy read 62.50 against r3's 65.50, and
+   I said in the same paragraph that ±3.4pp covered it — then led with the turn anyway.
+2. **"The acc|ANSWERED trend was already flattening."** +13.3 → +1.0 → +3.3 is not a flattening trend.
+
+⚠️**THE OPERATIONAL LESSON, and it is one I had already written down.** §41y says of these same smoke tests:
+*"the n=200 noise band is ±3.4pp, so those three are not separable here and the smoke test cannot rank them —
+it was only ever asked whether they terminate."* Twenty subsections later I used it to rank checkpoints
+anyway. **`closure_smoke.py` is a guardrail, not a ranking instrument.** The ranking instrument is the
+93,912-rollout taxonomy — a 470x larger sample, free, and already printed by every round of the chain.
+
+⚠️**And §41ap's empty-think regression partly self-corrected: `no_answer` went 9.20% → 5.99%.** It is still 4x
+the baseline's 1.40% and still worth the repair pass, but it is not monotonically worsening and should not be
+described as a runaway. The one thing that IS monotone across all four rounds is trace length
+(241 → 267 → 277 → 288 at greedy), which is the real cost and the thing the repair pass targets.
+
+**Consequence: do not stop the chain.** Rounds 5 and 6 are still running and the policy is still improving on
+every measure that has the sample size to say so.
