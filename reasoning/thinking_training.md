@@ -9082,3 +9082,57 @@ And because that channel needs only text, the ineligible 20-70B tier above is *n
 non-Qwen completer would just need its prefix passed as text rather than spliced as ids. Tokenizer identity
 is a convenience there, not a requirement. **The constraint that shaped six arms does not extend to the arm
 with the largest number on it, and I had been carrying it over by habit.**
+
+### §41bj — ⛔BASE-MODEL TEACHER REFUTED: greedy 0.00, unclosed 100.00%. And BOTH closure diagnostics read HEALTHY at the end.
+
+§41bg's prediction, stated before the run: a base model has no think-length policy, so once the two terminator
+columns are masked the body-level lengthening that killed §41bb's arms should not appear. **Wrong, and by the
+largest margin of any arm in this campaign.** `q17base` = Qwen3-1.7B-Base teacher, `--exclude-terminators 1`,
+`--ce-weight 0.5`, from round 6 on its own dump, 1,942 steps:
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | 66.50 | 13.50% | 1.50% | 282 |
+| **`q17base`** | **0.00** | **100.00%** | 0.00% | 492 |
+
+200 of 200 items unclosed. Worse than §41f's long-CoT arm (96.95%) and §41bb's prefix arms (88.5/96.5%).
+
+⚠️⚠️**THE INSTRUMENTATION FAILURE IS THE REAL FINDING, AND IT IS WORSE THAN §41f's.** Both training-time
+closure diagnostics ended *healthy*:
+
+| step | 1 | 200 | 700 | 1500 | **1800** |
+|---|---:|---:|---:|---:|---:|
+| `haz s` (marginal closure hazard) | 0.0067 | 0.0034 | 0.0058 | 0.0040 | **0.0065** |
+| `p(</think>` \| closed) | 1.00 | 0.89 | 0.96 | 0.97 | **0.98** |
+
+The hazard dipped, **recovered to within 3% of its step-1 value**, and I read that as the CE anchor winning a
+tug-of-war. The checkpoint terminates **never**. §41f's diagnostic at least had an excuse — it conditioned on
+the failure being absent. This one is the *marginal* hazard, the statistic built to replace it, and it was
+just as wrong.
+
+**WHY, and it generalises: both diagnostics are measured under TEACHER FORCING on the PREVIOUS policy's
+traces.** `haz s` is the student's probability of emitting a terminator at positions inside rollouts that an
+*earlier* checkpoint generated. Free-running generation walks the *updated* policy's own trajectory, and after
+1,942 steps of matching a base model that never stops writing, that trajectory goes somewhere those forced
+positions never visit. A per-position probability measured at stale states says nothing about the integral
+along a new trajectory. This is §41ah's lesson mirrored: there, on-policy KL was measured at states that
+*moved* and I misread flatness as exhaustion; here, the hazard is measured at states that *did not move* and I
+misread recovery as safety. **Neither is a progress metric, and only `closure_smoke.py` — which actually
+generates — is a closure metric.** Nothing about closure should ever again be concluded from the training log.
+
+⛔**`--exclude-terminators` DOES NOT RESCUE A ZERO-MASS TEACHER, and this completes §41bg's regime argument in
+the direction I did not expect.** Masking removes *gradient* from the two terminator logits; it cannot remove
+the *softmax normalisation* that a divergence over the other 151,667 columns imposes. Reverse KL against a
+teacher that always continues drives the kept logits up, and the terminators — now with no gradient to defend
+themselves — are squeezed out. So masking is not neutral here (§41w's hazard-matched null) and not sufficient
+either; **it is actively worse than nothing, because it silences the only channel that could have pushed back.**
+That also explains why the arm is worse than the unmasked long-CoT arm.
+
+**Running tally for per-token KD from a stronger same-tokenizer teacher: 0-for-7.** Qwen3-4B plain, Qwen3-4B
+prefix-50, Qwen3-4B prefix-50 + anchor, Qwen3-4B-Thinking, Qwen3-4B + brevity, Qwen3-4B `/no_think`,
+Qwen3-1.7B-Base + mask. Every protection tried — column masking, prefix masking, CE anchoring, context
+conditioning — and the only teacher that ever worked is the one whose trace-length distribution already
+matched (`haz_t/haz_s = 1.00`). ⚠️`q06base` was CANCELLED rather than run: its step-1 line printed the same
+`teacher 0.00000 vs student 0.00665` warning, so as a capability control it could only distinguish
+"weaker teacher fails identically" from "weaker teacher fails slightly less", neither of which changes a
+decision. That is 35 GPU-minutes not spent on a foregone conclusion.
