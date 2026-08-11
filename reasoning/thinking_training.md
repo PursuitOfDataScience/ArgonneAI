@@ -8399,3 +8399,42 @@ None of the six was caught by a test. All six were caught by reading a launcher 
 inventory and against the arm it was supposed to be running. On a line where one job is ~4 GPU-hours and a
 silent no-op is indistinguishable from a null result, **that read is the cheapest instrument available and
 should happen every time a checkpoint is deleted, repointed, or re-run.**
+
+### §41at — The chain has NOT converged, and the CE anchor is measurably a TRADE, not a free fix
+
+Weight-space trajectory of the whole chain, computed on CPU from the safetensors (`||combo|| = 1235.9`):
+
+| step | size (rel. ‖combo‖) | cumulative from combo |
+|---|---:|---:|
+| combo → opd35 (KD round 1) | 0.914% | 0.914% |
+| opd35 → anchor (CE 0.5) | 0.661% | **0.747%** |
+| anchor → r3 (two KD rounds) | 1.167% | 1.592% |
+| r3 → r4 | **0.666%** | 1.942% |
+| r4 → r5 | **0.656%** | 2.274% |
+
+**1. The chain has not converged.** Per-round steps are essentially constant (0.666%, 0.656%) rather than
+shrinking, and net displacement from the start grows linearly at **+0.33% per round** (1.592 → 1.942 → 2.274).
+A converging process would show step sizes decaying; this one is walking at a steady rate. Together with the
+taxonomy still improving at round 4 (§41ar), that says iteration remains productive — and also that it will
+keep drifting rather than settling, including in the one monotone cost, trace length (+16 tokens/round).
+
+**2. The rounds move in a CONSISTENT direction.** Cosine between consecutive steps: **+0.391** then **+0.319**
+for the iterated rounds. Not oscillation, not random walk — a persistent preferred direction with noise on top,
+which is exactly what the +0.693 seed-to-seed correlation of §41aa predicted at the single-round level.
+
+**3. ⚠️And the CE anchor is measurably OPPOSED to the KD direction: cos = −0.592.** That is the sharpest
+statement of what §41ab's numbers implied. The anchor is not a free repair that removes a side effect; it is a
+**controlled trade that walks partly back along the KD direction** — which is precisely why `anchor` kept
+**7.0pp of the 7.6pp** capability gain rather than all of it, and why it landed *closer* to the baseline in
+weight space (0.747% vs 0.914%).
+
+**Consequences for the repair pass (§41ap), stated before it runs:**
+* It will cost some capability. A pure-CE pass is the anchor step taken further, and the anchor step has
+  cos −0.592 with the direction that produced the gain. **Expect a trade, not a free fix**, and read
+  `acc|ANSWERED` alongside `t_len` to price it.
+* But the trade should be *favourable* here, because the current artifact is paying 2.88pt of five-pool
+  greedy to force-closing (§41ap) — i.e. the length cost is now larger than a −0.59-correlated step is likely
+  to cost in capability. That is the bet, and it is falsifiable in one job.
+* And the chain should keep running in parallel with that reasoning, because §41ar established the policy is
+  still improving and §41at now shows it has not converged. **Neither the repair pass nor another round is the
+  obvious single next move; they address different costs and both are cheap.**
