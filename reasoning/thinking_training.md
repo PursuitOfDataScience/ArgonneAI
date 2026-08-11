@@ -9204,3 +9204,48 @@ I read the working case as general.
 that is one line — `snapshot_download(repo_id=m, local_files_only=True)` — and it now passes for both models
 after a re-download with no `allow_patterns`. Cost: one job launch and ~4 minutes; it would have been ~40
 minutes had it failed after the data build instead of before it.
+
+### §41bm — COVERAGE ARM, stage 1: Qwen3-14B solves 71.6% of what a4 never solves. And the prefix does NOT help the completer.
+
+`build_prefix_completions.py` with Qwen3-14B, 1,945 never-solved gsm8k_train + math_train_easy problems,
+2 a4-prefixes + 1 empty-prefix control per problem, 2 samples each = 11,670 generations:
+
+**4,303 verified traces over 1,392 of 1,945 problems = 71.6% of a4's coverage hole newly solvable.**
+Trace tokens median 271, p90 320 — inside the student's own distribution (round 6 means 282), so no length
+regression is being imported. Empty-think mode went to zero.
+
+| kind | yield | wrong | no_answer | **too_long** | yield EXCLUDING too_long |
+|---|---:|---:|---:|---:|---:|
+| `pfx` (a4's own opening) | 2,541/7,780 = **32.66%** | 2,959 | 210 | **2,070** | **44.50%** |
+| `empty` (control) | 1,762/3,890 = **45.30%** | 2,081 | 47 | **0** | 45.30% |
+
+⚠️**THE RAW CONTROL LOOKS LIKE THE PREFIX HURT, AND THAT READING IS AN ARTIFACT OF MY OWN LENGTH CAP.**
+`too_long` is 2,070 for prefixed splices and **exactly zero** for prefix-free ones — the prefix consumes up to
+96 of the 330-token budget, so prefixed traces hit a cap the others never approach. Correcting for it, the two
+are within a point: **44.50% vs 45.30%**. So the honest finding is that **an a4 prefix does not improve the
+completer's ability to solve the problem; it only spends budget.** That kills one of the two motivations.
+The other is untouched by this measurement: a prefixed target starts at a state a4 *actually visits*, which is
+a claim about TRANSFER, not about the completer's accuracy, and only the gate tests it.
+
+⚠️**A DESIGN WEAKNESS I SHOULD HAVE CAUGHT BEFORE BUILDING, NOT AFTER: this run trains on the UNION of both
+kinds, so its gate cannot attribute the result to either.** Fixed for the follow-up rather than papered over —
+`a4_pfxcomp.sh` gained `KIND=pfx|empty|all`, filtering the existing dump by the `kind` field each row already
+carries (no regeneration). `KIND=empty` is precisely §41c — plain external-teacher imitation — rerun with a
+same-tokenizer 14B, which makes it the right control for the whole method.
+
+**Stage 2/3 — plain CE on (coverage traces ∪ a4's own verified-correct rollouts), lr 5e-6, 970 steps:**
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | 66.50 | 13.50% | 1.50% | 282 |
+| **`pfxcomp`** | 64.50 | **12.50%** | **0.00%** | **279** |
+
+✅**Closure PASSED, and the CE curve is the diagnostic that separates this from §41bc's repair pass: CE fell
+0.2892 → 0.2304 (−20%) here versus 0.1964 → 0.1884 (−4%) there.** The repair pass had no gradient signal
+because it trained on the model's own samples, which are already high-likelihood by construction. These traces
+solve problems the model has *never* solved, so they are genuinely new information. That was the predicted
+difference and it showed up in the loss.
+⚠️asdiv greedy −2.00 is inside the smoke's ±3.4pp and is **uninformative for this arm** — asdiv is a pool a4
+already scores ~65% on, while this arm only added traces for problems it never solved. **The success criterion
+is `pass@8`** (§41bf: coverage is +6.36 of the +8.09 gap). An arm that moves only the floor has failed at what
+it was built for, which is the exact inverse of how the KD arms had to be read.
