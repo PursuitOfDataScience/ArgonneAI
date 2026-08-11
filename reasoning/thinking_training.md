@@ -7130,9 +7130,36 @@ WRONG answer. The wrong-answer control is what makes it a measurement —
 * `answer ≫ plain` and `wrong ≪ plain` → it COPIES the hint (in-context use, but not reasoning);
 * neither moves → it ignores its context, and that is the fundamental finding.
 
-**`gasd_ansonly` is the informative contrast** and is training now: its teacher gets strictly less
-privileged information (the answer, no derivation). If it is less damaging, the damage scales with the
-unattainable information content, which is exactly what the irreducible-divergence account predicts.
+**`gasd_ansonly` was the informative contrast, and it REFUTED my prediction.** I wrote above that a
+teacher given strictly less privileged information should be less damaging. It is not — it is damaged
+*equally*, through a different channel:
+
+| arm | teacher's hint | JSD@1 | JSD@end | reduced | agree | asdiv greedy | unclosed | no_answer | decoded |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (combo) | — | — | — | — | — | **64.30** | 6.9% | 0.3% | 212 |
+| `gasd_full` | answer + derivation | 0.0113 | 0.0098 | **13%** | 95.0→95.6% | **32.00** | 30.0% | 1.5% | 292 |
+| `gasd_ansonly` | answer only | 0.0046 | 0.0017 | **63%** | 97.1→98.3% | **32.00** | 26.0% | **19.0%** | 317 |
+
+The dose-response IS there on the two axes I predicted — less information gives a smaller divergence
+(0.0046 vs 0.0113) and a far more LEARNABLE one (63% reduced vs 13%) — and it does not translate into
+less damage at all. Both land on exactly 32.00.
+
+**So "optimising an irreducible divergence produces drift" is not the whole account. The sharper one is
+calibration destruction, and the symptom split shows it.** A hinted teacher is confident about things
+the student cannot infer from its own input, and matching that confidence is what does the damage. WHERE
+the teacher's unattainable confidence is concentrated decides the failure mode:
+
+* `ansonly` — the hint's entire advantage sits at the ANSWER-EMISSION position. Train the student to
+  match a distribution that is sharp on digits it cannot predict and it learns to commit to no digit:
+  **no_answer 0.3% → 19.0%**, closing the think block and then failing to produce a `\boxed{}`.
+* `full` — the reference derivation makes the teacher confident throughout the trace BODY too, so the
+  damage spreads into the reasoning: **unclosed 6.9% → 30.0%**.
+
+That account is falsifiable and it names its own fix: mask the KD loss over the answer span (the
+positions where the hint's advantage is maximal and unattainable) and keep it only on the reasoning
+body — the same shape as `--exclude-terminators`, which was built for the same class of problem. Anyone
+revisiting hindsight distillation on a small base should try that before concluding the family is dead;
+what is refuted here is the family AS RUN, with the loss applied everywhere.
 
 ### §41o — Self-consistency ACTIVELY DESTROYS 4.0pt of items that a single greedy pass already had
 
