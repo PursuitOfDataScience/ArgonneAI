@@ -7289,3 +7289,48 @@ expect `notail` to only partly work: 3.5-think genuinely writes longer traces (t
 and length is encoded in "what to say next" as much as in "when to stop", so masking the terminator
 COLUMNS removes the direct pressure and not the body pressure. `anchor`'s CE term on a4's own shorter
 verified traces is the arm that attacks body length.
+
+### §41r — THE RESULT, pooled over 3,000 items: the FLOOR rose and the CEILING did not
+
+One paired McNemar over every item of the four CLEAN pools (asdiv/svamp n=1000, gsmplus/mawps n=500;
+math500 excluded as near-duplicate-contaminated for every model on this line):
+
+| config | a4opd35 | a4combo | Δ | opd35-only | combo-only | p |
+|---|---:|---:|---:|---:|---:|---:|
+| greedy | 53.10 | 50.87 | +2.23 | 356 | 289 | 9.30e-03 |
+| +budget | 56.30 | 51.50 | +4.80 | 384 | 240 | 8.96e-09 |
+| +extend1 | 56.50 | 51.37 | +5.13 | 383 | 229 | 5.08e-10 |
+| **+extend2** | **56.77** | 51.57 | **+5.20** | 389 | 233 | **4.18e-10** |
+| +extend3 | 56.47 | 51.63 | +4.83 | 390 | 245 | 9.54e-09 |
+| self-cons@8 | 62.60 | 60.43 | +2.17 | 258 | 193 | 2.54e-03 |
+| **pass@8** | 76.90 | 77.83 | **−0.93** | 174 | 202 | 1.64e-01 (n.s.) |
+
+**+5.20 at `extend2`, p = 4.2e-10** — seven orders inside the Bonferroni threshold for ~17 arms
+(p<0.003). Pool-mean form, which is how this campaign has always reported: four-pool best-decode
+**48.63 → 53.48 (+4.85)**, `acc|ANSWERED` **53.5% → 62.3% (+8.8pp)**, and the acc|ANS gain is positive on
+every single pool (+5.1 asdiv, +10.2 svamp, +10.0 gsmplus, +10.1 mawps).
+
+**And the last row is the whole story:**
+
+| | floor (greedy) | ceiling (pass@8) | gap |
+|---|---:|---:|---:|
+| a4combo_a100 | 50.87 | 77.83 | 26.97 |
+| **a4opd35_a100** | **53.10** | 76.90 | **23.80** |
+
+**The ceiling did not move (−0.93, not significant) and the floor rose.** That is the exact inversion of
+the previous thirteen arms, which took pass@8 62.4 → 68.9 while greedy sat still — §41j's diagnosis was
+that the model reaches answers it cannot select, and every imitative arm answered it by adding more
+reachable answers. Mode-seeking reverse KL on the student's own states is the first objective on this
+line to sharpen instead of spread, which is exactly what it is supposed to do and exactly what was
+needed.
+
+**Where this leaves the a4 line**, against 3.5-think on the same four pools (best decode 63.38, acc|ANS
+73.5%): the gap closes from 14.75 to **9.90**, and the `acc|ANSWERED` gap from 20.0pp to **11.2pp**.
+
+⚠️**Still one seed.** `s47` in `a4_kd3.sh` decides whether this is quoted or withdrawn; this line has
+produced two retractions from single-seed reads and the measured seed noise is ±0.87 pool-mean. What
+makes this different from those retractions is that the effect is 5-6x the noise, pooled p is 4e-10,
+`acc|ANSWERED` moves the same direction on all four pools independently, and the mechanism predicted the
+symptom before it was measured (a length-matched teacher raises capability; the capability costs
+termination; force-closing buys it back; force-closing helps in proportion to the unclosed rate — combo
++0.95, 3.5-think +3.30, opd35 +4.95).
