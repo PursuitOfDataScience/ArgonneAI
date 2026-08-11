@@ -8173,3 +8173,45 @@ at the start of the session. Everything gained was in *committing to what it alr
 +11.4pp, self-consistency +3.72, greedy +4.15, best-decode +7.30. §41j opened this session by measuring
 that a4 "reaches answers it cannot select" and pricing the fix at +1.24. The fix was worth +7.30, and it
 worked by changing which answer the argmax lands on rather than by teaching the model anything new.
+
+### §41an — FIVE POOLS, ALL POSITIVE. Iteration repaired the two pools round 1 regressed on.
+
+Five-pool means (math500 included; still near-duplicate-contaminated for every model on this line):
+
+| model | greedy | +budget | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.25 | 56.43 | **58.37** | 61.49 | 75.20 | 69.7% | 16.76 |
+| **a4opdi_a100 (round 3)** | **47.01** | 49.49 | **50.73** | **54.11** | 68.76 | **62.0%** | 22.75 |
+| a4opd35_a100 (round 1) | 44.95 | 47.81 | 48.12 | 52.05 | 66.64 | 59.6% | 23.50 |
+| a4combo_a100 (session start) | 43.31 | 43.92 | 44.15 | 51.13 | 68.94 | 49.6% | 13.32 |
+
+**Five-pool session totals: greedy 43.31 → 47.01 (+3.70), best-decode 44.15 → 50.73 (+6.58), `acc|ANSWERED`
+49.6% → 62.0% (+12.4pp), `pass@8` 68.94 → 68.76 (−0.18, unchanged).**
+
+**And the per-pool table settles §41ad's limitation:**
+
+| pool | r1 greedy | **r3 greedy** | r1 best-decode | **r3 best-decode** |
+|---|---:|---:|---:|---:|
+| asdiv | **−2.40** | **+0.80** | +3.00 | **+5.50** |
+| svamp | +5.80 | +6.60 | +8.00 | **+9.50** |
+| gsmplus | +2.80 | +6.40 | +3.40 | **+7.60** |
+| mawps | +4.20 | +2.80 | +4.20 | **+6.00** |
+| math500 | **−2.19** | **+1.88** | +0.94 | **+4.39** |
+
+**Round 1 was negative on two pools; round 3 is positive on all five, on both metrics**, with best-decode
+gains from +4.39 to +9.50. §41ad concluded that "this method's benefit is bounded by the pool's headroom to
+the token cap" and warned it could cost more than it buys on long-derivation problems. **Iteration repairs
+that**: math500 — the longest-derivation, least-headroom pool — went from −2.19 to **+1.88** on greedy and
++0.94 to **+4.39** on best-decode, with unclosed falling 50.8% → 43.6%. The abstention that round 1 parked on
+those problems (§41ag) was partly converted back into correct answers by rounds 2 and 3.
+
+⚠️So §41ad's caveat is **narrowed rather than withdrawn**: it describes a single round, not the method. The
+residual is that a4's unclosed rate is still 22.75% against the baseline's 13.32%, so `budget`/`extend`
+remains worth +3.7 to the artifact and the deployed configuration should use it.
+
+**Gap to the released argonne-3.5-think, five-pool: greedy 11.94 → 8.24, best-decode 14.22 → 7.64,
+`acc|ANSWERED` 20.1pp → 7.7pp.**
+
+Rounds 4-6 are now running from round 3 (job 53255641) to find where the trend saturates. Each round prints
+`fail_taxonomy.py` on its own fresh rollouts before training, so saturation will be visible round by round
+from behaviour rather than from the divergence (§41ai).
