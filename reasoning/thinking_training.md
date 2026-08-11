@@ -8599,3 +8599,43 @@ the two axes that decide it, both already printed by `opd_train.py` at step 1:
 Read it as: **prefer the highest `revKL` among teachers whose `haz t` is within ~2x of `haz s`.** A
 high-signal teacher with a collapsed hazard is not usable as-is and becomes a `--kd-prefix-frac` question
 instead. Six steps at lr 1e-6 barely moves the student, so the audition is a measurement, not a training run.
+
+### §41ay — FOUR-POOL FINAL: round 6 is the artifact. Session closes ~half the gap to 3.5-think.
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.75 | 62.15 | 63.12 | **63.32** | 68.88 | 80.60 | 73.3% | 12.33 |
+| **a4opdi_a100 (round 6)** | **54.32** | 55.55 | 56.15 | **56.27** | **62.55** | **76.38** | **66.1%** | 16.30 |
+| a4start_a100 (round 3) | 52.17 | 55.20 | 55.87 | 55.65 | 60.42 | 74.35 | 64.6% | 17.55 |
+| a4combo_a100 (session start) | 48.02 | 48.40 | 48.20 | 48.58 | 56.70 | 74.03 | 53.2% | 9.12 |
+
+Pooled paired McNemar, 3,000 items:
+
+| | greedy | +extend1 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| r6 vs session start | **+5.70** (8.44e-12) | **+7.67** (4.22e-20) | **+5.07** (4.06e-12) | **+2.20** (4.76e-04) |
+| r6 vs round 3 | +1.70 (2.99e-02) | +0.00 (1.00) | +1.80 (5.66e-03) | +2.00 (6.34e-04) |
+
+**Round 6 is the artifact.** §41aw could only call r6 and r3 indistinguishable because it had two pools; on four
+it is **better on greedy, self-consistency and pass@8, and exactly tied on best-decode** — plus a lower
+unclosed rate (16.30% vs 17.55%). ⚠️Note this REVISES §41aw's "either is defensible": with 3,000 items instead
+of 2,000 the ordering resolves. A two-pool read was not enough to rank two checkpoints 1.7pt apart, which is
+the same sample-size lesson as §41ar, one rung up.
+
+**⭐THE SESSION, four clean pools:**
+
+| | start | round 6 | Δ | 3.5-think | gap closed |
+|---|---:|---:|---:|---:|---:|
+| greedy | 48.02 | **54.32** | **+6.30** | 60.75 | 12.73 → **6.43** (49%) |
+| best decode | 48.58 | **56.27** | **+7.69** | 63.32 | 14.74 → **7.05** (52%) |
+| self-cons@8 | 56.70 | **62.55** | **+5.85** | 68.88 | 12.18 → 6.33 (48%) |
+| pass@8 | 74.03 | **76.38** | +2.35 | 80.60 | 6.57 → 4.22 (36%) |
+| `acc\|ANSWERED` | 53.2% | **66.1%** | **+12.9pp** | 73.3% | 20.1 → **7.2pp** (64%) |
+
+**About half the gap to the released argonne-3.5-think is gone**, on every metric, from a 1.04B model against a
+2.88B one, on a base measured at −16.79pt with the identical recipe (§40). `acc|ANSWERED` closed the most
+(64%) — which is the axis §41j identified at the start of the session as the whole deficit.
+
+For scale one last time: the thirteen arms preceding this session moved the deployable number **+4.96 in total**
+across ~10 GPU-days. This session moved it **+7.69** on the same basis, and **+2.35 of `pass@8`** which no
+previous arm had moved at all.
