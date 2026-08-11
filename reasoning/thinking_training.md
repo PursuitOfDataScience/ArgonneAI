@@ -8682,3 +8682,49 @@ session — against **+4.96 total** from the thirteen arms that preceded it acro
 **52-54%** of the distance to a 2.88B model from a 1.04B one whose base measures −16.79pt with the identical
 recipe. `acc|ANSWERED` closed **71%**, which was §41j's whole diagnosis. It is still **6.6 points short** of the
 released argonne-3.5-think on best-decode, and §41ax's audition is the next thing that could move that.
+
+### §41ba — The audition CALIBRATED ITS OWN THRESHOLD, and the answer about a stronger teacher is now sharp
+
+`reasoning/a4_teacher_audition.sh`, 6 steps at lr 1e-6 per candidate, against the **round-6 artifact's own**
+rollouts:
+
+| teacher | params | revKL | agree | `haz s` | `haz t` | ratio | known outcome |
+|---|---:|---:|---:|---:|---:|---:|---|
+| released 3.5-think | 2.88B | **0.1057** | 92.7% | 0.0052 | 0.0052 | **1.00** | ✅ worked, +7.73 five-pool |
+| Qwen3-4B-Thinking-2507 | 4.02B | **0.9434** | 78.4% | 0.0052 | 0.0039 | **0.75** | ⛔ greedy 1.75, 96.95% unclosed |
+
+**Three findings, and together they settle the "get a better teacher" question.**
+
+**1. ⚠️My audition threshold was wildly wrong, and its own first run says so.** I wrote "prefer the highest
+`revKL` among teachers whose `haz t` is within ~2x of `haz s`." The teacher that destroyed termination has a
+ratio of **0.75** — comfortably inside 2x. A **25% hazard deficit, integrated over ~1,700 steps, was enough to
+drive closure to zero.** The threshold is now `haz_t/haz_s >= ~0.95`, anchored on one known-good point (1.00,
+worked) and one known-fatal point (0.75, catastrophic). ⚠️A criterion invented before any calibration data is
+a guess wearing a number; this one was wrong by more than a factor of four in the quantity that matters.
+
+**2. The safe teacher is now genuinely, measurably exhausted.** 3.5-think's reverse KL against the round-1
+student was 0.1872; against the **round-6** student it is **0.1057** — the artifact is nearly twice as close to
+its teacher as when the session started. Combined with §41aw (deployed metric flat from round 3) and §41au
+(sampling metrics peaking at round 4), the chain did not stop for want of iterations; **it stopped because the
+teacher ran out of things to say.**
+
+**3. The strong teacher's headroom is large and completely untouched.** Qwen3-4B-Thinking still measures
+**revKL 0.9434 — 8.9x** what 3.5-think has left — with 78.4% argmax agreement against 92.7%. That signal is
+real, it is on the current policy's own states, and the ONLY thing standing between it and the model is a
+0.75 closure hazard.
+
+> **So the capability lever is not closed; it is gated on exactly one unsolved problem — making a
+> longer-trace teacher safe.** `--kd-prefix-frac` was built for precisely that (§41x), verified numerically,
+> and has never been run. It is now the single highest-value experiment on this line, and the audition gives
+> it a cheap pass/fail: run the probe with `--kd-prefix-frac 0.5` and see whether the effective hazard ratio
+> comes back to ~1.0 while `revKL` stays high.
+
+⚠️**And two bugs the audition surfaced on its first run, both of which made a crash look like a clean result:**
+* `opd_train.py`'s argonne2 detection opened `<teacher>/config.json` as a local path, so the hub ID
+  `Qwen/Qwen3-4B` died with `FileNotFoundError` before `from_pretrained`. Guarded with `os.path.isdir`.
+* the launcher printed `exit=$?` **inside the same `echo` as a `$(basename ...)`**, and bash runs command
+  substitutions during word expansion — so `$?` held *basename's* status. It reported **`exit=0` for a
+  candidate that crashed and printed nothing.** Demonstrated: `false; echo "$(basename /x/y) -> $?"` prints
+  `0`; capturing `rc=$?` first prints `1`. Every audition would have reported success. Fixed, and a non-zero
+  status now prints "FAILED to audition — NOT a verdict about the teacher", because a broken probe and a bad
+  teacher must never read the same.
