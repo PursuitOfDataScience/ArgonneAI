@@ -7244,3 +7244,48 @@ Qwen3-4B, because 3.5-think is the teacher that actually produced the +7.6pp.
 the failure channels are exactly as §41n's calibration-destruction account predicts: `ansonly` pushes
 no_answer to 162/1000 on asdiv (the hint's advantage is all at the answer position), `full` pushes
 unclosed to 316/1000 (the reference derivation makes the teacher confident throughout the body).
+
+### §41q — AND THE GAIN IS RECOVERABLE AT DECODE TIME: +5.70 over the baseline's best config
+
+§41p left the capability gain (+7.6pp `acc|ANSWERED`) being spent on a termination regression, with the
+two pools disagreeing in sign on plain greedy. The gate already measured the fix, because `budget` and
+`extend` are s1-style force-closes and a lost answered-rate is exactly what they repair:
+
+| model | greedy | +budget | +extend1 | +extend2 | +extend3 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 73.55 | 73.40 | 73.80 | **74.15** | 80.70 | 92.00 |
+| **a4opd35_a100** | 58.40 | 62.65 | 63.00 | **63.35** | 63.00 | 68.95 | 83.95 |
+| a4combo_a100 | 56.70 | 57.60 | 57.50 | **57.65** | 57.65 | 68.05 | 85.45 |
+
+**Best-decode against best-decode: 63.35 vs 57.65 = +5.70.** And the per-pool paired tests show the
+§41p sign disagreement was *entirely* the termination regression:
+
+| config | asdiv Δ | p | svamp Δ | p | pool-mean |
+|---|---:|---|---:|---|---:|
+| greedy | **−2.50** | 1.1e-01 | +5.90 | 1.3e-04 | +1.70 |
+| +budget | **+3.10** | 3.7e-02 | +7.00 | 5.1e-06 | **+5.05** |
+| +extend2 | **+2.90** | 5.0e-02 | **+8.50** | 2.6e-08 | **+5.70** |
+
+asdiv flips from −2.50 to +2.90 the moment closure is imposed from outside. Both pools positive, same
+sign, and svamp clears the Bonferroni threshold for ~17 arms (p<0.003) by five orders of magnitude.
+
+Note also **which model force-closing helps most**: combo +0.95, 3.5-think +3.30, opd35 **+4.95**. It
+helps in exact proportion to the unclosed rate it repairs, which is the mechanism confirming itself.
+
+**This is the largest gain of the campaign.** For context, thirteen arms moved the five-pool deployable
+number 39.21 → 44.17 (+4.96) in total; this one arm is +5.70 on two pools over the best of them, and it
+arrives with the mechanism understood end to end: a length-matched teacher raises `acc|ANSWERED` by
+7.6pp, the raised capability costs termination, and force-closing at decode buys the capability back.
+
+⚠️**What still has to hold before this is quoted as a result:** it is ONE SEED (the `s47` replicate is
+arm 3 of `a4_kd3.sh`), it is TWO of the five pools (gsmplus/mawps/math500 are running), and asdiv's
+force-closed p is 0.037-0.050 — real but not Bonferroni-clean on its own. The robust legs are svamp's
+2.6e-08 and the fact that `acc|ANSWERED` moved with the same sign on both pools.
+
+⚠️And the honest framing of the fix: force-closing is a decode wrapper `clean_eval.py` already ships,
+so the +5.70 needs no retraining — but a model that needs force-closing to reach it is worse than one
+that closes on its own, which is what `a4_kd3.sh`'s `notail` and `anchor` arms are for. ⚠️One reason to
+expect `notail` to only partly work: 3.5-think genuinely writes longer traces (t_len 248 vs a4's 200),
+and length is encoded in "what to say next" as much as in "when to stop", so masking the terminator
+COLUMNS removes the direct pressure and not the body pressure. `anchor`'s CE term on a4's own shorter
+verified traces is the arm that attacks body length.
