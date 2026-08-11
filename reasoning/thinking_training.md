@@ -7943,3 +7943,35 @@ that abstention parked.
 mirror of math500's eval behaviour (§41ad) and the same limitation stated twice — **on problems the model
 cannot solve, this objective teaches it to stop pretending, which is worth nothing on an accuracy metric and
 would be worth something on a calibration one.**
+
+### §41ah — Round 2: the teacher has almost nothing left to say, and a third launcher bug of the same family
+
+**The signal is largely exhausted after one round.** Round 2 re-sampled 93,912 rollouts from
+`think_opd35anchor` and distilled on them with the same teacher. Reverse KL at step 1: **0.1326**, against
+round 1's 0.1872 — the student is already much closer to the teacher on the states its improved policy
+visits. And it does not fall over the epoch (0.1326 → 0.1385 at step 1900, argmax agreement 90.9% → 89.9%).
+Round 1's fell 0.1872 → 0.1512.
+
+That is the honest read on iteration: **one round captures most of what this teacher can transfer.** The
+residual 0.13 nats / ~10% argmax disagreement is presumably the irreducible 1.04B-vs-2.88B gap, and pushing
+on it is the same shape of mistake as §41n's irreducible-divergence drift.
+
+Closure smoke, 200 asdiv items: greedy **65.00%**, unclosed 15.5%, mean decoded **267** — against its own
+starting point's 62.50% / 13.5% / **241**. So round 2 is +2.50 on a subset whose noise band is ±3.4pp
+(inconclusive), and it **re-lengthened traces by 26 tokens despite `--ce-weight 0.5` being carried through**.
+Each round re-accumulates part of the length cost, which is exactly what §41y's mechanism predicts: the CE
+anchor pulls toward a4's own traces, but "a4's own traces" is a moving target that got longer in round 1.
+
+⚠️**Third launcher bug of the same family, found while the job was running.** The gate line named
+`think_opd35` while `START` had been repointed to `think_opd35anchor`, so round 2 would be paired against a
+checkpoint it does not descend from — the McNemar would have measured **two differences at once** (the extra
+round AND the CE anchor) and been read as one. Fixed to `$START`. The three bugs were:
+* `a4_entbranch.sh` auto-including every checkpoint on disk in its model list;
+* `a4_opd_iter.sh`'s retention guard exempting a checkpoint **by name** that no longer existed, which would
+  have deleted the session's one positive result;
+* this one.
+All three are the same defect: **a hardcoded name that was correct when written and is not re-checked when
+its referent moves.** The repo has recorded this failure mode before for untracked `.sh` carrying a dead
+worktree path. Every one of these was caught by reading the launcher against the current checkpoint
+inventory rather than by any test, which is an argument for doing that read every time a checkpoint is
+deleted or repointed.
