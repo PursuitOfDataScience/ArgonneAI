@@ -7334,3 +7334,45 @@ makes this different from those retractions is that the effect is 5-6x the noise
 symptom before it was measured (a length-matched teacher raises capability; the capability costs
 termination; force-closing buys it back; force-closing helps in proportion to the unclosed rate — combo
 +0.95, 3.5-think +3.30, opd35 +4.95).
+
+### §41s — The queue after §41r, ranked by what §41p-r actually changed
+
+The best arm on this base is now a per-token on-policy KD arm, not a data arm, so the queue reorders
+again. All of these are built and validated; the order is by expected points.
+
+1. **`a4_kd3.sh` — RUNNING (job 53243842).** `s47` (the seed replicate that decides quote-or-withdraw),
+   `notail` (terminator columns dropped from the divergence — confirmed live in the log: ids 151645 and
+   151668 removed, 151669 → 151667 columns, and revKL at step 1 is 0.1891 against the unmasked 0.1980,
+   so dropping 2 of 151,669 columns barely perturbs the objective while removing all closure pressure),
+   and `anchor` (CE 0.5 on a4's own verified traces — the arm that attacks BODY length, which
+   column-masking cannot).
+2. **`a4_opdsoup.sh` — NEW, and the cheapest thing on the list.** The two best checkpoints fail in
+   opposite directions: `think_opd35` has `acc|ANSWERED` 62.3% with 17.0% unclosed, `think_combo` has
+   53.5% with 9.5%. Everything opd35 gained came through `acc|ANSWERED` and everything it lost came
+   through the answered rate, so a weight-space average sits on the line between those failure modes and
+   the only question is whether the curve is convex enough for some alpha to beat both endpoints. A soup
+   is a CPU-side tensor average, ~2 min per point, and all three alphas gate in one paired call against
+   both endpoints.
+   ⚠️This is NOT the alpha question already settled. "alpha=1.00 wins, do not soup a4" is about averaging
+   a post-CoT checkpoint with its own pre-CoT ANCESTOR, which can only dilute. This averages two fully
+   post-trained SIBLINGS that diverge in one stage and fail complementarily. Different pair.
+3. **`a4_entbranch.sh`** — the free selectors. Still ~23.8pt of floor-to-ceiling headroom after §41r
+   (76.90 vs 53.10), and §41o found the vote actively discarding 4.0pt of items greedy already had.
+4. **`a4_opd_iter.sh`** — round 2, re-sampling from the improved policy, which is the actual algorithm.
+   Round 1's reverse KL fell only 0.198 → 0.148, so the teacher still disagrees with the student on ~11%
+   of the student's own tokens after a full epoch, and as the policy moves the states move.
+5. **`TEACHER=<Qwen3-4B-Thinking> ARMS=notail sbatch reasoning/a4_kd3.sh`** — conditional on (1). The
+   Qwen teacher carries **4.5x** the per-token signal of 3.5-think (revKL 0.85 vs 0.20, argmax
+   disagreement 23% vs 12%) and was disqualified only by its trace length. If column-masking is
+   sufficient protection, this is the highest-ceiling variant available.
+
+⚠️**Two launcher bugs found and fixed while queueing, both of the same kind — a stale hardcoded name
+after a checkpoint was deleted:**
+* `a4_entbranch.sh` auto-included every arm present on disk in its model list, which would have run the
+  selector study on three checkpoints already measured as regressions and multiplied the job fourfold.
+  A selector study holds the MODEL fixed; it now runs on `think_combo` only.
+* `a4_opd_iter.sh`'s retention guard exempted `"$ROOT/think_opd"` from deletion by NAME — a checkpoint
+  that no longer exists — so with `START` repointed at `think_opd35` it would have **silently deleted the
+  session's one positive result** at the end of round 2. It now compares against `$START`.
+Both are the failure mode the repo has hit before (§ untracked `.sh` carrying a hardcoded path from a
+deleted worktree): a name that was correct when written and is not checked again when its referent moves.
