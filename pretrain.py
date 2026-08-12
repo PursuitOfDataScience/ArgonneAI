@@ -43,21 +43,28 @@ LOCAL_ATTENTION_WINDOW = 256
 LOGIT_SOFTCAP = 15.0
 
 # ---------------------------------------------------------------------------
-# argonne4.5 (2026-08-12). Param count is held BIT-IDENTICAL to argonne4.0's
-# 1,038,509,568 so every 4.5 lever is measured against a4.0's real downstream numbers with
-# size controlled -- we are data-limited (38.6B unique => 148 tok/param at 1B), not
-# capacity-limited, so shrinking adds no information and growing makes the ratio worse.
-# See ARGONNE4.5.md sec 3b for the measured budget this is derived from.
+# argonne4.5 (2026-08-12). SIZE GOES UP: 2,882,196,480 params, 2.8x argonne4.0 and
+# bit-identical to argonne3.5. The direct experiment settled this -- at essentially the same
+# token count (62.1B vs ~64B), 3.5's 2.88B beat a4.0's 1.04B by 16.79pt on 5-set think greedy
+# despite a4 having 2.7x the tokens/param AND a better data mix; pass@8 moved too (-12.72), so
+# it is capability. See ARGONNE4.5.md sec 3b. At D=154B the Chinchilla-optimal model is ~7.7B,
+# so 1.04 -> 2.88B moves TOWARD the optimum, not past it. Size-matching 3.5 also makes the
+# comparison against our best existing model unambiguous.
 #
-# The FFN swap is exactly iso-param: SwiGLU 4096 (3 matrices) == ReLU^2 6144 (2 matrices)
-# at hidden 1536 / 32L / 6Q / 2KV / head_dim 256. Depth, width and attention are unchanged,
-# so ReLU^2 is a clean single-variable test. Every fp8 GEMM dim stays /16-divisible
-# (1536, 6*256, 2*256, 6144).
+# The FFN swap is exactly iso-param: SwiGLU 8192 (3 matrices) == ReLU^2 12288 (2 matrices)
+# at hidden 3072 / 24L / 12Q / 4KV / head_dim 256, so ReLU^2 is a clean single-variable test
+# with depth, width, attention and total size all held against 3.5. Every fp8 GEMM dim stays
+# /16-divisible (3072, 12*256, 4*256, 12288).
 #
 # Set A45 = True only after the 10B-token arch bake-off in ARGONNE4.5.md sec 4 has run.
+# NOTE: at 2.88B this needs 8 GPUs (2 nodes) for a sane calendar -- 24 d vs 48 d for 154B.
 A45 = False
 if A45:
-    INTERMEDIATE_SIZE = 6144
+    HIDDEN_SIZE = 3072
+    NUM_LAYERS = 24
+    NUM_HEADS = 12
+    NUM_KV_HEADS = 4
+    INTERMEDIATE_SIZE = 12288
     MLP_TYPE = "relu2"
     ATTN_PATTERN = "LLLG"        # Muse Glimmer's 3 sliding : 1 global
     SLIDING_WINDOW_SIZE = 1024   # half of block 2048; ACTUALLY applied now (see model.py Finding A)
