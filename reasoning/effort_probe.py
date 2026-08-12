@@ -50,6 +50,31 @@ DATA = "/project/rcc/youzhi/data"
 CLOSE_STR = "\n</think>\n\nThe answer is $\\boxed{"
 
 
+_GSM_GOLD = None
+
+
+def gsm8k_gold_map():
+    """question -> GSM8K's OWN gold (`#### N`), for verifying curated-shard solutions.
+
+    The curated shard's `answer` is a MODEL-WRITTEN solution, so any gold read out of it is the
+    generator's answer, not the dataset's: measured 6.62% wrong (see load_pool). Anything that
+    treats those solutions as SFT targets needs to check them against this map -- the mix
+    builders' `canonicalize_gsm` verified `extract_boxed(content) == gold` where BOTH sides came
+    from the same generated text, which is a self-consistency check and cannot catch a wrong
+    answer. Returns {} if the materialised pool is absent, so callers degrade to the old
+    behaviour rather than crashing; check for the empty dict if you want to hard-fail.
+    """
+    global _GSM_GOLD
+    if _GSM_GOLD is None:
+        path = f"{DATA}/gsm8k_train_authoritative/train.jsonl"
+        _GSM_GOLD = {}
+        if os.path.exists(path):
+            for ln in open(path):
+                o = json.loads(ln)
+                _GSM_GOLD[o["question"].strip()] = o["gold"]
+    return _GSM_GOLD
+
+
 # ------------------------------------------------------------------ pools ----
 def load_pool(source, n, seed=0):
     """(question, gold) list. Delegates eval sets to clean_eval; adds TRAIN-only pools."""

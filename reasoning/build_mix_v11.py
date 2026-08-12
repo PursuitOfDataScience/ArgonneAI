@@ -97,7 +97,11 @@ def main() -> None:
         print(f"  {tier:<16} kept {len(kept):>5} of {len(pool):>6} available{flag}")
 
     print(f"Building gsm8k-TRAIN tier <- {GSM}  (max_tok={args.gsm_max_tok})")
-    gsm = []
+    # see build_mix_v6: canonicalize_gsm's `extract_boxed(content) == gold` compares the generated
+    # text to itself, so it cannot catch a solution whose final answer is wrong -- 4.66% are.
+    from effort_probe import gsm8k_gold_map
+    auth = gsm8k_gold_map()
+    gsm, n_badgold = [], 0
     for ln in open(GSM):
         o = json.loads(ln)
         if o.get("split") != "train" or o.get("num_tokens", 10 ** 9) > args.gsm_max_tok:
@@ -107,10 +111,15 @@ def main() -> None:
         content = canonicalize_gsm(o["answer"])
         if content is None:
             continue
+        a = auth.get(o["question"].strip())
+        if a is not None and extract_boxed(content) != a:
+            n_badgold += 1
+            continue
         gsm.append({"messages": [{"role": "user", "content": o["question"]},
                                  {"role": "assistant", "content": content}],
                     "tier": "gsm8k_train_short", "num_tokens": o.get("num_tokens", 0)})
-    print(f"  gsm8k unique canonicalized: {len(gsm)}  (upsample x{GSM_UPSAMPLE}, cap {GSM_TIER_CAP})")
+    print(f"  gsm8k unique canonicalized: {len(gsm)}  (upsample x{GSM_UPSAMPLE}, cap {GSM_TIER_CAP})"
+          f"  [dropped {n_badgold} whose generated answer disagrees with GSM8K gold]")
     gsm = (gsm * GSM_UPSAMPLE)
     rng.shuffle(gsm)
     rows += gsm[:GSM_TIER_CAP]

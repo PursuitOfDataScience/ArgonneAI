@@ -42,6 +42,12 @@ OUT = "/project/rcc/youzhi/data/cot_sft_mix_v13_gsmlong"
 SEED = 20260804
 
 
+from effort_probe import gsm8k_gold_map          # noqa: E402  (module-level config above)
+
+_auth = gsm8k_gold_map()
+n_badgold = [0]
+
+
 def canonicalize_gsm(answer):
     """Identical to build_mix_v6.canonicalize_gsm -- reconstruct to end with the deployed boxed close."""
     gold = extract_boxed(answer)
@@ -69,11 +75,17 @@ def build_tier(cap, upsample):
         res = canonicalize_gsm(o["answer"])
         if res is None:
             continue
+        # see build_mix_v6: canonicalize_gsm's check is self-consistent and cannot catch a
+        # generated solution whose final answer is simply wrong (4.66% of them are)
+        a = _auth.get(o["question"].strip())
+        if a is not None and res[1] != a:
+            n_badgold[0] += 1
+            continue
         rows.append({"messages": [{"role": "user", "content": o["question"]},
                                   {"role": "assistant", "content": res[0]}],
                      "tier": "gsm8k_train_short", "num_tokens": o.get("num_tokens", 0)})
-    print(f"  cap {cap}: {len(rows)} distinct train problems (skipped {n_test} non-train), "
-          f"x{upsample} -> {len(rows) * upsample} rows")
+    print(f"  cap {cap}: {len(rows)} distinct train problems (skipped {n_test} non-train, "
+          f"{n_badgold[0]} wrong-gold), x{upsample} -> {len(rows) * upsample} rows")
     return rows * upsample
 
 
