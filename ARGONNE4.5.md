@@ -50,6 +50,13 @@ Qwen3 tokenizer — is held, because that is the part of Argonne that is genuine
 run, and the fallback is 2.0B in 33 days. And the bake-off has to be run on a pinned GPU model: the
 retraction in §3b happened because the launcher silently switches H100↔H200 by time of day.
 
+**Where an intermediate choice is free, take it: the token budget.** Nothing pins D up front except
+the WSD cooldown (`cooldown_frac × estimated_steps`). Run, read capability at 40 / 80 / 120B on
+`clean_eval.py`, and decide the endpoint *before* the cooldown starts — extend into the synthetic
+corpus if the curve is still climbing, cool down early if it flattens. That is exactly what
+`base-for-reasoning.md` §2.3 Option C did for 3.5, and it costs nothing. Size cannot be deferred this
+way; the token budget can, so defer the one that is deferrable.
+
 **Explicitly deferred:** MoE → argonne5.0 (start the design in parallel — if parameters are the
 shortage and compute is the wall, it is the only lever that buys parameters without buying training
 FLOPs); Mamba-2 hybrid (would invalidate the vLLM port); NVFP4 (needs Blackwell, we are on Hopper);
@@ -403,13 +410,26 @@ real *iso-token at 1B-vs-1B*; it does not survive being cashed in for a 2.8× pa
 The earlier "hold 1.04B" reading in this document weighted comparability against **a4.0**. That was
 the wrong anchor: a4.0 is not the model to beat — **3.5 is**. So take 3.5's exact shape.
 
-- **Chinchilla says we are nowhere near over-parameterized.** At D = 154B the loss-optimal model is
-  ≈7.7B params. Moving 1.04B → 2.88B moves *toward* the optimum, not past it. The "300–450
-  tokens/param" target in `base-for-reasoning.md` is a *deployment* heuristic borrowed from models
-  trained on 10–40T tokens; at 154B it would force us down to a 0.4B model, which the table above
-  says is exactly the wrong direction.
-- **Size-matching 3.5 makes the read clean.** Same params, same tokenizer, same vocab: everything
-  that changes is data, objective and attention layout. If 4.5 beats 3.5 it is unambiguous.
+- **2.88B is where the optimum lands for our budget — it is not a landmark chosen for tidiness.**
+  Minimising the Chinchilla fit `L = 1.69 + 406.4·N^-0.34 + 410.7·D^-0.28` at fixed compute
+  `C = 6ND`, using our measured throughput, gives:
+
+  | budget (8×H200) | N·D | loss-optimal N | its D | its D/N |
+  |---|---|---|---|---|
+  | 16 GPU-days | 3.0e20 | 2.4B | 126B | 53 |
+  | **24 GPU-days** | 4.5e20 | **2.9B** | 157B | 55 |
+  | 32 GPU-days | 6.0e20 | 3.2B | 184B | 57 |
+  | 46 GPU-days | 8.6e20 | 3.8B | 225B | 59 |
+
+  For any calendar we would plausibly run, the optimum is **2.4–3.8B**, and at the 24-day budget it
+  is 2.9B. The curve is flat-bottomed — at 24 GPU-days, 2.0B costs +0.0033 predicted loss and 4.0B
+  costs +0.0030 — so anything in **2.5–3.5B** is defensible. Below ~2B is not: the loss is worse
+  *and* the compute-matched token count (224B at 2.0B, 299B at 1.5B) exceeds the 154B we can build.
+  ⚠️ An earlier draft of this section said "at D = 154B the loss-optimal model is ≈7.7B." That used
+  the wrong framing — it treats data as free and compute as unconstrained. At fixed *compute*, which
+  is the actual constraint, the answer is 2.9B.
+- **Size-matching 3.5 is a bonus, not the reason.** Since the optimum lands there anyway, we also get
+  a size-controlled read against our best existing model for free.
 - **2.88B is proven trainable here** — batch, HBM and wall-time behaviour are all known from the 3.5 run.
 - **Qwen3-0.6B is not a counterexample.** It beats a4 at 58% of the params on **36T tokens** =
   ~60,000 tok/param. That regime is three orders of magnitude away; inside the regime we can actually
