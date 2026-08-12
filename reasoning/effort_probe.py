@@ -58,14 +58,35 @@ def load_pool(source, n, seed=0):
     if source in ("gsm8k_train", "math_train", "math_train_hard", "math_train_easy"):
         probs = []
         if source == "gsm8k_train":
-            path = f"{DATA}/gsm8k_main_curated/shards/shard_00000.jsonl"
-            for ln in open(path):
-                o = json.loads(ln)
-                if o.get("split") != "train":      # the §23 contamination rule: TRAIN only
-                    continue
-                g = extract_boxed(o["answer"])
-                if g is not None:
-                    probs.append((o["question"], g))
+            # ⚠️GOLD COMES FROM THE DATASET, NOT FROM A GENERATED SOLUTION. The curated shard's
+            # `answer` field is a MODEL-WRITTEN solution, so taking its last \boxed{} as gold
+            # inherits both the generator's arithmetic errors and extract_boxed's brace bug.
+            # Measured 2026-08-12 against GSM8K's own `#### N`: 280 of 4,229 golds WRONG (6.62%)
+            # -- 197 generator errors, 83 nested-brace parses (`\boxed{\$14{,}000}` -> "14").
+            # Those golds label every rollout, every never-solved selection and every DPO pair on
+            # this line, so a wrong one makes a correct trace score incorrect and can park a
+            # solvable problem in the coverage hole permanently. The extractor ALSO drops any row
+            # whose generated solution has no \boxed at all, which silently cost 3,152 of GSM8K
+            # train's 7,473 problems -- 42% of the largest training pool, invisible because
+            # load_pool returned a plausible 4,229.
+            auth = f"{DATA}/gsm8k_train_authoritative/train.jsonl"
+            if os.path.exists(auth):
+                for ln in open(auth):
+                    o = json.loads(ln)
+                    probs.append((o["question"], o["gold"]))
+            else:
+                # fallback only -- an offline node without the materialised pool. Same behaviour as
+                # before the fix, including its 6.62% wrong-gold rate; the warning is the point.
+                print(f"!! WARNING {auth} missing; falling back to curated-shard golds, which are "
+                      f"6.62% WRONG and cover only 4,229 of 7,473 train problems", file=sys.stderr)
+                path = f"{DATA}/gsm8k_main_curated/shards/shard_00000.jsonl"
+                for ln in open(path):
+                    o = json.loads(ln)
+                    if o.get("split") != "train":  # the §23 contamination rule: TRAIN only
+                        continue
+                    g = extract_boxed(o["answer"])
+                    if g is not None:
+                        probs.append((o["question"], g))
         else:
             from datasets import load_from_disk
             d = load_from_disk(f"{DATA}/nlile_hendrycks-MATH-benchmark")["train"]
