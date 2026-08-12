@@ -9397,3 +9397,40 @@ governs the ceiling.
 ⚠️Read this table's coverage column only as *distance to the external reference*: round 6's pass@8 is 76.22
 here (paired) versus 74.35 in the largest-n merge of §41bo, and quoting the merge would have shown `pfxcomp`
 gaining +2.27 of coverage that the paired test says is −0.03.
+
+### §41br — ⛔STEP-LEVEL DPO IS A NULL, and §41bq's decomposition PREDICTED it. The n=200 smoke misled a third time.
+
+`sdpo` = step-level DPO on 6,565 length-neutral first-step preference pairs (on-policy from round 6, enriched
+with Qwen3-14B winning openings on 2,020 problems a4 could not contrast), from the `repairlo` policy.
+
+| four clean pools, 3,000 items | greedy | best-dec | sc@8 | pass@8 | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| round 6 | 54.15 | 56.33 | 62.58 | 76.22 | 15.27 | 275.5 |
+| `repairlo` (the policy) | 55.70 | 57.10 | 64.22 | 75.90 | 13.13 | 276.5 |
+| `sdpo_b04` (β=0.4) | 55.73 | **57.77** | 63.58 | 75.25 | 13.30 | 268.8 |
+| `sdpo_b01` (β=0.1) | 54.95 | 56.50 | 62.97 | 76.23 | 13.90 | 260.6 |
+
+Paired vs its own policy: b04 greedy **−0.27 (p=0.70)**, extend1 +0.10 (p=0.91), sc@8 −0.57, pass@8 −0.13;
+b01 greedy **−0.80 (p=0.24)**, extend1 −1.27 (p=0.062). **Both null-to-negative.** The apparent +1.67 greedy
+(p=0.016) against round 6 is `repairlo`'s own gain carried through — `sdpo` = repairlo + DPO, and repairlo
+alone was +1.93.
+
+✅**THE DECOMPOSITION PREDICTED THIS AND I RAN THE ARM ANYWAY.** §41bq measured `repairlo`'s SELECTION deficit
+at **+0.08pt**. Step-level DPO over first-step *choice* is a selection method by construction, so its available
+headroom was 0.08pt before a single GPU-second was spent. It returned −0.27. **The additive
+coverage/selection/floor decomposition is therefore a usable PRIOR, not just a post-hoc description** — it
+priced this arm correctly in advance, and had I applied it to the queue rather than to the write-up I would
+have skipped a 2.5-hour job. That is the lesson worth keeping: run levers against components that still have
+headroom, and the decomposition says which.
+⚠️The taxonomy's diagnosis is not refuted — 79.0% of wrong traces really do diverge at equation index 0 — but a
+correct *description* of where traces fail does not imply a *lever*: the model already picks among its
+reachable derivations as well as a model 2.8× its size, so improving the choice cannot pay.
+
+⚠️⚠️**THE n=200 SMOKE POINTED THE WRONG WAY, FOR THE THIRD TIME TODAY.** b01's asdiv smoke read greedy **71.00
+vs the policy's 68.00 (+3.00)** and the gate says **−0.80**; b04 read 69.00 (+1.00) and the gate says −0.27.
+`closure_smoke.py` is a GUARDRAIL — it answers "does this checkpoint terminate" — and at ±3.4pp it cannot rank
+checkpoints that differ by ~1pt. This is already recorded twice (§41ai, §41aq) and I still let a +3.00 read as
+encouraging. **The only correct use of the smoke number is the unclosed column.**
+✅One thing it did show truthfully: trace length fell 276.5 → 268.8 → 260.6 as β dropped, so the length-neutral
+pair construction worked exactly as designed — whole-trace RLVR-DPO went 230 → 312 and lost greedy to drift.
+The mechanism was sound; the target had no headroom.
