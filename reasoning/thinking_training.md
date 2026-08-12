@@ -9327,3 +9327,30 @@ items (§41bn) is **−0.03 at p=1.00**. The paired number is authoritative and 
 apparent gain is entirely an artifact of comparing across runs, and the same caveat applies to round 6's
 greedy (52.17 here vs 54.15 in the paired gate). ⚠️Use this table for *distance to the external reference*
 only, never for arm-vs-arm deltas — those require one gate call on identical items, which is what §41bn is.
+
+### §41bp — step-pair data: 19.5% of the signal is the 14B enrichment, and `--min-group 2` is UNAVAILABLE at K=8
+
+Attribution of the 6,565 pairs in `a4_step_pairs_r6x14b`, by whether the problem was one a4 never solved and
+a Qwen3-14B coverage trace supplied the winning opening:
+
+| source of the CHOSEN opening | pairs | share |
+|---|---:|---:|
+| a4's own contrast (problem solved sometimes) | 5,285 | **80.5%** |
+| **14B winning opening vs a4's dead opening** | 1,280 | **19.5%** |
+
+So four fifths of the signal is self-contrast — which is exactly what the prepared, never-run 5,897-pair set
+contained *alone*. The enrichment is a real fifth of the data and covers 2,020 problems that previously could
+not yield a pair at all, but any gain must not be attributed wholly to it.
+
+⚠️**A NOISE WEAKNESS, MEASURED: `chosen_rate` is 1.00 for 91.7% of pairs and only 25.0% have the chosen opening
+backed by more than one rollout.** So three quarters of the value estimates rest on a single sample. The
+rejected side is better supported by construction (it requires rate exactly 0.0 and picks the dead group with
+the MOST rollouts behind it), but the chosen side is thin.
+
+⛔**And the obvious fix does not exist at this sample size.** `--min-group 2` collapses the set from 6,565 to
+**673 pairs**, with `fewer_than_two_openings` rising to 9,109: at K=8 with diverse openings, almost every
+opening group is a singleton, so demanding two well-supported groups per problem eliminates nearly everything.
+673 pairs is not trainable. **This is a data-requirement finding, not a flag to tune** — Monte-Carlo value
+estimates over openings need K=16+ rollouts per problem to support a min-group filter, which doubles
+generation cost. The 673-pair set was deleted; its stats remain in `report/a4_step_pairs_mg2.json`.
+Recorded so the idea is not re-proposed as cheap.
