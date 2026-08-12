@@ -140,9 +140,10 @@ Ranked within tiers by (value to a reasoning base at ~1B on 3 GPUs) ÷ (engineer
 Train (or reuse) a small reference model on high-quality data; at pretrain time, compute per-token
 excess loss `L_student − L_ref` and backprop only the top-k% of tokens (typically 60%). Reported
 2–10× data efficiency on math specifically. Our binding constraint is documented in
-`base-for-reasoning.md` §1.1: a4 has 38.6B tokens for 1.04B params = **37 tokens/param**, against the
-300–450 that makes small models capable. RHO-1 attacks that ratio directly, costs nothing at
-inference, and needs no new data. The reference model can be an existing `a4_dose` checkpoint or
+`base-for-reasoning.md` §1.1: the a4 run finished at **62.1B tokens on 1.0385B params = 60
+tokens/param** (measured from `report/argonne4.0/`, not the corpus size — the run repeated data),
+against the 300–450 that makes small models capable. RHO-1 attacks that ratio directly, costs
+nothing at inference, and needs no new data. The reference model can be an existing `a4_dose` checkpoint or
 Qwen3-0.6B-Base (same tokenizer family).
 *Cost: a scoring pass over the corpus + a masked-CE path in `pretrain.py`. Risk: low — it degenerates to standard CE at k=100%.*
 
@@ -273,6 +274,70 @@ of Argonne that is genuinely well-tuned. Keep it.
 
 ---
 
+## 3b. Sizing: the measured budget (2026-08-12)
+
+Everything below is calibrated on the **actual a4.0 run**, reconstructed from the 239 slice logs in
+`report/argonne4.0/`. Two corrections to what was assumed:
+
+- The run was on **3× H100** (`--constraint=H100`, nodes midway3-0426/0372), not H200.
+- It finished at **62.1B tokens** (step 109,620) = **60 tokens/param**, not the 37 the corpus size implies.
+
+| Phase | config | median tok/s | slices |
+|---|---|---|---|
+| pretrain | block 1024, micro-batch **170**/GPU, accum 1 | **60,096** | 136 |
+| anneal A | block 1024, micro-batch **32**/GPU, accum 6 | **86,353** | 57 |
+| phase B | block 13568, micro-batch 2/GPU | 39,300 | 44 |
+| whole run | 62.1B tokens / 11.8 calendar days | 61,030 | — |
+
+### ⚠️ Finding C — the production micro-batch costs ~1.44× throughput
+
+Same block size, same effective batch (~0.52M vs 0.59M), **44% apart**. The mechanism is chunked CE:
+`loss_chunk_size 4096` over a 170×1024 micro-batch is **42.5 chunks**, over 32×1024 it is **8**. Each
+chunk is a separate `@torch.compiler.disable` eager kernel with its own checkpoint recompute, and
+`[[chunked-ce-is-the-throughput-lever]]` already recorded that cost scales with *chunk count*. The
+big micro-batch was chosen to fill HBM; `[[sft-length-grouping-beats-hbm-fill]]` and
+`[[optimize-gpu-hbm-usage]]` both say fill is not the objective here — s/step is.
+**Fix: shrink the micro-batch and raise grad-accum.** Free 1.44×, no quality change.
+
+Spend the freed HBM on **disabling gradient checkpointing** (≈33% recompute) rather than on a bigger
+micro-batch — that is the useful way to satisfy the fill target.
+
+### Throughput and calendar
+
+Calibrated: 5.27 B tok/day measured on 3×H100 → **10.7 B tok/day on 4×H200** (×4/3 GPUs, ×1.2 H200,
+×1.44 batch fix, ×0.88 for block 2048+LLLG). The `gpu` QOS ceiling is **16 GPUs / 4 nodes / 36h**, and
+the launcher is `--nodes=1 --gres=gpu:3` today — so 4×H200 on one node needs **no code change** and is
++2× over what a4 actually used.
+
+| tokens | tok/param | 4× H200 | 8× H200 | unique corpus needed @4× repetition |
+|---|---|---|---|---|
+| 100B | 96 | 9 d | 5 d | 25B |
+| 200B | 193 | 19 d | 9 d | 50B |
+| **300B** | **289** | **28 d** | **14 d** | **75B** |
+| 400B | 385 | 37 d | 19 d | 100B |
+| 600B | 578 | 56 d | 28 d | 150B |
+
+**Compute is not the constraint. Data is.** Our 38.6B unique corpus at ≤4× repetition is 154B usable
+= 148 tok/param at 1B — still 2–3× short of the target, and no amount of GPU fixes that.
+
+### The size decision: hold 1.0387B
+
+At a fixed corpus, tokens/param scales as 1/N, so smaller looks better on paper. It isn't, here:
+
+- **We cannot fill even 1B.** At 148 tok/param we are data-limited, not capacity-limited. Shrinking to
+  0.6B raises the ratio to 257 but does not add a single token of information, and pushes the
+  embedding to **33% of the model** (Qwen3's 151,936 vocab is a fixed 233M at hidden 1536).
+- **Growing is strictly worse.** 1.5B at the same corpus = 103 tok/param, and 61 days for 500:1.
+- **Holding the exact a4.0 param count buys a controlled comparison.** Every 4.5 lever then reads
+  against a4.0's real downstream numbers with size held fixed — and our history
+  (two retractions, a cross-GPU artifact, 450-step traps) says confound control is worth more than a
+  few percent of any scaling curve.
+- The thesis of 4.5 is *value per token*, not parameter count. Changing both at once measures neither.
+
+Conveniently the FFN swap is **exactly iso-param**: SwiGLU inter 4096 (3 matrices) and ReLU² inter
+6144 (2 matrices) are both 1,038,509,568 params at hidden 1536 / 32L / 6Q / 2KV / head_dim 256. So
+ReLU² can be tested with depth, width and attention all held constant.
+
 ## 4. Proposed argonne4.5
 
 **Thesis: 4.0 proved composition is the per-token lever and then ran out of tokens. 4.5's job is to
@@ -280,23 +345,40 @@ raise the value of each token (T1.1, T1.2) and the number of tokens (T1.5), fix 
 (Finding A, T1.4), and adopt the one architectural idea that solves a failure we have already
 measured (T1.3).** Capacity via MoE (T2.1) is the separate, larger bet.
 
-Recommended configuration, as deltas from 4.0:
+### The config
 
-| Axis | 4.0 | 4.5 |
-|---|---|---|
-| Params | 1.04B dense | 1.04B dense (unchanged — isolate the variables) |
-| Attention pattern | 1:1 interleaved, window 256 (**inert**) | `sssF` — 3 sliding@2048 : 1 full, **window actually applied** |
-| Position encoding | RoPE θ=1e6 everywhere | RoPE θ=500k on sliding, **NoPE on full-attention layers** |
-| Doc boundaries | ignored (cross-doc attention) | block-diagonal mask from doc ids |
-| Objective | plain CE | CE + **RHO-1 top-60% token selection** |
-| MTP | degenerate, off | **real MTP module**, on; + MTP-boost phase at the end |
-| Block size | 1024 | 2048 |
-| Corpus | 38.6B real | 38.6B real + synthetic expansion, target ≥150B effective |
-| LR / schedule / FP8 | 6e-4, WSD 8k/0.15, clip 0.4, fp8 | unchanged, but **µP-parametrized** so proxies transfer |
-| Tied embeddings | tied | tied at 1B (revisit only if params grow) |
+| Axis | 4.0 | **4.5 (decided)** | why |
+|---|---|---|---|
+| Params | 1,038,509,568 | **1,038,509,568 — identical** | controlled comparison; we are data-limited, not capacity-limited |
+| hidden / layers | 1536 / 32 | **1536 / 32** | unchanged |
+| heads Q/KV, head_dim | 6 / 2, 256 | **6 / 2, 256** | head_dim 256 confirmed by the Phase-1 sweep |
+| FFN | SwiGLU 4096 | **ReLU² 6144** (iso-param) | 2-matrix FFN, 50% wider at equal params; gated on the bake-off |
+| Attention pattern | 1:1 interleave, window 256 (**inert**) | **`LLLG`, sliding 1024, actually applied** | Finding A; Muse's 3:1 layout |
+| Position encoding | RoPE θ=1e6 all layers | **RoPE θ=500k on L, NoPE on G** | targets the documented `[[rope-extrapolation-fails-phaseb-works]]` failure |
+| Block size | 1024 | **2048** | reasoning traces need room; ~12% cost with the window active |
+| Doc boundaries | cross-doc attention | **block-diagonal doc mask** | plain objective defect |
+| Objective | plain CE | **CE + RHO-1 top-60%** | the tokens/param lever |
+| MTP | degenerate, off | **real module, depth 1, w 0.3** + MTP-boost phase | denser signal + free drafter |
+| Embeddings | tied | **tied** | untying adds 233M (+22%) at this vocab |
+| Optimizer | AdamW, LR 6e-4, WSD 8k/0.15, clip 0.4, fp8 | **unchanged** (+ µP) | the well-searched part — do not touch |
+| Micro-batch | 170/GPU, accum 1 (42 CE chunks) | **16/GPU, accum 4 @ 4 GPUs** (8 chunks) | Finding C: 1.44× free |
+| Effective batch | 522,240 | **524,288** | the LR-6e-4-validated value |
+| Grad checkpointing | on | **probe off** | the freed HBM's best use (~33% recompute) |
+| Hardware | 3× H100 | **4× H200, single node** | no launcher change; +2× |
+| Token budget | 62.1B (60:1) | **300B (289:1)** | 28 d at 4×H200; needs 75B unique |
 
 Everything above is config-gated and defaults OFF in the code, so `argonne4.5` can still reproduce a
 4.0 run byte-for-byte.
+
+### The two things that gate the run
+
+1. **Data, not compute.** 300B tokens needs ~75B unique at 4× repetition; we have 38.6B. The
+   synthetic expansion (T1.5) is on the critical path — it is the only item that must finish before
+   the main run can be worth its calendar time. Everything else can be developed in parallel.
+2. **A 10B-token arch bake-off before committing 28 days.** 4 arms × 10B tokens ≈ 4 GPU-days total at
+   4×H200 — trivial next to the run it protects, and the only defence against another 450-step trap:
+   (a) baseline = 4.0 arch at block 2048; (b) + `LLLG`/NoPE/doc-mask; (c) + ReLU²; (d) + MTP module.
+   Ship whatever (b)-(d) actually win, at the same GPU, gated on `reasoning/clean_eval.py`.
 
 ## 5. How to validate — don't repeat the 450-step mistake
 

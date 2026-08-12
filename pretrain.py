@@ -42,6 +42,40 @@ ENABLE_INTERLEAVED_LOCAL_ATTENTION = True
 LOCAL_ATTENTION_WINDOW = 256
 LOGIT_SOFTCAP = 15.0
 
+# ---------------------------------------------------------------------------
+# argonne4.5 (2026-08-12). Param count is held BIT-IDENTICAL to argonne4.0's
+# 1,038,509,568 so every 4.5 lever is measured against a4.0's real downstream numbers with
+# size controlled -- we are data-limited (38.6B unique => 148 tok/param at 1B), not
+# capacity-limited, so shrinking adds no information and growing makes the ratio worse.
+# See ARGONNE4.5.md sec 3b for the measured budget this is derived from.
+#
+# The FFN swap is exactly iso-param: SwiGLU 4096 (3 matrices) == ReLU^2 6144 (2 matrices)
+# at hidden 1536 / 32L / 6Q / 2KV / head_dim 256. Depth, width and attention are unchanged,
+# so ReLU^2 is a clean single-variable test. Every fp8 GEMM dim stays /16-divisible
+# (1536, 6*256, 2*256, 6144).
+#
+# Set A45 = True only after the 10B-token arch bake-off in ARGONNE4.5.md sec 4 has run.
+A45 = False
+if A45:
+    INTERMEDIATE_SIZE = 6144
+    MLP_TYPE = "relu2"
+    ATTN_PATTERN = "LLLG"        # Muse Glimmer's 3 sliding : 1 global
+    SLIDING_WINDOW_SIZE = 1024   # half of block 2048; ACTUALLY applied now (see model.py Finding A)
+    NOPE_GLOBAL = True           # global layers carry no RoPE -> nothing to extrapolate wrong
+    ROPE_THETA = 500000.0        # on the sliding layers only
+    DOC_MASK = True
+    MTP_MODULE_LAYERS = 1        # real MTP module, NOT the degenerate mtp_horizon path
+    MTP_LOSS_WEIGHT = 0.3
+    ATTN_GATE = False            # bake-off candidate; off until it wins an arm
+else:
+    MLP_TYPE = "swiglu"
+    ATTN_PATTERN = None
+    SLIDING_WINDOW_SIZE = 2048
+    NOPE_GLOBAL = False
+    DOC_MASK = False
+    MTP_MODULE_LAYERS = 0
+    ATTN_GATE = False
+
 # Parse arguments
 parser = argparse.ArgumentParser()
 # Paths
@@ -722,6 +756,14 @@ def main():
         mtp_loss_weight=MTP_LOSS_WEIGHT if ENABLE_MTP else 0.0,
         interleaved_local_attention=ENABLE_INTERLEAVED_LOCAL_ATTENTION,
         local_attention_window=LOCAL_ATTENTION_WINDOW if ENABLE_INTERLEAVED_LOCAL_ATTENTION else None,
+        # argonne4.5 (no-ops unless A45 is on)
+        attn_pattern=ATTN_PATTERN,
+        sliding_window_size=SLIDING_WINDOW_SIZE,
+        nope_global=NOPE_GLOBAL,
+        attn_gate=ATTN_GATE,
+        mlp_type=MLP_TYPE,
+        mtp_module_layers=MTP_MODULE_LAYERS,
+        doc_mask=DOC_MASK,
         logit_softcap=LOGIT_SOFTCAP,
         loss_chunk_size=args.loss_chunk_size,
         tie_word_embeddings=True,
