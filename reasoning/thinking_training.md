@@ -9302,3 +9302,28 @@ not the signature of too little of a good thing.
 wrong traces diverge at equation index 0) and the last untried mechanism with a measured diagnosis behind it.
 And the coverage data is not wasted: as **contrast** rather than imitation it supplies the winning opening on
 2,020 problems where a4 had none, which is what §41bo tests.
+
+### §41bo — FOUR-POOL STANDING: the session has closed 61-62% of the gap to 3.5-think, ~5pt remain
+
+Four CLEAN pools (asdiv, svamp, gsmplus, mawps; math500 excluded as contaminated for this line):
+
+| model | greedy | best-decode | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| a4 `combo` — session start | 47.95 | 48.62 | 56.62 | 74.02 |
+| a4 round 6 | 52.17 | 55.88 | 60.42 | 74.35 |
+| a4 **`pfxcomp`** | 55.02 | **57.75** | **64.58** | 76.62 |
+| a4 **`repairlo`** | **55.70** | 57.10 | 64.22 | 75.90 |
+| **argonne-3.5-think** — target | 60.73 | 63.38 | 68.90 | 80.50 |
+
+**greedy 47.95 → 55.70 (+7.75), best-decode 48.62 → 57.75 (+9.12); 61% and 62% of the gap closed.** Remaining
+≈5.02 greedy and ≈5.62 best-decode. For scale, the thirteen arms preceding this campaign moved the deployable
+number +4.96 in total.
+
+⚠️⚠️**THIS TABLE MIXES RUNS, AND THAT ARTIFACT WOULD LET ME CLAIM A COVERAGE GAIN I DID NOT GET.** 3.5-think is
+not in today's gate, so the only way to include it is the largest-n record per (model, pool) across every gate
+JSON — which means round 6's row here comes from a different run than `pfxcomp`'s. Read naively, round 6's
+pass@8 74.35 against `pfxcomp`'s 76.62 looks like **+2.27 of coverage**. The PAIRED measurement on identical
+items (§41bn) is **−0.03 at p=1.00**. The paired number is authoritative and the coverage null stands; the
+apparent gain is entirely an artifact of comparing across runs, and the same caveat applies to round 6's
+greedy (52.17 here vs 54.15 in the paired gate). ⚠️Use this table for *distance to the external reference*
+only, never for arm-vs-arm deltas — those require one gate call on identical items, which is what §41bn is.
