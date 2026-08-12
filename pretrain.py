@@ -43,28 +43,35 @@ LOCAL_ATTENTION_WINDOW = 256
 LOGIT_SOFTCAP = 15.0
 
 # ---------------------------------------------------------------------------
-# argonne4.5 (2026-08-12). SIZE GOES UP: 2,882,196,480 params, 2.8x argonne4.0 and
-# bit-identical to argonne3.5. The direct experiment settled this -- at essentially the same
-# token count (62.1B vs ~64B), 3.5's 2.88B beat a4.0's 1.04B by 16.79pt on 5-set think greedy
-# despite a4 having 2.7x the tokens/param AND a better data mix; pass@8 moved too (-12.72), so
-# it is capability. See ARGONNE4.5.md sec 3b. At D=154B the Chinchilla-optimal model is ~7.7B,
-# so 1.04 -> 2.88B moves TOWARD the optimum, not past it. Size-matching 3.5 also makes the
-# comparison against our best existing model unambiguous.
+# argonne4.5 (2026-08-12). SIZE: 2,063,667,712 -- 2.0x argonne4.0, 0.72x argonne3.5.
 #
-# The FFN swap is exactly iso-param: SwiGLU 8192 (3 matrices) == ReLU^2 12288 (2 matrices)
-# at hidden 3072 / 24L / 12Q / 4KV / head_dim 256, so ReLU^2 is a clean single-variable test
-# with depth, width, attention and total size all held against 3.5. Every fp8 GEMM dim stays
-# /16-divisible (3072, 12*256, 4*256, 12288).
+# Why bigger than a4.0: at essentially the same token count (62.1B vs ~64B), 3.5's 2.88B beat
+# a4.0's 1.04B by 16.79pt on 5-set think greedy despite a4 having 2.7x the tokens/param AND a
+# better data mix; pass@8 moved too (-12.72), so it is capability, not post-training. At our
+# compute budget the Chinchilla fit puts the loss optimum at 2.4-3.8B with a FLAT bottom across
+# 2.5-3.5B, and 2.0B costs only ~+0.003 predicted loss at fixed compute.
 #
-# Set A45 = True only after the 10B-token arch bake-off in ARGONNE4.5.md sec 4 has run.
-# NOTE: at 2.88B this needs 8 GPUs (2 nodes) for a sane calendar -- 24 d vs 48 d for 154B.
+# Why not larger: 2.0B runs 154B tokens in 34 days on FOUR GPUs, so the multi-node launcher
+# stops being a prerequisite, and the compute saved goes into actually ablating the five
+# untried levers -- which is the point of 4.5. Unmeasured upside from RHO-1 / real MTP / NoPE /
+# doc-masking / ReLU^2 plausibly exceeds 0.003 loss; 0.88B more dense params does not buy a
+# hypothesis, it buys a slightly lower number.
+#
+# Shape: head_dim 256 (Phase-1 confirmed), MLP 2.75x (the sweep's HIGH-confidence optimum),
+# 24 layers so "LLLG" divides evenly (6 global / 18 sliding, and the LAST layer is global),
+# GQA ratio 5 -> 48 KB/token KV cache, 2.5x smaller than ratio 2, which matters because the
+# deployable recipe is self-consistency at K=8-32. Both reference models run 16:1, so 5:1 is
+# conservative. FFN swap is exactly iso-param: SwiGLU 7040 (3 mat) == ReLU^2 10560 (2 mat).
+# Every fp8 GEMM dim is /16-divisible (2560, 10*256, 2*256, 7040, 10560).
+#
+# Set A45 = True only after the arch bake-off in ARGONNE4.5.md sec 4 has run.
 A45 = False
 if A45:
-    HIDDEN_SIZE = 3072
+    HIDDEN_SIZE = 2560
     NUM_LAYERS = 24
-    NUM_HEADS = 12
-    NUM_KV_HEADS = 4
-    INTERMEDIATE_SIZE = 12288
+    NUM_HEADS = 10
+    NUM_KV_HEADS = 2
+    INTERMEDIATE_SIZE = 10560
     MLP_TYPE = "relu2"
     ATTN_PATTERN = "LLLG"        # Muse Glimmer's 3 sliding : 1 global
     SLIDING_WINDOW_SIZE = 1024   # half of block 2048; ACTUALLY applied now (see model.py Finding A)
