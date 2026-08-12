@@ -9354,3 +9354,46 @@ opening group is a singleton, so demanding two well-supported groups per problem
 estimates over openings need K=16+ rollouts per problem to support a min-group filter, which doubles
 generation cost. The 673-pair set was deleted; its stats remain in `report/a4_step_pairs_mg2.json`.
 Recorded so the idea is not re-proposed as cheap.
+
+### §41bq — ⭐⭐SELECTION IS CLOSED. The remaining gap is ~90% COVERAGE, and coverage-by-CE is a measured null.
+
+`greedy` decomposes exactly into coverage + selection + floor. Using the PAIRED gate (§41bn — round 6,
+`pfxcomp`, `repairlo` on identical items) plus 3.5-think's own internally-consistent run, four clean pools:
+
+| model | greedy | sc@8 | pass@8 | never-solved | selection (sc@8−pass@8) | floor (greedy−sc@8) |
+|---|---:|---:|---:|---:|---:|---:|
+| a4 `combo` (session start) | 47.95 | 56.62 | 74.02 | 25.98 | −17.40 | −8.67 |
+| a4 round 6 | 54.15 | 62.58 | 76.22 | 23.78 | −13.64 | −8.43 |
+| a4 **`pfxcomp`** | 55.02 | 64.58 | 76.62 | 23.38 | **−12.04** | −9.56 |
+| a4 **`repairlo`** | 55.70 | 64.22 | 75.90 | 24.10 | **−11.68** | −8.52 |
+| **3.5-think** (target) | 60.73 | 68.90 | 80.50 | 19.50 | −11.60 | −8.17 |
+
+**Gap to target by component** (each row sums to the greedy gap exactly):
+
+| model | greedy gap | **coverage** | **selection** | floor |
+|---|---:|---:|---:|---:|
+| `combo` (session start) | +12.77 | +6.48 | **+5.80** | +0.50 |
+| round 6 | +6.58 | +4.28 | +2.04 | +0.26 |
+| **`pfxcomp`** | +5.71 | **+3.88** | **+0.44** | +1.39 |
+| **`repairlo`** | **+5.03** | +4.60 | **+0.08** | +0.35 |
+
+⭐**THE SELECTION DEFICIT IS GONE: +5.80 at session start → +2.04 at round 6 → +0.08 (`repairlo`) / +0.44
+(`pfxcomp`).** a4-think now converts what it can reach into a chosen answer as well as a model 2.8× its size.
+That is the entire content of this campaign's gains, and it is finished — there is no more than half a point
+left on that axis by any method.
+
+⛔**AND WHAT REMAINS IS COVERAGE, WHICH TODAY'S BEST-EQUIPPED ATTEMPT MOVED BY NOTHING.** Coverage is +3.88 to
++4.60 of the ~5pt gap — **76-91% of it** — essentially unchanged from round 6's +4.28. §41bn threw the strongest
+available tool at it (Qwen3-14B verified solutions for 71.6% of the never-solved set, gold-filtered,
+length-matched) and pass@8 moved −0.03 at p=1.00.
+
+✅**So the honest position: post-training on this base is approaching its limit, and the limit is REACH.**
+Every remaining mechanism I can name targets selection or shape — the two components already at parity — and
+the one component that matters is the one §39 attributes to pretraining (a4's phase-C base is −26.5 mmlu /
+−41.2 gsm8k against Qwen3-0.6B-Base). This is not a reason to stop post-training: `repairlo` (+1.93, p=3.0e-3)
+and step-DPO (smoke 68.00 → 71.00) are real and cheap. It is a reason to stop expecting post-training to
+deliver the remaining 4pt of pass@8, and to price the base decision (§41bf Tier D) as the thing that actually
+governs the ceiling.
+⚠️Read this table's coverage column only as *distance to the external reference*: round 6's pass@8 is 76.22
+here (paired) versus 74.35 in the largest-n merge of §41bo, and quoting the merge would have shown `pfxcomp`
+gaining +2.27 of coverage that the paired test says is −0.03.
