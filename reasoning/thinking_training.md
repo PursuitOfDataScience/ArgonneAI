@@ -9582,3 +9582,80 @@ terms there is 13-21pt of oracle headroom that majority voting does not capture 
 not newly available: §41j measured text-feature selectors 10-14pt WORSE than voting, and §25's reranker
 that did capture it was a two-model SERVING win, not a single-checkpoint one. Recorded so the two
 statements are not read as contradicting each other.
+
+### §41bv — ⛔ROUNDS 7-9 ARE A NULL, and the two-pool read that said otherwise is the finding worth keeping
+
+Three more rounds of on-policy KD from `repairlo`, on the §41bt-corrected pool (15,212 problems, +27.1%),
+run as a 17-step chain of ~1-hour jobs. Four clean pools, 3,000 identical items, paired McNemar:
+
+| vs `repairlo` | greedy | extend1 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| **round 8** | +0.57 (p=0.479) | +1.07 (p=0.171) | −1.17 (p=0.080) | +0.83 (p=0.156) |
+| **round 9** | −0.07 (p=0.964) | −0.27 (p=0.755) | **−1.43 (p=0.033)** | +0.93 (p=0.132) |
+
+⛔**Nothing moved.** Standing on four pools: `combo` 50.87 -> `repairlo` **58.43** -> r8 59.00 / r9 58.37,
+against 3.5-think's 64.10. The remaining gap decomposes as **5.40 coverage + 0.23 selection + 0.03 floor**
+for `repairlo` — materially where §41bq left it. Round 8 traded selection (0.23 -> 2.23 deficit) for
+coverage (5.40 -> 4.57) and floor (0.03 -> −1.70, better than the target's), netting nothing.
+
+⚠️⚠️**THE MISTAKE, AND IT IS THE MOST TRANSFERABLE THING HERE. I read gate call 1 (asdiv+svamp, 2,000
+items) as `pass@8 +2.05 at p=0.003` and reported COVERAGE MOVED. On four pools it is +0.83 at p=0.156.**
+Adding 1,000 items did not merely fail to confirm it — it reversed it, which means the effect is
+heterogeneous, not underpowered:
+
+| pool | pass@8 Δ, r8 vs `repairlo` | p |
+|---|---:|---:|
+| svamp | **+2.70** | **0.013** |
+| asdiv | +1.40 | 0.125 |
+| mawps | +0.60 | 0.701 |
+| **gsmplus** | **−3.80** | **0.040** |
+
+**Two nominally-significant effects in OPPOSITE directions, cancelling under pooling.** The same split
+shows up independently in the k=32 reach probes: on asdiv r9 goes 94.67 -> 92.67 and never-solved 16 -> 22,
+while on svamp it goes 93.67 -> **97.00** and never-solved 19 -> **9**. Three independent instances in one
+day of *svamp likes this arm, asdiv/gsmplus do not*.
+
+⭐**THE RULE THIS ESTABLISHES: on this line the pool-to-pool spread (±3pt) is LARGER than the effect sizes
+being chased (~1pt), so any readout narrower than the four-pool pooled paired test can be made to say
+whatever the chosen pools prefer.** §41bo recorded this hazard for cross-RUN merges; it applies just as
+hard to pool SUBSETS inside a single run, and with ~30 tests run across metrics/arms/pools today, a couple
+of p<0.05 readings are expected from noise alone. Report the four-pool pooled number first, always.
+
+✅**REACH probes (k=32, n=600 pooled, T=0.9), the counterpart to §41bu's baseline:** `repairlo` 94.17 /
+never 35, r8 **95.67** / never **26**, r9 94.83 / never 31. So r8 does hold a small tail gain — and
+`majority@32` is FLAT across all three (77.50 / 77.33 / 76.83), i.e. **the extra reach is entirely
+unconverted**, which is §41bu's widening vote→oracle gap showing up as a null on the deployed metric.
+
+⚠️**PREDICTION SCORECARD, stated before the gate ran and mostly WRONG.** I predicted (a) r9 lands ~1.5
+below `repairlo` on greedy because the 1e-5 KD overwrote `repairlo`'s LR-fragile 3e-6 repair gain, and
+(b) pass@8 rises. On four pools (a) is **−0.07 at p=0.964** — no overwrite — and (b) is **not
+significant**. The mechanism story was clean, plausible, and unsupported.
+⚠️**AND THE WARNING I RAISED MID-RUN DID NOT MATERIALISE EITHER.** On-policy sampling at T=0.9 showed
+`acc|gradeable` **54.35 -> 49.42 -> 49.36** across 121,696 rollouts and `no_answer` tripling 2.38% ->
+6.40%; I flagged it as a likely regression. The gate says greedy is flat. **That is the THIRD instance of
+§41au's divergence — a large, high-n, paired decline in the SAMPLING distribution that does not appear in
+the deployed metric.** Sampling statistics on train pools are not a preview of the gate; stop reading
+them as one.
+✅One thing the rounds did close: termination converged to the teacher — unclosed 11.0% -> 8.5% (teacher
+8.45%) and t_len 283 -> 251, stable between r8 and r9. That axis is finished, and it bought no accuracy.
+
+⭐**THE ONE LIVE LEVER LEFT BY THIS ARM IS ORDERING, and it is cheap.** `repairlo`'s +1.93 (§41bn) came
+from pure CE at **lr 3e-6**, and §41bn also recorded that **1e-5 on the same data DAMAGES it**. This chain
+ran 1e-5 KD *starting from* `repairlo` — i.e. the fragile gain was the FIRST thing the chain wrote over.
+Running that repair pass LAST, on round 8's own correct traces, is one generation + one ~50-min CE pass
+(~1.6h) and stacks the two effects instead of trading them. Choosing the best-greedy checkpoint as START
+without asking HOW it earned its greedy is the planning error to avoid repeating.
+
+✅**INFRASTRUCTURE (`reasoning/a4_chunk.sh`), which outlives the null.** 17 steps of <=55 min each,
+self-resubmitting, state derived entirely from on-disk artifacts so any death resumes correctly; measured
+overhead ~5% against the monolith, and only ~3 min of queue gap across 17 handoffs. Three bugs were caught
+in a DRY RUN before costing GPU time: (1) retention deletes the dir holding the round's own `.done`
+markers, so keying the skip on them regenerates a finished round forever — the marker must be
+`report/*_smoke.json`, which retention never touches; (2) a step exiting 0 without producing its artifact
+resubmits until the step budget is gone, so `finish` now asserts its artifact; (3) `closure_smoke.py`
+writes its JSON and THEN raises SystemExit(3), so a failed round left a completion marker that would make
+a resubmit skip it and iterate on a non-terminating checkpoint.
+⚠️**And retention had to be overridden mid-run.** Latest-only would have deleted round 8 before the gate
+read it; gate call 1 then showed r8 beating r9 on extend1 (+1.33, p=0.048 four-pool). That is §41au's
+incident exactly, so the penultimate round is now HELD through the gate. **A checkpoint queued for a gate
+is a pending result, not a superseded one.**
