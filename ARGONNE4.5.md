@@ -10,6 +10,58 @@ parameter names, which are considerably more informative than what either vendor
 
 ---
 
+## 0. The proposal, in one page
+
+**Build argonne-4.5-base: 2,882,196,480 params — argonne3.5's exact shape, argonne4.0's data
+recipe, 2.4–4.7× the tokens, and five things neither previous run had.**
+
+The line's whole diagnosis is that base capability is the wall (six post-training methods, two
+model generations). 3.5 is the strongest base we have; 4.5 is 3.5 held at the same size so the
+comparison is unambiguous, with every other axis improved.
+
+| | argonne3.5 | argonne4.0 | **argonne4.5** |
+|---|---|---|---|
+| params | 2,882,196,480 | 1,038,509,568 | **2,882,196,480** |
+| tokens | ~64B (22:1) | 62.1B (60:1) | **154B → 300B (53–104:1)** |
+| data | web 85 / math 15, no code | edu 50 / math 30 / code 20 | **edu 50 / math 30 / code 20 + synthetic** |
+| think 5-set greedy | 55.16 | 38.37 | *the thing being bought* |
+
+**Five changes, in value order.** (1) **RHO-1** selective loss — the tokens/param lever, and the
+cheapest thing on the list. (2) **Real MTP module** — denser signal per token plus a free
+speculative-decoding drafter, which multiplies every future self-consistency experiment.
+(3) **NoPE global layers + RoPE sliding layers** (`LLLG`, window 1024) — Muse Glimmer's answer to
+the length-generalization failure we have already measured. (4) **Intra-document masking** — a plain
+objective defect: packed documents currently attend across their own boundaries. (5) **ReLU² FFN**
+at inter 12288, exactly iso-param with 3.5's SwiGLU 8192 so it is a clean single-variable test.
+Everything else — AdamW, LR 6e-4, WSD 8k/0.15, grad_clip 0.4, qk-norm, FP8, tied embeddings, the
+Qwen3 tokenizer — is held, because that is the part of Argonne that is genuinely well-searched.
+
+**Order of work.**
+
+| # | step | cost | blocks what |
+|---|---|---|---|
+| 1 | multi-node DDP in the launcher (QOS allows 16 GPU / 4 nodes; today it is `--nodes=1 --gres=gpu:3`) | ~1 day | halves every run from here on |
+| 2 | 5-arm bake-off at 10B tokens, **one pinned card** | ~10 GPU-days | decides ReLU², gated attn, untie; catches a 450-step trap |
+| 3 | synthetic data expansion → ~75B unique (runs in parallel from day 1) | GPU-weeks, interruptible | the 300B budget; 154B can start without it |
+| 4 | main pretrain, 8×H200 | **24 d @154B, 46 d @300B** | — |
+| 5 | reasoning anneal + MTP-boost phase | ~3 d | — |
+
+**Two things must be true or the plan changes.** Multi-node has to land — at 4 GPUs this is a 48-day
+run, and the fallback is 2.0B in 33 days. And the bake-off has to be run on a pinned GPU model: the
+retraction in §3b happened because the launcher silently switches H100↔H200 by time of day.
+
+**Explicitly deferred:** MoE → argonne5.0 (start the design in parallel — if parameters are the
+shortage and compute is the wall, it is the only lever that buys parameters without buying training
+FLOPs); Mamba-2 hybrid (would invalidate the vLLM port); NVFP4 (needs Blackwell, we are on Hopper);
+multilingual; a new optimizer (neither reference model uses one).
+
+**Honest bound.** 4.5 should beat 3.5 — same size, 2.4× the tokens, a mix the campaign proved is
+worth ~1.3 CE at proxy scale, and five levers on top. It will not approach Qwen3-0.6B's regime
+(~60,000 tokens/param); that is three orders of magnitude of data away, and no architecture on this
+list closes it.
+
+---
+
 ## 1. The two reference models, as measured
 
 ### 1.1 NVIDIA Nemotron 3.5 Lightning — `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
