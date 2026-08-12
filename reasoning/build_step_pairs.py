@@ -55,6 +55,9 @@ from rft_generate import EQ, _val  # noqa: E402
 from star_generate import norm     # noqa: E402
 
 WS = re.compile(r"\s+")
+# an opening that already states the final answer is not a first reasoning step (see the filter
+# at the pair-construction site for the reward-hacking case this exists to remove)
+ANSWER_MARK = re.compile(r"\\boxed\{|####")
 
 
 def strip_think_open(trace):
@@ -186,6 +189,19 @@ def main():
                 continue
             if not opening_arith_ok(ch):
                 stat["chosen_bad_arith"] += 1
+                continue
+            # ⚠️REWARD-HACKED CHOSEN OPENINGS. A trace is graded `correct` from the LAST \boxed{} anywhere in
+            # it -- `clean_eval.grade` reads `pred` independently of closure -- so a rollout that blurts
+            # `\boxed{<gold>}` in its first sentence is labelled correct no matter how incoherent the rest
+            # is. With --min-group 1 one such rollout scores that opening 1.00 and it becomes the CHOSEN
+            # sample. Observed verbatim on the first build: chosen = "...the x-dependence of the expression
+            # is \boxed{2}, and this is the only term..." against a rejected opening that was a perfectly
+            # sane restatement of the problem. Training DPO on that pair teaches the model to emit the
+            # answer inside the think block -- degenerate, and the opposite of a first REASONING step.
+            # A first step states a computation, never the final answer, so this is a definitional filter,
+            # not a heuristic.
+            if ANSWER_MARK.search(ch):
+                stat["chosen_states_answer"] += 1
                 continue
             rows.append({
                 "chosen": [{"role": "user", "content": q},

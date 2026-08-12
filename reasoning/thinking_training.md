@@ -9249,3 +9249,56 @@ difference and it showed up in the loss.
 already scores ~65% on, while this arm only added traces for problems it never solved. **The success criterion
 is `pass@8`** (§41bf: coverage is +6.36 of the +8.09 gap). An arm that moves only the floor has failed at what
 it was built for, which is the exact inverse of how the KD arms had to be read.
+
+### §41bn — ⛔COVERAGE-BY-CE IS A NULL ON pass@8. Injecting the answers does not install the capability.
+
+Four clean pools, 3,000 items, paired McNemar against round 6. `pfxcomp` = 4,303 Qwen3-14B-completed,
+gold-verified traces for problems a4 had **never** solved in 8 samples, trained as plain CE alongside a4's own
+correct rollouts.
+
+| | greedy | best-dec | sc@8 | **pass@8** | `acc\|ANS` | uncl% | noans% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| round 6 (baseline) | 54.15 | 56.33 | 62.58 | **76.22** | 67.77 | 15.27 | 1.37 | 275.5 |
+| **`pfxcomp`** | 55.02 | **57.75** | **64.58** | **76.62** | 67.11 | 14.33 | **0.03** | 275.3 |
+| **`repairlo`** | **55.70** | 57.10 | 64.22 | 75.90 | 67.40 | **13.13** | 0.17 | 276.5 |
+| combo (pre-KD) | 47.95 | 48.62 | 56.62 | 74.02 | 56.43 | 8.70 | 1.17 | 213.3 |
+
+| pooled paired vs round 6 | greedy | extend1 | sc@8 | **pass@8** |
+|---|---:|---:|---:|---:|
+| `pfxcomp` | +0.97 (p=0.19) | +0.03 (p=1.0) | **+1.93 (p=1.6e-3)** | **−0.03 (p=1.00)** |
+| `repairlo` | **+1.93 (p=3.0e-3)** | +1.13 (p=0.086) | +1.60 (p=0.012) | −0.97 (p=0.10) |
+
+⛔**THE ARM FAILED AT WHAT IT WAS BUILT FOR, and the criterion was stated in advance** (§41bm: "pass@8 is the
+criterion; an arm that moves only the floor has failed"). pass@8 moved **−0.03, p=1.00** — not a small
+positive, a dead flat null, on 3,000 paired items. 4,303 verified solutions to never-solved problems, at
+71.6% coverage of the hole, median trace length inside the student's own distribution, closure intact — and
+the ceiling did not move by any amount.
+
+✅**What it DID do is move SELECTION: sc@8 +1.93 at p=1.6e-3, and best-decode +1.42 (the best of any
+checkpoint today).** So the traces were absorbed as *better choosing among what it can already reach*, not as
+new reach. That is the same axis §41bf measured as nearly closed (+1.11 left), which is why the gain is ~2pt
+and not ~6.
+
+⭐**THE REAL RESULT OF THE DAY IS `repairlo`: greedy +1.93 at p=3.0e-3**, from pure CE at lr 3e-6 on the
+model's *own* verified-correct traces — the cheapest arm attempted, no teacher, no new data. §41bd capped that
+lever at ≈+1.8 and it landed at +1.93. **Both** arms also drove the empty-think mode to ~zero (1.37% →
+0.03%/0.17%), and `repairlo` cut unclosed 15.27% → 13.13%.
+
+⚠️**WHAT THIS MEANS FOR §41bf's ROADMAP, stated plainly: the coverage deficit is not a data-availability
+problem.** The obvious reading of "+6.36 lives in pass@8" was "find solutions the model lacks and show them to
+it." Solutions were found for 71.6% of the hole by a 14B model, verified against gold, length-matched, and CE
+on them bought exactly zero pass@8. This corroborates §41bf's own caveat — coverage is inherited from
+pretraining (§39: a4's base is −26.5 mmlu / −41.2 gsm8k against Qwen3-0.6B-Base) — and it means scaling the
+coverage corpus (the hard-MATH half, more samples, shorter prefixes) is **not** justified: the first 4,303
+traces moved the target metric by nothing, so 10,000 more will not either. That branch of the roadmap is
+withdrawn rather than scaled.
+⚠️One confound I am NOT claiming away: training used the UNION of coverage traces and a4's own correct rows,
+so the coverage rows were ~27% of the mix, and it was one epoch at lr 5e-6. A dilution/undertraining
+explanation is not excluded by this run. But it is not worth chasing at the same cost, because the *shape* of
+the result (selection up, ceiling exactly flat) is the signature of absorbing style rather than capability,
+not the signature of too little of a good thing.
+
+**→ The line moves to the FIRST STEP (job 53290470)**, the one failure the taxonomy names precisely (79.0% of
+wrong traces diverge at equation index 0) and the last untried mechanism with a measured diagnosis behind it.
+And the coverage data is not wasted: as **contrast** rather than imitation it supplies the winning opening on
+2,020 problems where a4 had none, which is what §41bo tests.
