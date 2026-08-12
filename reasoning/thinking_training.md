@@ -9490,3 +9490,95 @@ and the one comparable attempt failed."
 `delta pass@8 = −5.75pt` for what is `+5.75pt`: it computed `rows[-1] − rows[0]` over a *sorted glob*, and
 `a4_covprobe_pfxcomp.json` sorts before `a4_covprobe_r6.json`, so the arm was treated as the baseline. Now
 keyed by label. **A summary line that silently flips the sign of the result is worse than no summary line.**
+
+### §41bt — ⚠️THE TRAINING POOL'S GOLD WAS 6.6% WRONG, and pricing it honestly costs the fix most of its story
+
+Went to expand the problem pool (§41bs: the coverage null is a GENERALISATION failure, and diversity is
+what generalisation scales with) and found the pool both smaller and wronger than it looked.
+`effort_probe.load_pool` built `gsm8k_train` gold as `extract_boxed(o["answer"])` over
+`gsm8k_main_curated` — but that `answer` field is a **MODEL-WRITTEN solution**, not GSM8K's gold. Against
+the dataset's own `#### N`, all 7,473 train rows:
+
+| | count | share |
+|---|---:|---:|
+| golds it produced that are WRONG | **280 / 4,229** | **6.62%** |
+| ├ generator arithmetic errors (parsed 2125, gold 2210) | 197 | 4.66% |
+| └ `extract_boxed`'s `[^}]*` stopping at a nested brace (`\boxed{\$14{,}000}` -> "14") | 83 | 1.96% |
+| rows DROPPED because the generated solution had no `\boxed` at all | **3,152 / 7,473** | **42%** |
+
+Pool: **11,968 -> 15,212 problems (+27.1%)**, 280 golds corrected. Gold now comes from `#### N`,
+materialised to `data/gsm8k_train_authoritative/train.jsonl` so offline nodes need no hub access.
+
+⭐**AND THE SAME DEFECT IS IN THE CoT-SFT PATH.** All three mix builders (v6/v11/v13) carry their own
+`canonicalize_gsm`, and each "verifies" with `extract_boxed(content) == gold` where **both sides came out
+of the same generated text** — a self-consistency check that catches a broken reconstruction and cannot
+catch a wrong answer. **4.00% of the rows v6's gsm8k tier emitted (110 of 2,748) have a wrong final
+answer**, handed to CoT-SFT as ground truth in the tier v6's own docstring calls "contamination-SAFE".
+Contamination-safe it was; correct it was not. All three now check an external gold and report drops.
+
+⚠️**`extract_boxed`'s brace bug is NOT fixed.** It is the shared MODEL-answer parser behind
+clean_eval/effort_gate/vllm_grade, so changing it would shift every published gate number mid-campaign.
+It underscores all arms equally, so paired comparisons stay valid. Recorded, not touched.
+
+✅**NOW THE PRICE, MEASURED, AND IT IS SMALL.** Re-scored round 6's OWN 32,000 gsm8k_train rollouts with
+nothing changed but the gold:
+
+| gsm8k_train, identical rollouts | never-solved in 8 |
+|---|---:|
+| scored with the curated (wrong) gold | 991 / 4,000 = **24.77%** |
+| scored with GSM8K's own `#### N` | 950 / 4,000 = **23.75%** |
+
+**The wrong golds explain 1.02pp of a 24.77pp hole.** At most ~77 of §41bm's 1,392-problem never-solved
+set (5.5%) were gold artifacts, so **§41bn's coverage null stands essentially unweakened.** I had written
+that bad gold "can park a solvable problem in the coverage hole permanently — a live concern for §41bm's
+set"; directionally right, and I gave no magnitude. The magnitude refutes the concern. 263 of 4,000 golds
+wrong on this independent sample (6.58%, confirming 6.62%) and 405 of 32,000 rollouts (1.27%) labelled
+`wrong` while in fact correct — real corruption of the RFT keep-filter and every DPO pair, and still not
+a coverage story.
+
+⭐**THE MECHANISM DETAIL WORTH KEEPING: 77 problems were rescued but the net is only 41, because 36 went
+the OTHER WAY.** On those 36, a4 made the *same* arithmetic error as the model that wrote the curated
+solution, so the wrong gold scored a wrong answer **correct**. Student and teacher-of-record sharing a
+mistake is invisible to any self-consistency check, and it is exactly why the mix-builder guard had to
+reach for an external gold rather than a stricter internal one.
+
+⚠️⚠️**AND THE TRAP I WALKED INTO WHILE READING THE FIX.** Round 6 -> round 7 never-solved on gsm8k_train
+fell 24.77% -> 22.69% and I read it as the fuel fix working. It is not: `math_train_easy`, which the gold
+fix **does not touch at all**, fell further (−2.97pp vs −2.08pp). The drop is `repairlo` being a better
+policy than round 6. **A change that coincides with a fix is not evidence for the fix unless the
+untouched arm holds still** — and here the untouched arm moved more.
+
+✅Decontamination re-measured for the 27%-larger question set (the old 0.0% reading does not transfer):
+max Jaccard vs judged eval items asdiv **0.812** (1 item >=0.70), svamp 0.550, gsmplus 0.593, mawps
+0.417, math500 0.433. **Zero items >=0.85 anywhere**; gsmplus at 0.593 confirms GSM8K-train and
+GSM8K-test-derived GSM-Plus are disjoint. The gate stays fair.
+
+### §41bu — ⭐⭐REACH IS NOT THE CONSTRAINT: pass@32 is 94.67 where pass@8 is 88.38, and only 5% is never solved
+
+The first measurement above K=8 for **any** a4-think post-training arm. `repairlo`, n=300/pool, T=0.9,
+top-p 0.95, one K=32 draw subsampled:
+
+| k | 1 | 2 | 4 | 8 | 16 | 32 | never-solved @32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **asdiv** pass@k | 67.54 | 76.79 | 82.50 | 88.38 | 92.12 | **94.67** | **16 / 300 = 5.33%** |
+| asdiv majority@k | 67.54 | 70.79 | 74.17 | 76.67 | 80.04 | 82.00 | |
+| **svamp** pass@k | 58.88 | 69.42 | 78.67 | 85.17 | 90.75 | **93.67** | **19 / 300 = 6.33%** |
+| svamp majority@k | 58.88 | 60.50 | 66.33 | 69.33 | 71.33 | 73.00 | |
+
+⭐**Reach does not flatten past k=8 — it is still gaining +2.55 (asdiv) and +2.92 (svamp) on the last
+doubling, and 94-95% of problems are solved within 32 samples.** So the derivations exist inside a4's own
+distribution and the deficit is **probability MASS, not reachability.** This is the discriminating
+measurement §41bq wanted: it says keep spending on probability concentration (more distillation rounds,
+more problem diversity) rather than jumping to the base rebuild, and it corroborates §41bs's
+reinterpretation of the "coverage hole" as a low-probability tail rather than a wall.
+⚠️Do NOT quote this against 3.5-think's pooled pass@8 of 92.00 as if it were a win: that number is
+asdiv+svamp pooled at n=1000 under the gate's own sampling, this is per-pool n=300 at T=0.9/top-p 0.95.
+Suggestive, not matched. The load-bearing claim is the SHAPE of a4's own curve, which needs no baseline.
+
+⚠️**AND A NUANCE THAT QUALIFIES §41bq's "SELECTION IS CLOSED".** The vote→oracle gap **widens** with k:
+asdiv 11.71pt at k=8 -> 12.67 at k=32, svamp 15.84 -> 20.67. "Selection is closed" was always a statement
+about a4's deficit *relative to 3.5-think at k=8* (+0.08), never about the absolute gap — in absolute
+terms there is 13-21pt of oracle headroom that majority voting does not capture at k=32. That headroom is
+not newly available: §41j measured text-feature selectors 10-14pt WORSE than voting, and §25's reranker
+that did capture it was a two-model SERVING win, not a single-checkpoint one. Recorded so the two
+statements are not read as contradicting each other.
