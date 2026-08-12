@@ -9434,3 +9434,59 @@ encouraging. **The only correct use of the smoke number is the unclosed column.*
 ✅One thing it did show truthfully: trace length fell 276.5 → 268.8 → 260.6 as β dropped, so the length-neutral
 pair construction worked exactly as designed — whole-trace RLVR-DPO went 230 → 312 and lost greedy to drift.
 The mechanism was sound; the target had no headroom.
+
+### §41bs — ⭐⭐"NEVER SOLVED IN 8" IS MOSTLY THE DRAW, NOT THE PROBLEM. And the coverage arm DID learn — on the trained problems only.
+
+The probe (`reasoning/coverage_probe.py`, job 53292218): K=8 at T=0.9 on the **1,392 problems `pfxcomp` was
+trained on**, all of them verified 0/8 in round 6's own rollout dump.
+
+| | pass@8 | per-sample solve rate | solved all 8 |
+|---|---:|---:|---:|
+| round 6 | **30.03%** | 5.48% | 0.00% |
+| `pfxcomp` | **35.78%** | **7.91%** | 0.00% |
+| Δ | **+5.75pt** | **+2.43pp (+44% relative)** | — |
+
+**FINDING 1 — the original question is answered, and it is (b) with a sharper mechanism.** CE on verified
+solutions raised the per-sample solve rate on the trained problems by **44% relative**, and moved held-out
+pass@8 by **−0.03 (p=1.00)**. So the learning happened and transferred **nothing**. This is a pure
+generalisation failure, not an optimisation failure — the null is not "too little training".
+
+⭐**FINDING 2, WHICH I WAS NOT LOOKING FOR AND WHICH REFRAMES THE WHOLE COVERAGE STORY: round 6 re-solves
+30.03% of its own "never-solved" set on a fresh draw of 8.** Those 1,392 problems were *selected* by scoring
+0/8 in a single K=8 pass from this very checkpoint. At the measured 5.48% per-sample rate,
+`(1−p)^8 = 0.637`, so **36.3%** of them should show ≥1 hit on any re-draw — and 30.03% do (slightly lower
+because p is heterogeneous, which concentrates the misses). The arithmetic per problem:
+
+| true per-sample p | looks "never-solved in 8" |
+|---|---:|
+| 0.02 | 85.1% |
+| 0.05 | 66.3% |
+| 0.10 | 43.0% |
+| 0.15 | 27.2% |
+| 0.25 | 10.0% |
+
+⚠️**So "0/8" is largely a statement about the DRAW, not about reachability, and the "coverage hole" selected by
+one K=8 pass is substantially the low-probability TAIL re-sampled.** Three consequences:
+1. **The coverage arm's target selection was noisy** — it mixed genuinely-hard problems with easy-but-unlucky
+   ones, so an unknown share of the 4,303 traces taught things the model could already do sometimes.
+2. **The §41bf/§41bq decomposition survives intact**, because pass@8 there is measured on identical items with
+   the same seed for every model — a *paired* comparison of a noisy estimator is still valid. What does **not**
+   survive is the gloss "31.24% of problems are unreachable"; they are **low-probability, not unreachable**.
+3. ⚠️**And that makes the withdrawal of the coverage-scaling branch weaker than §41bn stated.** If the problems
+   are reachable-but-improbable and training genuinely raises per-sample probability (+44% relative, measured),
+   then the barrier is generalisation from **4,303 examples** — and generalisation is exactly what scales with
+   data. §41bn withdrew the branch on "the first 4,303 moved nothing, so 10,000 will not either", which is
+   sound against a reachability wall and *not* sound against a generalisation deficit.
+
+✅**Honest revised position.** The withdrawal stands for the *never-solved-only* corpus: the reachable extra
+data there is ~4,531 problems (3.5× at best), which will not change a generalisation regime. The remaining
+honest version of the branch is **full-corpus distillation from Qwen3-14B** — all 11,738 problems, ~30-50k
+verified traces, CoT-SFT scale — which is a materially larger job whose nearest precedent (§41c, whole-trace
+imitation of Llama-3.1-8B) was a NULL that pushed `acc|ANSWERED` *down*. That is the fair statement: not
+"coverage is impossible", but "coverage needs a corpus an order of magnitude larger than anything tried here,
+and the one comparable attempt failed."
+
+⚠️**A BUG IN MY OWN SUMMARY, worth recording because it inverted a result.** The launcher printed
+`delta pass@8 = −5.75pt` for what is `+5.75pt`: it computed `rows[-1] − rows[0]` over a *sorted glob*, and
+`a4_covprobe_pfxcomp.json` sorts before `a4_covprobe_r6.json`, so the arm was treated as the baseline. Now
+keyed by label. **A summary line that silently flips the sign of the result is worse than no summary line.**
