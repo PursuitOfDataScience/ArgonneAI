@@ -60,6 +60,14 @@ class ArgonneConfig(PretrainedConfig):
         mtp_loss_weight: float = 0.0,
         interleaved_local_attention: bool = True,
         local_attention_window: Optional[int] = 256,
+        # --- argonne4.5 additions (all default-OFF: an argonne4.0 config reproduces 4.0 exactly) ---
+        attn_pattern: Optional[str] = None,
+        sliding_window_size: int = 2048,
+        nope_global: bool = False,
+        attn_gate: bool = False,
+        mlp_type: str = "swiglu",
+        mtp_module_layers: int = 0,
+        doc_mask: bool = False,
         logit_softcap: float = 15.0,
         loss_chunk_size: int = 0,
         tie_word_embeddings: bool = True,
@@ -126,6 +134,22 @@ class ArgonneConfig(PretrainedConfig):
         self.local_attention_window = (
             int(local_attention_window) if local_attention_window is not None and int(local_attention_window) > 0 else None
         )
+        # argonne4.5 attention layout. `attn_pattern` is a cycled string of 'L' (local/sliding)
+        # and 'G' (global/full) -- Muse Glimmer's layout is "LLLG" (3 sliding@2048 : 1 full).
+        # When set it OVERRIDES interleaved_local_attention/local_attention_window. `nope_global`
+        # strips RoPE from the global layers (Muse sets layer_rope_theta=0 on exactly those),
+        # so the layers that see the whole sequence carry no frequency basis to extrapolate wrong.
+        self.attn_pattern = attn_pattern.upper() if attn_pattern else None
+        if self.attn_pattern is not None and set(self.attn_pattern) - {"L", "G"}:
+            raise ValueError(f"attn_pattern must contain only 'L'/'G', got {attn_pattern!r}")
+        self.sliding_window_size = int(sliding_window_size)
+        self.nope_global = bool(nope_global)
+        self.attn_gate = bool(attn_gate)
+        if mlp_type not in ("swiglu", "relu2"):
+            raise ValueError(f"mlp_type must be 'swiglu' or 'relu2', got {mlp_type!r}")
+        self.mlp_type = mlp_type
+        self.mtp_module_layers = max(0, int(mtp_module_layers))
+        self.doc_mask = bool(doc_mask)
         self.logit_softcap = float(logit_softcap)
         # >0 enables chunked cross-entropy (frees the full (batch*seq, vocab) fp32 logit transient
         # that caps batch at long context). 0 = off (default; unchanged full-logit path).
@@ -278,6 +302,21 @@ class GroupedQueryAttention(nn.Module):
         )
         self.o_proj._is_residual = True
 
+        # argonne4.5: gated attention (Muse Glimmer's `self_attn.gate_proj`). A per-(head, position)
+        # sigmoid gate on the attention output before o_proj. Cheap, and reported to suppress
+        # attention sinks / stabilize high-LR training -- the regime [[argonne-next-arch-search]]
+        # already put us in ("qk_norm is ESSENTIAL at this LR").
+        self.attn_gate = getattr(config, "attn_gate", False)
+        if self.attn_gate:
+            self.gate_proj = nn.Linear(
+                self.hidden_size,
+                self.num_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
+        # Set per-layer by ArgonneModel when attn_pattern/nope_global are in play. False => this
+        # layer is NoPE (no rotary applied at all), which is what Muse does on its global layers.
+        self.use_rope = True
+
         self.attention_dropout = config.attention_dropout
         self.use_flash_attention = config.use_flash_attention
         if self.qk_norm:
@@ -316,8 +355,9 @@ class GroupedQueryAttention(nn.Module):
         if self.v_norm:
             value = self.v_norm_layer(value)
 
-        cos, sin = position_embeddings
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        if self.use_rope and position_embeddings is not None:
+            cos, sin = position_embeddings
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # ---- KV cache (inference only; training keeps past_kv=None/use_cache=False) ----
         # Cache pre-repeat (num_kv_heads), post-rotary K/V. The SDPA/math path
@@ -403,6 +443,27 @@ class GroupedQueryAttention(nn.Module):
                         query, key, value, attn_mask=decode_mask,
                         dropout_p=0.0, is_causal=False,
                     )
+                elif attention_mask is None and self.sliding_window is not None and not is_decode:
+                    # argonne4.5 FIX (Finding A): flash-attn-2 is the ONLY path above that honors
+                    # `window_size`, and this env ships flash-attn-4 without the 2.x
+                    # `flash_attn_interface` module -- so `_flash_attn_available` is False and every
+                    # Argonne pretrain since 3.0 silently ran FULL attention on every layer while
+                    # pretrain.py advertised LOCAL_ATTENTION_WINDOW=256. experiments/model.py got
+                    # this fix during the arch sweep; production never did. Apply the window
+                    # explicitly here so the configured layout is the layout that trains.
+                    # Token i attends to keys in [i-w, i].
+                    qi = torch.arange(seqlen, device=hidden_states.device)
+                    ki = torch.arange(kv_len, device=hidden_states.device)
+                    win_mask = (ki[None, :] <= qi[:, None]) & (
+                        ki[None, :] >= qi[:, None] - self.sliding_window)
+                    attn_output = F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=win_mask[None, None],
+                        dropout_p=self.attention_dropout if self.training else 0.0,
+                        is_causal=False,
+                    )
                 elif attention_mask is None:
                     # Prefill / training: fast causal path.
                     attn_output = F.scaled_dot_product_attention(
@@ -448,8 +509,20 @@ class GroupedQueryAttention(nn.Module):
                     diagonal=1,
                 )
                 scores = scores.masked_fill(causal_mask, mask_value)
+                # argonne4.5: keep the math fallback consistent with the SDPA path above --
+                # it must apply the sliding window too, or the two paths train different models.
+                if self.sliding_window is not None:
+                    qi = torch.arange(seqlen, device=hidden_states.device)
+                    ki = torch.arange(kv_len, device=hidden_states.device)
+                    too_old = ki[None, :] < qi[:, None] - self.sliding_window
+                    scores = scores.masked_fill(too_old, mask_value)
                 if attention_mask is not None:
-                    scores = scores + attention_mask
+                    # Bool masks (argonne4.5 document masking) are True == attend; the legacy
+                    # float mask is additive.
+                    if attention_mask.dtype == torch.bool:
+                        scores = scores.masked_fill(~attention_mask, mask_value)
+                    else:
+                        scores = scores + attention_mask
             attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value)
@@ -459,6 +532,8 @@ class GroupedQueryAttention(nn.Module):
             .contiguous()
             .view(bsz, seqlen, self.num_heads * self.head_dim)
         )
+        if self.attn_gate:
+            attn_output = attn_output * torch.sigmoid(self.gate_proj(hidden_states))
         out = self.o_proj(attn_output)
         if use_cache:
             return out, new_kv
@@ -495,6 +570,37 @@ class SwiGLUMLP(nn.Module):
         return self.dropout(self.down_proj(F.silu(gate) * up))
 
 
+class ReLU2MLP(nn.Module):
+    """Two-matrix ReLU-squared FFN (Nemotron 3.5 Lightning's `mlp_hidden_act: relu2`).
+
+    Drops SwiGLU's `gate_proj` entirely: up -> ReLU(x)^2 -> down. Two matrices instead of three,
+    so at equal intermediate width it is 1/3 cheaper in params and FLOPs, and at equal params the
+    FFN can be ~50% wider. This is what makes Nemotron's 128 experts/layer affordable. The Argonne
+    arch sweep tested SwiGLU *ratios* (2.0x worse, 2.75x optimal, 3.5x neutral) but never the
+    activation family, so this axis is unmeasured here.
+    """
+
+    def __init__(self, config: ArgonneConfig) -> None:
+        super().__init__()
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.down_proj._is_residual = True
+        self.dropout = nn.Dropout(config.hidden_dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.up_proj(x)
+        h = torch.clamp(h, min=-65504.0, max=65504.0)
+        h = F.relu(h).pow(2)
+        # ReLU^2 squares its input, so a large activation overflows bf16 far more easily than
+        # SwiGLU's bounded silu gate does. Re-clamp before the down projection.
+        h = torch.clamp(h, min=-65504.0, max=65504.0)
+        return self.dropout(self.down_proj(h))
+
+
+def build_mlp(config: ArgonneConfig) -> nn.Module:
+    return ReLU2MLP(config) if getattr(config, "mlp_type", "swiglu") == "relu2" else SwiGLUMLP(config)
+
+
 class Block(nn.Module):
     """Transformer block with GQA attention and SwiGLU feed-forward."""
 
@@ -508,7 +614,7 @@ class Block(nn.Module):
         if self.sandwich_norm:
             self.attn_out_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.mlp_out_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = SwiGLUMLP(config)
+        self.mlp = build_mlp(config)
 
     def forward(
         self,
@@ -545,6 +651,38 @@ class Block(nn.Module):
         return hidden_states
 
 
+class MTPModule(nn.Module):
+    """One multi-token-prediction depth, DeepSeek-V3 / Nemotron-3.5-Lightning style.
+
+    This is NOT what `config.mtp_horizon` does. That path re-uses the SAME lm_head on the SAME
+    hidden state with shifted labels, so the auxiliary objective competes with t+1 for the trunk's
+    capacity -- which is exactly what exp045 measured (horizon 2, weight 0.3, 450 steps: 3.8513 ->
+    3.9346, +0.083 LOSS). A real MTP module instead owns its own parameters:
+
+        h'_i = eh_proj([ enorm(emb(t_{i+k})) ; hnorm(h_i) ])   ->  Block  ->  final_norm -> lm_head
+
+    so the trunk's next-token objective is untouched and the extra signal is additive. It also
+    yields a speculative-decoding drafter for free, which matters here because the deployable
+    reasoning recipe is self-consistency at K=8-32: a 2-3x decode speedup is 2-3x the samples per
+    GPU-hour on every downstream experiment.
+    """
+
+    def __init__(self, config: ArgonneConfig, layer_idx: int = 0) -> None:
+        super().__init__()
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.block = Block(config, layer_idx)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, hidden_states, next_token_embeds, position_embeddings, attention_mask=None):
+        merged = torch.cat(
+            [self.enorm(next_token_embeds), self.hnorm(hidden_states)], dim=-1
+        )
+        h = self.eh_proj(merged)
+        return self.final_norm(self.block(h, position_embeddings, attention_mask))
+
+
 class ArgonneModel(PreTrainedModel):
     config_class = ArgonneConfig
     _no_split_modules = ["Block"]
@@ -556,7 +694,18 @@ class ArgonneModel(PreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([Block(config, idx) for idx in range(config.num_hidden_layers)])
-        if config.interleaved_local_attention and config.local_attention_window is not None:
+        # argonne4.5 layout: an explicit 'L'/'G' pattern (e.g. Muse Glimmer's "LLLG" = 3
+        # sliding@2048 : 1 full) takes precedence over the legacy odd/even interleave. On 'G'
+        # layers `nope_global` removes RoPE outright -- Muse sets layer_rope_theta=0 on exactly
+        # those layers, so the only layers that see the whole sequence carry no frequency basis
+        # to extrapolate incorrectly past the training block.
+        pattern = getattr(config, "attn_pattern", None)
+        if pattern:
+            for idx, block in enumerate(self.blocks):
+                is_local = pattern[idx % len(pattern)] == "L"
+                block.attn.sliding_window = config.sliding_window_size if is_local else None
+                block.attn.use_rope = is_local or not config.nope_global
+        elif config.interleaved_local_attention and config.local_attention_window is not None:
             for idx, block in enumerate(self.blocks):
                 block.attn.sliding_window = config.local_attention_window if (idx % 2 == 1) else None
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -566,6 +715,15 @@ class ArgonneModel(PreTrainedModel):
             base=config.rope_theta,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Real MTP heads (config.mtp_module_layers > 0). Depth k predicts token t+1+k from the
+        # previous depth's state plus the embedding of the token that state predicts. They share
+        # lm_head with the trunk (DeepSeek-V3 does the same) so the cost is the blocks only.
+        self.mtp_modules = nn.ModuleList(
+            [
+                MTPModule(config, config.num_hidden_layers + k)
+                for k in range(getattr(config, "mtp_module_layers", 0))
+            ]
+        )
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -677,6 +835,7 @@ class ArgonneModel(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[list] = None,
         use_cache: bool = False,
+        document_ids: Optional[torch.LongTensor] = None,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
         _, seq_length = input_ids.shape
@@ -688,6 +847,16 @@ class ArgonneModel(PreTrainedModel):
 
         # The training path does not use attention masks.
         attention_mask = None
+        # argonne4.5 document masking. The production loaders pack many documents into one flat
+        # contiguous window, and this line used to be the whole story -- so every token attended
+        # freely across document boundaries. That is worst on exactly the target domains (short
+        # math problems, short code files), where a block-1024 window spans many documents. When
+        # `doc_mask` is on and per-token document ids are supplied, build a block-diagonal mask
+        # per DISTINCT window size (at most two: sliding and global) and share it across layers.
+        # Costs one (B, T, T) bool per distinct window; without document_ids nothing changes.
+        doc_masks = None
+        if getattr(self.config, "doc_mask", False) and document_ids is not None and not use_cache:
+            doc_masks = self._build_doc_masks(document_ids.to(device), seq_length)
 
         # RoPE positions are offset by the cached length so incremental decode
         # uses the correct absolute positions.
@@ -699,23 +868,26 @@ class ArgonneModel(PreTrainedModel):
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.blocks):
             _skip_ckpt = (self.checkpoint_stride >= 2) and (i % self.checkpoint_stride == 0)
+            layer_mask = (
+                doc_masks[layer.attn.sliding_window] if doc_masks is not None else attention_mask
+            )
             if self.gradient_checkpointing and self.training and not _skip_ckpt:
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     layer,
                     hidden_states,
                     rotary,
-                    attention_mask,
+                    layer_mask,
                     use_reentrant=False,
                 )
             elif use_cache:
                 past_kv = past_key_values[i] if past_key_values else None
                 hidden_states, layer_kv = layer(
-                    hidden_states, rotary, attention_mask,
+                    hidden_states, rotary, layer_mask,
                     past_kv=past_kv, use_cache=True,
                 )
                 new_cache.append(layer_kv)
             else:
-                hidden_states = layer(hidden_states, rotary, attention_mask)
+                hidden_states = layer(hidden_states, rotary, layer_mask)
 
         hidden_states = self.norm(hidden_states)
 
@@ -725,7 +897,8 @@ class ArgonneModel(PreTrainedModel):
         # non-chunked / default runs). Only taken when MTP + z-loss are off (both default off).
         _chunk = getattr(self.config, "loss_chunk_size", 0)
         if (self.training and labels is not None and _chunk > 0
-                and self.config.mtp_horizon == 1 and self.config.z_loss_weight == 0):
+                and self.config.mtp_horizon == 1 and self.config.z_loss_weight == 0
+                and len(self.mtp_modules) == 0):
             loss = self._chunked_lm_loss(hidden_states, labels, _chunk)
             if torch.isnan(loss):
                 self._nan_loss_count += 1
@@ -776,6 +949,10 @@ class ArgonneModel(PreTrainedModel):
                     mtp_terms.append(mtp_loss / horizon)
                 if mtp_terms:
                     loss = loss + (self.config.mtp_loss_weight * torch.stack(mtp_terms).mean()).to(loss.dtype)
+            if self.training and len(self.mtp_modules) > 0 and self.config.mtp_loss_weight > 0:
+                loss = loss + (
+                    self.config.mtp_loss_weight * self._mtp_module_loss(hidden_states, labels, rotary)
+                ).to(loss.dtype)
             if self.config.z_loss_weight > 0:
                 z = torch.logsumexp(logits.float(), dim=-1)
                 loss = loss + (self.config.z_loss_weight * z.pow(2).mean()).to(loss.dtype)
@@ -803,6 +980,62 @@ class ArgonneModel(PreTrainedModel):
         if use_cache:
             return CausalLMOutputWithPast(logits=logits, loss=loss, past_key_values=new_cache)
         return CausalLMOutput(logits=logits, loss=loss)
+
+    def _build_doc_masks(self, document_ids, seq_length):
+        """{sliding_window -> bool mask (B, 1, T, T), True == attend}, one per distinct window.
+
+        Combines causal, the layer's sliding window, and the document boundary, so a token can
+        only see earlier tokens of its OWN packed document. Built once per forward and shared
+        across every layer with the same window (at most two under an 'LLLG' layout).
+        """
+        qi = torch.arange(seq_length, device=document_ids.device)
+        same_doc = document_ids[:, :, None] == document_ids[:, None, :]   # (B, T, T)
+        base = same_doc & (qi[:, None] >= qi[None, :])
+        masks = {}
+        for window in {block.attn.sliding_window for block in self.blocks}:
+            if window is None:
+                masks[None] = base.unsqueeze(1)
+            else:
+                masks[window] = (base & (qi[None, :] >= qi[:, None] - window)).unsqueeze(1)
+        return masks
+
+    def _mtp_module_loss(self, hidden_states, labels, rotary):
+        """Mean CE over the real MTP depths (see MTPModule).
+
+        Depth k reads the previous depth's state at position i plus the embedding of token t+k
+        (the token that state predicts) and predicts t+k+1, so each depth is truncated by one
+        more position. `labels[:, i]` is already token i+1 (the loaders hand back y = x shifted),
+        hence token t+k at position i is `labels[:, i + k - 1]`.
+        """
+        terms = []
+        h_prev = hidden_states
+        cap = float(self.config.logit_softcap)
+        seq_len = labels.shape[1]
+        for k, module in enumerate(self.mtp_modules, start=1):
+            if seq_len - k < 1:
+                break
+            h_in = h_prev[:, : seq_len - k, :]
+            tokens_in = labels[:, k - 1 : seq_len - 1]
+            targets = labels[:, k:]
+            # Ignored positions (-100) would index the embedding out of range; their targets are
+            # ignored by cross_entropy anyway, so any in-range id works as a placeholder.
+            embeds_in = self.embed_tokens(tokens_in.clamp_min(0))
+            rot_k = (rotary[0][: seq_len - k], rotary[1][: seq_len - k])
+            h_out = module(h_in, embeds_in, rot_k)
+            mtp_logits = self.lm_head(h_out)
+            if cap > 0:
+                mtp_logits = torch.tanh(mtp_logits / cap) * cap
+            terms.append(
+                F.cross_entropy(
+                    mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                    targets.reshape(-1),
+                    ignore_index=-100,
+                )
+            )
+            h_prev = h_out
+        if not terms:
+            return hidden_states.new_zeros(())
+        return torch.stack(terms).mean()
 
     @torch.compiler.disable
     def _chunked_lm_loss(self, hidden_states, labels, chunk_size):
