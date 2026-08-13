@@ -9846,3 +9846,46 @@ for everyone.
 ⚠️Mechanics worth keeping: `datasets` streaming threw `Bad file descriptor` mid-pull and segfaults at
 interpreter teardown (with or without torch imported), so the builder defaults to downloading the 1.15 GB
 parquet — a silently truncated corpus is the worst failure mode for a corpus whose point is size.
+
+### §41ca — BUILDING A DIVERSE POOL TOOK FOUR FILTERS, and three of them changed the answer
+
+§41bz decontaminated the NuminaMath pool. Two further filters were needed before it was usable, and the
+funnel is the record:
+
+| stage | problems | what it removes |
+|---|---:|---|
+| NuminaMath-CoT raw | 859,494 | — |
+| numeric-verifiable gold, in-range sources | 341,832 | non-numeric gold; olympiad/AMC tiers a 59%-greedy model cannot touch |
+| **− eval decontamination** (§41bz) | 335,990 | 5,842 rows that are eval items **verbatim** |
+| **− novelty filter** | 279,330 | 56,660 near-dups of problems this line ALREADY trains on |
+| **− well-formedness filter** | **233,675** | 45,655 not answerable as a single number |
+
+⭐**NOVELTY, measured (`reasoning/pool_novelty.py`, same exact prefix filter):** 16.86% of the
+decontaminated pool near-dups (J>=0.70) a problem already in the 15,212. By source: **synthetic_math
+30.33%, orca_math 18.29%, cn_k12 0.27%.** The two synthetic sources ARE partly restatements of MATH and
+GSM8K, exactly as suspected — but only partly, and `cn_k12` is a genuinely foreign distribution. §41bs's
+constraint is diversity across DISTINCT problems, so paraphrases of the existing pool are dilution, not
+signal, and they are dropped. **83.14% genuinely new.**
+
+⚠️**WELL-FORMEDNESS, and this one is a data-integrity issue rather than an efficiency one.** The first
+generation shard on the unfiltered pool read `no_answer` **25.85%** against 11.42% on the familiar pool.
+Inspection found multi-part exam items whose gold is only part (1)'s answer (`"(1) find the range of m.
+(2) Prove that..."` with gold `-2`), `prove that` prompts, "express in simplest fractional form", and
+float-noise golds like `0.32420000000000004` that a correct `0.3242` scores WRONG against. **16.34% of
+the novel pool, and 39.88% of cn_k12** — Chinese K-12 questions are routinely multi-part.
+⛔**`--labels correct` does NOT protect against this**, because the label is the thing that is wrong: on
+a multi-part item a trace that happens to emit part (1)'s number is marked CORRECT and trained on, i.e. a
+wrong derivation banked as ground truth. Same defect family as §41bt's gold bug — a value derived from
+the wrong thing, trusted.
+
+✅**The filter is validated but only partial**, which is itself the finding. Re-running shard 0 on the
+filtered pool: `no_answer` **25.85% -> 19.16%**, correct 17.21% -> 19.60%, kept 2,300 -> 2,698. So
+malformation was ~1/3 of the excess; the remaining gap to the familiar pool's 11.42% is DIFFICULTY
+(never-solved 54.73%, acc|gradeable 31.94% vs 46.27%). Harder problems mean longer reasoning against a
+512-token generation cap, which is §41bx's truncation-cliff hypothesis showing up a second time and is
+worth a fixed-seed length sweep before any label-mix diagnostic is trusted again.
+
+⚠️**Carry into the read of the arm:** its ~21,600 training traces come from the easier ~45% of a harder
+distribution, and on a problem solved 1-in-8 some "correct" traces are coincidentally-right reasoning.
+That is the standing RFT trade-off, mitigated only partly by the keep-tier cap of 3 traces per hard
+problem. If the arm reads positive, this is the first alternative explanation to rule out.
