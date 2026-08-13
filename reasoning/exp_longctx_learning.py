@@ -42,6 +42,13 @@ EVAL_LEN = 24576
 EXTRA_EDGES = [32768, 40960, 49152, 65536]
 DOCBIN = "/project/rcc/youzhi/data/proof_pile2_arxiv_qwen3_docbin/data"
 TOKP = "/project/rcc/youzhi/toxic-models/Qwen/Qwen3-0.6B-Base"
+# `repo` in ARMS is the tree whose pretrain.py constants describe the checkpoint's ARCH. The a4
+# arms used to hardcode /home/youzhi/ArgonneAI-4.0; that worktree was removed on 2026-08-08 when
+# argonne4.0 was consolidated into the main clone, so every a4 arm died on a missing pretrain.py.
+# Derive it from this file instead -- the tree holding this script is the tree holding the
+# matching constants. (An arch mismatch is not silent either way: load_state_dict raises on a
+# size mismatch, so pointing an arm at the wrong tree aborts rather than mismeasuring.)
+REPO_SELF = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_ckpt(pt_path, repo, theta=1e6):
@@ -164,18 +171,18 @@ if __name__ == "__main__":
     a4 = sorted(glob.glob(os.path.join(a4d, "checkpoint_step_*.pt")),
                 key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
     if a4:
-        ARMS["a4_anneal"] = (a4[-1], "/home/youzhi/ArgonneAI-4.0")
+        ARMS["a4_anneal"] = (a4[-1], REPO_SELF)
 
     if a.eval_len != EVAL_LEN:
         EVAL_LEN = a.eval_len
         edges = [e for e in [1024, 2048, 4096, 8192, 13568, 20480, 24576] + EXTRA_EDGES if e < EVAL_LEN]
         BUCKETS = list(zip([0] + edges, edges + [EVAL_LEN]))
     ARMS["a4_phaseb"] = ("/project/rcc/youzhi/models/argonne4_midtrain/checkpoint_step_109622.pt",
-                         "/home/youzhi/ArgonneAI-4.0")
+                         REPO_SELF)
     c = sorted(glob.glob("/project/rcc/youzhi/models/argonne4_midtrain_c/checkpoint_step_*.pt"),
                key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
     if c:
-        ARMS["a4_phasec"] = (c[-1], "/home/youzhi/ArgonneAI-4.0")
+        ARMS["a4_phasec"] = (c[-1], REPO_SELF)
     for spec in a.pin:
         arm, _, pt = spec.partition("=")
         assert arm in ARMS, "cannot pin unknown arm %r (known: %s)" % (arm, ",".join(sorted(ARMS)))

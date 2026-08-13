@@ -96,10 +96,63 @@ The campaign proves the recipe is far more data-efficient PER TOKEN than 3.5's w
 persists; math/code/reasoning is genuinely winnable. Proxy CE is blind to downstream, so a
 decontaminated eval suite (GSM8K/MMLU/HumanEval) is a prerequisite before trusting end-to-end.
 
+## RUN COMPLETE + RELEASED (2026-08-13) — `argonne-4.0-base`
+
+The run finished at **step 112,674 / 65.12B tokens** and is published as
+[`PursuitOfDataScience/argonne-4.0-base`](https://huggingface.co/PursuitOfDataScience/argonne-4.0-base).
+Card: `model_cards/argonne-4.0-base.md` (the file actually uploaded, so the card is versioned here
+rather than existing only on the Hub).
+
+**What actually ran, versus the plan above.** The plan was three stages ending at phase B; a fourth
+was added mid-run.
+
+| stage | script | ended at step | tokens | block | LR |
+|---|---|---:|---:|---:|---|
+| 1 pretrain | `pretrain.py` | 72,827 | 38.03B | 1,024 | 6e-4 WSD, cooldown 10,923 |
+| 2 anneal (phase A) | `continue_pretrain.py` | 103,457 | 18.07B | 1,024 | **2e-4 flat — NO cooldown** |
+| 3 ctx ext (phase B) | `continue_pretrain.py` | 109,622 | 6.02B | 13,568 | 1e-4 WSD, cooldown 900 |
+| 4 ctx ext (phase C) | `continue_pretrain.py` | **112,674** | 3.00B | **65,536** | 1e-4 WSD, cooldown 458 |
+| | | | **65.12B** | | |
+
+Deltas from the plan worth knowing:
+- **`A4_TRAIN_TOKENS` was left at the default**, so stage 1 ran ~1×/source (38.03B) rather than the
+  overtrained 100–150B the section above sketches. The "raise it for a more overtrained run" option
+  was never exercised — it is still the cheapest untried lever on this recipe.
+- **Phase C's block went 27,136 → 40,960 → 65,536** and its corpus was rebuilt to match
+  (`phasec_mix32k_flat.bin`: 3.00B tokens, 50% arXiv docs ≥32,768 tok / 25% reasoning replay / 25%
+  edu replay, docs ≥32,768 only). The 6.00B `phasec_longctx_flat.bin` in the plan above is superseded.
+- **Phase A's missing cooldown is a defect, not a choice** — the launcher passed `cooldown 0`, so
+  28% of the run sat at a flat 2e-4. Stages 1/3/4 all cooled to 0.1×.
+
+**The honest-bounds section above asked the right question and the answer is mixed.** It predicted
+"general/world-knowledge is where the 2.88B capacity edge likely persists; math/code/reasoning is
+genuinely winnable." Measured on the released weights against 1B-class public bases on an identical
+lm-eval harness, that is exactly what happened, and harder than predicted: a4 wins generative math
+against Llama-3.2-1B by ~5× and loses to Qwen3-0.6B-Base on **every** axis, worst of all on MMLU,
+where it reads at chance. Numbers, anchors and caveats are in the model card's evaluation section and
+in `reasoning/thinking_training.md` §39/§42. **GENERAL is the binding axis for this line** — and the
+two most likely contributors are both recorded above: a 9%-of-mixture general replay tier in stage 2,
+and stage 2's missing cooldown.
+
+**A fifth release-config defect was found while building this release** (§37 catalogued four):
+`interleaved_local_attention: true` / `local_attention_window: 256` were published on 3.0 and 3.5
+even though the window has **never been active in any Argonne pretrain** — `model.py` implements it
+only on the flash-attn-2 path and this cluster runs flash-attn-4, so every slice logged
+`local_attention_window=256 is configured but IGNORED`. `push_model_to_hf.py` now normalises both
+fields out at release time and asserts on them, so the published config describes the attention the
+weights were trained with. Verified end-to-end: a standalone `trust_remote_code` load of the staged
+release logs `full attention` with no "IGNORED" warning and reports `sliding_window=None` on all 32
+blocks.
+
 ## Files (this branch)
 
 - `pretrain.py` — 1B arch constants; `WeightedMultiLoader` + `--train_sources`/`--train_tokens`; save margin 150s.
 - `continue_pretrain.py` — 1B arch constants; save margin 150s.
 - `build_a4_data.py` — build the scale per-source flat bins from docbin shards.
-- `run_full_training.sh`, `weekend.sh`, `night.sh` — the workflow (untracked per repo policy; never committed).
+- `build_phasec_data.py` — build the phase-C long-document + replay mixture.
+- `run_full_training.sh`, `weekend.sh`, `night.sh`, `midtrain_c_a4.sh` — the workflow (untracked per repo policy; never committed).
 - `model.py` — unchanged (arch comes from the constants above; validated on this exact config by the campaign).
+- `model_cards/argonne-4.0-base.md` — the published model card.
+- `reasoning/plot_a4_loss.py` — the four-stage loss figure (`plots/argonne4_0_loss_plot.png`).
+- `reasoning/release_table.py` — turns lm-eval JSONs into the card's benchmark table under one metric rule.
+- `push_model_to_hf.py` — release staging + config normalisation (`--profile base --card-file`).

@@ -9975,3 +9975,134 @@ have turned a 1-hour question into a 3.4-hour one).
 ✅Health is fine either way — `divrep` smoke: unclosed **8.00%**, t_len 245.2, the best of any a4 arm.
 Retention: `think_divrep` deleted (null, dominated, numbers preserved in the gate JSON); `think_r8repair`
 and `think_opd35repairlo` kept.
+
+---
+
+## §42 — RELEASING `argonne-4.0-base`: the finished stage confirms §39, and a FIFTH release-config defect (2026-08-13)
+
+The argonne4.0 phase-C run ended at **step 112,674 / 65.12B tokens**; §39 measured step **112,412**,
+which was 262 steps and 0.26B tokens short of that and still mid-cooldown at LR 6.1e-5. §39 labelled
+its own numbers "a lower bound on the finished stage" and said the trade "may soften". This round
+published the model, so the released weights had to be measured rather than inherited. Jobs 53327912
+(lm-eval, 1h08, MaxRSS 23.6 GB) and 53328723 (long-context + gate).
+
+### 42a. THE COOLDOWN CHANGED NOTHING — §39's caveat was honest, and its conclusion holds
+
+Byte-identical task list, few-shot counts and vLLM backend to §39d/§39f, so the rows merge.
+
+| | a4 step 112,412 (§39) | **a4 step 112,674 (RELEASED)** | Δ |
+|---|---:|---:|---:|
+| 8-task mean | 49.94 | **49.86** | −0.08 |
+| mmlu | 25.95 | **26.15** | +0.20 |
+| gsm8k strict | 8.11 | **7.51** | −0.60 |
+
+The remaining 0.26B tokens of cooldown moved the mean by less than a tenth of a point. **"May soften"
+was the right hedge and the answer is no.** Two things this settles:
+
+- **MMLU is at chance on the finished stage** (26.15 vs 25.0). Not a mid-cooldown artifact.
+- **The generative-math regression is real and slightly worse at the end.** vs phase B: gsm8k
+  **9.70 → 7.51 (−2.19)** while the 14-cell MC mean rose. §39d read −1.59 at 1.4σ and declined to
+  call it; on the finished stage it is −2.19 in the same direction, alongside §39b's 7-of-8 worse
+  reasoning tiers. **Phase C is a domain trade.** That is now measured on the artifact, not predicted.
+
+Anchors are unchanged (not re-run): a4 is behind **Qwen3-0.6B-Base on all nine cells** — −8.24 mean,
+−26.34 mmlu, −41.77 gsm8k at 1.7× the params — and beats **Llama-3.2-1B** on gsm8k 7.51 vs 1.82
+(4.1×) while losing the commonsense/knowledge tasks. §39f's retraction stands.
+
+### 42b. THE FIFTH RELEASE-CONFIG DEFECT — publishing a sliding window the weights never saw
+
+§37 catalogued four silent config defects (`auto_map` popped, `block_size` capped at 4096,
+`eos_token_id` wrong for chat, `use_cache` false). Here is the fifth, and it is the only one that
+would have shipped a model computing something different from what was trained:
+
+`interleaved_local_attention: true` / `local_attention_window: 256` are in **every** Argonne config,
+including the published 3.0-base and 3.5-base — and the window has **never been active in any Argonne
+pretrain.** `model.py` implements it only on the flash-attn-2 path (`flash_attn.flash_attn_interface`);
+this cluster's env is flash-attn-4, which does not expose that module, so every slice since 3.0 fell
+back to SDPA and printed `local_attention_window=256 is configured but IGNORED on this path`. The
+vLLM port ignores the window for the same reason and is token-for-token exact against `model.py`.
+
+The defect is not in training — full attention is what all these models are — it is in **publishing
+the flag**. A downstream user with flash-attn-2 installed gets a 256-token window on odd layers,
+silently, at an advertised 65,536-token context. `push_model_to_hf.py` now sets
+`interleaved_local_attention: false` / `local_attention_window: null` at release time and **asserts**
+on them, alongside a sixth normalisation: `loss_chunk_size` → 0, because a nonzero value makes
+`forward()` return `logits=None` whenever `self.training and labels is not None` — inert at inference,
+a footgun on a base model whose whole purpose is to be fine-tuned.
+
+Verified end-to-end, not just in the JSON: a standalone `trust_remote_code` load of the staged
+release (empty `PYTHONPATH`, only the bundled `model.py` + `auto_map`) logs `full attention` with no
+"IGNORED" warning, reports `sliding_window=None` on all 32 blocks, `max_position_embeddings=65536`,
+450/450 tensors and 1,038,492,672 params. ⚠️**The already-published 3.0-base and 3.5-base configs
+still carry the flags** — they were not re-pushed in this round.
+
+### 42c. TOOLING — two fixes and two new scripts, because a release table typed by hand is a defect
+
+- ⚠️`exp_longctx_learning.py`'s a4 arms all pointed at `/home/youzhi/ArgonneAI-4.0`, the worktree
+  **deleted on 2026-08-08** when argonne4.0 consolidated into the main clone. Every a4 arm would have
+  died on a missing `pretrain.py`. Now derived from `__file__`.
+- `reasoning/release_table.py` (new) — emits the card's benchmark table from lm-eval JSONs under ONE
+  metric rule (`acc_norm`; `acc` for winogrande/mmlu). Validated by reproducing §39f's banked table
+  cell-for-cell before being used. This exists because `lmeval_summary.py`'s docstring already records
+  what hand-mixing `acc` and `acc_norm` costs: a 3.74pt phantom regression.
+- `reasoning/plot_a4_loss.py` (new) — the four-stage loss figure. Two a4-specific traps: phase C ran
+  from a **different launcher** (`midtrain_c_a4.sh`) that prints no `Stage:` banner, so banner-only
+  parsing drops it entirely; and stage 1's per-step loss **alternates 1.0↔2.8** because
+  `WeightedMultiLoader` draws ONE source per step and edu/math/code have very different entropies.
+  That sawtooth is the sampler, not the optimization — the figure draws raw faint + a rolling median.
+- `model_cards/argonne-4.0-base.md` is committed, so the published card is versioned in the repo
+  instead of existing only on the Hub.
+
+### 42d. LONG CONTEXT ON THE RELEASED WEIGHTS — the window is real, but the phase-C GAIN is not extension
+
+Three arms **paired on the same 24 held-out arXiv windows** (`arXiv_09*`, 49,152 tokens each), pinned
+checkpoints, one job. This is the comparison §39c could not make: it ran phase B vs phase C, both of
+which are already context-extended, so it had no 1,024-only control.
+
+| bucket | a4_anneal (103,457, ctx 1,024) | a4_phaseb (109,622) | **a4_phasec (112,674) = RELEASE** |
+|---|---:|---:|---:|
+| 0–1,024 | 2.5611 | 2.4009 | **1.9704** |
+| 1,024–2,048 | **5.0859** | 2.0611 | **1.6711** |
+| 8,192–13,568 | 5.9643 | 1.2417 | **0.9798** |
+| 24,576–32,768 | 5.9900 | 1.1978 | **0.8643** |
+| 40,960–49,152 | 6.0749 | 1.2998 | **0.8203** |
+
+**H2 confirmed, decisively: RoPE θ=1e6 does not extrapolate on this arch.** The 1,024-only anneal
+checkpoint is coherent in-window (2.56) and **flat at 5.1–6.2 nats for the next 48,000 tokens**. Same
+result the 3.5 line got; it now has a 1.04B replication. At the full 65,536 window (10 windows, same
+seeded document set) the tail bucket 49,152–65,536 reads **anneal 5.2153 · phaseb 1.0972 · phasec
+0.7737**, so the advertised window is usable end to end.
+
+⚠️**H3 FAILS for phase C, and it fails the same way §39c found.** The phaseb→phasec gap is **U-shaped**:
+−0.4305 at 0–1,024, minimum −0.2619 in the middle, −0.4795 in the 40,960–49,152 tail. A real extension
+predicts a gap that GROWS with position. It is as large at position 0 as at position 49,000, and phase
+C had no need to extend 0–1,024. **The extension proper is PHASE B's** — that is where the ~6-nat
+plateau collapses to 1.2–2.1. Phase C is a distribution move toward arXiv, which is the same
+conclusion §39b/§39d reached from tier CE and gsm8k. Three instruments, one story, now measured on the
+released artifact.
+
+Also: finishing the cooldown improved long-context NLL **uniformly by ~0.02 nats** vs §39c's step
+112,412 at every bucket — real but negligible, and in the opposite direction to the benchmark mean
+(−0.08). Do not read either as movement.
+
+**GATE on the released weights** (`a4_gate_probe.py`, MAXNEW=60): math 17/20 std · 17/20 ext = **34/40**;
+general **14/15** std · 14/15 ext = 28/30 → **CLEARED**. ⚠️Note §39a recorded 15/15 general for the two
+mid-cooldown phase-C arms; the released weights read 14/15 (the miss is "king of the jungle" → jaguar).
+That is inside the probe's ±2 noise floor and is exactly why this gate is a footnote in the model card:
+the general axis has a ceiling of 15 and every a4 checkpoint ever tested sits at 14 or 15.
+
+### 42e. OPS — a 24G OOM that left NO traceback, and the fix that was not the memory bump
+
+⚠️Job 53328723 completed the 49,152 stage (3 arms) and then **died silently** partway through the 65,536
+stage: no Python traceback, and no `[exit=]` echo despite the call being wrapped in `set +e`. No
+traceback AND no exit code = **SIGKILL from the cgroup OOM killer**, not a Python error. `sacct`
+reported MaxRSS **6.4 GB against a 24G limit**, which is why it looked safe — sstat SAMPLES, and the
+spike lives inside one interval. Cause: `load_ckpt()` mmaps a 12.46 GB `.pt` and materialises ~4 GB of
+fp32 CPU weights before `.to(bfloat16).to(cuda)`, and **three arms in one process** accumulate mmap
+page cache the cgroup charges back.
+
+The fix that mattered was **one arm per python process** (53332877: 5:58, MaxRSS 7.9 GB), not the 24G→32G
+bump — 32G was over-provisioned once the process was split. **Lesson, and it generalises: a
+multi-arm probe that loads a large checkpoint per arm should fork per arm.** Also ⚠️`set +e` does not
+protect against SIGKILL, so "the echo is missing" is itself the diagnostic — treat a missing exit-code
+line as a kill, not as a puzzle.
