@@ -9889,3 +9889,46 @@ worth a fixed-seed length sweep before any label-mix diagnostic is trusted again
 distribution, and on a problem solved 1-in-8 some "correct" traces are coincidentally-right reasoning.
 That is the standing RFT trade-off, mitigated only partly by the keep-tier cap of 3 traces per hard
 problem. If the arm reads positive, this is the first alternative explanation to rule out.
+
+### §41cb — ⭐"UNCLOSED" IS 98% TRUNCATION, so the termination story is really a BREVITY story
+
+§41bx and §41ca both ended with a truncation-cliff hypothesis. Measured directly on the divrep shard-0
+dump (8,000 sampled traces, tokenised with the model's own tokenizer; generation cap `--max-new-tokens
+512`):
+
+| label | n | median tokens | p90 | **>= 500 tokens** |
+|---|---:|---:|---:|---:|
+| correct | 1,594 | 235 | 486 | 9.1% |
+| wrong | 3,245 | 311 | 491 | 8.3% |
+| **unclosed** | 1,815 | **512** | 512 | **98.2%** |
+| **no_answer** | 1,346 | **512** | 512 | **89.7%** |
+
+⭐**`unclosed` and `no_answer` are not reasoning failures, they are BUDGET failures** — the trace hit the
+cap and stopped, either before `</think>` or after it but before `\boxed{}`. The gate uses the same
+`--max-new-tokens 512`, so every "unclosed%" in this campaign is substantially a *did the trace fit in
+512 tokens* measurement.
+
+⭐**THAT SHARPENS THE CAMPAIGN'S CENTRAL MECHANISM RATHER THAN CONTRADICTING IT.** §41p-r's finding is
+that a length-MATCHED teacher works and a long-CoT teacher collapses the student; §41f measured the
+long-CoT arm at 96.95% unclosed. Read through this table, per-token KD from a short teacher does not
+install a "termination policy" — **it makes the student BRIEF ENOUGH TO FINISH inside the budget.**
+Unclosed 11.0% -> 8.5% across rounds 7-9 (§41bv) is the student's traces fitting in 512 as often as the
+teacher's do, and t_len 283 -> 251 is the same fact stated directly.
+
+⛔**AND THE OBVIOUS "FREE WIN" IS NOT ONE.** Raising the cap looks tempting until you notice correct
+traces have median 235 / p90 486: a trace still running at 512 is usually a LOST trace, not an
+almost-finished one. The campaign already has the right mitigation in the gate's force-close `budget`
+config, and it is worth a real amount — four pools, 3,000 items:
+
+| model | greedy | +force-close | gain | p |
+|---|---:|---:|---:|---:|
+| repair-last | 59.17 | 60.73 | +1.57 | 1.9e-06 |
+| `repairlo` | 58.43 | 59.80 | +1.37 | 6.6e-05 |
+| 3.5-think | 64.10 | **66.00** | **+1.90** | 8.3e-07 |
+
+**Every model gains, the TARGET gains most, and the gap WIDENS 4.93 -> 5.27.** So truncation is real,
+costs ~1.5pt, is already recoverable by a deployed wrapper, and is NOT a differential a4 weakness. ⚠️Price
+a lever by the target's value on that axis (§41bf's lesson) — I nearly recorded this as free headroom.
+
+✅Practical rules: quote `unclosed` as "did not fit the budget", never as "failed to terminate"; and when
+a label-mix diagnostic moves, check the length distribution before attributing it to behaviour.
