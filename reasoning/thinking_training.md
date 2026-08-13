@@ -10106,3 +10106,56 @@ bump — 32G was over-provisioned once the process was split. **Lesson, and it g
 multi-arm probe that loads a large checkpoint per arm should fork per arm.** Also ⚠️`set +e` does not
 protect against SIGKILL, so "the echo is missing" is itself the diagnostic — treat a missing exit-code
 line as a kill, not as a puzzle.
+
+### 42f. AUDITING THE WHOLE PUBLISHED FAMILY — `argonne-4.0-base` is the ONLY clean repo of 15
+
+§37 recorded the lesson as *"ALWAYS diff the staged config against the LIVE Hub config."* That was a
+habit, not a check, and habits do not run themselves — which is how §42b's window flag sat on two
+flagship releases for weeks. So the lesson is now a script: **`reasoning/hub_config_audit.py`** reads
+every published Argonne repo's config **from the Hub** (the copy users actually get) and asserts the
+release invariants. Exit 1 on any failure, so it can gate a release.
+
+**Result: 2 clean of 15** (`argonne-4.0-base` and `Argonne-1.5`), 13 failing. Two findings are much
+more severe than the window flag that prompted the audit:
+
+⚠️**`auto_map` is MISSING on EIGHT published repos, and they genuinely cannot be loaded the documented
+way.** Verified, not inferred — `AutoConfig.from_pretrained(repo, trust_remote_code=True)` with an
+empty `PYTHONPATH`:
+
+| repo | ships `model.py`? | standalone load |
+|---|---|---|
+| `Argonne2.5-base` | yes | **ValueError: Transformers does not recognize `argonne2`** |
+| `argonne-3.0-base` | yes | **ValueError: Transformers does not recognize `argonne2`** |
+| `argonne-3.5-base` | yes | OK (has `auto_map`) |
+
+Shipping `model.py` is **not sufficient**: without `auto_map` nothing maps `model_type: argonne2` onto
+the bundled class, so `trust_remote_code=True` has nothing to resolve. Affected: `Argonne-1.0`,
+`Argonne-1.0-Instruct`, `Argonne-2.0`, `Argonne-2.5-ctx13568`, `Argonne-2.5-ctx13568-instruct`,
+`Argonne-2.5-think`, `Argonne2.5-base`, `Argonne2.5-instruct`, `argonne-3.0-base`,
+`argonne-3.0-instruct`. (The 3.5-base card already noted in passing that 3.0-base lacks it; what was
+not recorded is that this makes the repo **unloadable**, not merely inconvenient.)
+
+⚠️**`eos_token_id` is null on FIVE chat-shaped repos** — `Argonne-1.0-Instruct`,
+`Argonne-2.5-ctx13568-instruct`, `Argonne-2.5-think`, `Argonne2.5-instruct`, `argonne-3.0-instruct` —
+so `.generate()` never stops at end of turn unless the caller passes `eos_token_id` itself. This is
+**exactly the §37 defect**, still live on five older repos: §37 fixed it going forward and never
+back-filled.
+
+And the window flag from §42b, on five: `argonne-3.0-base`, `argonne-3.0-instruct`, `Argonne-3.0-think`,
+`argonne-3.5-base`, `Argonne-3.5-think`.
+
+**Evidence that all five are full-attention weights, so `false`/`null` is the CORRECT value and not a
+guess:** (1) `model.py` uses `sliding_window` **only** inside the `use_flash_attn_2` branch (~line 376),
+gated on `_flash_attn_available`; the SDPA fallback ignores it entirely, so the window is unreachable
+without `flash_attn.flash_attn_interface`, which this env does not expose. (2) **581 of 581** attention
+banners across every log in `report/` read *"full attention — local_attention_window=256 is configured
+but IGNORED"*; **zero** read the flash-attn-2 windowed variant. (3) Every one of these models was
+evaluated — and released on the strength of — **full-attention inference**, through both `model.py`'s
+SDPA path and the vLLM port, which passed an 8/8 token-for-token gate against each other. Window-trained
+weights would make all of those numbers mismatched measurements.
+
+⛔**NOT FIXED IN THIS ROUND, deliberately.** Every fix here is a push to a live public repo, which
+[[dont-substitute-base-or-publish-without-asking]] gates on a per-action owner OK. The audit is
+committed and the finding is recorded; the corrections are a one-field-per-repo config commit each and
+need that OK. ⚠️Note the two 1.x repos use `model_type: argonne` (not `argonne2`) — a different
+`auto_map` target, so do not assume one patch fits all fifteen.
