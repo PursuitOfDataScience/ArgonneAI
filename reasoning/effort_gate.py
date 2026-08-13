@@ -305,6 +305,53 @@ def main():
         report(all_res, args)
         return
 
+    # MULTIPLE MODELS MUST NOT SHARE A PROCESS. vLLM does not release its KV cache when an LLM object
+    # goes out of scope, so a second engine in the same process dies with
+    #   "Free memory on device (25.85/139.73 GiB) on startup is less than desired ... (0.85, 118.77)"
+    # and everything after the first model is silently lost -- the run still exits 0 and still prints
+    # the FIRST model's numbers, which is exactly how it gets mistaken for a result. This cost two runs
+    # on 2026-08-04 (the alpha sweep, then the long-trace screen) even though the loop-per-model
+    # workaround was already known and used in the gate scripts. So the isolation lives HERE now, and
+    # callers can pass as many --models as they like.
+    if len(args.models) > 1:
+        import subprocess
+        import tempfile
+        all_res, parts = {}, []
+        tmpdir = tempfile.mkdtemp(prefix="effort_gate_")
+        try:
+            for i, spec in enumerate(args.models):
+                name = spec.split("=", 1)[0]
+                out = os.path.join(tmpdir, f"{i}.json")
+                argv = [sys.executable, os.path.abspath(__file__), "--models", spec,
+                        "--pools", *args.pools, "--n", str(args.n), "--k", str(args.k),
+                        "--extensions", str(args.extensions),
+                        "--extend-tokens", str(args.extend_tokens),
+                        "--max-new-tokens", str(args.max_new_tokens),
+                        "--max-model-len", str(args.max_model_len),
+                        "--gpu-util", str(args.gpu_util), "--seed", str(args.seed),
+                        "--json-out", out]
+                print(f"\n=== [{i+1}/{len(args.models)}] {spec}  (isolated subprocess)", flush=True)
+                r = subprocess.run(argv)
+                if r.returncode != 0 or not os.path.exists(out):
+                    print(f"!!! {name} FAILED (rc={r.returncode}) -- dropped from the merge, "
+                          f"NOT silently treated as absent", flush=True)
+                    continue
+                o = json.load(open(out))
+                all_res.update(o["res"])
+                parts.append(out)
+            if not all_res:
+                raise SystemExit("every model failed; nothing to report")
+            missing = [s.split("=", 1)[0] for s in args.models if s.split("=", 1)[0] not in all_res]
+            if missing:
+                print(f"\n⚠️MISSING FROM THIS REPORT: {missing}", flush=True)
+        finally:
+            pass
+        if args.json_out:
+            os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
+            json.dump({"args": vars(args), "res": all_res}, open(args.json_out, "w"))
+        report(all_res, args)
+        return
+
     all_res = {}
     for spec in args.models:
         name, path = spec.split("=", 1)

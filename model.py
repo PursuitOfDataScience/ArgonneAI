@@ -424,6 +424,14 @@ class GroupedQueryAttention(nn.Module):
                         dropout_p=self.attention_dropout if self.training else 0.0,
                         is_causal=False,  # Mask already includes causal component
                     )
+            except torch.cuda.OutOfMemoryError:
+                # Do NOT degrade to math attention on OOM. torch.OutOfMemoryError subclasses
+                # RuntimeError, so the old blanket `except RuntimeError` turned a recoverable SDPA
+                # OOM into the seq^2 math path -- which needs strictly MORE memory and then dies
+                # for real. At phase-C ctx 65,536 that fallback asked for a single 48 GiB tensor
+                # and killed the slice. Surface the original OOM instead; the caller can retry
+                # smaller. The fallback below stays for genuine kernel-unavailability.
+                raise
             except RuntimeError:
                 # Fallback to math attention when kernels are unavailable
                 attn_output = None

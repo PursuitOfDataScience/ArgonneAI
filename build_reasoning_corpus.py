@@ -171,6 +171,11 @@ SOURCES = {
     # five days AFTER the anneal flatten was built, which is the only reason it was missed.
     # flatten only needs `tier` + `budget_tokens` (it globs the already-tokenized .bin files),
     # so no re-tokenization is required.
+    # argonne4.0 uses the SAME tokenized output as its pretrain `edu` arm; tokenize it with
+    #   python build_reasoning_corpus.py tokenize --source fineweb_edu_a4 --workers 46
+    # -> $RC_OUT_ROOT/fineweb_edu_a4, which build_a4_data.py globs directly. It is `enabled`
+    # (a4 originally kept it enabled=False to leave the reasoning corpus untouched) because
+    # the 3.5 anneal flatten needs it in the source table to draw the general-replay pool.
     "fineweb_edu_a4": dict(
         tier="general", fmt="arrow", renderer="text",
         files=lambda: _g("/project/rcc/youzhi/data/fineweb-edu", "fineweb-edu-train-*-of-00218.arrow"),

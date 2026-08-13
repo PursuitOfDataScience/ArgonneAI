@@ -1000,6 +1000,22 @@ def build_model_and_tokenizer(
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
+
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) -------------------------------
+    # See sft.py for the rationale. Purely additive: argonne2 configs are untouched.
+    if config_dict.get("model_type", "argonne2") != "argonne2":
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base detected (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+        return model, tokenizer
+
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
     config.max_position_embeddings = max_seq_len
     config.use_flash_attention = True
@@ -1392,6 +1408,42 @@ def load_checkpoint(
             f"tokens={metadata['tokens_seen']:,} epoch={metadata['epoch']}"
         )
     return metadata
+
+
+def prune_intermediate_checkpoints(output_dir: str) -> None:
+    """After a PHASE finishes, drop its resumable `checkpoint-*` dirs.
+
+    `--save_total_limit` keeps only the newest checkpoint DURING training, but that survivor is
+    still on disk when the phase ends -- most of it AdamW state that exists solely to resume a
+    stage that is now complete. The final export in output_dir/ is what every downstream stage
+    consumes and is strictly NEWER than the last intermediate, so the intermediate is a
+    superseded copy, not a second reference point.
+
+    Called only after the final export has landed, so the newest weights are never the thing
+    being deleted. Never fatal: a phase that trained successfully must not be failed by cleanup.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return
+        if not os.path.exists(os.path.join(output_dir, "model.safetensors")):
+            print("[retention] final export missing -- keeping intermediate checkpoints", flush=True)
+            return
+        freed = 0.0
+        for name in sorted(os.listdir(output_dir)):
+            full = os.path.join(output_dir, name)
+            if not os.path.isdir(full) or not re.search(r"checkpoint-\d+$", name):
+                continue
+            gib = sum(os.path.getsize(os.path.join(full, f))
+                      for f in os.listdir(full)
+                      if os.path.isfile(os.path.join(full, f))) / 2**30
+            shutil.rmtree(full)
+            freed += gib
+            print(f"[retention] phase complete -- removed {name} ({gib:.1f} GiB); "
+                  f"the final export supersedes it", flush=True)
+        if freed:
+            print(f"[retention] freed {freed:.1f} GiB", flush=True)
+    except Exception as e:  # cleanup must never take down a phase that just finished
+        print(f"[retention] prune skipped: {e}", flush=True)
 
 
 def main() -> None:
@@ -1875,6 +1927,9 @@ def main() -> None:
         print(f"  warn: could not write completion marker: {e}")
 
     print("Training complete.")
+    # Phase is done and exported -- drop the resumable intermediates.
+    prune_intermediate_checkpoints(args.output_dir)
+
 
 
 if __name__ == "__main__":

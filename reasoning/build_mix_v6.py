@@ -82,7 +82,14 @@ def main():
     print("  v3-short kept:", dict(Counter(r["tier"] for r in rows)))
 
     print(f"Building gsm8k-TRAIN short procedure tier <- {GSM}")
-    gsm = []
+    # ⚠️canonicalize_gsm's own check is SELF-CONSISTENT: it compares extract_boxed(content) to a
+    # gold that came out of the same generated text. It therefore cannot catch a solution whose
+    # final answer is simply wrong, and 4.66% of them are (2026-08-12, measured against GSM8K's
+    # `#### N`: 197 generator arithmetic errors + 83 nested-brace parses out of 4,229). Those rows
+    # were being handed to CoT-SFT as ground truth.
+    from effort_probe import gsm8k_gold_map
+    auth = gsm8k_gold_map()
+    gsm, n_badgold = [], 0
     for ln in open(GSM):
         o = json.loads(ln)
         if o.get("split") != "train":
@@ -94,11 +101,16 @@ def main():
         res = canonicalize_gsm(o["answer"])
         if res is None:
             continue
+        a = auth.get(o["question"].strip())
+        if a is not None and res[1] != a:
+            n_badgold += 1
+            continue
         content, _ = res
         gsm.append({"messages": [{"role": "user", "content": o["question"]},
                                  {"role": "assistant", "content": content}],
                     "tier": "gsm8k_train_short", "num_tokens": o.get("num_tokens", 0)})
-    print(f"  gsm8k_train_short unique: {len(gsm)}  (upsample x{GSM_UPSAMPLE})")
+    print(f"  gsm8k_train_short unique: {len(gsm)}  (upsample x{GSM_UPSAMPLE})"
+          f"  [dropped {n_badgold} whose generated answer disagrees with GSM8K gold]")
     rows += gsm * GSM_UPSAMPLE
 
     rng.shuffle(rows)

@@ -29,6 +29,14 @@ for _p in (RDIR, REPO):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from star_generate import extract_boxed, norm  # noqa: E402
+# ⚠️REQUIRED for any NON-Argonne teacher. transformers 5.x dropped
+# `all_special_tokens_extended`, which vLLM 0.11.2's get_cached_tokenizer still reads, so every
+# external model (Llama, gpt-oss, Nemotron) dies at engine init with
+# `TokenizersBackend has no attribute all_special_tokens_extended`. effort_gate.py gets the fix
+# via vllm_argonne.register(); this script never did, which made external teachers look
+# impossible in this env when they are not.
+import vllm_argonne as _va  # noqa: E402
+_va._shim_tokenizer_for_vllm()
 from clean_eval import build_ids               # noqa: E402
 
 GSM = "/project/rcc/youzhi/data/gsm8k_main_curated/shards/shard_00000.jsonl"
@@ -56,8 +64,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--verifier", default="Qwen/Qwen3-4B")   # the teacher
     ap.add_argument("--out", default="/project/rcc/youzhi/data/teacher_qwen_gsm")
-    ap.add_argument("--n-problems", type=int, default=0)     # 0 = all train (7473)
-    ap.add_argument("--max-tokens", type=int, default=400)   # short solutions only
+    ap.add_argument("--n-problems", type=int, default=0)
+    ap.add_argument("--pools", nargs="*", default=None,
+                    help="TRAIN-only pools via effort_probe.load_pool (gsm8k_train, "
+                         "math_train_easy, math_train_hard). Default None = gsm8k-train only, "
+                         "which is what this script originally hardcoded and which caps the "
+                         "corpus at ~4.2k problems -- far less fuel than the RFT path draws.")     # 0 = all train (7473)
+    ap.add_argument("--max-tokens", type=int, default=768)  # 400 truncated Llama mid-solution, before its \boxed line   # short solutions only
     ap.add_argument("--max-sol-chars", type=int, default=1400)
     ap.add_argument("--gpu-util", type=float, default=0.90)
     ap.add_argument("--max-model-len", type=int, default=2048)
@@ -73,7 +86,17 @@ def main():
     from datasets import Dataset
     import datetime as _dt
 
-    probs = load_gsm_train()
+    if args.pools:
+        from effort_probe import load_pool
+        probs, seen = [], set()
+        for pool in args.pools:
+            got = load_pool(pool, args.n_problems or 10**9, seed=args.seed)
+            for q, g in got:
+                if q not in seen:
+                    seen.add(q); probs.append((q, g))
+            print(f"[teacher] pool {pool}: +{len(got)} (total {len(probs)})", flush=True)
+    else:
+        probs = load_gsm_train()
     if args.n_problems and args.n_problems > 0:
         probs = probs[:args.n_problems]
     print(f"[teacher] gsm8k-train problems: {len(probs)}", flush=True)

@@ -5,6 +5,7 @@ and automatic checkpoint resume.
 """
 
 import os
+import re
 import sys
 import glob
 import time
@@ -19,11 +20,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-# Model architecture
-HIDDEN_SIZE = 3072
-NUM_LAYERS = 24
-NUM_HEADS = 12
-NUM_KV_HEADS = 4  # GQA
+# Model architecture -- argonne4.0: the argonne3.5 arch SCALED TO ~1.04B (the
+# data-efficiency campaign's fixed "3.5-at-1B" shape; see ARGONNE4.0.md). Only the
+# four width/depth constants change from 3.5's 2.88B; head_dim is DERIVED
+# (hidden_size // num_heads = 1536 // 6 = 256) and every fp8 GEMM dim stays
+# /16-divisible (1536, 6*256, 2*256, 4096), so fp8 + lm_head remain eligible.
+HIDDEN_SIZE = 1536
+NUM_LAYERS = 32
+NUM_HEADS = 6
+NUM_KV_HEADS = 2  # GQA (num_heads % num_kv_heads == 0 required)
+INTERMEDIATE_SIZE = 4096  # 3.5 lets this fall to the model.py default (8192); argonne4.0 PINS 4096
 ENABLE_QK_NORM = True
 ENABLE_V_NORM = True
 Z_LOSS_WEIGHT = 0.0
@@ -40,9 +46,11 @@ LOGIT_SOFTCAP = 15.0
 parser = argparse.ArgumentParser()
 # Paths
 parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer")
-parser.add_argument("--data_path", type=str, required=True, help="Path to training data: a flat llm.c .bin OR a doc-manifest .json (fineweb+finemath docbin, doc-aware)")
+parser.add_argument("--data_path", type=str, required=False, default=None, help="Single training source: a flat llm.c .bin OR a doc-manifest .json. Mutually exclusive with --train_sources; exactly one is required.")
+parser.add_argument("--train_sources", type=str, default=None, help="argonne4.0 weighted data mixture: 'PATH:WEIGHT,PATH:WEIGHT' (e.g. edu.bin:50,math.bin:30,code.bin:20). Samples ONE source per micro-batch by weight (DDP-synced across ranks, resumable). Overrides --data_path.")
+parser.add_argument("--train_tokens", type=int, default=0, help="Total training-token budget defining the WSD schedule length when --train_sources is used (estimated_steps = train_tokens / effective_batch, so the cooldown lands at the run's true end). 0 = default to the combined source size (~one weighted pass).")
 parser.add_argument("--doc_shuffle", type=int, default=0, choices=[0, 1], help="If 1 and --data_path is a doc-manifest .json, globally shuffle document order each epoch (REQUIRED for an intermix manifest so fineweb+finemath are interleaved, not trained sequentially)")
-parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling")
+parser.add_argument("--doc_shuffle_seed", type=int, default=1337, help="Base seed for doc-manifest document shuffling; ALSO seeds the --train_sources source sampler (identical on every rank so source picks stay in lockstep)")
 parser.add_argument("--checkpoint_dir", type=str, required=True, help="Directory for checkpoints")
 # Training hyperparameters
 # Production LR: 6e-4
@@ -85,15 +93,19 @@ parser.add_argument("--max_epochs", type=int, default=1, help="Maximum epochs to
 parser.add_argument("--gradient_checkpointing", type=int, default=1, help="Use gradient checkpointing")
 parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (ported from argonne4.0). 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Numerically identical; requires --gradient_checkpointing 1.")
 parser.add_argument("--torch_compile", type=int, default=1, choices=[0, 1], help="Use torch.compile for speedup")
-parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], help="torch.compile mode")
 parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
 parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 5 min before this limit. 0 = disabled.")
+parser.add_argument("--save_deadline_epoch", type=int, default=0, help="Absolute wall-clock deadline (unix epoch seconds): when time.time() reaches it, save ONE checkpoint and exit cleanly. SLURM-clock-relative (run_full_training.sh sets it = job_start + slice_seconds - lead), so it fires a FIXED time before the SLURM kill regardless of compile/startup drift -> the reliable save trigger. 0 = disabled.")
 parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Reset LR schedule, step counter, and data position when resuming. Use for continued pretraining on new data.")
 parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
+parser.add_argument("--val_batch_size", type=int, default=16, help="Micro-batch for validation eval — small + independent of the train batch so the val logit tensor never OOMs at a large train batch.")
+parser.add_argument("--periodic_val_every", type=int, default=0, help="If >0, eval val every N optimizer steps during training (rank-0 + barrier), logging 'PERIODIC_VAL step=.. tokens=.. val_loss=..'. 0 = only the end-of-run eval (production default).")
 parser.add_argument("--final_model_dir", type=str, default=None, help="Optional directory for the final Hugging Face model export.")
 parser.add_argument("--completion_marker", type=str, default=None, help="Optional marker file written only after max_epochs is completed and the final model export succeeds.")
 parser.add_argument("--seed", type=int, default=444, help="Base random seed")
 args = parser.parse_args()
+assert args.data_path or args.train_sources, "provide exactly one of --data_path or --train_sources"
 
 # Distributed setup
 def setup_distributed():
@@ -132,8 +144,10 @@ assert GRAD_ACCUM_STEPS >= 1, (
 )
 ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-# Wall time: save 5 minutes before limit
-WALL_TIME_SAVE = args.wall_time - 300 if args.wall_time > 0 else 0
+# Wall time: save the checkpoint before the hard kill. argonne4.0 is ~1.04B (checkpoint
+# ~11 GB vs argonne3.5's ~32 GiB), so the flush is ~3x faster. This training-ELAPSED margin is now a
+# BACKUP; the PRIMARY save trigger is --save_deadline_epoch (absolute wall clock, startup-immune).
+WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
 
 # Autocast setup
 if args.precision == "bf16":
@@ -194,6 +208,147 @@ class DataLoader:
 
     def set_position(self, position):
         self.current_position = position
+
+
+# ---------------------------------------------------------------------------
+# Weighted multi-source loader (argonne4.0): realize a train-data mixture at an
+# EXACT ratio by sampling a SOURCE per micro-batch by weight, without pre-building a
+# blend .bin per ratio. Ported from the validated data-efficiency probe
+# (argonne4_probe.py) and made DDP-aware + resumable for the wall-time-sliced run.
+#   DDP correctness: the source-selection RNG is seeded IDENTICALLY on every rank
+#     (seed carries no rank term), so at each draw all ranks pick the SAME source and
+#     stay in lockstep; within a source the per-rank DataLoader shards disjointly
+#     (offset rank*B*T, stride B*T*world_size) => no token is seen by two ranks.
+#   Resume: get_position() (called on rank 0) returns the shared rng state + each
+#     source's rank-0 cursor; on resume every rank restores the rng and sets each
+#     source cursor to rank0_cursor + rank*B*T (the per-source analogue of the flat
+#     loader's resume math). Because it is a RANDOM sampler over corpora far larger
+#     than any single slice, an imperfect resume only re-samples a little data (no
+#     contiguous skip/repeat) -- strictly more robust than a single-pass flat bin.
+def parse_train_sources(spec):
+    """'PATH:WEIGHT,PATH:WEIGHT' -> [(path, weight)] (rsplit on ':' so paths keep slashes)."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        path, w = part.rsplit(":", 1)
+        out.append((path.strip(), float(w)))
+    return out
+
+
+class WeightedMultiLoader:
+    def __init__(self, sources, B, T, rank=0, world_size=1, seed=1337, train_tokens=0):
+        # sources: list of (path, weight); reuse the DDP-aware flat DataLoader per source
+        self.B, self.T = B, T
+        self.rank, self.world_size = rank, world_size
+        self.paths = [p for p, _ in sources]
+        self.loaders = [DataLoader(p, B, T, rank, world_size) for p, _ in sources]
+        w = np.array([wt for _, wt in sources], dtype=np.float64)
+        assert (w > 0).all() and w.sum() > 0, "source weights must be positive"
+        self.p = w / w.sum()
+        self.n = len(self.loaders)
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+        self.counts = [0] * self.n
+        # Progress is tracked in TOKENS, not draws. `counts` stays a per-source draw
+        # tally (mixture telemetry only); `drawn_base` holds tokens consumed BEFORE
+        # this process started and `draws` counts this process's own draws. Deriving
+        # progress from `counts * B` instead made it rescale by B_new/B_old whenever a
+        # resume changed the micro-batch, silently misreporting corpus consumption and
+        # breaking the epoch stop (regression test: scratchpad/test_wml_accounting.py).
+        self.drawn_base = 0
+        self.draws = 0
+        self.epoch = 0
+        total = sum(len(l.tokens) for l in self.loaders)
+        # num_tokens sets the WSD schedule length (estimated_steps = num_tokens/eff_batch).
+        # Default = combined corpus size (~one weighted pass); override with --train_tokens.
+        self.num_tokens = int(train_tokens) if train_tokens and int(train_tokens) > 0 else int(total)
+        if rank == 0:
+            frac = ", ".join(f"{os.path.basename(p)}:{self.p[i]:.3f}" for i, p in enumerate(self.paths))
+            print(f"WeightedMultiLoader: {self.n} sources [{frac}] combined={total:,} tok; "
+                  f"schedule num_tokens={self.num_tokens:,} (seed={self.seed})")
+
+    def next_batch(self):
+        i = int(self.rng.choice(self.n, p=self.p)) if self.n > 1 else 0
+        self.counts[i] += 1
+        self.draws += 1
+        xy = self.loaders[i].next_batch()
+        # Define an "epoch" as one full pass over the token BUDGET (num_tokens): total tokens
+        # drawn across all ranks = (per-rank draws) * B * T * world_size. This makes
+        # `train_loader.epoch >= max_epochs` fire in pretrain.py's stop check so the pretrain
+        # stage TERMINATES at the budget and writes .pretrain_complete -- WITHOUT this an
+        # infinite sampler never triggers the epoch-completion transition to continue_pretrain.
+        # Only THIS process's draws are scaled by the current B; earlier progress is carried
+        # as a token count so a micro-batch change across a resume cannot rescale it.
+        drawn = self.drawn_tokens()
+        self.epoch = int(drawn // self.num_tokens)
+        return xy
+
+    def drawn_tokens(self):
+        """Total tokens consumed across all ranks, invariant to micro-batch changes."""
+        return int(self.drawn_base + self.draws * self.B * self.T * self.world_size)
+
+    def get_position(self):
+        # rank-0 aggregate state (save_checkpoint calls this on IS_MAIN only). Picklable
+        # -> stored verbatim as checkpoint['data_position'].
+        return {
+            "wml": True,
+            "rng": self.rng.bit_generator.state,
+            "positions": [int(l.current_position) for l in self.loaders],
+            "counts": list(self.counts),
+            "epoch": int(self.epoch),
+            # Persist progress in TOKENS (and the B that produced it) so a resume at a
+            # different micro-batch restores consumption exactly. Older checkpoints lack
+            # both keys; resume falls back to the authoritative tokens_processed instead.
+            "drawn_tokens": self.drawn_tokens(),
+            "B": int(self.B),
+        }
+
+    def resume_from_checkpoint_position(self, state, drawn_tokens=None):
+        # Presence of this method routes the loader through the manifest-style resume
+        # branch (pretrain.py passes the raw data_position, no external rank offset).
+        if not isinstance(state, dict) or not state.get("wml"):
+            if self.rank == 0:
+                print("WeightedMultiLoader: no compatible resume state; starting sampler fresh")
+            return
+        try:
+            self.rng.bit_generator.state = state["rng"]
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"WeightedMultiLoader: rng restore failed ({e}); reseeding {self.seed}")
+            self.rng = np.random.default_rng(self.seed)
+        off = self.rank * self.B * self.T
+        for l, pos0 in zip(self.loaders, state.get("positions", [])):
+            newpos = int(pos0) + off
+            if newpos + (self.B * self.T + 1) > len(l.tokens):  # wrap safety
+                newpos = l.start_token_offset + self.rank * self.B * self.T
+            l.current_position = newpos
+        self.counts = list(state.get("counts", self.counts))
+        # Restore token progress, most authoritative source first:
+        #   1. tokens_processed from the checkpoint (exact; passed by the caller)
+        #   2. drawn_tokens persisted by a post-fix checkpoint
+        #   3. legacy derivation counts * B, using the B that WROTE the state if recorded
+        # Never counts * self.B -- that is the rescaling bug this replaces.
+        if drawn_tokens is None:
+            drawn_tokens = state.get("drawn_tokens")
+        if drawn_tokens is None:
+            b_old = int(state.get("B", self.B))
+            drawn_tokens = sum(self.counts) * b_old * self.T * self.world_size
+        self.drawn_base = int(drawn_tokens)
+        self.draws = 0
+        self.epoch = int(state.get("epoch", 0))
+        if self.rank == 0:
+            print(f"WeightedMultiLoader: resumed {self.n} source cursors + rng "
+                  f"(epoch {self.epoch}, {self.drawn_base:,} tok consumed, micro_batch={self.B})")
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def set_position(self, position):
+        # Compat shim: pretrain.py's flat-loader reset path may hand back an int; a
+        # random sampler has nothing contiguous to seek, so only a dict state is honored.
+        if isinstance(position, dict):
+            self.resume_from_checkpoint_position(position)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +521,9 @@ class DocManifestDataLoader:
     def start_from_beginning(self):
         self.current_position = self.rank * self.B
 
-    def resume_from_checkpoint_position(self, position):
+    def resume_from_checkpoint_position(self, position, drawn_tokens=None):
+        # drawn_tokens accepted for signature parity with WeightedMultiLoader; this
+        # loader derives its epoch from doc-order position, not a token tally.
         self.current_position = int(position) + self.rank * self.B
 
     def steps_from_position(self, position):
@@ -381,7 +538,15 @@ def build_train_loader(
     world_size,
     doc_shuffle=0,
     doc_shuffle_seed=1337,
+    train_sources=None,
+    train_tokens=0,
 ):
+    if train_sources:
+        srcs = parse_train_sources(train_sources)
+        return WeightedMultiLoader(
+            srcs, batch_size, block_size, rank, world_size,
+            seed=int(doc_shuffle_seed), train_tokens=train_tokens,
+        )
     if data_path.endswith(".json"):
         return DocManifestDataLoader(
             data_path,
@@ -479,6 +644,7 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+    prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
 
 
@@ -544,6 +710,7 @@ def main():
         num_hidden_layers=NUM_LAYERS,
         num_attention_heads=NUM_HEADS,
         num_key_value_heads=NUM_KV_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=args.block_size,
         rope_theta=ROPE_THETA,
         use_flash_attention=args.flash_attention == 1,
@@ -571,6 +738,8 @@ def main():
             model.gradient_checkpointing_enable()
             if IS_MAIN:
                 print("Gradient checkpointing enabled")
+        # Selective checkpointing: checkpoint every Nth layer (stride>1 => store more activations,
+        # recompute less => faster + more HBM). stride=1 keeps prior behavior (checkpoint all).
         if args.checkpoint_stride > 1 and hasattr(model, 'checkpoint_stride'):
             model.checkpoint_stride = int(args.checkpoint_stride)
             if IS_MAIN:
@@ -619,6 +788,8 @@ def main():
         WORLD_SIZE,
         doc_shuffle=args.doc_shuffle,
         doc_shuffle_seed=args.doc_shuffle_seed,
+        train_sources=args.train_sources,
+        train_tokens=args.train_tokens,
     )
     val_loader = None
     if IS_MAIN and args.val_data_path:
@@ -626,7 +797,7 @@ def main():
         # a contiguous slice via .tokens / .current_position); manifests are train-only.
         val_loader = DataLoader(
             args.val_data_path,
-            args.batch_size,
+            args.val_batch_size,
             args.block_size,
             rank=0,
             world_size=1,
@@ -725,7 +896,12 @@ def main():
                 # reproduces the original epoch) then place the per-rank cursor.
                 if hasattr(train_loader, "set_epoch"):
                     train_loader.set_epoch(resumed_epoch)
-                train_loader.resume_from_checkpoint_position(data_position)
+                # Pass the checkpoint's tokens_processed as the authoritative progress
+                # count: it is tracked independently of the loader and is exact, so the
+                # sampler's epoch survives a micro-batch change on resume.
+                train_loader.resume_from_checkpoint_position(
+                    data_position, drawn_tokens=tokens_processed
+                )
             else:
                 train_loader.set_position(data_position + RANK * args.batch_size * args.block_size)
                 train_loader.epoch = resumed_epoch
@@ -766,6 +942,30 @@ def main():
         tokens_processed = 0
     last_checkpoint_time = time.time()
     training_start_time = time.time()
+    def _eval_val():
+        # Val loss on the underlying (non-DDP) module at a SMALL fixed batch (val_batch_size) so the
+        # logit tensor never OOMs regardless of the train batch. Used for the end eval + periodic eval.
+        if val_loader is None:
+            return float("nan")
+        base_eval = get_base_model(model)
+        was_training = base_eval.training
+        base_eval.eval()
+        losses = []
+        with torch.no_grad():
+            orig = val_loader.current_position
+            val_loader.current_position = 0
+            nb = min(100, max(1, min(2_000_000, len(val_loader.tokens)) // (args.val_batch_size * args.block_size)))
+            for _ in range(nb):
+                vx, vy = val_loader.next_batch()
+                vx = vx.to(DEVICE, non_blocking=True); vy = vy.to(DEVICE, non_blocking=True)
+                with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
+                    vout = base_eval(vx, labels=vy)
+                losses.append(vout.loss.item())
+            val_loader.current_position = orig
+        if was_training:
+            base_eval.train()
+        return float(np.mean(losses)) if losses else float("nan")
+
     train_losses = []
     completed_max_epochs = train_loader.epoch >= args.max_epochs
 
@@ -833,6 +1033,15 @@ def main():
             if pbar:
                 pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
 
+        # Periodic validation (translate-test / learning curve). Gated (default off). All ranks reach
+        # here together (global_step is synced); rank 0 evals while the others wait at the barrier.
+        if args.periodic_val_every > 0 and global_step % args.periodic_val_every == 0:
+            if IS_MAIN and val_loader is not None:
+                _pv = _eval_val()
+                print(f"PERIODIC_VAL step={global_step} tokens={tokens_processed} val_loss={_pv:.4f} lr={current_lr:.3e}", flush=True)
+            if WORLD_SIZE > 1:
+                dist.barrier()
+
         # Synchronized checkpoint decision
         should_checkpoint = torch.tensor([0], device=DEVICE)
         if IS_MAIN:
@@ -859,19 +1068,25 @@ def main():
                 dist.barrier()
             last_checkpoint_time = time.time()
 
-        # Synchronized wall time check
-        if WALL_TIME_SAVE > 0:
+        # Synchronized wall-time / deadline check -- save ONE checkpoint, then exit cleanly (the
+        # weekend.sh chain resubmits on that clean exit = save-THEN-submit). Two triggers, whichever
+        # fires first: (1) --save_deadline_epoch = ABSOLUTE wall clock (job_start + slice - lead) =>
+        # fires a fixed time before the SLURM kill regardless of compile/startup drift = PRIMARY;
+        # (2) WALL_TIME_SAVE = training-ELAPSED margin = backup.
+        if WALL_TIME_SAVE > 0 or args.save_deadline_epoch > 0:
             should_wall_stop = torch.tensor([0], device=DEVICE)
             if IS_MAIN:
                 elapsed = time.time() - training_start_time
-                if elapsed >= WALL_TIME_SAVE:
+                if WALL_TIME_SAVE > 0 and elapsed >= WALL_TIME_SAVE:
+                    should_wall_stop[0] = 1
+                if args.save_deadline_epoch > 0 and time.time() >= args.save_deadline_epoch:
                     should_wall_stop[0] = 1
             if WORLD_SIZE > 1:
                 dist.broadcast(should_wall_stop, src=0)
 
             if should_wall_stop[0] == 1:
                 if IS_MAIN:
-                    print(f"\nApproaching wall time ({args.wall_time}s). Saving checkpoint and exiting...")
+                    print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
                     checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
                     print(f"Wall time checkpoint saved: {checkpoint_path}")
@@ -905,24 +1120,9 @@ def main():
         val_losses = []
         if val_loader is not None:
             print("\nEvaluating on validation...")
-            model.eval()
-            val_tokens = min(1_000_000, len(val_loader.tokens))
-            val_batches = val_tokens // (args.batch_size * args.block_size)
-
-            with torch.no_grad():
-                original_pos = val_loader.current_position
-                val_loader.current_position = 0
-
-                for _ in range(min(val_batches, 100)):
-                    x, y = val_loader.next_batch()
-                    x = x.to(DEVICE, non_blocking=True)
-                    y = y.to(DEVICE, non_blocking=True)
-
-                    with torch.amp.autocast("cuda", dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                        outputs = model(x, labels=y)
-                    val_losses.append(outputs.loss.item())
-
-                val_loader.current_position = original_pos
+            _vl = _eval_val()
+            if not np.isnan(_vl):
+                val_losses = [_vl]
         else:
             print("\nValidation skipped: no held-out validation file was provided.")
 
@@ -986,3 +1186,46 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def prune_old_checkpoints(checkpoint_dir, keep_path):
+    """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).
+
+    Keep `keep_path` (the checkpoint just written) and delete every other checkpoint_step_*.pt in
+    THIS dir -- i.e. this run's own earlier checkpoints. At 12-35 GB apiece a non-rotating dir eats
+    hundreds of GB, and one checkpoint is all a resume needs.
+
+    HISTORY, because this spot previously said the opposite: a keep-last-3 prune added 2026-07-28
+    was removed 2026-07-29 after it silently deleted 14 of 17 checkpoints and read as data loss.
+    The owner reversed the policy on 2026-08-05: latest-only is now the default. What was actually
+    wrong then was silence and aggressiveness, so this version PRINTS every deletion.
+
+    Deliberately narrow, so it can only ever remove this run's superseded checkpoints:
+      * only `checkpoint_step_<int>.pt` directly in `checkpoint_dir` (glob, not a walk)
+      * never `keep_path`, never a symlink (so `checkpoint_last.pt` is untouched), never a `.tmp`
+      * never the numerically-highest step present, even if `keep_path` somehow is not it
+      * per-file try/except: a failed unlink must not abort training after a good save
+    """
+    try:
+        keep = {os.path.realpath(keep_path)}
+        found = []
+        for p in glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt")):
+            m = re.fullmatch(r"checkpoint_step_(\d+)\.pt", os.path.basename(p))
+            if m and not os.path.islink(p):
+                found.append((int(m.group(1)), p))
+        if len(found) <= 1:
+            return
+        # Belt and braces: whatever has the highest step number also stays.
+        keep.add(os.path.realpath(max(found)[1]))
+        for _, p in sorted(found):
+            if os.path.realpath(p) in keep:
+                continue
+            try:
+                gib = os.path.getsize(p) / 2**30
+                os.remove(p)
+                print(f"[retention] removed superseded checkpoint {os.path.basename(p)} "
+                      f"({gib:.1f} GiB freed); keeping {os.path.basename(keep_path)}", flush=True)
+            except OSError as e:
+                print(f"[retention] could not remove {p}: {e}", flush=True)
+    except Exception as e:  # retention must never take down a run that just saved successfully
+        print(f"[retention] prune skipped: {e}", flush=True)

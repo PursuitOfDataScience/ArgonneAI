@@ -6,6 +6,7 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 | Model | Params | Context | Training tokens | Hugging Face |
 |-------|--------|---------|-----------------|--------------|
+| [Argonne 4.0-base](#argonne-40-base) | **1.04B** | **65,536** (trained) | ~65.12B | [argonne-4.0-base](https://huggingface.co/PursuitOfDataScience/argonne-4.0-base) |
 | [Argonne 3.5-think](#argonne-35-think) | 2.88B | 13,568 | ~88.84B + post-training | [Argonne-3.5-think](https://huggingface.co/PursuitOfDataScience/Argonne-3.5-think) |
 | [Argonne 3.5-base](#argonne-35-base) | 2.88B | **13,568** (trained) | ~88.84B | [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base) |
 | [Argonne 3.0](#argonne-30) | 2.88B | 1,024 (RoPE θ=1e6) | ~76.05B | [argonne-3.0-base](https://huggingface.co/PursuitOfDataScience/argonne-3.0-base) |
@@ -13,6 +14,91 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 | [Argonne 2.0](#argonne-20) | 4.9B | 4,096 | ~21.9B | — (not released) |
 | [Argonne 1.5](#argonne-15) | 357M | 2,048 | ~15.45B | [Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5) |
 | [Argonne 1.0](#argonne-10) | 276M | 2,048 | FineWeb-Edu | [Argonne-1.0](https://huggingface.co/PursuitOfDataScience/Argonne-1.0) |
+
+---
+
+# Argonne 4.0-base
+
+Argonne 4.0-base is a **1.04B-parameter** decoder-only transformer with a **trained 65,536-token context**, released as [`PursuitOfDataScience/argonne-4.0-base`](https://huggingface.co/PursuitOfDataScience/argonne-4.0-base). Full model card: [`model_cards/argonne-4.0-base.md`](model_cards/argonne-4.0-base.md).
+
+It is deliberately **smaller** than 3.5-base — 36% of the parameters on 73% of the tokens — and spends those tokens on a math/code-weighted mixture instead of mostly web text. The bet, from a 49-run iso-token campaign, is that at ~1B scale **data composition** outweighs parameter count. Architecture is 3.5's, re-shaped to 1,536 hidden × 32 layers (6 query / 2 KV heads, head_dim 256, SwiGLU 4,096).
+
+## Training loss curve
+
+![Argonne 4.0 loss curve](plots/argonne4_0_loss_plot.png)
+
+Four stages. Two easy misreadings: the **sawtooth in stage 1 is the mixture sampler**, not the optimization — each step draws one of the three sources and their entropies differ (edu ≈2.7, math/code ≈1.0–1.5), so consecutive logged steps alternate (faint = raw, solid = rolling median); and loss steps at stage boundaries are **changes of data mixture**, not capability jumps.
+
+## Training details
+
+| Item | Value |
+|------|-------|
+| **Stages** | Pretrain (`pretrain.py`) → reasoning anneal → ctx extension to 13,568 → ctx extension to 65,536 (`continue_pretrain.py`) |
+| **Total optimizer steps** | 112,674 |
+| **Tokens processed** | ~65.12B (38.03B pretrain + 18.07B anneal + 6.02B ctx 13,568 + 3.00B ctx 65,536) |
+| **Sequence length** | 1,024 (stages 1–2) → 13,568 (stage 3) → **65,536** (stage 4) |
+| **Effective batch** | 522,240 → 589,824 → 976,896 → 983,040 tokens/step |
+| **Peak learning rate** | 6e-4 pretrain / 2e-4 anneal / 1e-4 both extensions; WSD, 8,000 warmup steps |
+| **Optimizer** | AdamW (β₁=0.9, β₂=0.95, weight decay 0.1), grad clip 0.4 |
+| **Precision** | FP8 (torchao tensorwise, incl. `lm_head`) under bf16 autocast, chunked CE, `torch.compile`, gradient checkpointing |
+| **Hardware** | 3× NVIDIA H100/H200 (DDP) |
+
+**Stage 2 ran at a constant 2e-4 with no cooldown** — the launcher passed `cooldown 0`. That is a defect, not a choice, and it covers 18.07B tokens (28% of the run); it is the most likely place the general-knowledge weakness below originates. Stages 1, 3 and 4 all cooled to 0.1×.
+
+**Attention:** trained with **full causal attention on every layer**, and the released `config.json` says so (`interleaved_local_attention: false`). The 3.0/3.5 configs advertise a 256-token interleaved window, but `model.py` implements it only on the flash-attn-2 path and this cluster runs flash-attn-4 — so the window has never been active in *any* Argonne pretrain. Publishing the flag as-is would hand a window the weights never saw to anyone with flash-attn-2 installed; [`push_model_to_hf.py`](push_model_to_hf.py) now normalizes it out at release time.
+
+## Training data
+
+- Stage 1 — **50 / 30 / 20** [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) / [FineMath-4plus](https://huggingface.co/datasets/HuggingFaceTB/finemath) / GitHub code, sampled **per micro-batch** by `pretrain.py`'s `WeightedMultiLoader` rather than pre-blended, so the ratio is decoupled from raw source sizes (~38.03B tokens, ≈1× per source). Built by [`build_a4_data.py`](build_a4_data.py).
+- Stage 2 — code / math / reasoning / tool anneal with a FineWeb-Edu replay tier, built by [`build_reasoning_corpus.py`](build_reasoning_corpus.py) (~18.07B tokens). Measured pool composition: 45.4% code, 24.0% reasoning, 19.9% math, **9.0% general replay**, 1.7% tool.
+- Stage 3 — a **disjoint** slice of the same composite, read at 13,568 tokens (~6.02B tokens)
+- Stage 4 — 50% long arXiv (docs ≥32,768 tokens, [proof-pile-2](https://huggingface.co/datasets/EleutherAI/proof-pile-2)) / 25% reasoning replay / 25% edu replay, built by [`build_phasec_data.py`](build_phasec_data.py) (3.00B tokens)
+- Tokenizer: [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base) (151,669-token vocab)
+
+## Benchmarks — measured on the released weights
+
+lm-eval via a vLLM backend that is token-for-token validated against `model.py` on this architecture. `acc_norm` for the MC tasks, `acc` for winogrande/mmlu, gsm8k separately. Both anchors are 1B-class and were scored on the **same harness, tasks and few-shot counts** in the same campaign. Regenerate with [`reasoning/release_table.py`](reasoning/release_table.py).
+
+| task | **Argonne 4.0-base** | stage 3 (ctx 13,568) | Llama-3.2-1B | Qwen3-0.6B-Base |
+|---|---:|---:|---:|---:|
+| arc_challenge | **36.26** | 35.75 | 34.90 | 44.88 |
+| arc_easy | 56.19 | 54.88 | 59.93 | 57.87 |
+| hellaswag | 45.44 | 43.85 | 60.36 | 53.61 |
+| piqa | 67.74 | 67.08 | 73.50 | 69.80 |
+| sciq | 79.80 | 77.80 | 89.90 | 91.30 |
+| openbookqa | 31.80 | 32.20 | 36.20 | 34.60 |
+| winogrande *(acc)* | 55.49 | 56.35 | 61.96 | 60.22 |
+| **mmlu** *(acc)* | **26.15** | 24.73 | 31.41 | **52.49** |
+| **8-task mean** | **49.86** | **49.08** | **56.02** | **58.10** |
+| **gsm8k strict-match** | **7.51** | **9.70** | **1.82** | **49.28** |
+| gsm8k flexible-extract | 7.88 | 10.16 | 2.27 | 50.04 |
+
+Params / tokens: **4.0-base 1.04B / 65.12B** · Llama-3.2-1B 1.24B / ~9T · Qwen3-0.6B-Base 0.6B / ~36T — i.e. 0.7% of Llama's and 0.2% of Qwen's token budget, so a deficit is expected; its size and shape are the finding.
+
+- **The data bet pays off against Llama-3.2-1B where it was supposed to:** generative math **7.51 vs 1.82 (4.1×)** at 84% of the parameters. It loses the commonsense/knowledge tasks.
+- **Against Qwen3-0.6B-Base it is behind on all nine cells** — −8.24 mean, **−26.34 mmlu**, **−41.77 gsm8k** — at 1.7× the parameters. Tokenizer is not a confound (4.0 pretrains with Qwen3's). **MMLU at 26.15 against 25.0 chance is this model's real weakness**, and the two levers this recipe left on the table are the 9% general replay tier and stage 2's missing cooldown.
+- **Stage 4 was a domain trade, not a free context extension:** +0.78 MC mean and the whole 65,536 window, against **−2.19 gsm8k** — the only generative task — plus worse held-out CE on 7 of 8 reasoning tiers (`reason_r1` +69% PPL). Detail in [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §39.
+- Finishing the LR cooldown (262 steps, 0.26B tokens past §39's mid-cooldown reading) **moved nothing**: 49.86 vs 49.94 mean, 26.15 vs 25.95 mmlu.
+
+**The internal two-axis base gate disagrees, and the gate is wrong.** It rates the released weights **17/20 math · 14/15 general** (pooled 34/40 · 28/30, CLEARED) — *ahead* of the 2.88B base behind Argonne-3.5-think (14/20 · 14/15) at 36% of the parameters — while blind to a 2× MMLU and 6.6× gsm8k gap. The general axis has a ceiling of 15 and every a4 checkpoint tested reads 14–15 on it; two phase-C checkpoints 40 steps apart differ by the probe's own ±2-item noise floor. **A saturating gate cannot rank bases; it can only reject very bad ones.** Reproduce with [`reasoning/a4_gate_probe.py`](reasoning/a4_gate_probe.py).
+
+## The 65,536-token context is trained, not extrapolated
+
+RoPE θ=1e6 does **not** extrapolate unaided on this architecture. All three arms scored on the **same 24 held-out windows** of 49,152 tokens from proof-pile-2 arXiv shards stage 4 did not train on. Nats/token, lower is better:
+
+| Token position | stage 2 (ctx 1,024) | stage 3 (ctx 13,568) | **Argonne 4.0-base** (ctx 65,536) |
+|---|---:|---:|---:|
+| 0 – 1,024 | 2.561 | 2.401 | **1.970** |
+| 1,024 – 2,048 | 5.086 | 2.061 | **1.671** |
+| 4,096 – 8,192 | 6.051 | 1.427 | **1.139** |
+| 8,192 – 13,568 | 5.964 | 1.242 | **0.980** |
+| 13,568 – 20,480 | 5.920 | 1.197 | **0.924** |
+| 24,576 – 32,768 | 5.990 | 1.198 | **0.864** |
+| 40,960 – 49,152 | 6.075 | 1.300 | **0.820** |
+
+Stage 2 is coherent inside its 1,024-token window and **flat at ~6 nats for the next 48,000 tokens** — the counterexample to "a large RoPE base buys free context", measured on this model's own ancestor. The release falls monotonically with position and pays no short-context tax.
+
+**But the stage 3 → 4.0-base gain is not context extension.** The probe's falsifiable test says a real extension makes the gap *grow* with position; instead it is **U-shaped** — −0.43 nats at 0–1,024, −0.26 at the minimum, −0.48 in the 40,960–49,152 tail. It is as large at position 0 as at position 49,000, and stage 4 did not need to extend position 0–1,024. With stage 4 also making 7 of 8 reasoning tiers worse, the honest attribution is **distribution (toward arXiv), not length**. The extension proper is stage 3's. Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
 
 ---
 

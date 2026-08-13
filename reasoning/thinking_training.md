@@ -5825,3 +5825,4284 @@ shorter** than `main`'s, because `main` gained the multi-model index after the b
 merge looked like it would clobber the published README — it did not, because the branch never touched
 that file after the merge base, so git took `main`'s copy cleanly. Verified before pushing rather than
 after.
+
+## §38 — CAN 3.5-THINK IMPROVE FURTHER? Re-opening every conclusion that was measured through the defect (2026-08-04, 17:00 → 01:00)
+
+Owner: *"do more research to see if we can continue to improve argonne3.5 think … 1 H200 … don't stop
+until 1am."*
+
+### 38a. The thesis
+
+§36 got +7.06pt by fixing a data-loading defect, not by inventing anything. That has a corollary worth
+taking seriously: **every recipe decision on this line was measured through that defect.** 1 epoch, LR
+1e-5, α=0.85, effective batch 12, the 768-token trace cap, the 512-token gsm8k cap, and — most
+importantly — the *negative* results. A conclusion of the form "X didn't help" is only as good as the
+data X was trained on. So this round re-opens them, cheapest and strongest-prior first.
+
+### 38b. TRUNCATION WAS ANTI-CORRELATED WITH DIFFICULTY — the finding that reframes everything else
+
+New tool `reasoning/think_len_audit.py` reports per-tier **think**-token length and what
+`--max_think_tokens 128` removed. On the shipped mix:
+
+| tier | % rows cut | **% of think tokens lost** |
+|---|---:|---:|
+| `hard_strict` | 88% | **57%** |
+| `med_openmath` | 89% | **56%** |
+| `hq_opus` | 81% | 47% |
+| `gsm8k_train_short` | 84% | 41% |
+| `med_math` | 44% | 30% |
+| `ms_series` / `ms_divisors` / `ms_algebra` / `ms_geometry` | **0%** | **0%** |
+| `synth_arith` | **0%** | **0%** |
+
+**The easy procedural drills were untouched and the hard tiers lost over half their reasoning.** The
+defect was not a uniform tax; it was a difficulty-graded one, because hard problems need long
+derivations and the cut was at a fixed token count. The model was trained on complete easy procedures
+and half-amputated hard reasoning — which is a fair description of a model that scores 74.90 on ASDiv
+and 39.18 on MATH-500.
+
+**And the two length filters compound.** `hard_strict` has 12,000 source rows. The 768-token mix cap
+admitted **651**. Of those, 88% were then truncated, losing 57% of their think tokens. Effective hard
+reasoning signal reaching the model ≈ **2.3%** of what was available. §36's fix raised that to ~5.4%
+(the cap still binds); §38's `v12_long` raises it to ~20%.
+
+### 38c. The α knee: arithmetic is α-INSENSITIVE (a clean null)
+
+Re-swept α on clean-data weights, no training (`400`/`403`). §19/§32 called 0.85 "the knee" and warned
+that 0.70 reintroduces non-termination — both measured on corrupted-data weights, where the DPO partner
+was doing repair work.
+
+| α | 0.70 | 0.80 | **0.85 (shipped)** | 0.90 | 0.95 | 1.00 (pure CoT) |
+|---|---:|---:|---:|---:|---:|---:|
+| one-step arithmetic /144 | 142 | 142 | **144** | 144 | 144 | 143 |
+
+**Every α ≥98.6%.** The §36 arithmetic repair is carried entirely by the CoT checkpoint and is not a
+property of the blend — so α can be tuned freely on math accuracy without risking the axis that blocked
+§33. Accuracy, though, does move with α: at 0.70, ASDiv 63.80 / GSM-Plus 34.20 versus the shipped
+74.90 / 42.00, so *lower* α remains clearly bad. The upward direction (0.90/0.95/1.00) is what `403`
+tests.
+
+⚠️Note α=0.85 reads 144/144 here against 143/144 in §36's gate — same model, same `--probe-seed 77`.
+Treat this probe as **±1 item**, and do not read a 1-item difference as a result.
+
+### 38d. §33's VERIFY TIER WAS NEVER ACTUALLY TRAINED
+
+This is the most consequential thing found today. §33 built a self-verification tier, measured ≈+2.0pt
+over five held-out sets, and blocked the ship because it cost **−23.8pt on one-step arithmetic** (`2+2`
+→ 6). §33t showed the gain and the damage were the same rows; §33u found the repair null at three
+seeds; the family was abandoned as a dead end.
+
+Measured on `cot_mix_robust`, the mix behind that candidate:
+
+| tier | p50 think tokens | % cut at 128 |
+|---|---:|---:|
+| `pert_verify_fix` | 246 | **100%** |
+| `pert_verify_rederive` | 249 | **100%** |
+| `verify_rederive` | 202 | **98%** |
+| `verify_fix` | 208 | **96%** |
+| `pert_verify_confirm` | 167 | 82% |
+| `verify_confirm` | 150 | 71% |
+| `synth_arith` | 15 | **0%** |
+
+**In a self-verification trace the verification comes after the solve, inside the think block.** Cutting
+at 128 think-tokens removed the verification from essentially every row meant to teach it. The model was
+trained on *"solve, begin re-checking, stop"* — which is precisely the double-application failure §33v
+documented (`2+2` → 4 → apply `+2` again → 6) and precisely the arithmetic regression that blocked the
+ship. §33 did not measure a bad idea; it measured a truncated one.
+
+`402_verify_refix` re-runs that exact mix, that exact recipe, seed 46, with only the loader fixed. The
+comparison is against §33's own `robust_a085` rather than the shipped model, because `cot_mix_robust`
+carries a smaller general anchor (tulu 8000 / ultrachat 3000 vs 9600 / 3400) and comparing across that
+would confound the loader question.
+
+### 38e. The queue
+
+| # | experiment | change | re-opens |
+|---|---|---|---|
+| 401 | long-trace re-admit | `hard_strict` 600→2412, `med_openmath` 300→1048; 31,860 rows @ max_seq 1664 | the 768 cap (§32's "termination pressure") |
+| 402 | verify-tier re-run | `cot_mix_robust`, loader fixed | §33's blocked verify family |
+| 403 | α upward | 0.90 / 0.95 / 1.00, no training | §32's α knee |
+| 404 | gsm8k coverage | 1,446 distinct ×3 → 3,271 distinct ×1 | the 512 cap + the upsampling trade |
+| 409 | 2 epochs | — | §32b's "2 epochs regressed on all four measures" |
+
+Termination is instrumented on every training arm (`no_answer`, against the shipped ~1–2%), because it
+is the axis all four length caps were introduced to protect. If it climbs, the caps were load-bearing
+and that is the finding.
+
+### 38f. 401 — RE-ADMITTING THE LONG TRACES IS A NULL, slightly negative. Hypothesis refuted.
+
+The headline experiment of this round, and the one I predicted would win. `cot_sft_mix_v12_long`
+(31,860 rows; `hard_strict` 600→2412, `med_openmath` 300→1048) at max_seq 1664, seed 46, everything
+else identical to `genfix46`. Loader audit clean at 0.0%, so the added rows genuinely reached the model.
+
+| pool (n=500 greedy, paired) | shipped `genfix46` | `longtr46` | delta | p |
+|---|---:|---:|---:|---:|
+| ASDiv | 74.40 | 73.20 | −1.20 | 0.56 |
+| GSM-Plus | 42.40 | 40.20 | −2.20 | 0.31 |
+| MATH-500 | 39.18 | 37.62 | −1.57 | 0.66 |
+| **3-pool mean** | **51.99** | **50.34** | **−1.65** | |
+
+All three negative, none individually significant, and termination degraded (unclosed 32/300 and
+29/300 versus the shipped 26/300 and 21/300).
+
+**So the 768-token cap is load-bearing after all, and §32's "termination pressure" rationale survives
+the loader fix.** §38b's framing — that hard reasoning was starved to ~2.3% of the available signal —
+is *true as an accounting statement* and *false as a diagnosis*: giving that signal back does not help.
+The under-representation of hard tiers is not what limits this model.
+
+**The instructive contrast is 402.** The verify tiers are also dense multi-step reasoning, they are also
+"more reasoning content", and they stay under 768 tokens — and they gained +4.2 ASDiv. So the useful
+variable is not how LONG a trace is, it is what the trace TEACHES. Length was a proxy I mistook for the
+mechanism.
+
+### 38g. 402 — §33's VERIFY TIER IS ALIVE. The arithmetic regression was the loader, not the tier.
+
+`cot_mix_robust` — §33's own mix, unchanged — retrained with only the loader fixed.
+
+| axis | §33's verify arm | shipped `genfix46` | **`vfyfix46`** |
+|---|---|---:|---:|
+| **one-step arithmetic** | **catastrophic**: `2+2`→6, −23.8pt, SHIP BLOCKED | 143/144 | **144/144** |
+| ASDiv greedy (n=500) | — | 74.40 | **78.60 (+4.20)** |
+| ASDiv greedy (n=300 judge) | — | 73.33 | **79.33 (+6.00)** |
+| GSM-Plus (n=500) | — | 42.40 | 40.00 (−2.40) |
+| MATH-500 (n=500) | — | 39.18 | 37.93 (−1.25) |
+| pass@8 (n=300) | — | 93.67 | 94.00 |
+
+**§33's blocker is gone and arithmetic is now perfect — better than the shipped model.** §33s wrote
+"any future round must gate on a one-step arithmetic probe"; the deeper lesson is that §33's *negative*
+result was an artifact, and a whole family was abandoned on it. **A negative result obtained through a
+broken pipeline is not a finding about the idea.**
+
+Overall accuracy is a wash at one seed (3-pool mean 52.18 vs 51.99). The shape — a large ASDiv gain
+partly returned on the other two pools — is the signature of a composition deficit, because
+`cot_mix_robust` still carries the pre-§36 general anchor (tulu 8000 / ultrachat 3000 vs 9600 / 3400)
+that §36 measured as worth the entire instruction axis. `405` restores exactly that and nothing else.
+
+### 38h. α=0.85 IS NOT THE KNEE — math is monotone in α, and the best arm needs no soup at all
+
+| α | ASDiv | GSM-Plus | 2-pool mean | arithmetic | vs shipped (GSM-Plus) |
+|---|---:|---:|---:|---:|---|
+| **0.85 (shipped)** | 74.40 | 42.40 | 58.40 | 144/144 | — |
+| 0.90 | 75.40 | 43.60 | 59.50 | 144/144 | +1.20 (p=0.49) |
+| 0.95 | 75.60 | 44.40 | 60.00 | 144/144 | +2.00 (p=0.30) |
+| **1.00 (pure CoT, no soup)** | **75.80** | **46.40** | **61.10** | 143/144 | **+4.00 (p=0.049)** |
+
+Monotone on both pools, 6 of 6 comparisons in the same direction, and **free** — it is a soup weight,
+not a retrain. §32 chose 0.85 when the DPO partner was repairing corrupted-data damage; with whole
+traces the CoT checkpoint stands on its own. Individually only α=1.00 on GSM-Plus clears p<0.05, so the
+monotonicity is doing more work here than any single comparison.
+
+⚠️**NOT believed yet.** α=1.00 discards the DPO/SFT partner that §32 credited with general ability and
+with fixing the one general-probe miss, and a 2-pool math screen cannot see instruction-following,
+termination, or general knowledge. That is exactly the §33s trap — a math gain invisible to the axis it
+damages. `403b` gates it on all three before this counts as an improvement.
+
+### 38i. 404 — gsm8k COVERAGE-FOR-UPSAMPLING IS SIGNIFICANTLY NEGATIVE
+
+`cot_sft_mix_v13_gsmlong`: the gsm8k tier rebuilt at cap 1536 / upsample 1 (3,271 distinct train
+problems) in place of cap 512 / upsample 3 (1,446 distinct, each shown three times). Mix 27,361 rows,
+seed 46, max_seq 1664, loader audit clean.
+
+| pool (n=500 greedy, paired) | shipped | `gsmlong46` | delta | p |
+|---|---:|---:|---:|---:|
+| **GSM-Plus** (the target pool) | 42.40 | 36.00 | **−6.40** | **0.0035** |
+| **ASDiv** | 74.40 | 69.40 | **−5.00** | **0.013** |
+| MATH-500 | 39.18 | 35.42 | −3.76 | 0.18 |
+| **3-pool mean** | **51.99** | **46.94** | **−5.05** | |
+
+Two pools significantly worse, and **termination collapsed**: unclosed 45/300 and 46/300 (≈15%) versus
+the shipped 26/300 and 21/300 (≈8%). Arithmetic held at 144/144, so this is not a numeracy failure —
+it is a *finishing* failure.
+
+"More distinct problems beat repeats" is a sound principle that is wrong here, and the reason is
+visible in the termination numbers: the 3× repetition of SHORT, cleanly-closed gsm8k derivations was
+doing format work, not information work. Removing it — and admitting 513–1536-token derivations in its
+place — cost the model its ability to close a trace, and greedy accuracy follows termination on this
+model.
+
+## §38j — THE ANSWER: the 768-token cap is the load-bearing constraint, and it is about TERMINATION, not difficulty
+
+Four arms, one consistent mechanism. Sorting them by what they did to trace length:
+
+| arm | change to trace length | unclosed /300 | 3-pool mean vs shipped |
+|---|---|---:|---:|
+| shipped `genfix46` | — (≤768) | 26 / 21 | — |
+| **402 verify tier** | none (≤768), denser reasoning | 32 / 21 | **+0.19** (ASDiv **+4.20**) |
+| **403 α=1.00** | none (no data change at all) | 17 / 23 | **+2.70** (2-pool) |
+| 401 long-trace | 768 → 1536 on hard tiers | 32 / 29 | **−1.65** |
+| 404 gsm coverage | 512 → 1536 on gsm8k | **45 / 46** | **−5.05** (2 pools significant) |
+
+**Every arm that lengthened traces lost, and the loss tracks the unclosed rate almost monotonically.
+Every arm that left length alone won.** §32's "termination pressure" rationale for the 768 cap is
+correct and survives the loader fix intact.
+
+**§38b's framing was a red herring and I should name it as such.** It is true that only ~2.3% of the
+available hard-reasoning signal reached the model, and it is true that the truncation was
+anti-correlated with difficulty. Both facts are real. The inference I drew from them — that hard
+reasoning was the binding constraint — is refuted by 401 and 404 together. This model's limiter is not
+a shortage of hard reasoning; it is that long derivations break its ability to finish, and an unfinished
+derivation scores zero no matter how good it was.
+
+That also resolves why §36's fix worked so well while §38's length experiments failed. §36 did not add
+length — it restored the *ends* of traces the loader had been cutting off, i.e. it gave the model back
+the concluding step. §38's arms added *middles*. The model was never short of reasoning; it was short
+of endings.
+
+**What this predicts, and it is testable:** the productive direction is more reasoning DENSITY inside
+the existing length budget — which is exactly what §33's verify tiers are (a solve plus a check, all
+under 768), and exactly the one data arm that gained. Not longer traces. Not more of the hard tail.
+
+### 38k. ⚠️THE α FINDING RETRACTED: it is a POOL TRADE, not a gain. 3 seeds, no training.
+
+α is a soup weight, so replicating it costs three EVALS rather than three trainings. All six
+checkpoints (genfix / genfix46 / genfix99, each with `_think` = α 1.00 and `_a085`) existed, so §33u's
+three-seed bar was reachable tonight. Per-seed delta, α 0.85 → 1.00, greedy n=500:
+
+| seed | ASDiv | GSM-Plus | **MATH-500** | 3-pool |
+|---|---:|---:|---:|---:|
+| s5150 | +2.80 | +4.60 | **−4.70** | +0.90 |
+| s46 | +1.40 | +4.00 | **−4.70** | +0.23 |
+| s99 | +2.60 | +3.80 | **−5.02** | +0.46 |
+| **3-seed mean** | **+2.27** | **+4.13** | **−4.81** | **+0.53** |
+
+Same sign on every pool at every seed; 3-pool spread 0.67.
+
+**§38h called this "free" and that was wrong.** The α screen in 403 used ASDiv + GSM-Plus only, and
+MATH-500 — omitted — is exactly where α=1.00 loses, by −4.81pt, replicated 3/3. The net is **+0.53pt**,
+inside the 1.68pt run-to-run variation §33p measured on this recipe, and it still costs an instruction
+item (12/14 vs 13/14). **Not adoptable. It is a characterised trade: competition-style math for
+word-problem math.**
+
+This is the second time in one round that a pool-subset screen produced an over-claim (the first being
+§38b's difficulty framing). **Rule: a screen that omits a pool cannot support a claim about the mean.**
+Either screen on all five, or state the claim only for the pools screened.
+
+**The levers also do not compose.** α=1.00 on top of the un-blocked verify tier:
+
+| arm | ASDiv | GSM-Plus | MATH-500 | 3-pool |
+|---|---:|---:|---:|---:|
+| `vfyfix46` α=0.85 | 78.60 | 40.00 | 37.93 | **52.18** |
+| `vfyfix46` α=1.00 | 78.40 | 37.80 | 35.11 | 50.44 |
+
+−1.74pt from stacking them, independently reproducing [[a35-think-effort-verify-tier]]'s recorded "the
+two scaling axes do NOT compose".
+
+### 38l — EVERY ARM, ONE TABLE. Nothing tested tonight improves the model.
+
+3-pool mean (ASDiv/GSM-Plus/MATH-500, greedy, n=500, paired on identical items):
+
+| arm | 3-pool mean | vs shipped | verdict |
+|---|---:|---:|---|
+| `s99_a100` (α=1.00, seed 99) | 52.31 | +0.32 | inside noise |
+| `s5150_a100` (α=1.00, seed 5150) | 52.26 | +0.27 | inside noise |
+| `s46_a100` (α=1.00, seed 46) | 52.23 | +0.24 | inside noise |
+| **`vfyfix46` verify tier** | **52.18** | **+0.19** | inside noise, but SAFE (arith 144/144) |
+| **shipped `genfix46`** | **51.99** | — | the released model |
+| `s99_a085` | 51.85 | −0.14 | seed noise |
+| `s5150_a085` | 51.36 | −0.63 | seed noise |
+| `vfyfix46` α=1.00 | 50.44 | −1.55 | levers do not compose |
+| `longtr46` long traces | 50.34 | −1.65 | REFUTED |
+| `gsmlong46` gsm coverage | 46.94 | **−5.05** | REFUTED, 2 pools significant |
+
+**The answer to "can we improve 3.5-think further": not by any lever tested here.** Everything that is
+not refuted sits in a 51.4–52.3 band against the shipped 51.99 — i.e. within the recipe's own
+run-to-run variation. The two arms that clearly move are both *negative*, and both moved by lengthening
+traces.
+
+**What the round is actually worth:**
+1. **The mechanism (§38j).** Termination is the binding constraint; the 768-token cap is load-bearing.
+   That closes off an entire family of "give it more/harder/longer reasoning" ideas cheaply, and it
+   predicts where to look instead: density inside the budget.
+2. **§33's verify family is un-blocked and is the only data arm that gained anything.** Its −23.8pt
+   arithmetic blocker was a loader artifact; it now scores 144/144, better than shipped. +4.20 ASDiv at
+   one seed, flat overall. That is the direction §38j predicts, and it deserves the proper 3-seed round
+   this session had no room for.
+3. **α is characterised** rather than unknown: a stable ±4-5pt pool trade, not a knob to turn.
+4. **A methodological result that outranks all of the above:** every negative result on this line
+   recorded before §35 was measured through a loader that deleted 39% of think tokens, weighted toward
+   the hardest tiers. §33's abandonment is the proof case. `reasoning/think_len_audit.py` tells you in
+   one command whether a given arm's tiers were actually trained.
+
+### 38m. 405 — the anchor does NOT buy instruction-following back, and that reframes §38g
+
+`cot_mix_robust_gen` = §33's verify mix with §36's general anchor restored (tulu 8000→9598,
+ultrachat 3000→3400 — identical to `genfix46`), nothing else changed. Seed 46.
+
+| pool (n=500 greedy, paired) | shipped | `vfyfix46` (old anchor) | **`vfyanc46`** (anchor restored) |
+|---|---:|---:|---:|
+| ASDiv | 74.40 | 78.60 | 76.00 (+1.60, p=0.45) |
+| GSM-Plus | 42.40 | 40.00 | 39.60 (−2.80, p=0.19) |
+| MATH-500 | 39.18 | 37.93 | **41.38 (+2.19, p=0.53)** |
+| **3-pool mean** | **51.99** | 52.18 | **52.33 (+0.34)** |
+| one-step arithmetic | 144/144 | 144/144 | **144/144** |
+| unclosed /300 | 26 / 21 | 32 / 21 | 28 / 16 |
+| **instruction /14** | **13** | — | **11** |
+
+Best 3-pool mean of the round, and still inside the 1.68pt noise band. But the anchor **did not** fix
+instruction-following, and because `vfyanc46` carries the *identical* anchor to `genfix46`, the 2-item
+loss is attributable to the verify tiers themselves rather than to composition. §38g predicted the
+opposite; that prediction is wrong.
+
+**Why, from the actual failures:**
+
+```
+Correct the grammar: 'She don't like apples.'
+  -> **Answer: The sentence is grammatically correct.**  **Explanation:** 1. **Subje...
+Correct the grammar: 'They was happy.'
+  -> ## Solution  **Sentence:** They was happy.  ### Step-by-Step Analysis: 1. **Sub...
+```
+
+**The verify tier teaches the model to verify everything, including prompts that need no verification.**
+That is the identical pathology to §33's `2+2` → 6 — a checking step over-applied to a trivial input.
+Fixing the truncation did not eliminate it; it **RELOCATED** it, from one-step arithmetic to
+instruction-following. §38g's "the blocker is gone" is true only of the *arithmetic* blocker.
+
+This is the sharper version of §33t's finding that the gain and the damage were the same rows. The
+mechanism is not "the verify data was broken" but **"training a model to always check makes it check
+things that need no checking"** — and a 2.88B model has no reliable way to tell those apart. That is a
+property of the objective, not of the pipeline, which is why the loader fix moved it rather than
+removing it.
+
+**Revised verdict on the verify family:** safe on arithmetic (144/144, genuinely fixed), flat on math
+(+0.34, noise), and it costs 2 of 14 instruction items to over-analysis. **Not an improvement**, and the
+next round should not simply re-run it at three seeds — it should first test whether the pathology can be
+targeted, e.g. verify rows conditioned on problem difficulty, or an explicit "trivial input → answer
+directly" tier. Without that, three seeds would just measure the same trade more precisely.
+
+### 38n. 408 — the verify tier on the FULL gate is NEGATIVE (−1.37), and it is a TEST-TIME lever
+
+`vfyfix46` measured on §36's exact release configuration (ASDiv/SVAMP n=1000, GSM-Plus/MAWPS n=500,
+MATH-500 n=319), merged against §36's recorded `genfix46` JSONs.
+
+| pool | shipped `genfix46` | `vfyfix46` | delta | p |
+|---|---:|---:|---:|---:|
+| ASDiv | 74.90 | **77.00** | +2.10 | 0.13 |
+| SVAMP | 69.60 | 67.70 | −1.90 | 0.21 |
+| MATH-500 | 39.18 | 37.93 | −1.25 | 0.74 |
+| GSM-Plus | 42.00 | 40.00 | −2.00 | 0.39 |
+| **MAWPS** | **61.20** | **57.40** | **−3.80** | **0.020** |
+| **5-set greedy mean** | **57.38** | **56.01** | **−1.37** | |
+
+`genfix46` reproduces 57.38 exactly, so the harness is measuring the same thing §36 did.
+
+**⚠️THIRD pool-subset over-claim of the round.** §38g/§38l scored this arm at **+0.19** on a 3-pool
+screen; the full gate says **−1.37**, and the reason is that the screen omitted SVAMP and MAWPS — both
+pools the verify tier loses, one significantly. §38k already recorded the rule after the α case; it
+applies here retroactively and §38l's table should be read as 3-pool-only, not as a proxy for the mean.
+**Three separate times this round a subset screen pointed the wrong way. Screen on all five.**
+
+**What the tier actually does, which the greedy column hides:**
+
+| | 5-set greedy | 5-set self-consistency@8 |
+|---|---:|---:|
+| shipped `genfix46` | **57.38** | 62.91 |
+| `vfyfix46` | 56.01 (**−1.37**) | **65.43 (+2.52)** |
+
+**The verify tier converts greedy accuracy into sampled accuracy.** Per-pool the sampled gains are
+large where the greedy losses are (`vfyfix46` self-cons: ASDiv 84.80, SVAMP 81.40, MATH-500 45.77 vs
+shipped's ~78/74/34), and its extension deltas are the significant ones in the table
+(SVAMP greedy→extend1 +2.40 p=0.002, GSM-Plus greedy→extend2 +3.80 p=0.013, MAWPS greedy→budget +2.00
+p=0.006) — i.e. it responds to test-time compute where the shipped model has stopped responding.
+
+That is a coherent mechanism, not a curiosity: a model trained to check its work benefits from being
+allowed to produce several attempts and reconcile them, and is penalised when forced to commit on the
+first pass. It also lands exactly where §26 left this line — *"real levers = serving-system OR better
+base"* — and it means the verify family belongs in a **best-of-N / self-consistency deployment**, not in
+a greedy single-pass release. §33's original framing as a greedy-accuracy lever was the wrong frame for
+it, independently of the loader defect.
+
+### 38o. 409 — the greedy↔sampled trade REPRODUCES, and verify influence is a monotone dial
+
+`vfyanc46` on the full gate, merged with §36's `genfix46` and §38n's `vfyfix46`:
+
+| arm | verify influence | **5-set greedy** | **5-set self-cons@8** | best MATH-500 |
+|---|---|---:|---:|---:|
+| shipped `genfix46` | none | **57.38** | 62.91 | 39.18 |
+| `vfyanc46` (verify + §36 anchor) | diluted | 56.60 (−0.78) | 64.36 (+1.45) | **41.38** |
+| `vfyfix46` (verify, old anchor) | full | 56.01 (−1.37) | **65.43 (+2.52)** | 37.93 |
+
+**The §38n mechanism reproduces on a second mix and is monotone in verify influence: more verify → lower
+greedy, higher self-consistency.** The general anchor is the dial — it dilutes the verify tiers' share
+and moves BOTH metrics back toward the shipped model. That rules out "the anchor fixes the verify tier"
+(§38g/§38m) in favour of something simpler: the anchor just turns the dial down.
+
+`vfyanc46` is also the best MATH-500 of any arm measured tonight (41.38 vs the shipped 39.18) and ties
+the shipped model on best-single-pass (189.78 vs 189.61 on merge A), so the greedy deficit is
+concentrated in SVAMP/MAWPS/GSM-Plus — the easy, short, one-to-two-step pools, which is precisely where
+over-verification costs most. Consistent with §38m's grammar failures and with §33s's original
+one-step-arithmetic catastrophe: **verification training hurts exactly where verification is unnecessary,
+and helps where several attempts can be reconciled.**
+
+## §38p — FINAL: the recipe is at its ceiling; the remaining headroom is SELECTION, not data
+
+Thirteen arms. **No arm beats the shipped model on 5-set greedy, the deployable metric:**
+
+| arm | 5-set greedy | 5-set self-cons@8 |
+|---|---:|---:|
+| **shipped `genfix46`** | **57.38** | 62.91 |
+| `vfyanc46` | 56.60 | 64.36 |
+| `vfyfix46` | 56.01 | **65.43** |
+
+and on the 3-pool screen everything not refuted sits in 51.4–52.3 around the shipped 51.99 — a spread
+narrower than this recipe's own 1.68pt run-to-run variation. The two arms that clearly move are both
+negative and both lengthened traces (−1.65, −5.05).
+
+**Three findings worth carrying forward:**
+
+1. **Termination is the binding constraint** (§38j). The 768-token cap is load-bearing; the model was
+   short of *endings*, not reasoning. This closes off the whole "more/harder/longer reasoning data"
+   family cheaply and explains §36's +7.06pt as an endings fix.
+2. **The verify family is a test-time-compute lever, not a greedy one** (§38n/§38o), with verify share as
+   a dial. Its right home is a best-of-N or self-consistency deployment where +2.52 self-consistency is
+   the number that matters — not a greedy single-pass release. §33 framed it wrong independently of the
+   loader defect.
+3. **Every pre-§35 negative on this line is untrustworthy** and `think_len_audit.py` checks any of them
+   in one command. §33's abandoned verify family is the proof case: 71–100% of its rows were truncated.
+
+**The strategic read, unchanged from where §20/§26 left the 3.0 line:** the headroom is the greedy →
+pass@8 gap (57.38 → ~77.8), which is a SELECTION problem. The levers that have ever moved it here are a
+better base or a serving-system change. Post-training data composition on this recipe is exhausted, and
+tonight is the measurement that says so — thirteen arms, one mechanism, no gains.
+
+---
+
+## §39 — THE argonne4.0 PHASE-C BASE: it CLEARS the §15 gate, and phase C is a DOMAIN TRADE, not a context extension (2026-08-05)
+
+argonne4.0 phase C (ctx 13,568 → 65,536) was ~91% done and mid-WSD-cooldown when this was measured, and
+it hands off to SFT + the reasoning line next. So the question is not "is phase C finished" but **"is
+phase C the right SEED, and what does its base quality predict for the recipe."** Job 53072616
+(`reasoning/a4_pcgate.sh`, 1×H100, 1h34, read-only — the training chain was untouched).
+
+**The headline checkpoint was PINNED** (`--pin a4_phasec=...step_112412.pt`, a new flag on
+`exp_longctx_learning.py`). Phase C writes a checkpoint roughly hourly, and the probe previously globbed
+"the latest" at stage start, so a multi-stage job would silently have measured *different models* in
+different stages. It also now `torch.load(..., mmap=True)`: a training `.pt` is ~2/3 optimizer state, and
+reading 4.2 GB of weights was pulling all 12.4 GB into RAM (measured working set 9.98 GB after the fix).
+
+### 39a. THE §15 BASE GATE — CLEARED, by phase B and by phase C. The first a4 checkpoints to do it.
+
+| arm | math std | math ext | **math /40** | gen std | gen ext | **gen /30** | gate |
+|---|---:|---:|---:|---:|---:|---:|---|
+| phase B 109,622 | 16/20 | 16/20 | **32** | 15/15 | 13/15 | **28** | **CLEARED** |
+| phase C 112,372 | 17/20 | 18/20 | **35** | 15/15 | 14/15 | **29** | **CLEARED** |
+| phase C 112,412 | 17/20 | 16/20 | **33** | 15/15 | 14/15 | **29** | **CLEARED** |
+
+Against the pretrain-era history (`report/a4_gatedose_*.json`), where a4 NEVER cleared both axes:
+
+| pretrain step | math std | gen std | gate |
+|---|---:|---:|---|
+| 37,924 | 12 | 13 | no |
+| 43,672 | 11 | 13 | no |
+| 49,947 | 10 | 13 | no |
+| 59,723 | **14** | 12 | math only |
+| 60,127 | 12 | 12 | no |
+
+So phase A anneal + B + C moved a4 from "never cleared" to cleared with margin. **3.5 cleared this same
+gate at 14/20 · 14/15 at 2.88B params; a4 reads 17/20 · 15/15 at 1.04B** — ahead of the base that
+produced 3.5-think, at 36% of the parameters.
+
+**Two caveats that bound how far that can be pushed.** (1) `gen std` is 15/15 on all three arms — the axis
+is SATURATED, so the gate cannot rank them. (2) The two phase-C arms are 40 steps (~13M tokens) apart and
+differ by **2 points on pooled math** (35 vs 33). That is §31's ±2 probe noise reproducing on demand, and
+it is why two adjacent checkpoints were run rather than one. **Phase C is therefore INDISTINGUISHABLE from
+phase B on this gate** — the honest phase-C number is ~34/40 ± 1 against phase B's 32/40.
+
+### 39b. TIER CE — phase C is WORSE on 7 of 8 reasoning-anneal tiers, and the 50% replay did not hold them
+
+`tier_ce_probe.py`, 1M held-out tokens/tier, block 1024. Negative = phase C better.
+
+| tier | phase B CE | phase C CE | Δ | PPL change |
+|---|---:|---:|---:|---:|
+| **reason_r1** | 1.9262 | 2.4516 | **+0.5254** | **+69.1%** |
+| **code_github** | 0.7765 | 1.0018 | **+0.2253** | **+25.3%** |
+| math_openmath | 0.6595 | 0.7613 | +0.1018 | +10.7% |
+| tool_agentic | 0.4399 | 0.5090 | +0.0691 | +7.2% |
+| code_compprog | 0.9237 | 0.9795 | +0.0559 | +5.7% |
+| reason_mot | 1.0013 | 1.0535 | +0.0522 | +5.4% |
+| think_05m | 0.7377 | 0.7753 | +0.0376 | +3.8% |
+| general_edu | 2.6506 | 2.6099 | −0.0407 | −4.0% |
+
+This matters because `build_phasec_data.py` was **explicitly designed to prevent it**: phase C is 50% long
+arXiv + 50% replay, and the docstring cites the §12 incident by name as the reason. **The mitigation was
+reasoned correctly and still did not work** — the reasoning tiers degraded anyway, worst on exactly the
+tier (`am_r1`) whose distribution the reasoning line trains on. `general_edu` is the only gain, and it is
+the CONTAMINATED tier for a4 (no holdout), so it is valid only as a within-model B-vs-C reading.
+
+### 39c. LONG-CONTEXT NLL — phase C wins at EVERY position, which is why it is NOT a context extension
+
+Held-out arXiv shards only (`arXiv_09*`; phase C trains on `arXiv_0[0-8]*`). eval_len 49,152, 24 windows.
+
+| bucket | phase B | phase C | Δ |
+|---|---:|---:|---:|
+| **0–1024** | 2.4009 | 1.9906 | **−0.410** |
+| 1024–2048 | 2.0611 | 1.6966 | −0.365 |
+| 2048–4096 | 1.7047 | 1.4106 | −0.294 |
+| 4096–8192 | 1.4274 | 1.1613 | −0.266 |
+| 8192–13568 | 1.2417 | 1.0011 | **−0.241** |
+| 13568–20480 | 1.1970 | 0.9455 | −0.251 |
+| 20480–24576 | 1.2198 | 0.9250 | −0.295 |
+| 24576–32768 | 1.1978 | 0.8844 | −0.313 |
+| 32768–40960 | 1.3162 | 0.9170 | −0.399 |
+| 40960–49152 | 1.2998 | 0.8403 | −0.459 |
+
+At 65,536 (10 windows) the same shape holds, tail bucket 49152–65536: 1.0972 → 0.7889 (−0.308).
+
+**Read against the probe's own falsifiable H3** — *"effective context extension → the gap GROWS with
+position; a uniform offset means generic training instead."* The gap is not growing; it is **U-shaped**,
+and it is **as large at 0–1024 (−0.41) as in the 40k–49k tail (−0.46)**, with the MINIMUM in the middle.
+Phase C did not need to extend position 0–1024 and improved there most of all.
+
+**The attribution is clean because two instruments measure the same positions on different corpora.** Both
+the tier probe (block 1024) and this probe's 0–1024 bucket score positions 0–1023 with no prior context.
+They disagree in SIGN: −0.41 nats on arXiv, +0.04 to +0.53 nats on the reasoning tiers. **That rules out
+context length and leaves distribution: phase C moved toward arXiv and away from the reasoning corpus.**
+
+### 39d. REAL BENCHMARKS — MC up ~1pt, GENERATIVE MATH down. vLLM validated on the a4 arch.
+
+`run_lmeval_vllm.py`, gated on stage 3.5: **VLLM_GATE 6/6, token-for-token greedy vs `model.py`.** The port
+was validated on 3.5 (12 query / 4 KV heads); this is the first proof it is exact on **a4's 6/2 config**,
+so the fast path is now available for the whole a4 line (`vllm_argonne.py` needed no change — head_dim is
+256 in both, and it reads head counts from config).
+
+| task / metric | phase B | phase C | Δ |
+|---|---:|---:|---:|
+| sciq acc_norm | 77.80 | **80.40** | +2.60 |
+| arc_challenge acc | 31.40 | **33.87** | +2.47 |
+| arc_easy acc | 60.77 | **62.71** | +1.94 |
+| hellaswag acc_norm | 43.85 | **45.30** | +1.45 |
+| mmlu | 24.73 | **25.95** | +1.22 |
+| sciq acc | 85.50 | **86.60** | +1.10 |
+| arc_easy acc_norm | 54.88 | **55.89** | +1.01 |
+| piqa acc_norm | 67.08 | **68.01** | +0.92 |
+| hellaswag acc | 35.51 | **36.15** | +0.64 |
+| winogrande | 56.35 | **56.67** | +0.32 |
+| piqa acc | 67.36 | 67.30 | −0.05 |
+| arc_challenge acc_norm | 35.75 | 35.67 | −0.09 |
+| openbookqa acc | 22.60 | 22.20 | −0.40 |
+| openbookqa acc_norm | 32.20 | 31.60 | −0.60 |
+| **14 MC cells, mean** | **45.68** | **46.59** | **+0.91** |
+| **gsm8k strict-match** | **9.70** | **8.11** | **−1.59** |
+| gsm8k flexible-extract | 10.16 | 8.57 | −1.59 |
+
+**The ONLY benchmark phase C loses is the generative one**, by 16% relative (128 → 107 of 1319 items).
+Alone that is ~1.4σ and not significant. But it points the same way as §39b's `math_openmath` (+10.7% PPL)
+and `reason_r1` (+69%), and **two independent instruments agreeing is a signal, not noise.** The MC gains
+have an obvious source: the largest single one is `sciq` (+2.60), which is what 3B tokens of arXiv buys.
+
+**MMLU is the standout weakness: 24.73 → 25.95 against 25.0 chance, i.e. at the FLOOR.** That independently
+confirms the banked finding that GENERAL, not math, is a4's binding axis.
+
+### 39e. VERDICT — phase C trades generative reasoning for scientific text and long-context reach
+
+Four instruments, one consistent story:
+
+| axis | phase C vs phase B |
+|---|---|
+| §15 base gate | equal (inside ±2 probe noise); both CLEARED |
+| MC benchmarks | +0.91 mean, driven by sciq/arc |
+| arXiv NLL, all positions | −0.24 to −0.46 nats (better) |
+| **reasoning-anneal CE** | **worse on 7/8 tiers** |
+| **generative math (gsm8k)** | **−1.59pt (−16% relative)** |
+
+**For a line whose deliverable is a generative reasoner, that trade runs the wrong way.** Phase C's gains
+are on multiple-choice and on its own training domain; its losses are on generation, which is what the
+reasoning recipe produces.
+
+**Honest bounds.** (1) Phase C was **mid-cooldown** at step 112,412 (197 of 458 cooldown steps, LR
+6.1e-5 → 1e-5, ~261 steps and 0.26B tokens remaining) — these are a lower bound on the finished stage, and
+the trade may soften. (2) The long-context eval corpus IS phase C's training domain, so its win there
+cannot be read as capability. (3) gsm8k is 1.4σ on its own. (4) `general_edu` is contaminated for a4.
+
+**What this does NOT say.** It does not say phase C was a mistake — it bought a real 65,536 window and a
+measured 3.0B-token improvement on long scientific text, which phase B does not have. It says the two
+seeds are **good at different things**, and the reasoning line should not assume the longer-context one is
+automatically the better seed.
+
+**The cheap decisive test, if the seed choice matters:** run the SAME CoT-SFT from both seeds and compare
+on `clean_eval`. That is ~1 GPU-hour per arm and it measures the thing the CE and gsm8k readings can only
+predict. Recorded as an OFFER, not run.
+
+### 39f. THE ANCHOR — a4's base is DOMINATED by Qwen3-0.6B-Base on every axis, and §39a's optimism is RETRACTED
+
+§39a-e measured phase C against phase B, which can say whether phase C was a good step but cannot say how
+far the recipe can go from it, because nothing in the a4 line has a post-recipe outcome yet. §15 does: the
+same recipe on Qwen1.5-0.5B beat the shipped 3.0-think v4 at 1/6 the params, and the recorded conclusion
+was *"base QUALITY not size was the ceiling."* So the anchor question is whether a4's base reads at
+real-base grade. Job 53074942, identical harness/tasks/few-shot to §39d so the tables merge.
+
+| task (acc_norm; acc for winogrande/mmlu) | a4 phase B | a4 phase C | Llama-3.2-1B | **Qwen3-0.6B-Base** |
+|---|---:|---:|---:|---:|
+| arc_challenge | 35.75 | 35.67 | 34.90 | **44.88** |
+| arc_easy | 54.88 | 55.89 | **59.93** | 57.87 |
+| hellaswag | 43.85 | 45.30 | **60.36** | 53.61 |
+| piqa | 67.08 | 68.01 | **73.50** | 69.80 |
+| sciq | 77.80 | 80.40 | 89.90 | **91.30** |
+| openbookqa | 32.20 | 31.60 | **36.20** | 34.60 |
+| winogrande | 56.35 | 56.67 | **61.96** | 60.22 |
+| **mmlu** | 24.73 | 25.95 | 31.41 | **52.49** |
+| **8-task mean** | 49.08 | 49.94 | 56.02 | **58.10** |
+| **gsm8k strict** | 9.70 | 8.11 | 1.82 | **49.28** |
+| gsm8k flexible | 10.16 | 8.57 | 2.27 | **50.04** |
+
+Params / tokens: a4 1.04B / **64.9B** · Llama-3.2-1B 1.24B / ~9T · Qwen3-0.6B **0.6B** / ~36T.
+
+**⚠️RETRACTION of §39a's framing.** §39a said a4 reads 17/20 · 15/15 against 3.5's gate-passing 14/20 ·
+14/15 "at 36% of the parameters," and §39d's ARC reading was called parity. Both statements are literally
+true — the first on the toy gate, the second against Llama only — but **the mean they implied is wrong.**
+Against Qwen3-0.6B-Base, a4 phase C is behind on **every** axis: −8.16 on the 8-task mean, **−26.54 on
+MMLU**, **−41.17 on gsm8k**, at 1.7× the parameter count. The "4.5× Llama on math" reading in §39d held
+only because Llama-3.2-1B is itself weak at math (1.82%); the honest math comparison is 8.11 vs 49.28.
+
+**This is precisely the failure mode §31 predicted and it is the methodological result of the round.** The
+two-axis gate saturates — 15/15 general on all three a4 arms, 17/20 math — so it certified "cleared, run
+the recipe" while blind to a 2× MMLU gap and a 6× gsm8k gap. **A saturating gate cannot rank bases. It can
+only reject very bad ones.** Every "a4 base looks strong" claim on this line traces to that instrument and
+must be re-read against §39f.
+
+**Caveats, stated so the conclusion is not over-read.** (1) Qwen3-0.6B's 49.28 gsm8k invites its own
+contamination question, and lm-eval strict-match rewards emitting `#### N`. But MMLU is much harder to game
+and shows −26.54, so discounting gsm8k entirely does not rescue the comparison. (2) Tokenizer is NOT a
+confound for the Qwen comparison — a4 pretrains with Qwen3's tokenizer, so the two share it exactly.
+(3) a4 phase C was mid-cooldown; the remaining ~140 steps (0.26B tokens) cannot close a 26-point MMLU gap.
+(4) The a4-vs-Llama gsm8k number carries the §-recorded Argonne GSM8K contamination asterisk; a4's anneal
+drew on openmath/GSM8K-style data and train-vs-test exposure was not audited here.
+
+**The strategic read, and it is the same conclusion §20/§25/§26/§38p reached from the other side.** This
+project's throughline #1 is *capability is set upstream*, and §38p closed post-training composition as
+exhausted, leaving "a better base or a serving-system change." §39f says the better base is **already on
+disk and is not ours**: applying the §15 recipe to `Qwen3-0.6B-Base` starts from +8.2 mean / +26.5 MMLU /
++41.2 gsm8k over a4 phase C at 58% of the parameters. §15 already ran this experiment one generation back
+(Qwen1.5-0.5B + recipe > shipped 3.0-think v4); Qwen3-0.6B is far stronger than Qwen1.5-0.5B.
+
+**What a4 phase C is still good for, stated plainly rather than dropped:** it is a genuine 65,536-context
+model with measured long-arXiv gains that no Qwen-0.6B checkpoint here has, it is fully ours end-to-end,
+and it clears the §15 gate so the recipe *will* run on it. Those are real. They are just not the same thing
+as being the best available starting point for a reasoner.
+
+**Recommendation (an OFFER — no training launched):** before committing the SFT + reasoning budget to
+phase C, run the §15 recipe head-to-head from BOTH seeds — a4 phase C and Qwen3-0.6B-Base — and gate on
+`clean_eval`. `reasoning/reason_control/` is already the base-agnostic harness for exactly this, and it is
+~1 GPU-hour per arm against a multi-day reasoning line. If a4 loses that head-to-head, the a4 pretraining
+result is still publishable as a data-efficiency finding; what changes is which base the *reasoner* is
+built on.
+
+---
+
+## §40 — CAN THE EXACT 3.5-THINK RECIPE BUILD A BETTER a4-THINK? NO: −16.79pt, every pool, p≤1e-5 (2026-08-06)
+
+Owner question: *"if we follow the exact recipe of training argonne3.5-think, can we train a better
+argonne4-think using the latest checkpoint?"* Answered by BUILDING it — the full four-stage recipe off
+argonne4.0 phase C (step 112,412), then gating it against the released 3.5-think **in one process on
+identical items**. Jobs 53090861 (stage A) + 53112991 (B/C/D) + 53119566 (gate), 1 GPU throughout.
+
+### 40a. The port was verbatim, and that was CHECKED rather than assumed
+
+| held identical | evidence |
+|---|---|
+| tokenizer + chat template | both 151,669; `<think>`=151667 `</think>`=151668 `<|im_end|>`=151645; template byte-identical, **md5 fb4eb61f6c** |
+| eos lineage | a4 phase C starts at eos=151643 exactly like 3.5's stage-A base; `sft.py` logged `EOS updated: '<|endoftext|>' -> '<|im_end|>' (id=151645) [detected from chat template]` — the recipe does it itself |
+| stage A | 10,393 optimizer steps = 3.5's documented figure (207,865 rows ÷ eff 20); 247,228,129 tokens |
+| stage B | 844 steps, β=0.03, lr 1e-6 |
+| stage C | 2,369 steps = 28,428 ÷ eff 12; **loader audit 0.0% discarded on all 12 tiers** with `max_think_tokens=0 preserve_raw_reasoning=1 allow_non_reasoning=1` |
+| effective batch | A=20, B=8, C=12 — all preserved |
+| seeds | 42 / 42 / 46 (46 = cot-sft.py's default AND the released arm's seed) |
+| data | ultrachat_200k/train_sft · argilla_dpo-mix-7k · cot_sft_mix_v6_gen (genfix, 28,428 rows) |
+| arch | all three trainers build ArgonneConfig from the input dir's config.json |
+
+**Only two things differed, both forced:** the base model (the experiment) and 1 GPU instead of 2, with
+batch×accum re-split to preserve BOTH effective batch and 3.5's per-device micro-batch of 10.
+
+⚠️Stage A **cannot run on an 80 GiB H100** at that micro-batch: the fp32 logit tensor is
+10×4096×151,680×4B ≈ 24.8 GB and `sft.py` has no chunked-CE option, so a probe OOM'd at step 6
+(`Tried to allocate 19.36 GiB`). 3.5 used H200s for this reason; 1×H200 keeps the recipe intact.
+
+### 40b. THE RESULT — worse on every pool, none of it close
+
+Paired, same items, one process. 3.5-think = the released `genfix46_a085`.
+
+| pool | n | **a4-think** | **3.5-think** | **Δ** | McNemar p | banked 3.5 (§38n) | drift |
+|---|---:|---:|---:|---:|---|---:|---:|
+| ASDiv | 1000 | 57.10 | 73.60 | **−16.50** | **1.8e-22** | 74.90 | −1.30 |
+| SVAMP | 1000 | 46.80 | 68.00 | **−21.20** | **6.2e-33** | 69.60 | −1.60 |
+| MAWPS | 500 | 48.20 | 60.60 | **−12.40** | **1.7e-10** | 61.20 | −0.60 |
+| GSM-Plus | 500 | 20.00 | 41.00 | **−21.00** | **1.4e-18** | 42.00 | −1.00 |
+| MATH-500 | 319 | 19.75 | 32.60 | **−12.85** | **9.8e-06** | 39.18 | −6.58 |
+| **5-SET GREEDY** | | **38.37** | **55.16** | **−16.79** | | 57.38 | −2.22 |
+| self-cons@8 | | 45.43 | 61.60 | −16.17 | | | |
+| pass@8 | | 62.50 | 75.22 | −12.72 | | | |
+
+Harness reproduces the banked 3.5 numbers to −0.6…−1.6pt on four pools (−2.22 on the 5-set mean), so
+it is measuring the same thing §36 did. MATH-500's −6.58 drift is larger and unexplained; it does not
+affect the paired contrast, since both models were scored on identical items in the same process.
+
+### 40c. WHY — it is CAPABILITY, and every alternative mechanism is ruled out by the same run
+
+Greedy failure-mode histograms, n=1000:
+
+| | ASDiv | SVAMP |
+|---|---|---|
+| unclosed + no_answer, a4 vs 3.5 | 138 vs 114 (**+24**) | 107 vs 104 (**+3**) |
+| **accuracy AMONG traces that answered** | **66.2% vs 83.1% (−16.8)** | **52.4% vs 75.9% (−23.5)** |
+| mean think tokens | 243 vs 218 | 256 vs 257 |
+| mean decoded tokens | 268 vs 251 | 268 vs 269 |
+
+**The recipe transferred; the capability did not.** a4-think writes traces of the same length, closes
+them at essentially the same rate, and emits the same format — it is simply WRONG far more often.
+Restricted to properly-terminated answered traces it is still 17–24pt behind. That eliminates, from
+this one run, every mechanism this line has previously invoked:
+
+- **not termination** — §38j's binding constraint for 3.5; the unclosed gap is +3 on SVAMP
+- **not trace length** — §38's refuted long-trace family; lengths match within ~25 tokens
+- **not selection** — §38p's remaining headroom; **pass@8 is also −12.72**, so the ceiling moved too
+- **not the loader defect** — §34/§35; audit was 0.0% across all 12 tiers
+
+### 40d. What it means
+
+This is throughline #1 holding under the cleanest test the project has run: with the recipe, data,
+seeds, effective batches, tokenizer and chat template all held byte-identical, **swapping only the base
+moves the deployable metric by −16.79pt.** Post-training calibrates; it does not create.
+
+It also confirms §39f prospectively rather than retrospectively. §39f measured a4 phase C's base at
+−26.5 MMLU and −41.2 gsm8k against Qwen3-0.6B-Base and predicted the recipe could not rescue it; §40
+is that prediction tested and upheld. The §15 gate said "licensed to run the recipe" — it was right
+that the recipe would RUN, and useless as a predictor of how well, exactly as §31 warned a saturating
+gate would be.
+
+**Consequences for the a4 line:**
+1. **Do not seed the reasoning line from phase C expecting a 3.5-class reasoner.** It is ~17pt short.
+2. The a4 pretrain result stands on its own as a DATA-EFFICIENCY finding (§39: gsm8k 8.11 vs
+   Llama-3.2-1B's 1.82 at 140× less data) — that is a real result and is not what §40 refutes.
+3. The lever remains the base. §39f's offer stands and is now better motivated: run this same recipe
+   from **Qwen3-0.6B-Base** and gate it the same way. `reason_control/` is the base-agnostic harness,
+   the pipeline in `reasoning/a4think.sh` is now proven end-to-end, and it is ~10 GPU-hours.
+
+**Artifacts:** `/project/rcc/youzhi/models/a4_think/{sft,dpo,think,think_a085}` (3.9G each).
+`report/a4think_gate_{n1000,n500,math500}.json` hold per-item `ok` arrays, so any later arm can be
+merged into this paired table via `effort_gate.py --report-from`.
+
+⚠️`think`/`think_a085` carry `max_position_embeddings=4096` inherited from CoT-SFT's save, so the
+model does NOT expose phase C's 65,536 window. Irrelevant to this gate (max_model_len 2560); it would
+have to be restored before any release.
+
+## §41 — WHAT a4-THINK'S WRONG ANSWERS CONTAIN, and the three levers that follow from it (2026-08-10)
+
+**READ THIS FIRST.** §41 ran 24 arms and a dozen zero-GPU analyses in one session. The result:
+
+> **Per-token on-policy reverse-KL distillation from a LENGTH-MATCHED teacher is the best arm of the
+> whole a4 campaign** — `acc|ANSWERED` 53.5% → 62.3% (+8.8pp, positive on all four clean pools),
+> best-decode 48.63 → 53.48 (+4.85), pooled `extend2` **+5.20 at p=4.2e-10** over 3,000 items — and
+> **it raised the FLOOR while leaving the CEILING untouched** (pass@8 −0.93, n.s.), which is the exact
+> inversion of the thirteen imitative arms before it. ⚠️One seed; the replicate is in flight.
+
+The map, so the subsections can be read out of order:
+
+| § | what it establishes |
+|---|---|
+| a | the 12-arm table; a 3x-stronger external teacher is a NULL; RLVR-DPO's gain was eaten by length drift |
+| b | **the wrong answers are PLAN failures, not arithmetic**; arithmetic is a false lead (the checker fires on 18.7% of CORRECT traces) |
+| f, n | two whole families REFUTED — long-CoT teachers (greedy 1.75) and hindsight/gold-anchored self-distillation (−21.6) |
+| h, l, o | the selector: text features are dead; 78.2% of the vote's losses are near-ties; the vote discards 4.0pt greedy already had; **`effort_gate` breaks ties by SAMPLING ORDER** |
+| j, u, v | three of my own estimates CORRECTED by measurement — the "+1.2 capability ceiling", the soup's premise, and the gain's supposed structure |
+| p, q, r | **the result**, its decode-time recovery, and the pooled significance |
+| w, y | the mechanism pinned from both sides: **trace length is body-level**, so a terminator mask does nothing (1 token) and a body anchor works (39 tokens) |
+| s, t, x | the queue, the 24-arm record, and the protection that matches the mechanism |
+
+Two process lessons worth more than any single number:
+* ⚠️**Never instrument a failure with a statistic conditioned on the failure being absent.** The
+  closure diagnostic read healthy for 1,719 steps of a run that ended at 96.95% unclosed, because it
+  only sampled positions where the trace had already closed. Fixing it to the marginal hazard was
+  *still* not enough; only a 90-second end-to-end generation caught the drift.
+* ⚠️**Never price a lever by the best value an exhausted family of methods reached.** §41j put the whole
+  remaining capability lever at +1.24 on exactly that reasoning, and the next arm returned +4.85.
+
+
+§40 closed the "transfer the 3.5 recipe" question (−16.79pt) and the arms that followed it closed
+nine more. This section is about the twelve-arm total, one measurement that reorganised the problem,
+and the mechanism class that had never been tried on this base.
+
+### §41a — The twelve-arm table, and two conclusions that were the opposite of the standing note
+
+Pool-mean greedy over asdiv/svamp (n=1000) + gsmplus/mawps (n=500) + math500 (n=319), paired inside
+each gate call, decomposed with `gate_report.py`:
+
+| arm | greedy | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.10 | 61.58 | 75.12 | 70.1% | 16.90 | 247.6 |
+| **a4combo_a100** | **43.44** | 50.94 | 68.94 | 50.1% | 13.66 | 229.8 |
+| a4dist_a100 | 42.42 | 49.70 | 67.23 | 50.3% | 15.74 | 236.4 |
+| a4rft_a100 | 41.91 | 50.19 | 66.11 | 49.1% | 14.65 | 237.1 |
+| a4rlvrwu_a100 | 41.93 | 52.89 | 69.97 | 50.9% | 19.11 | 293.1 |
+| a4rlvr_a100 | 41.30 | 53.00 | 69.22 | **52.6%** | 22.37 | 311.7 |
+| a4llama_a100 | 39.24 | 47.17 | 65.08 | 46.1% | 15.54 | 240.3 |
+| a4e1_a085 (baseline) | 39.21 | 45.10 | 62.41 | 50.5% | 20.60 | 278.3 |
+| a4llamall_a100 | 38.51 | 48.39 | 65.95 | 46.0% | 19.21 | 254.5 |
+
+**1. The "stronger teacher" lever is a NULL, and it is the MECHANISM that is wrong, not the teacher.**
+The standing note said the one untested lever was a teacher genuinely stronger than 3.5-think, now
+unblocked. It was run. Llama-3.1-8B-Instruct solves 45.7% of the same train problems against a4's
+14.9% — 3x the correctness — and distilling its text scored **39.24 against a 39.21 baseline**, with
+`acc|ANSWERED` **down** to 46.1%; covering all three train pools instead of gsm8k alone made it worse
+still (38.51, 46.0%). A 1.04B student acquires a style it cannot execute. This is the cleanest
+available refutation of "find a better teacher" as the fix, and it is what motivated §41c.
+
+**2. RLVR-DPO produced the best `acc|ANSWERED` on this base and lost anyway, to length.** 52.6% vs
+the 50.1% baseline — the only lever in twelve that moved the number every other arm left frozen —
+while unclosed went 13.66% → 22.37% and `t_len` 230 → 312. Unregularised DPO learned "longer"
+alongside "better". Arithmetic on the decomposition: greedy = acc|ANS x answered-rate, so at combo's
+86.7% answered-rate a 52.6% acc|ANS is **~45.6 greedy**, +2.2 over the best arm. The contrastive
+objective works; the length preference eats it. That is a fixable pathology, not a dead lever.
+
+**3. The gap SHRINKS with sampling: greedy −11.7, sc@8 −8.6, pass@8 −5.2.** a4's knowledge is much
+closer to 3.5-think's than its greedy suggests. Budget-forcing and `extend` are worth only +0.5-0.7
+here against +1.8-3.8 on 3.5-think, so the deployable ceiling today is **44.17** vs **58.85**.
+
+### §41b — `fail_taxonomy.py`: the "wrong" bucket, split into buckets that name a lever
+
+`gate_report.py` localises the deficit to one number and stops. "Wrong" is one bucket, and the fixes
+for its contents are mutually exclusive — training on more traces cannot fix a readout bug and a
+decode change cannot fix an execution bug. New tool, 21 s, no GPU, run on the 93,912 on-policy
+rollouts of `think_combo` itself (`/project/rcc/youzhi/data/a4_dpo/a4_dpo_all.jsonl`):
+
+| bucket | share of wrong | lever named |
+|---|---:|---|
+| gold never appears AND every stated equation checks out | **67.9%** | **PLAN** — it derived the wrong thing, correctly |
+| gold appears in the trace, something else is boxed | 15.3% | readout (upper bound; coincidental numbers inflate it) |
+| a stated `a op b = c` is false | 16.7% | execution — **and this is a false lead, see below** |
+
+⚠️**Arithmetic is NOT the differentiator; do not build a drill or tool arm off the 16.7%.**
+`has_bad_arith` fires on 20.1% of wrong traces and **18.7% of CORRECT ones**. The matcher reads
+`1/3 = 5` out of `1/2 + 1/3 = 5/6`, so on MATH it false-positives constantly. True signal: **+1.4pp**.
+This also deflates the "~35% of gold-reaching traces pass through wrong arithmetic" figure that
+`rft_generate`'s step-verify was built on, and it corroborates §38's arithmetic 144/144.
+
+**The failure starts at the FIRST step.** Comparing each wrong trace's equation sequence against the
+most explicit correct trace for the same problem (10,896 pairs, 6,260 problems): **79.0% already
+differ at equation index 0**, median shared-equation prefix **0%**. Honest caveat: these are T=0.9
+samples and the test needs exact equation-string equality, so "differs" conflates "different plan"
+with "same plan, no explicit equation" (69.8% of wrong traces state no equation at all). Direction
+safe, magnitude not.
+
+**Per problem (K=8, 11,738 train problems):** 44.1% never solved once; only 2.1% solved 8/8; 53.8%
+solvable-but-unreliable. **Gold is the plurality answer in only 65.2% of those** — the hard cap on
+self-consistency, and why sc@8 recovers just 7.5 of the 25.5-point pass@8 gap. The other 34.8% need a
+verifier, not a vote. It is also why RFT/STaR saturated after one round: only 23.3% of rollouts are
+correct, so a likelihood objective has nothing to say about the other 77%.
+
+⚠️**A scale argument worth reusing.** The 2026 failure-dynamics result (arXiv 2604.14528) reports
+>85% of failure onsets in the first 30% of a trajectory, exactly one invalid segment in 43.5% of
+wrong traces, a local entropy spike at onset, >20% of failures recoverable from the same prefix, and
++8.5pt Pass@1 from entropy-triggered branching on R1-Distill-Qwen-7B. It was validated on ~6,700-token
+trajectories. **a4's traces are ~230 tokens with 1.1 equations — the whole trace IS the first 30%**,
+so there are no "late" transitions to rescue, and §41b's own divergence measurement says the same
+thing more directly. `entropy_branch.py` was built anyway (with a compute-matched control and the
+per-candidate-set oracle, because "3 branches beat 1 greedy pass" is a statement about compute) but
+DEPRIORITISED to the free-selector question it also answers: does self-confidence beat plurality
+voting on this model? Do not assume a long-CoT inference-time method transfers to a short-CoT model.
+
+### §41c — ON-POLICY DISTILLATION: the one mechanism class never tried here
+
+Every one of the twelve arms is a likelihood objective over a set of sequences someone else picked.
+Per-token reverse KL evaluated at the states the student itself visits is a different object, and it
+answers both structural problems §41b found:
+
+* **The discarded 77% becomes the signal.** The teacher grades every token of a wrong trace, so
+  "you can only imitate successes you already produce" — `gen_teacher.py`'s own stated ceiling —
+  stops binding.
+* **No distribution shift.** The trajectories are the student's, which is precisely what §41a's
+  Llama null says off-policy imitation gets wrong.
+* **Mode-seeking is the right direction.** Reverse KL asks the student to put mass where the teacher
+  has mass, not to cover every mode a 4B teacher has. A diffuse argmax (greedy 43 under pass@8 69) is
+  this model's defect; forward KL and more imitation spread mass, which is what the twelve arms did.
+
+**It is possible here only because argonne4 kept the Qwen3 tokenizer.** Verified before writing a
+line of trainer, not assumed: `think_combo` and `Qwen3-4B-Thinking-2507` share the 151,643-entry
+vocab, the merge list, all 26 added tokens, the `<think>`/`</think>`/`<|im_end|>` ids, and a real
+329-token trace tokenises to the identical id sequence under both. `opd_train.py` re-checks it at
+startup and refuses to run otherwise — a single id mismatch would compare distributions for
+different tokens and produce a silently meaningless run. The teacher is only ever run FORWARD, so
+**vLLM arch support is irrelevant to a teacher** — a model vLLM 0.11.2 cannot serve is still usable.
+
+Two engineering points worth carrying forward:
+* **Batch by PADDED TOKEN COUNT, not row count.** The KD term materialises several
+  [tokens, 151669] fp32 tensors, so with a row-count batch the peak is a lottery over which long
+  traces land together. A token budget makes the peak a constant a probe can settle: measured
+  16384 OOMs (needed 9.14 GiB more), **8192 = 65.1 GiB of 79.1 = 86% HBM**, 7.6% padding waste.
+* **Instrument the known failure mode, don't hope.** Qwen3-4B-Thinking is a long-CoT model and every
+  arm on this line that lengthened traces lost. The trainer logs p(`</think>`) under BOTH models at
+  the positions where the student closed. Measured mild: teacher 0.72-0.88 against the student's
+  ~1.00, and the student converges to ~0.80 rather than collapsing. Reverse KL is conservative here
+  by construction — it only pulls where the teacher assigns near-zero mass.
+
+Training behaviour: revKL 0.85 → ~0.32 with argmax agreement 76% → 84.7%, i.e. the teacher picks a
+different next token at ~15% of the student's own tokens even after training. The curve FLATTENS
+by ~step 100 of 1,719 on unseen traces each step, which is the argument for §41e: a flat KL on
+held-out traces from the OLD policy does not mean nothing is left to learn, it means the student has
+absorbed what it can about the states the old policy visited.
+
+### §41d — GOLD-ANCHORED SELF-DISTILLATION: remove the teacher gap instead of widening it
+
+§41a says a stronger external teacher makes the model worse. The alternative is a teacher that is
+better informed rather than bigger: freeze a copy of the STUDENT, give the frozen copy the verified
+answer (plus a reference derivation when one of its own rollouts found one), and train the unhinted
+model to match the hinted model's next-token distribution on the unhinted model's own traces. Zero
+capacity gap, zero style gap, and the student's prompt is never touched.
+
+Why this base specifically: the consensus-self-distillation literature (arXiv 2607.13643) reports
+gains tracking "consensus accuracy meaningfully exceeds pass@1" and near-zero where the base is
+saturated. a4 is sc@8 50.94 vs greedy 43.44 with 2.1% of problems solved 8/8 — nothing is saturated.
+Using GOLD rather than consensus also removes that method's one measured failure mode (negative
+transfer where every sample agrees on a wrong answer). Measured on the built corpus: 6,565 problems
+get answer+derivation and **5,173 get the answer alone — those 5,173 are the never-solved problems
+no imitative arm could touch at all.** Divergence is JSD, following that literature, because teacher
+and student start from identical weights and differ only by context.
+
+⚠️**The honest caveat, recorded before the result:** the student is trained to behave as if it knew
+the answer and at inference it will not. That is the standing risk of any hindsight objective. What
+makes it worth running is that the states are the student's own, so the target is "what a model that
+knows the answer would say next GIVEN this partial reasoning" — steering, not an answer leak. Read
+`acc|ANSWERED`: if it finally moves off ~50% the mechanism worked; if greedy rises while it does not,
+be suspicious.
+
+### §41e — What is queued, and why in this order
+
+1. **Iterative on-policy distillation** (`a4_opd_iter.sh`) — re-sample from the improved policy each
+   round, which is the actual algorithm rather than the one-shot approximation. ~30 min generation +
+   ~35 min training per round.
+2. **Prefix-local preference optimisation** (`build_step_pairs.py` + `rlvr_dpo.py --no-append-eos`) —
+   §41a's +2.2pt sitting behind DPO length drift, and §41b's 79%-differ-at-the-first-equation, give
+   the same prescription: contrast the OPENING and nothing else. 5,897 pairs, VALUED rather than
+   outcome-labelled (openings grouped by their equation, each group scored by the fraction of its
+   K=8 rollouts that reached gold; chosen rate typically 1.00, rejected 0.00, mean gap 0.98).
+   Length-neutral **measured**: chosen 63.2 tokens vs rejected 62.2, delta +1.0, against the
+   whole-trace arm's +82. `--no-append-eos` is not optional — a prefix-local pair ending in
+   `<|im_end|>` teaches the policy to stop after one reasoning step.
+3. **The free-selector question** (`entropy_branch.py`'s control arm) — plurality voting caps at
+   65.2% of the recoverable headroom (§41b). Whether min-entropy or max-logprob selection beats
+   voting on this model decides whether a verifier needs training at all, and it costs one
+   inference job and no training.
+
+**New tools:** `reasoning/fail_taxonomy.py`, `reasoning/opd_train.py`, `reasoning/build_step_pairs.py`,
+`reasoning/entropy_branch.py`; `rlvr_dpo.py --no-append-eos`; `gen_teacher.py --pools` + the
+vLLM tokenizer shim without which no external teacher loads at all.
+
+### §41f — ARM 1'S RESULT: greedy 1.75. A long-CoT teacher destroyed termination, and the instrument built to catch that said it was fine
+
+Reverse-KL on-policy distillation from Qwen3-4B-Thinking-2507 into `think_combo`, 1,719 steps,
+33.2 min, job 53237295. Paired gate on asdiv+svamp n=1000:
+
+| | greedy | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 80.70 | 92.00 | 79.5% | 8.60 | 237.5 |
+| a4combo_a100 | 56.70 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 |
+| **a4opd_a100** | **1.75** | 7.15 | 7.15 | 96.2% | **96.95** | **509.5** |
+
+`t_len` 509.5 against a 512-token cap and 96.95% unclosed: **the model no longer terminates.** The
+remaining gate stages were cancelled — 40 GPU-minutes of self-consistency and pass@8 on a model that
+cannot finish a sentence buys nothing.
+
+⚠️**The 96.2% `acc|ANSWERED` is not a capability signal.** It is the 2-3% of items the model managed
+to finish, i.e. the easiest ones, and reading it as "the reasoning improved" would be exactly the kind
+of selected-subsample error §41b was written to prevent.
+
+**Why the instrument missed it, which is the transferable part.** The run was built with this precise
+failure mode in mind — §38j established that every arm on this line which lengthened traces lost — and
+it logged p(`</think>`) under both models every step. It read teacher 0.72-0.88 against the student's
+~1.00 for all 1,719 steps and never once looked alarming. The bug is in *where* it looked: **only at
+positions where the student's trace had already emitted `</think>`.** That is a biased sample of
+exactly the states in which a long-CoT teacher and a short-CoT student agree.
+
+Termination is not a property of the closing position; it is **the integral of a per-position closing
+hazard over ~200 tokens.** Qwen3-4B-Thinking can hold reasonable mass on `</think>` at a finished
+derivation while holding essentially none of it mid-derivation, and reverse KL — mode-seeking, which
+is what recommended it — then drives the student's per-position hazard toward zero, at which point it
+never reaches a closing state at all. A per-position hazard of 2% closes reliably inside 200 tokens; at
+0.01% it never closes. Both are consistent with a comfortable-looking conditional.
+
+**Rule worth carrying past this project: when you instrument a failure mode, check that the statistic
+is not conditioned on the failure being absent.**
+
+Two fixes, both now in the tree:
+* `opd_train.py` logs `haz s/t` — mean p(`</think>`)+p(eos) over EVERY completion position for both
+  models — and prints a loud WARNING when the teacher's hazard drops below 1/5 of the student's.
+* `reasoning/closure_smoke.py`: 200 greedy items, ~90 s, exit 3 above 45% unclosed (healthy arms here
+  sit at 7-12%, the worst gated arm at 22%). `a4_kd2.sh` gates only the arms that pass it. The cost of
+  not having this was one cancelled gate; the cost of having it is 90 seconds per arm.
+
+**⚠️CORRECTION to the first reading of this arm.** The remaining gate stages had in fact completed
+before the cancel landed, so the full five-pool picture exists — and it says the damage was not only to
+format. Force-closing the think block recovers a lot but nowhere near the baseline:
+
+| config | a4opd_a100 | a4combo_a100 |
+|---|---:|---:|
+| greedy | 0.82 | 43.44 |
+| +budget (s1 force-close at 256) | 28.73 | 43.96 |
+| +extend3 | 33.74 | 44.17 |
+
+Per pool the force-closed numbers are asdiv 47.90 (combo 64.40), svamp 37.90, mawps 35.80, gsmplus
+9.20, math500 12.85 — so even when closure is imposed from outside, the arm is ~10pt short pool-mean and
+catastrophically short on the two pools needing the longest derivations. I had written that it "failed
+on format before capability could be read"; that is too generous. **Both were damaged.** Two caveats
+keep this from being a clean capability measurement in the other direction: a 256-token think budget
+truncates a model that now wants 510, and a model trained never to stop puts mass on continuation
+phrases everywhere, so the content degradation may be a CONSEQUENCE of the termination collapse rather
+than independent of it.
+
+**What arm 1 establishes:** a teacher whose trace-length distribution is 20-30x the student's is
+disqualified for per-token KD however strong it is, and the collapse is not repairable at decode time.
+**What it still does not establish:** whether that teacher's per-token signal would help a4 reason if it
+were prevented from touching trace length in the first place. §41g and §41i ask that.
+
+### §41g — Three arms, one paired gate (job 53239042, `reasoning/a4_kd2.sh`)
+
+* **opd35** — identical mechanism, teacher swapped for the released **argonne-3.5-think**: same arch,
+  same tokenizer, trained on the same CoT mix so `t_len` is 248 against a4's 230 rather than 6,000+,
+  and 11.7pt stronger. If §41f was the length mismatch, this works; if per-token KD is simply harmful
+  here, it fails too. ⚠️An Argonne-arch teacher must go through manual construction —
+  `AutoModelForCausalLM` does not re-tie `lm_head` for this arch and would hand back a random-head
+  target distribution, silently. `opd_train.py` now detects `model_type == argonne2`.
+  ⚠️Off-policy distillation from this same teacher was already measured at +1.11, inside the ±0.87
+  seed noise. Same teacher, different channel — that is the experiment, not an oversight.
+* **gasd_full / gasd_ansonly** — §41d's gold-anchored self-distillation. A self-teacher cannot have a
+  length mismatch, which makes it structurally immune to §41f.
+
+**Artifacts:** `report/a4opd_gate_n1000.json` keeps arm 1's per-item `ok` arrays. The checkpoint
+itself (2.0 GB) was deleted after the four-question audit — no live writer, no symlinks into it, no
+script or result depends on it (the one stale reference, in `a4_entbranch.sh`, was repointed), and it
+reproduces in 33 minutes from `reasoning/a4_opd.sh`.
+
+### §41h — No surface feature of a trace predicts its correctness. If a free selector exists it lives in the PROBABILITIES
+
+Zero GPU, on the same 93,912-rollout dump. Over 11,738 problems with K=8, how well does each
+candidate-selection rule do? (Train pools, so absolute numbers are not comparable to the eval gate —
+the comparison between rows is the point.)
+
+| selector | acc | vs plurality |
+|---|---:|---:|
+| oracle (any of the 8 correct) | 55.93 | +18.73 |
+| **plurality vote** | **37.20** | — |
+| length-weighted vote | 34.42 | −2.79 |
+| plurality over the shortest half | 29.35 | −7.85 |
+| most explicit equations | 27.35 | −9.86 |
+| one rollout (the pass@1 analogue) | 26.54 | −10.67 |
+| longest answered trace | 24.16 | −13.04 |
+| shortest answered trace | 22.93 | −14.27 |
+| fewest hedge words ("wait", "however", …) | 22.92 | −14.29 |
+
+**Every text-derived heuristic is 10-14 points WORSE than simply voting**, and re-weighting the vote by
+length makes it worse too. Voting recovers 10.7 of the 29.4-point headroom (36%); a perfect selector
+would add 18.7 more.
+
+⚠️**And note the trap this kills.** §41b reports correct traces averaging 524 characters against
+wrong ones at 632 — which reads like "shorter is better" and would license a shortest-of-K selector.
+That correlation is entirely BETWEEN problems (easy problems get short correct traces) and vanishes
+WITHIN a problem: picking the shortest of 8 candidates for the same question is 14 points worse than
+voting, and picking the longest is *better* than picking the shortest. Same class of error as §41f's
+closure-hazard mistake — a statistic measured under the wrong conditioning.
+
+**Consequence:** the cheap selectors are dead, so a free selector must come from the model's own
+next-token distributions rather than from its text. That is exactly what `entropy_branch.py`'s control
+arm now measures (self-certainty = KL(uniform‖p) averaged over tokens, plus Borda and
+certainty-weighted vote over self-certainty ranks, at N=8, on identical items). If those also fail,
+the remaining route to the other 18.7 points is a TRAINED verifier, and the honest prior for that is
+poor — §22i measured a learned verifier failing on this line, and the 2026 process-verification result
+reports that meta-cognition "amplifies confusion without sufficient model capacity" at small scale.
+
+### §41i — The strong teacher, with termination surgically removed from the objective (`a4_kd3.sh`)
+
+Qwen3-4B-Thinking-2507 carries **4.5x more per-token signal** for a4-think than the released 3.5-think
+does: reverse KL 0.85 nats against 0.20 at step 1, and argmax disagreement on 23% of a4's own tokens
+against 12%. Under the shared Qwen3 tokenizer it is by far the most informative teacher available, and
+§41f threw all of it away. Two independent ways to keep it and drop only the part that broke:
+
+* **`opdq_notail` — surgical.** The `</think>` and eos COLUMNS are removed from the divergence and both
+  distributions renormalised over content tokens only. Verified numerically, not argued: the excluded
+  logits receive exactly zero gradient from the KD term, kept columns receive nonzero gradient, and the
+  loss differs from the full-vocab value so the mask is live.
+  ⚠️It must be the COLUMNS, not the positions whose target is a terminator. The damage came from the
+  ~200 positions per trace whose target is ordinary text and where the teacher still assigns near-zero
+  closing mass; masking terminator-target positions would have fixed nothing at all.
+* **`opdq_anchor` — standard.** Full-vocab reverse KL plus `--ce-weight 0.5` on gold-verified rows, so a
+  likelihood term pins the model's own verified format while KD injects capability.
+
+Reading the two together is the point: if only the surgical arm works the protection has to be
+structural; if both work the effect is robust; **if neither works, per-token KD from a much stronger
+teacher does not help this model** — which, given §41f's corrected reading (content damaged too), is
+now the outcome to expect rather than the surprise.
+
+**New tool:** `reasoning/arms_table.py` — every arm ever gated, ranked, all decode configs plus the
+diagnosis columns, largest-n record per (pool, model), arms missing a pool excluded from the ranking
+rather than averaged over fewer pools. `gate_report.py` answers "how does this arm compare to its
+baseline inside this gate call", which is the right question inside one experiment and the wrong one
+after twenty; hand-answering the cross-arm question is how the standing note came to say the
+stronger-teacher lever was untested after it had been run and refuted.
+
+### §41j — WHERE THE POINTS ACTUALLY ARE: selection is worth +25.5, capability +1.2
+
+Everything measured on this base, arranged as a reachability ladder. Five-pool means, largest-n record
+per (pool, model), from the gate JSONs:
+
+| | greedy-equivalent | Δ vs best a4 today |
+|---|---:|---:|
+| best a4 today, single pass (`a4combo_a100`) | 43.44 | — |
+| + hold the best `acc\|ANSWERED` any a4 arm ever reached (52.6%, RLVR) at combo's answered rate | 44.68 | **+1.24** |
+| + plurality vote over 8 samples (measured `sc@8`) | 50.94 | +7.50 |
+| + a PERFECT selector over the same 8 samples (`pass@8`) | 68.94 | **+25.50** |
+| released 3.5-think, single pass | 55.10 | +11.66 |
+| released 3.5-think, vote over 8 | 61.58 | +18.14 |
+| released 3.5-think, perfect selector over 8 | 75.12 | +31.68 |
+
+Three consequences, and they reorder the whole queue:
+
+**1. `a4`'s pass@8 (68.94) ALREADY EXCEEDS 3.5-think's single pass (55.10), by +13.84.** The knowledge
+needed to beat the released model is in a4's distribution today. It is not being selected.
+
+**2. A selector recovering 23% of a4's remaining vote→oracle gap matches 3.5-think's greedy; 59%
+matches 3.5-think's own vote@8.** Those are the two thresholds worth quoting.
+
+**3. Beating 3.5-think single-pass-to-single-pass needs `acc|ANSWERED` = 64.8%** at a4's current
+answered rate. It has 50.1%; its best across thirteen arms is 52.6%; 3.5-think has 70.1%. That is
+~13 points of capability on a base measured at −16.79pt against 3.5's (§40). **Post-training will not
+get there**, and the +1.24 row is the honest size of the whole remaining capability lever.
+
+⚠️Also note a4's answered rate is 85.0% against 3.5-think's 77.0% — a4 answers MORE often and is right
+less often when it does. Its higher answered rate is not an advantage to protect; `acc|ANSWERED` is
+the only capability number that matters here.
+
+**So the queue is reordered by expected points, not by novelty:**
+1. `a4_entbranch.sh` — the FREE end of the selection lever: self-certainty, Borda over self-certainty
+   ranks, certainty-weighted vote, and zero-shot p(Yes) self-verification, at N=8, on identical items.
+   No training, no second model. §41h already killed the text-feature end of this.
+2. `a4_extverify.sh` — the CEILING: the §24/§25 harness unmodified, with `--policy` pointed at a4 and
+   Qwen3-4B as the external judge. That configuration reached roughly pass@32 on the 3.0 line
+   (+35/+25pt). ⚠️A two-model serving result, and the owner has already judged that class as not a
+   single-card ship — it is run to bound every cheaper selector and to say whether a trained
+   single-model verifier is worth building. ⚠️And its `solver` lens is an upper reference, not a
+   capture: a high solver-bon can just mean the 4B model solved the problem itself, which is why the
+   harness prints `solver_solo`/`solver_cov`.
+3. The capability arms (`a4_kd3.sh`, `a4_steppref.sh`) — worth at most the +1.24 row, and after §41f's
+   correction the prior on strong-teacher KD got worse, not better.
+
+### §41k — Ideas considered and deliberately NOT run, with the reason
+
+Recorded so they are not re-derived from scratch, and so the ranking is auditable against §41j's
+ladder (capability lever ≤ +1.24, selection lever up to +25.50).
+
+* **Plan-first / "Given: … Find: …" structured opening.** The one place off-policy data is the RIGHT
+  tool: §40 and the Llama arm together show off-policy imitation transfers FORMAT reliably (same
+  length, same termination, same format) and CAPABILITY not at all. So a format change that is itself
+  worth accuracy should be learnable from off-policy data. And the mechanism fits §41b — a model that
+  misreads the problem and derives the wrong thing from equation 0 might benefit from being made to
+  restate the quantities first. It could even be built with zero generation cost by extracting the
+  numeric quantities and the question sentence mechanically. **Not run** because §38j says every arm
+  that lengthened traces lost and a header costs 30-50 tokens, and because §41j caps the whole
+  capability lever at +1.24 while two capability arms are already queued.
+* **Inverting RFT's difficulty weighting** (it keeps 3 traces from hard problems and 1 from easy, on
+  the standard "a problem solved 15/16 teaches nothing" argument, which may be wrong for a model this
+  weak). **Measured and dropped, cheaply:** hard problems are only 15.3% of the kept fuel and their
+  traces are 184 median think-tokens against 116-168 for the rest — far too small a share to move the
+  model's trace length, and combo's `t_len` (229.8) is in fact SHORTER than the baseline's (278.3).
+  The hypothesis is refuted by the data without an experiment.
+* **A trained single-model verifier (V-STaR / GenRM).** The data exists — 93,912 rollouts with gold
+  labels, both positives and negatives, which is exactly V-STaR's input. Held behind the two selector
+  jobs on purpose: if a FREE selector (`a4_entbranch.sh`) captures the gap, no verifier is needed; if
+  the external ceiling (`a4_extverify.sh`) turns out low, a trained verifier cannot beat it either. Run
+  it only when those two say a verifier is both necessary and sufficient. ⚠️And the prior is poor at
+  this scale — §22i measured a learned verifier failing on this line, and the 2026 process-verification
+  result reports meta-cognition "amplifying confusion without sufficient model capacity".
+* **A zone-of-proximal-development curriculum for the hinted arms.** Implemented but off by default
+  (`opd_train.py --solve-band 1 7`): 44.1% of problems are never solved in 8 samples and 67% of the
+  math_train_hard ones are, so a teacher holding the answer produces a target the student has no route
+  to. The band keeps 18,952 rows from 6,319 problems — exactly the "solvable-but-unreliable" count
+  §41b reports independently. Left off for the first arms so the unfiltered result exists to compare
+  against; it is the obvious follow-up if the hinted arms underperform.
+* **Self-consistency at K=32** rather than 8. Not a separate job: `a4_extverify.sh`'s generate phase
+  samples K=32 and prints self-consistency and pass@K for free, so the K=8→32 voting curve arrives
+  with the reranking result.
+
+### §41l — The selector does not have to be a good verifier: 78.2% of the vote's losses are NEAR-TIES
+
+The obstacle to §41j's +25.50 looked like "we need a verifier good enough to overrule a majority". It
+is not. Over the 6,565 train problems where gold appears among the answered candidates:
+
+| | count | share |
+|---|---:|---:|
+| the vote already picks gold | 4,367 | 66.5% |
+| **the vote picks a WRONG mode** | **2,198** | **33.5%** ← the selector's whole target |
+
+and among those 2,198 losses, how far behind gold is:
+
+| margin (top votes − gold votes) | count | share | cumulative |
+|---|---:|---:|---:|
+| **0 (an EXACT tie)** | 849 | **38.6%** | 38.6% |
+| 1 | 870 | 39.6% | **78.2%** |
+| 2 | 298 | 13.6% | 91.8% |
+| 3 | 113 | 5.1% | 96.9% |
+| ≥4 | 68 | 3.1% | 100.0% |
+
+**78.2% of the losses are decided by one vote or fewer, and 38.6% are exact ties** — currently broken
+by `Counter.most_common` insertion order, i.e. arbitrarily. Gold carries just 1 of 8 votes in 70.6% of
+the losses, but so does the wrong answer beating it: a4's answer distribution over 8 samples is
+**fragmented**, many distinct answers with 1-2 votes each, which is precisely the regime where
+plurality is near-arbitrary and where the self-certainty line reports Borda helping most.
+
+**Consequence: a selector needs to be slightly better than a coin flip on near-ties, not a good
+verifier.** Rough arithmetic on the recoverable pool: perfect near-tie breaking takes the vote's hit
+rate 66.5% → 92.7%; a selector merely 60% accurate on near-ties (against ~50% now) is worth ~+1.8pt of
+five-pool greedy-equivalent, and 75% is worth ~+4.5pt. That is more than the entire remaining
+capability lever (+1.24) for zero training.
+
+So `entropy_branch.py` gains **vote-then-tie-break**: take the plurality, but among answers within a
+vote-slack of the top, choose the one whose most-certain candidate has the highest self-certainty. It
+never lets confidence override a clear plurality, which makes it strictly lower-variance than
+`ent`/`borda`/`wvote` — those can lose points a fragile confidence signal would otherwise have kept.
+It ships as two selectors because they make different claims:
+
+* **`vtb0`** touches ONLY exact ties — and here is the specific finding about the EXISTING code:
+  `effort_gate.py:183` resolves the vote with `votes.most_common(1)[0][0]`, and Python's
+  `Counter.most_common` breaks ties by **insertion order**. So every self-consistency number ever
+  reported on this line, for every model including the released 3.5-think, resolves ~38.6% of its vote
+  losses by which candidate vLLM happened to sample first. Replacing an arbitrary choice with an
+  informed one cannot lose anything a principled voter was entitled to, so if `vtb0` works it is an
+  unconditional improvement to the deployed decode recipe — and it also means the reported `sc@8`
+  carries a variance term nobody has been accounting for.
+  Rough size: sc@8 50.94 against pass@8 68.94 leaves 18.00 points in vote losses; if 38.6% of those
+  are exact ties, ~6.9 points are currently decided by sampling order.
+* **`vtb1`** also overrules a one-vote plurality — where most of the headroom is (another 39.6% of
+  losses) but it can now lose items the vote had right, so it must earn its keep against `vtb0`.
+
+Both were unit-tested on synthetic candidate sets before the GPU run: an exact 2-2 tie moves to the
+lower-entropy group, a clear 3-1 plurality is untouched by both, and a 2-1 margin moves under `vtb1`
+and not under `vtb0`. `vtb1_vfy` is the same rule with zero-shot p(Yes) as the tie-break.
+
+⚠️These margins are measured on the TRAIN pools (K=8, T=0.9). The eval pools are easier — the vote's
+hit rate on the recoverable pool there is 50.94/68.94 = 73.9% against 66.5% here — so the loss count is
+smaller, and whether the margin distribution is equally tie-heavy is an assumption until
+`a4_entbranch.sh` reports it on the gate pools.
+
+### §41m — Two early reads from §41g's arms, both worth keeping whatever the gate says
+
+**1. `opd35` PASSED the closure check and still showed the losing signature.** The length-matched
+teacher (released 3.5-think: same arch, same tokenizer, same CoT mix, `t_len` 248 vs a4's 230) trained
+cleanly — revKL 0.198 → 0.148, argmax agreement 88.4% → 89.8%, and the new marginal-hazard diagnostic
+read student 0.0065 against teacher 0.0065, matched to four decimals, all 2,241 steps. Then
+`closure_smoke.py` on 200 asdiv items: **unclosed 14.5% against combo's 6.9%, mean decoded 280 tokens
+against 212.** Inside the 45% failure bar, so it goes to the gate — and exactly the drift §38j says
+loses.
+
+⚠️**Matching the AVERAGE hazard does not mean matching it pointwise.** A teacher can hold less closing
+mass early and more late; reverse KL then redistributes the student's closure later without changing
+the mean. The training-time statistic cannot see that and a 90-second generation can, which is the
+second time in one session that the cheap end-to-end check beat the clever in-training one.
+`closure_smoke.py` now also warns on token-count drift (`--warn-decoded`, 300 in the kd launchers).
+
+**2. Telling a4 the answer barely changes its own distribution.** `gasd_full`'s first step: **JSD
+0.0113 with 95.0% argmax agreement and `gnorm` 0.14**, against `opd35`'s 1.5 and the Qwen arm's
+0.85-nat reverse KL. Two readings, and they have opposite implications:
+
+* *Optimistic:* the 5% is the PURE effect of the privileged information, concentrated at exactly the
+  tokens where knowing the answer matters. Most tokens in a 200-token trace are near-deterministic
+  given the prefix, so a small average is what a well-targeted signal looks like. An external teacher's
+  23% disagreement is mostly style.
+* *Pessimistic (and WRONG — corrected below):* a gradient ~10x smaller moves the weights ~10x less, so
+  a null would only say the step size was too small.
+
+⚠️**The pessimistic reading is wrong, and the reason matters for reading every KD arm here: AdamW is
+scale-invariant in the loss.** Its update is `lr · m̂/(√v̂+ε)`, so multiplying the loss by 20 leaves the
+update unchanged; the step size is set by `lr`, not by the gradient magnitude. The only way a small
+gradient would shrink the update is if `ε` dominated `√v̂`, and it does not come close here — `gnorm`
+0.14 over 1.04B parameters puts per-parameter gradients around 1e-5 and `√v̂` around 1e-5 against
+`eps=1e-8`, three orders clear. So `gasd_full` at `lr 1e-5` is a FAIR test of the method, a null is a
+null about the method, and raising the LR is not the automatic follow-up I was about to write down.
+
+What the small divergence does mean is that the signal is SPARSE — concentrated on ~5% of tokens — so
+the update direction is determined by few positions per sequence. That is a variance argument (more
+data or more epochs), not a step-size one. The thing to watch in the curve is whether JSD falls toward
+zero, i.e. whether the student absorbs the hint-conditioned distribution at all.
+
+### §41n — GOLD-ANCHORED SELF-DISTILLATION IS REFUTED, and the mechanism generalises to any hindsight objective
+
+`gasd_full`'s closure smoke test, 200 asdiv items, greedy: **32.00% correct, 30.00% unclosed, mean
+decoded 292 tokens.** The baseline on the same pool is 64.30% correct, 6.9% unclosed, 212 tokens. It
+passed the 45% failure bar so it goes to the gate, but a ~32-point regression is not a subtlety.
+
+**The mechanism, and it is the interesting part.** The objective looked almost inert: JSD 0.0113 at
+step 1 with 95.0% argmax agreement, and 2,811 steps reduced it only to **0.0098** — a 13% reduction
+after a full epoch. Put that together with §41m's correction (AdamW is scale-invariant in the loss, so
+every one of those 2,811 steps was full-size regardless of how small the gradient was) and the picture
+is complete:
+
+> **A hindsight teacher conditions on information the student's input does not contain, so most of the
+> divergence is IRREDUCIBLE. Optimising an irreducible divergence with a scale-invariant optimiser is
+> not slow learning — it is 2,811 full-size steps of drift in a direction that cannot reduce the loss.**
+
+The 13%-reduction curve is the signature: if the target had been attainable the loss would have fallen.
+Instead the weights moved, the loss did not, and what moved is trace shape (unclosed 6.9% → 30.0%) and
+accuracy (−32pt). This is the risk the launcher header recorded before the run — "the student is being
+trained to behave as if it knew the answer, and at inference it will not" — realised in full.
+
+**Scope of the refutation.** It applies to the family, not just this arm: STaR-style rationalisation,
+HDPO's reference hints, and consensus-anchored self-distillation all condition the teacher on
+privileged information. Whether they work depends entirely on how much of that information the student
+can RECOVER from its own input, and nothing in those methods measures that. On a 1.04B base with
+230-token traces the recoverable fraction appears to be small.
+
+⚠️**But there is a second explanation that must be ruled out before the refutation is clean**, and it is
+cheaper to test than to argue: **the model may not be able to exploit in-context information at all.**
+
+⚠️⚠️**SUPERSEDED — READ §41af.** That test was run and the answer is neither option offered here. The model
+DOES read the hint and is DAMAGED by it in both directions: told the correct answer it scores 5 points BELOW
+the plain prompt. So the "better-informed teacher" was a WORSE teacher, and this section's
+irreducible-divergence account is not so much wrong as beside the point — GASD was distilling the student
+toward a degraded version of itself.
+The teacher's argmax changed on only 5% of tokens when it was handed the answer *and* a correct
+derivation. If a4 simply does not read its context, the hindsight objective never had a signal to give,
+the refutation is about the model rather than the method, and the same deficit caps every hint-,
+retrieval- and few-shot-based approach on this base — a far more fundamental finding than any reasoning
+gap. That has never been tested on this line.
+
+**`reasoning/hint_probe.py`** (new, ~2 min, folded into `a4_entbranch.sh`) tests it directly: the same
+items under the plain prompt, the prompt plus the correct answer, and the prompt plus a DELIBERATELY
+WRONG answer. The wrong-answer control is what makes it a measurement —
+* `answer ≫ plain` and `wrong ≈ plain` → it reasons WITH the hint;
+* `answer ≫ plain` and `wrong ≪ plain` → it COPIES the hint (in-context use, but not reasoning);
+* neither moves → it ignores its context, and that is the fundamental finding.
+
+**`gasd_ansonly` was the informative contrast, and it REFUTED my prediction.** I wrote above that a
+teacher given strictly less privileged information should be less damaging. It is not — it is damaged
+*equally*, through a different channel:
+
+| arm | teacher's hint | JSD@1 | JSD@end | reduced | agree | asdiv greedy | unclosed | no_answer | decoded |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (combo) | — | — | — | — | — | **64.30** | 6.9% | 0.3% | 212 |
+| `gasd_full` | answer + derivation | 0.0113 | 0.0098 | **13%** | 95.0→95.6% | **32.00** | 30.0% | 1.5% | 292 |
+| `gasd_ansonly` | answer only | 0.0046 | 0.0017 | **63%** | 97.1→98.3% | **32.00** | 26.0% | **19.0%** | 317 |
+
+The dose-response IS there on the two axes I predicted — less information gives a smaller divergence
+(0.0046 vs 0.0113) and a far more LEARNABLE one (63% reduced vs 13%) — and it does not translate into
+less damage at all. Both land on exactly 32.00.
+
+**So "optimising an irreducible divergence produces drift" is not the whole account. The sharper one is
+calibration destruction, and the symptom split shows it.** A hinted teacher is confident about things
+the student cannot infer from its own input, and matching that confidence is what does the damage. WHERE
+the teacher's unattainable confidence is concentrated decides the failure mode:
+
+* `ansonly` — the hint's entire advantage sits at the ANSWER-EMISSION position. Train the student to
+  match a distribution that is sharp on digits it cannot predict and it learns to commit to no digit:
+  **no_answer 0.3% → 19.0%**, closing the think block and then failing to produce a `\boxed{}`.
+* `full` — the reference derivation makes the teacher confident throughout the trace BODY too, so the
+  damage spreads into the reasoning: **unclosed 6.9% → 30.0%**.
+
+That account is falsifiable and it names its own fix: mask the KD loss over the answer span (the
+positions where the hint's advantage is maximal and unattainable) and keep it only on the reasoning
+body — the same shape as `--exclude-terminators`, which was built for the same class of problem. Anyone
+revisiting hindsight distillation on a small base should try that before concluding the family is dead;
+what is refuted here is the family AS RUN, with the loss applied everywhere.
+
+### §41o — Self-consistency ACTIVELY DESTROYS 4.0pt of items that a single greedy pass already had
+
+From the gate JSONs' per-item `ok` arrays, over all five pools (3,319 items), for `a4combo_a100`:
+
+| | count | |
+|---|---:|---|
+| recoverable (pass@8 = 1) | 2,490 | 75.0% of items |
+| the vote wins on those | 1,903 | 76.4% of recoverable |
+| the vote LOSES on those | 587 | 23.6% of recoverable |
+| **…of which greedy ALREADY had it right** | **133** | **22.7% of the vote's losses = 4.0pt** |
+| net exchange | vote gains 480, loses 184 | **net +296 = +8.92pt** |
+
+Self-consistency is a large net win (+8.92pt) that is paying for itself by **throwing away 184 items
+greedy had right, 133 of them recoverable**. The released 3.5-think shows the same pattern — 128 of its
+413 vote losses (31.0%) were greedy hits — so this is a property of majority voting on these models,
+not something peculiar to a4. A `greedy ∪ vote` oracle would be +5.5pt over the vote.
+
+That makes the cheapest possible informed tie-break worth testing, and it needs nothing computed:
+**`gtb0`/`gtb1` — take the plurality, but among answers within the vote-slack, prefer the answer the
+GREEDY pass gave.** No logprobs, no entropy, no extra generation, one line in a decode wrapper.
+
+All five selectors were unit-tested against four hand-built candidate sets before any GPU time, and the
+table below is the honest discrimination — including the case where the cheap rule loses:
+
+| case | vote | vtb0 | vtb1 | gtb0 | gtb1 |
+|---|---|---|---|---|---|
+| 2-2 tie, greedy right | ok (by luck) | ok | ok | ok | ok |
+| **2-2 tie, greedy WRONG** | bad | **ok** | **ok** | **bad** | **bad** |
+| 2-1 plurality wrong, greedy right | bad | bad | **ok** | bad | **ok** |
+| 3-1 plurality right, greedy wrong | ok | ok | ok | ok | ok |
+
+So `gtb` is free but blindly trusts greedy and loses exactly where greedy is wrong on a tie; `vtb` pays
+for logprobs and handles that case. Neither ever overrides a clear plurality. Which one wins is an
+empirical question about how often greedy is right on a near-tie, which is what `a4_entbranch.sh`
+measures — nine selectors on identical candidate sets with per-item `ok` arrays, plus the eval-pool
+margin distribution that §41l could only measure on the train pools.
+
+### §41p — ⭐PER-TOKEN ON-POLICY KD MOVES `acc|ANSWERED` FOR THE FIRST TIME: +7.6pp
+
+Five-model paired gate, asdiv + svamp at n=1000, identical items, one call:
+
+| model | greedy | sc@8 | pass@8 | **acc\|ANS** | uncl% | t_len | Δgreedy | McNemar p |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 80.70 | 92.00 | 79.5% | 8.60 | 237.5 | +14.15 | — |
+| **a4opd35_a100** | **58.40** | 68.95 | 83.95 | **68.8%** | 14.35 | 265.6 | **+1.70** | asdiv 0.11 / svamp 1.3e-4 |
+| a4combo_a100 | 56.70 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 | — | — |
+| a4gasd_ansonly_a100 | 35.10 | 49.85 | 73.55 | 52.0% | 21.45 | 219.5 | −21.60 | 1.6e-56 / 1.3e-14 |
+| a4gasd_full_a100 | 34.80 | 38.15 | 71.90 | 50.7% | 30.30 | 280.7 | −21.90 | 2.1e-49 / 6.5e-15 |
+
+**`acc|ANSWERED` rose 61.2% → 68.8%, +7.6pp, and the sign is consistent on both pools** (asdiv 69.3 →
+74.4, svamp 53.0 → 63.2). That is the number thirteen previous arms left frozen — the best any of them
+reached was +2.5pp (RLVR-DPO), and this closes **41% of the remaining gap to 3.5-think's 79.5%**.
+
+**Why greedy only moved +1.70.** `greedy = acc|ANSWERED × answered-rate`, and the answered rate fell
+92.7% → 85.1% as unclosed doubled (7.15% → 14.35%) and `t_len` went 200 → 266. The capability gain is
+real and is being spent on the termination regression. The arithmetic:
+
+> **68.8% `acc|ANSWERED` at combo's 92.7% answered rate is greedy 63.8 — +7.1 over the baseline**, more
+> than the entire thirteen-arm campaign produced (39.21 → 43.44 = +4.2 five-pool).
+
+⚠️**Honest caveats, stated before the follow-up:** the pool-mean greedy gain of +1.70 is ~2σ against the
+measured ±0.87 seed noise and the two pools DISAGREE IN SIGN on greedy (asdiv −2.50 at p=0.11, svamp
++5.90 at p=1.3e-4); with ~17 arms on this base the Bonferroni threshold is p<0.003, which svamp clears
+and the pool-mean has no p for. What is robust is `acc|ANSWERED`: +5.1pp and +10.2pp, same sign, far
+outside noise, and mechanistically coherent with the trace-shape numbers. **Read this as "the mechanism
+works and the shape regression is eating it", not as "+1.70 greedy".** A seed replicate is required
+before any of it is quoted as a headline.
+
+**And it retro-explains §41f.** The Qwen3-4B arm produced greedy 1.75 because reverse KL from a long-CoT
+teacher destroyed termination — but the same objective from a length-matched teacher moves capability.
+The channel was never the problem; the teacher's trace-length distribution was. That is now measured
+twice from opposite directions.
+
+**The follow-up is already built and numerically verified.** `--exclude-terminators` drops the
+`</think>` and eos columns from the divergence so the teacher cannot touch trace length (the excluded
+logits receive exactly zero gradient, checked), and `--ce-weight` anchors format with a likelihood term
+on gold-verified rows. `a4_kd3.sh` runs both, and its teacher is now pointed at **3.5-think** rather than
+Qwen3-4B, because 3.5-think is the teacher that actually produced the +7.6pp.
+
+**GASD is refuted with two independent p-values under 1e-14 per pool**, at −21.6/−21.9 pool-mean, and
+the failure channels are exactly as §41n's calibration-destruction account predicts: `ansonly` pushes
+no_answer to 162/1000 on asdiv (the hint's advantage is all at the answer position), `full` pushes
+unclosed to 316/1000 (the reference derivation makes the teacher confident throughout the body).
+
+### §41q — AND THE GAIN IS RECOVERABLE AT DECODE TIME: +5.70 over the baseline's best config
+
+§41p left the capability gain (+7.6pp `acc|ANSWERED`) being spent on a termination regression, with the
+two pools disagreeing in sign on plain greedy. The gate already measured the fix, because `budget` and
+`extend` are s1-style force-closes and a lost answered-rate is exactly what they repair:
+
+| model | greedy | +budget | +extend1 | +extend2 | +extend3 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 | 70.85 | 73.55 | 73.40 | 73.80 | **74.15** | 80.70 | 92.00 |
+| **a4opd35_a100** | 58.40 | 62.65 | 63.00 | **63.35** | 63.00 | 68.95 | 83.95 |
+| a4combo_a100 | 56.70 | 57.60 | 57.50 | **57.65** | 57.65 | 68.05 | 85.45 |
+
+**Best-decode against best-decode: 63.35 vs 57.65 = +5.70.** And the per-pool paired tests show the
+§41p sign disagreement was *entirely* the termination regression:
+
+| config | asdiv Δ | p | svamp Δ | p | pool-mean |
+|---|---:|---|---:|---|---:|
+| greedy | **−2.50** | 1.1e-01 | +5.90 | 1.3e-04 | +1.70 |
+| +budget | **+3.10** | 3.7e-02 | +7.00 | 5.1e-06 | **+5.05** |
+| +extend2 | **+2.90** | 5.0e-02 | **+8.50** | 2.6e-08 | **+5.70** |
+
+asdiv flips from −2.50 to +2.90 the moment closure is imposed from outside. Both pools positive, same
+sign, and svamp clears the Bonferroni threshold for ~17 arms (p<0.003) by five orders of magnitude.
+
+Note also **which model force-closing helps most**: combo +0.95, 3.5-think +3.30, opd35 **+4.95**. It
+helps in exact proportion to the unclosed rate it repairs, which is the mechanism confirming itself.
+
+**This is the largest gain of the campaign.** For context, thirteen arms moved the five-pool deployable
+number 39.21 → 44.17 (+4.96) in total; this one arm is +5.70 on two pools over the best of them, and it
+arrives with the mechanism understood end to end: a length-matched teacher raises `acc|ANSWERED` by
+7.6pp, the raised capability costs termination, and force-closing at decode buys the capability back.
+
+⚠️**What still has to hold before this is quoted as a result:** it is ONE SEED (the `s47` replicate is
+arm 3 of `a4_kd3.sh`), it is TWO of the five pools (gsmplus/mawps/math500 are running), and asdiv's
+force-closed p is 0.037-0.050 — real but not Bonferroni-clean on its own. The robust legs are svamp's
+2.6e-08 and the fact that `acc|ANSWERED` moved with the same sign on both pools.
+
+⚠️And the honest framing of the fix: force-closing is a decode wrapper `clean_eval.py` already ships,
+so the +5.70 needs no retraining — but a model that needs force-closing to reach it is worse than one
+that closes on its own, which is what `a4_kd3.sh`'s `notail` and `anchor` arms are for. ⚠️One reason to
+expect `notail` to only partly work: 3.5-think genuinely writes longer traces (t_len 248 vs a4's 200),
+and length is encoded in "what to say next" as much as in "when to stop", so masking the terminator
+COLUMNS removes the direct pressure and not the body pressure. `anchor`'s CE term on a4's own shorter
+verified traces is the arm that attacks body length.
+
+### §41r — THE RESULT, pooled over 3,000 items: the FLOOR rose and the CEILING did not
+
+One paired McNemar over every item of the four CLEAN pools (asdiv/svamp n=1000, gsmplus/mawps n=500;
+math500 excluded as near-duplicate-contaminated for every model on this line):
+
+| config | a4opd35 | a4combo | Δ | opd35-only | combo-only | p |
+|---|---:|---:|---:|---:|---:|---:|
+| greedy | 53.10 | 50.87 | +2.23 | 356 | 289 | 9.30e-03 |
+| +budget | 56.30 | 51.50 | +4.80 | 384 | 240 | 8.96e-09 |
+| +extend1 | 56.50 | 51.37 | +5.13 | 383 | 229 | 5.08e-10 |
+| **+extend2** | **56.77** | 51.57 | **+5.20** | 389 | 233 | **4.18e-10** |
+| +extend3 | 56.47 | 51.63 | +4.83 | 390 | 245 | 9.54e-09 |
+| self-cons@8 | 62.60 | 60.43 | +2.17 | 258 | 193 | 2.54e-03 |
+| **pass@8** | 76.90 | 77.83 | **−0.93** | 174 | 202 | 1.64e-01 (n.s.) |
+
+**+5.20 at `extend2`, p = 4.2e-10** — seven orders inside the Bonferroni threshold for ~17 arms
+(p<0.003). Pool-mean form, which is how this campaign has always reported: four-pool best-decode
+**48.63 → 53.48 (+4.85)**, `acc|ANSWERED` **53.5% → 62.3% (+8.8pp)**, and the acc|ANS gain is positive on
+every single pool (+5.1 asdiv, +10.2 svamp, +10.0 gsmplus, +10.1 mawps).
+
+**And the last row is the whole story:**
+
+| | floor (greedy) | ceiling (pass@8) | gap |
+|---|---:|---:|---:|
+| a4combo_a100 | 50.87 | 77.83 | 26.97 |
+| **a4opd35_a100** | **53.10** | 76.90 | **23.80** |
+
+**The ceiling did not move (−0.93, not significant) and the floor rose.** That is the exact inversion of
+the previous thirteen arms, which took pass@8 62.4 → 68.9 while greedy sat still — §41j's diagnosis was
+that the model reaches answers it cannot select, and every imitative arm answered it by adding more
+reachable answers. Mode-seeking reverse KL on the student's own states is the first objective on this
+line to sharpen instead of spread, which is exactly what it is supposed to do and exactly what was
+needed.
+
+**Where this leaves the a4 line**, against 3.5-think on the same four pools (best decode 63.38, acc|ANS
+73.5%): the gap closes from 14.75 to **9.90**, and the `acc|ANSWERED` gap from 20.0pp to **11.2pp**.
+
+⚠️**Still one seed.** `s47` in `a4_kd3.sh` decides whether this is quoted or withdrawn; this line has
+produced two retractions from single-seed reads and the measured seed noise is ±0.87 pool-mean. What
+makes this different from those retractions is that the effect is 5-6x the noise, pooled p is 4e-10,
+`acc|ANSWERED` moves the same direction on all four pools independently, and the mechanism predicted the
+symptom before it was measured (a length-matched teacher raises capability; the capability costs
+termination; force-closing buys it back; force-closing helps in proportion to the unclosed rate — combo
++0.95, 3.5-think +3.30, opd35 +4.95).
+
+### §41s — The queue after §41r, ranked by what §41p-r actually changed
+
+The best arm on this base is now a per-token on-policy KD arm, not a data arm, so the queue reorders
+again. All of these are built and validated; the order is by expected points.
+
+1. **`a4_kd3.sh` — RUNNING (job 53243842).** `s47` (the seed replicate that decides quote-or-withdraw),
+   `notail` (terminator columns dropped from the divergence — confirmed live in the log: ids 151645 and
+   151668 removed, 151669 → 151667 columns, and revKL at step 1 is 0.1891 against the unmasked 0.1980,
+   so dropping 2 of 151,669 columns barely perturbs the objective while removing all closure pressure),
+   and `anchor` (CE 0.5 on a4's own verified traces — the arm that attacks BODY length, which
+   column-masking cannot).
+2. **`a4_opdsoup.sh` — NEW, and the cheapest thing on the list.** The two best checkpoints fail in
+   opposite directions: `think_opd35` has `acc|ANSWERED` 62.3% with 17.0% unclosed, `think_combo` has
+   53.5% with 9.5%. Everything opd35 gained came through `acc|ANSWERED` and everything it lost came
+   through the answered rate, so a weight-space average sits on the line between those failure modes and
+   the only question is whether the curve is convex enough for some alpha to beat both endpoints. A soup
+   is a CPU-side tensor average, ~2 min per point, and all three alphas gate in one paired call against
+   both endpoints.
+   ⚠️This is NOT the alpha question already settled. "alpha=1.00 wins, do not soup a4" is about averaging
+   a post-CoT checkpoint with its own pre-CoT ANCESTOR, which can only dilute. This averages two fully
+   post-trained SIBLINGS that diverge in one stage and fail complementarily. Different pair.
+3. **`a4_entbranch.sh`** — the free selectors. Still ~23.8pt of floor-to-ceiling headroom after §41r
+   (76.90 vs 53.10), and §41o found the vote actively discarding 4.0pt of items greedy already had.
+4. **`a4_opd_iter.sh`** — round 2, re-sampling from the improved policy, which is the actual algorithm.
+   Round 1's reverse KL fell only 0.198 → 0.148, so the teacher still disagrees with the student on ~11%
+   of the student's own tokens after a full epoch, and as the policy moves the states move.
+5. **`TEACHER=<Qwen3-4B-Thinking> ARMS=notail sbatch reasoning/a4_kd3.sh`** — conditional on (1). The
+   Qwen teacher carries **4.5x** the per-token signal of 3.5-think (revKL 0.85 vs 0.20, argmax
+   disagreement 23% vs 12%) and was disqualified only by its trace length. If column-masking is
+   sufficient protection, this is the highest-ceiling variant available.
+
+⚠️**Two launcher bugs found and fixed while queueing, both of the same kind — a stale hardcoded name
+after a checkpoint was deleted:**
+* `a4_entbranch.sh` auto-included every arm present on disk in its model list, which would have run the
+  selector study on three checkpoints already measured as regressions and multiplied the job fourfold.
+  A selector study holds the MODEL fixed; it now runs on `think_combo` only.
+* `a4_opd_iter.sh`'s retention guard exempted `"$ROOT/think_opd"` from deletion by NAME — a checkpoint
+  that no longer exists — so with `START` repointed at `think_opd35` it would have **silently deleted the
+  session's one positive result** at the end of round 2. It now compares against `$START`.
+Both are the failure mode the repo has hit before (§ untracked `.sh` carrying a hardcoded path from a
+deleted worktree): a name that was correct when written and is not checked again when its referent moves.
+
+### §41t — The campaign record, four clean pools, 24 arms
+
+`reasoning/arms_table.py --prefix a4 --pools asdiv svamp mawps gsmplus`, sorted by greedy:
+
+| arm | greedy | best-decode | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.72 | 63.38 | 68.90 | 80.50 | 73.5% | 12.35 | 239.4 |
+| **a4opd35_a100** | **50.45** | **53.48** | 59.43 | 73.38 | **62.3%** | 17.02 | 272.5 |
+| a4combo_a100 (previous best) | 47.95 | 48.63 | 56.62 | 74.02 | 53.5% | 9.48 | 213.3 |
+| a4dist_a100 | 47.30 | 48.52 | 56.40 | 73.22 | 53.7% | 10.50 | 218.8 |
+| a4rft_s99_a100 | 47.23 | 48.30 | 55.80 | 71.95 | 53.0% | 10.30 | 215.2 |
+| … 15 further arms … | 43.32-47.12 | 44.80-48.60 | 51.00-57.80 | 68.62-74.45 | 50.5-54.3% | 8.03-17.30 | 204.9-302.3 |
+| a4gasd_full_a100 | 30.50 | 35.98 | 33.52 | 61.75 | 44.1% | 25.90 | 254.1 |
+| a4gasd_ansonly_a100 | 28.45 | 35.05 | 41.23 | 61.98 | 45.2% | 22.48 | 216.4 |
+| a4opd_a100 (Qwen teacher) | 1.02 | 38.02 | 4.42 | 4.42 | — | 98.02 | 510.4 |
+
+**The `acc|ANSWERED` column is the finding.** Twenty-one arms — every data mix, every RFT round, every
+verify tier, both soup alphas, both external-teacher doses, both RLVR variants — landed inside
+**50.5-54.3%**, a 3.8pp band. `a4opd35_a100` is at **62.3%**, eight points clear of the field's maximum.
+That is not an increment on a saturating curve; the objective class changed.
+
+Greedy tells the same story more quietly: the entire prior campaign spans **4.6pt across 21 arms**
+(43.32-47.95), and one arm is 2.50 clear of the top on greedy and **4.85 clear on best-decode**.
+
+⚠️Read `a4opd_a100`'s row as the cautionary one: greedy 1.02 with 98.02% unclosed, yet best-decode 38.02
+because force-closing rescues a third of it. A single number would have called that arm "broken" or
+"mediocre" depending on which column was quoted, and neither is what happened.
+
+### §41u — The soup arm was built and then DROPPED on a free measurement plus arithmetic
+
+`||opd35 − combo||₂ / ||combo||₂ = **0.914%**`, and strikingly uniform: every block between 0.77% and
+0.96% (only the last two rise, L30 0.85 / L31 0.96), every parameter group between 0.130%
+(`norm.weight`) and 1.180% (`embed_tokens`, which is also the tied `lm_head`). A full epoch of per-token
+reverse KL at lr 1e-5 moved the model by under one percent of its own norm — and produced +8.8pp
+`acc|ANSWERED`.
+
+That kills the premise of §41s's soup arm in two steps, neither of which needs a GPU:
+
+**1. At 0.9% separation the two checkpoints are in the same basin,** so interpolating them is
+essentially linear in function space — there is no barrier to cross and no reason to expect a
+non-monotone curve. The 3.5 line's soup sweep found a knee at α=0.85 for a pair separated by an entire
+CoT-SFT stage; this pair is not that.
+
+**2. Even granting perfectly linear interpolation of the two component metrics, the arithmetic puts the
+optimum at the endpoint.** `greedy = acc|ANSWERED × answered-rate` is a PRODUCT, so it is quadratic in α
+and *could* peak in the interior — that was the actual hope. Taking the endpoints,
+`acc|ANS(α) ≈ 53.5 + 8.8α` and `answered(α) ≈ 90.5 − 7.5α`:
+
+> `d/dα [ (53.5+8.8α)(90.5−7.5α) ] = 8.8·90.5 − 7.5·53.5 − 2·8.8·7.5·α = 395.15 − 132α`, zero at
+> **α = 2.99**, i.e. outside [0,1] — so greedy is increasing across the whole interval and **α=1 wins.**
+
+The reason is a ratio: opd35's capability gain is **+16% relative** (53.5→62.3) while its answered-rate
+loss is only **−8% relative** (90.5→85.1). The product cannot peak inside unless one curve is strongly
+non-monotone, which 0.9% separation makes unlikely.
+
+**3. And the deployable metric removes the trade entirely.** Force-closing eliminates the answered-rate
+penalty by construction — at best-decode opd35 is +4.85 over combo with nothing left to interpolate. So
+the soup could only ever help plain greedy, and even there the arithmetic says it will not.
+
+`reasoning/a4_opdsoup.sh` is kept (it is correct, and it becomes relevant the moment two checkpoints are
+separated by a whole stage rather than one epoch) but **dropped from the queue**. Cost of the analysis:
+one weight-norm pass and four lines of calculus. Cost of running it instead: a GPU slot, three
+checkpoints, and two gate stages to rediscover α=1.00.
+
+### §41v — The gain has NO structure, and that is the finding
+
+`load_pool` is deterministic, so the per-item `ok` arrays realign with the actual problems on CPU. Over
+all 3,000 items of the four clean pools, opd35 won 356 and lost 289 against combo. Profiles:
+
+| | n | words (median) | numbers in Q | \|gold\| (median) |
+|---|---:|---:|---:|---:|
+| opd35 won | 356 | 30 | 3 | 25 |
+| opd35 lost | 289 | 30 | 2 | 27 |
+| both right | 1237 | 25 | 2 | 30 |
+| both wrong | 1118 | 34 | 3 | 39 |
+
+Won and lost items are indistinguishable. And the net gain by question-length quartile is flat —
+**+2.11 / +2.76 / +2.42 / +1.63 pt** — across quartiles whose baseline accuracy spans **67.0% → 29.4%**.
+The "both wrong" bucket is the one with real structure (longer, more quantities, larger answers), i.e.
+difficulty is legible in the data; the *gain* is not aligned with it.
+
+**So the improvement is a uniform, diffuse recalibration, not a new capability on a problem class.** Three
+independent measurements now say the same thing:
+* the weight change is 0.914% and uniform across depth (§41u: every block 0.77-0.96%);
+* `pass@8` did not move (§41r: −0.93, n.s.) — no new knowledge entered the model;
+* the item-level gain is flat in difficulty (here).
+
+That is what mode-seeking sharpening is supposed to look like, and it is the exact opposite of what a
+data-composition arm looks like — those move specific problem classes and show up as structure here.
+
+**Consequence for the follow-ups:** targeted data arms ("add more multi-step problems", "drill large-number
+arithmetic") are not indicated by this result and should not be inferred from it. What IS indicated is more
+of the same mechanism — another round on freshly-sampled states (`a4_opd_iter.sh`), or a teacher with more
+per-token signal now that the termination fix exists.
+
+⚠️One asymmetry worth keeping: **asdiv is the only pool with a net loss (−25 items) and it is also the pool
+where the baseline is strongest** (combo 64.30). Combined with the flat difficulty profile, that points at
+the termination regression rather than a capability regression — a uniform format cost hurts most where
+there is most to lose. The `notail`/`anchor` arms test exactly that.
+
+### §41w — `notail` FAILS, as pre-registered: masking the terminator columns does not shorten traces
+
+`think_opd35notail` — the same objective with the `</think>` and eos COLUMNS removed from the divergence
+(confirmed live in the log: ids 151645 and 151668 dropped, 151669 → 151667 columns, and the excluded
+logits verified to receive exactly zero gradient) — closure smoke test on 200 asdiv items:
+
+| | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| think_combo (baseline, full pool) | 64.30 | 6.9% | 212 |
+| think_opd35 (unmasked) | 60.00 | 14.5% | 280 |
+| **think_opd35notail (columns masked)** | 62.50 | **16.0%** | **279** |
+
+**No protection at all.** Unclosed is if anything slightly worse and the trace length is identical to the
+unmasked arm. This was written into `a4_kd3.sh`'s header before the run, for the reason it failed:
+
+> "One reason to expect `notail` to only partly work: 3.5-think genuinely writes longer traces (t_len 248
+> vs a4's 200), and length is encoded in *what to say next* as much as in *when to stop*, so masking the
+> terminator COLUMNS removes the direct pressure and not the body pressure."
+
+So the mechanism is now pinned from both sides. Removing all gradient from the closure logits changes
+nothing, which means **the lengthening is not a closure-probability effect at all** — it is the student
+learning to produce the teacher's longer derivations, and the terminator only ever gets reached later as a
+consequence. §41f's Qwen catastrophe is the same effect at 20-30x the magnitude.
+
+**What this leaves:** the `anchor` arm (`--ce-weight 0.5` on a4's own gold-verified traces) is now the only
+protection with a mechanism that can work, because it pulls the BODY toward a4's own shorter derivations
+rather than pulling on the terminator. It is training next. If it also fails, the honest conclusion is that
+per-token KD from a longer-trace teacher buys capability at a fixed length cost that has to be paid at
+decode time — which §41q already showed is affordable (+5.20 pooled, p=4.2e-10, force-closed).
+
+⚠️Also note what `notail` did NOT cost: greedy 62.50 against the unmasked arm's 60.00 on the same
+200-item subset. That is inside the n=200 noise band (±3.4pp) and must not be read as an improvement.
+
+### §41x — `--kd-prefix-frac`: the protection that matches the mechanism, queued as `pre50`/`pre33`
+
+§41w's refutation was informative rather than merely negative: removing **all** gradient from the closure
+logits moved trace length by one token, so lengthening is not a closure-probability effect at all. The
+student is learning to produce the teacher's longer **derivations**, and the terminator simply arrives
+later. Neither protection in flight addresses that — `notail` pulls on the terminator (refuted), `anchor`
+pulls on the whole trace.
+
+**Prefix-only KD does.** Apply the divergence to the first FRAC of each trace's completion tokens and
+nothing after. Two independent findings converge on it:
+* **§41b** — the failure is at the OPENING: 79% of wrong traces differ from a correct derivation at
+  equation index 0, median shared-equation prefix 0%. The information the teacher has is concentrated
+  early.
+* **§41w** — the cost is in the tail: the body imitation that lengthens traces happens throughout, and the
+  student's own tail behaviour is exactly what should be left alone.
+
+Take the teacher's early decisions; leave the student's tail untouched. Arms `pre50` (half the completion),
+`pre33` (a third), and `pre50a` (half, plus the CE anchor) are wired into `a4_kd3.sh`, so the next
+submission is `ARMS="pre50 pre33" sbatch reasoning/a4_kd3.sh`.
+
+Verified before any GPU time, because a masking bug here would silently compare misaligned tokens: the KD
+mask is a strict subset of the completion mask, and both sides are cut by the same fraction of the same
+completion so the student and teacher gathers still line up token-for-token (49/49 → 28/28 at frac 0.5,
+18/18 at 0.33). The runtime count assertion in the training loop still holds. CE deliberately keeps the
+FULL completion when KD is prefix-only — holding the model's own tail in place is the anchor's entire job.
+
+**Why this ranks where it does.** §41q showed the length cost is already affordable at decode time (+5.20
+pooled, p=4.2e-10, force-closed). So prefix-KD is not needed to bank the gain — it is needed to bank it in
+PLAIN GREEDY, which is a strictly better artifact than one that depends on a decode wrapper. That makes it
+worth one slot but not worth pre-empting the selector study, which is still the largest untested number on
+the board (~23.8pt of floor-to-ceiling headroom).
+
+### §41y — `anchor` recovers the trace length, and the notail/anchor contrast pins the mechanism from both sides
+
+Closure smoke tests, 200 asdiv items, all three arms against the same baseline:
+
+| arm | what it pulls on | greedy | unclosed | mean decoded |
+|---|---|---:|---:|---:|
+| think_combo (baseline, full pool) | — | 64.30 | 6.9% | **212** |
+| think_opd35 | nothing (unprotected) | 60.00 | 14.5% | **280** |
+| think_opd35notail | the TERMINATOR (columns dropped) | 62.50 | 16.0% | **279** |
+| **think_opd35anchor** | the BODY (CE 0.5 on a4's own verified traces) | 62.50 | **13.5%** | **241** |
+
+**39 tokens recovered by the body intervention; one token by the terminator intervention.** `anchor` closes
+about 60% of the gap back to the baseline's 212 and brings unclosed below the unprotected arm (13.5% vs
+14.5%). The two arms were designed as independent protections and they turned out to be a clean
+discrimination instead:
+
+> **Trace length is body-level. Only a body-level intervention moves it.** Removing every scrap of
+> gradient from the closure logits (verified: exactly zero) does nothing, because the model was never
+> being taught *when* to stop — it was being taught *what to say*, and the terminator arrives when the
+> derivation it learned to write runs out.
+
+That completes the mechanistic chain for §41p-r, every link measured rather than argued:
+1. per-token reverse KL from a length-matched teacher raises `acc|ANSWERED` +8.8pp (§41r);
+2. the capability arrives with the teacher's longer derivations, costing the answered rate (§41p);
+3. the cost is body imitation, not closure probability (§41w — the notail null);
+4. a body-level anchor recovers most of the length (§41y — here);
+5. and the residual cost is payable at decode time anyway (§41q — +5.20 pooled, p=4.2e-10).
+
+⚠️`notail` and `anchor` both read greedy 62.50 on this 200-item subset against opd35's 60.00. The n=200
+noise band is ±3.4pp, so **those three are not separable here** and the smoke test cannot rank them — it
+was only ever asked whether they terminate. The paired five-model gate is what decides whether `anchor`
+kept the `acc|ANSWERED` gain while giving back the length, which is the whole question: if it did, plain
+greedy banks the gain and the artifact no longer depends on a decode wrapper.
+
+### §41z — The seed replicate reproduces the signature, and the seed is verifiably LIVE
+
+All three `a4_kd3` arms passed the closure check, so all three reach the gate. The replicate's preliminary
+read, on the same 200 asdiv items:
+
+| arm | seed | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|---:|
+| think_opd35 | 46 | 60.00 | 14.5% | 280 |
+| **think_opd35s47** | **47** | **61.00** | **15.0%** | **280** |
+| think_opd35notail | 46 | 62.50 | 16.0% | 279 |
+| think_opd35anchor | 46 | 62.50 | 13.5% | 241 |
+
+**Identical trace length, unclosed within 0.5pp, greedy within 1pt.** The arm's whole signature — the
+capability/length trade that §41p-y describe — reproduces at a different seed. That is not yet the
+replicate (the gate's `acc|ANSWERED` is), but it is the first evidence that this is not the kind of
+single-seed artefact that produced two retractions on this line.
+
+⚠️**And the seed is verifiably live, which had to be checked rather than assumed.** `--seed` was a silent
+NO-OP in `cot-sft.py` until 255dff1 — it seeded python/numpy/torch while HF Trainer built its sampler from
+`TrainingArguments.seed`, so two runs at different seeds were bit-identical at every logged step and a
+"replicate" was really a rerun. `opd_train.py` runs its own loop and seeds the length-bucketed batching
+directly, and the step counts prove it took: **1,719 / 1,719 / 1,713 micro-batches** for seeds 46 / 46 /
+47. The two seed-46 arms agree exactly and the seed-47 arm differs, which is what a live seed looks like
+and what a dead one cannot fake.
+
+### §41aa — Weight space triangulates the whole story, for free, and finds the soup that arithmetic does not rule out
+
+`||combo|| = 1235.9`. Relative distances, all computed on CPU from the safetensors:
+
+| checkpoint | distance to combo | distance to opd35 |
+|---|---:|---:|
+| think_opd35 (seed 46) | 0.914% | — |
+| think_opd35s47 (seed 47) | 0.817% | 0.680% |
+| think_opd35notail | 0.946% | 0.769% |
+| **think_opd35anchor** | **0.747%** | 0.661% |
+
+**1. Reproducibility, measured without the gate.** If the two seeds' updates were orthogonal,
+`||u−v||` would be `sqrt(0.914² + 0.817²) = 1.226%`. It is **0.680%**, so
+`cos(update₄₆, update₄₇) = +0.693`: **69.3% of the update DIRECTION is shared across seeds.** The objective
+drives the weights the same way regardless of data order. That is an independent line of evidence for
+§41p-r, arriving before the replicate's gate and unable to be confounded by it.
+
+**2. The `notail`/`anchor` mechanism is visible in the weights.** §41y showed the CE anchor recovers 39
+tokens of trace length and the terminator mask recovers one. In weight space the anchor is **closer to the
+baseline** (0.747% vs the unprotected 0.914%) and the terminator mask is **farther** (0.946%). The CE term
+literally pulls the model back toward combo; masking the terminator columns does not pull at all. Three
+independent readouts — trace length, unclosed rate, weight distance — agree on which intervention does
+something.
+
+**3. And the 31% seed-specific residual is the soup that §41u's arithmetic does NOT rule out.** §41u killed
+`combo ⊗ opd35` because interpolating two *recipes* has its optimum at α=2.99. Averaging two runs of the
+*same* recipe at different seeds is a different claim entirely: it cancels the ~31% that is seed-specific
+and keeps the 69% that is systematic, which is what model souping was invented for. `a4_opdsoup.sh` is
+repointed at `think_opd35 ⊗ think_opd35s47` at a flat 0.5 — no sweep, because there is no trade to tune —
+and `a4_kd3.sh` gains an `s48` arm so a third seed is available if two is not enough.
+
+⚠️**The prediction, recorded so it can be wrong:** the soup should land at or slightly above the better
+endpoint on every metric with no new failure mode. The two endpoints already agree to within 1pt greedy and
+0.5pp unclosed (§41z), so a soup landing BELOW both would mean the 31% residual is not noise but something
+each seed needs internally consistent — which would be a more interesting result than the soup working.
+
+### §41ab — ⭐THE REPLICATE CONFIRMS, AND `anchor` BANKS THE GAIN IN PLAIN GREEDY
+
+Five-model paired gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend2 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a4combo_a100 (baseline) | 56.70 | 57.60 | 57.65 | 68.05 | 85.45 | 61.2% | 7.15 | 200.0 |
+| a4opd35_a100 (seed 46) | 58.40 | 62.65 | **63.35** | 68.95 | 83.95 | 68.8% | 14.35 | 265.6 |
+| a4opd35s47_a100 (seed 47) | 58.30 | 62.10 | 62.45 | 67.20 | 84.80 | **69.0%** | 14.55 | 266.8 |
+| a4opd35notail_a100 | 57.10 | 61.60 | 61.90 | 67.75 | 84.95 | 68.0% | 15.30 | 270.8 |
+| **a4opd35anchor_a100** | **59.60** | 62.00 | 62.30 | 68.30 | 84.85 | 68.2% | **12.15** | **228.4** |
+
+**1. THE REPLICATE CONFIRMS. The one-seed caveat is withdrawn.** Seed 46 against seed 47 on identical
+items: greedy 58.40 vs 58.30 (**+0.10, p=0.96**), `acc|ANSWERED` 68.8% vs **69.0%**, unclosed 14.35% vs
+14.55%, `t_len` 265.6 vs 266.8, extend2 63.35 vs 62.45 (p=0.33). Only `sc@8` differs at all (68.95 vs
+67.20, p=0.04). Two independent runs of the objective produce the same model to within a tenth of a point
+on the headline metric — corroborating §41aa's weight-space finding that 69.3% of the update direction is
+shared across seeds. **This is the check that produced two retractions on this line, and it passed.**
+
+**2. `anchor` IS THE BEST ARTIFACT ON PLAIN GREEDY: 59.60, +2.90 over baseline at p=6.03e-03.** It keeps
+**7.0pp of opd35's 7.6pp** capability gain (68.2% vs 68.8%) while giving back 37 tokens of trace length
+(228.4 vs 265.6) and 2.2pp of unclosed. And note which gain is statistically solid: `anchor`'s +2.90 plain
+greedy is significant, while the unprotected arm's +1.70 on these two pools is **not** (p=0.12). The
+protection did not merely preserve the result, it made the headline metric the one that carries it.
+
+**3. So there are two defensible artifacts and the choice is a deployment question, not a science one:**
+* **best plain greedy — `anchor` at 59.60** (+2.90). No decode wrapper, shortest traces of the three KD
+  arms, and the significant p-value.
+* **best force-closed — `opd35` at 63.35** (+5.70, p=5.67e-08). Needs `clean_eval`'s budget/extend wrapper,
+  which ships already.
+Against released 3.5-think (greedy 70.85, best-decode 74.15) the gap closes from 14.15 → **11.25** on plain
+greedy and from 16.50 → **10.80** force-closed.
+
+**4. `notail` is confirmed a null on protection**, exactly as pre-registered in §41w: +0.40 greedy
+(p=0.75), unclosed 15.30% — *worse* than the unprotected arm — and `t_len` 270.8, the longest of any arm
+here. Removing all gradient from the terminator logits protects nothing, because trace length was never a
+closure-probability phenomenon.
+
+### §41ac — FINAL, four clean pools: `anchor` is the artifact, and the replicate is airtight
+
+Pool-mean over asdiv/svamp (n=1000) + gsmplus/mawps (n=500); math500 excluded as contaminated:
+
+| model | greedy | +budget | +extend2 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.72 | 62.23 | 62.65 | **63.38** | 68.90 | 80.50 | 73.5% | 12.35 | 239.4 |
+| **a4opd35anchor_a100** | **51.35** | 52.85 | 53.40 | **53.48** | 58.80 | 74.28 | 60.4% | 13.62 | 239.1 |
+| a4opd35_a100 (seed 46) | 50.45 | 53.12 | **53.48** | 53.20 | 59.43 | 73.38 | 62.3% | 17.02 | 272.5 |
+| a4opd35s47_a100 (seed 47) | 50.55 | 53.35 | 52.97 | 53.23 | 58.05 | 74.15 | 62.3% | 16.62 | 271.3 |
+| a4opd35notail_a100 | 49.50 | 52.60 | 52.75 | 52.80 | 58.08 | 73.02 | 61.4% | 17.10 | 275.7 |
+| a4combo_a100 (old best) | 47.95 | 48.45 | 48.52 | 48.63 | 56.62 | 74.02 | 53.5% | 9.48 | 213.3 |
+
+Pooled paired McNemar over all 3,000 items, against `a4combo_a100`:
+
+| arm | greedy | p | extend2 | p |
+|---|---:|---:|---:|---:|
+| **a4opd35anchor** | **54.10 (+3.23)** | **8.48e-05** | 56.37 (+4.80) | 4.76e-09 |
+| a4opd35s47 | 53.13 (+2.27) | 8.74e-03 | 56.13 (+4.57) | 5.49e-08 |
+| a4opd35 | 53.10 (+2.23) | 9.30e-03 | **56.77 (+5.20)** | **4.18e-10** |
+| a4opd35notail | 52.03 (+1.17) | 1.83e-01 (n.s.) | 55.80 (+4.23) | 3.91e-07 |
+
+**1. The replication is as clean as this measurement gets.** Pooled over 3,000 items, seed 46 and seed 47
+give greedy **53.10 vs 53.13 — a difference of −0.03 at p=1.00** — and extend2 56.77 vs 56.13 (p=0.38),
+`acc|ANSWERED` 62.3% vs 62.3%. Two independent runs of the objective are statistically the same model.
+
+**2. `anchor` is the artifact.** It wins plain greedy outright (+1.00 over the unprotected arm, and the
+only KD arm whose plain-greedy p-value clears Bonferroni for ~20 arms) and trails on extend2 by 0.40. It
+holds **6.9pp of the 8.8pp** capability gain, and it does so at `t_len` **239.1 — the same trace length as
+released 3.5-think (239.4)**, having started 59 tokens longer.
+
+**3. `notail` is the one arm that fails to clear significance on plain greedy** (p=0.18), which is the
+cleanest possible statement of §41w: an intervention aimed at the wrong mechanism buys nothing.
+
+**THE HEADLINE FOR THE a4 LINE:**
+
+| | old best (combo) | new best (anchor) | Δ | released 3.5-think |
+|---|---:|---:|---:|---:|
+| pool-mean greedy | 47.95 | **51.35** | **+3.40** | 60.72 |
+| pool-mean best-decode | 48.63 | **53.48** | **+4.85** | 63.38 |
+| `acc\|ANSWERED` | 53.5% | **60.4%** | **+6.9pp** | 73.5% |
+
+**The gap to the released 3.5-think closes from 14.75 to 9.90 on the deployable number**, and from 20.0pp
+to 13.1pp on `acc|ANSWERED` — achieved on a base measured at −16.79pt against 3.5's (§40), by a method that
+moved the weights 0.9% and left `pass@8` untouched.
+
+### §41ad — Five-pool means, and the per-pool caveat that decides which artifact to ship
+
+The campaign has always reported five-pool means, so here they are alongside the four-pool numbers of §41ac
+(math500 included, and it remains near-duplicate-contaminated for every model on this line):
+
+| model | greedy | +budget | +extend2 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **a4opd35anchor_a100** | **46.22** | 47.55 | 48.24 | **48.36** | **53.06** | 68.76 | 57.9% | 19.36 |
+| a4opd35_a100 | 44.81 | 47.77 | 48.11 | 47.70 | 52.12 | 66.60 | 59.7% | 23.78 |
+| a4opd35s47_a100 | 44.77 | 47.63 | 47.33 | 47.41 | 51.14 | 67.60 | 59.3% | 23.14 |
+| a4opd35notail_a100 | 44.36 | 47.16 | 47.34 | 47.38 | 51.04 | 66.63 | 59.2% | 23.34 |
+| a4combo_a100 (old best) | 43.44 | 43.96 | 44.15 | 44.17 | 50.94 | 68.94 | 50.1% | 13.66 |
+
+**Five-pool: greedy 43.44 → 46.22 (+2.78), best-decode 44.17 → 48.36 (+4.19), `acc|ANSWERED` 50.1% →
+57.9% (+7.8pp).** For the campaign's own scale: thirteen arms moved the five-pool deployable number
+39.21 → 44.17 (+4.96) in total; this is +4.19 more from one objective.
+
+**And the per-pool breakdown is the caveat that picks the artifact:**
+
+| pool | baseline t_len / uncl | opd35 Δgreedy | anchor Δgreedy |
+|---|---|---:|---:|
+| asdiv | 199.0 / 6.9% | **−2.50** | **+0.80** |
+| svamp | 201.1 / 7.4% | +5.90 | +5.00 |
+| mawps | 213.0 / 12.8% | +3.60 | **+5.40** |
+| gsmplus | 240.1 / 10.8% | +3.00 | +2.40 |
+| math500 | 295.8 / 30.4% | **−3.13** | **+0.31** |
+
+**`anchor` is positive on all five pools. The unprotected arm is negative on two, for two different
+reasons, and both are about the trace-length cost rather than the capability:**
+* **asdiv** is where the baseline is strongest (64.30) — least room to gain, most to lose from any format
+  cost. `anchor` turns −2.50 into +0.80.
+* **math500** is where the traces already sit nearest the 512-token cap (295.8 tokens with 30.4% already
+  unclosed). The lengthening pushes derivations past the cap, so `unclosed` goes 30.4% → 50.8% and the
+  capability gain (`acc|ANS` 36.5% → 49.3%, the largest on any pool) is entirely swallowed. `anchor` halves
+  the excess and lands +0.31.
+
+⚠️**So the honest limitation is: this method's benefit is bounded by the pool's headroom to the token cap.**
+On long-derivation problems it can cost more than it buys unless the length is controlled. That is a
+prediction for anything with longer traces than these five pools, and it is the strongest argument for
+shipping `anchor` rather than the unprotected arm — not the 1.4pt of five-pool greedy between them, but the
+fact that one is positive everywhere and the other is not.
+
+### §41ae — THE FREE SELECTOR: self-certainty Borda beats voting by +1.60, and that is the whole answer
+
+`a4_entbranch.sh` on `think_opd35anchor`, nine selectors on identical candidate sets, N=8 independent
+samples. asdiv+svamp pool-mean (greedy 43.10, oracle 65.70):
+
+| selector | acc | vs `vote` |
+|---|---:|---:|
+| oracle (any of the 8) | 65.70 | +15.70 |
+| **borda** — Borda over self-certainty ranks | **51.60** | **+1.60** |
+| wvote — vote weighted by raw self-certainty | 51.30 | +1.30 |
+| vtb0 — vote, exact ties broken by self-certainty | 51.20 | +1.20 |
+| gtb0 / vtb1 | 50.70 | +0.70 |
+| vfyvote — vote weighted by zero-shot p(Yes) | 50.60 | +0.60 |
+| **vote** (the baseline, i.e. self-consistency) | **50.00** | — |
+| gtb1 | 49.20 | −0.80 |
+| ent — pure self-certainty argmax | 47.00 | −3.00 |
+| lp — pure max-mean-logprob argmax | 43.70 | −6.30 |
+| **selfvfy — pure zero-shot p(Yes) argmax** | **32.60** | **−17.40** |
+
+**1. The literature's claim reproduces, modestly.** Self-certainty + Borda does beat self-consistency, by
+**+1.60**. Voting captures 6.90 of the 22.60 points of oracle headroom; Borda captures 8.50 — **38% of the
+headroom against voting's 31%**. Real, free, and nowhere near closing the gap: **15.70pt remains
+unreachable by any selector tested.**
+
+**2. Every rule that lets confidence OVERRIDE the vote loses; every rule that lets it MODIFY the vote
+wins.** `ent`/`lp`/`selfvfy` as argmax pickers are −3.0/−6.3/−17.4. The same signals as a vote weight or a
+tie-break are +1.6/+1.3/+1.2/+0.6. That is the §41o/§41l prediction confirmed: the vote carries most of the
+information and confidence is a refinement, not a replacement.
+
+**3. Zero-shot self-verification is refuted as a reranker (−17.40)** and mildly useful as a vote weight
+(+0.60). Mean p(Yes) is 0.753-0.755 across all three pools against ~60% actual accuracy, so the verifier is
+both over-confident and weakly discriminative — exactly the 2026 process-verification finding that
+meta-cognition "amplifies confusion without sufficient model capacity" at small scale, and consistent with
+§22i's learned-verifier failure on this line.
+
+**4. §41l's near-tie premise was measured on train pools and is WEAKER on the eval pools** — this is why the
+tool re-measured it rather than assuming:
+
+| pool | vote wins on recoverable | margin-0 (exact ties) | near-ties (≤1) |
+|---|---:|---:|---:|
+| train pools (§41l) | 66.5% | 38.6% | 78.2% |
+| asdiv | 86.2% | 14.0% | 57.0% |
+| gsmplus | 64.4% | 27.8% | 60.2% |
+| mawps | 82.1% | 16.2% | 39.7% |
+
+So the "free accuracy sitting in sampling-order tie-breaks" is 14-28% of the vote's losses on the eval
+pools, not 38.6%, and `vtb0`'s measured +1.20 is the honest size of that lever — not the ~6.9pt the train
+pools implied. **§41l's estimate is corrected downward by its own follow-up.**
+
+**5. The BRANCHING premise is refuted, exactly as §41b predicted from trace length.** `branch_oracle`
+49.10 against `control_oracle` 65.70: four candidates sharing a prefix explore **16.6 points less** than
+nine independent samples. On 230-token traces there is no long shared prefix worth rescuing, so
+entropy-triggered branching has nothing to work with — even though the trigger fired on 87-93% of items at
+a median 27-32% through the trace, i.e. exactly where the literature says failures onset. **The trigger
+works; the premise does not transfer.**
+
+⚠️**Process note:** the n=1000 stage was SIGKILLed (exit 137) by the host OOM killer at `--mem=16G` AFTER
+printing its results but BEFORE writing its JSON, so the per-item `ok` arrays for asdiv/svamp are lost and
+only the log survives. `--selfverify` is the hog: ~11,500 candidate scores plus `prompt_logprobs` dicts per
+pool on top of two full candidate sets with per-token logprobs. Raised to 48G. Nothing analytical was lost,
+but the paired McNemar for those two pools cannot be recomputed without a re-run.
+
+### §41af — ⛔THE REAL REASON GOLD-ANCHORED DISTILLATION FAILED: the hinted teacher was WORSE, not better
+
+`reasoning/hint_probe.py` on `think_opd35anchor`, asdiv + svamp at n=200 each, greedy:
+
+| condition | acc | echoed the hinted number |
+|---|---:|---:|
+| plain prompt | **61.25%** | — |
+| + the CORRECT final answer stated in the prompt | **56.25% (−5.00)** | 59.5% |
+| + a DELIBERATELY WRONG answer stated in the prompt | **30.00% (−31.25)** | 30.2% |
+
+Both pools agree tightly (asdiv −4.50/−32.00, svamp −5.50/−30.50).
+
+**The pre-registered decision rule enumerated three outcomes and reality produced a fourth.** The rule was:
+`answer≫plain` + `wrong≈plain` → reasons with the hint; `answer≫plain` + `wrong≪plain` → copies it; neither
+moves → ignores its context. What actually happens is **`answer<plain` and `wrong≪plain`**: the model
+demonstrably READS the hint (a model ignoring its context could not lose 31 points to a wrong one) and is
+**damaged by it in both directions**. Told the correct answer it does *worse than being told nothing*, and
+emits that answer only 59.5% of the time.
+
+**This replaces §41n's explanation of the GASD refutation, and the replacement is both simpler and more
+damning.** §41n reasoned that the divergence was irreducible because the teacher conditioned on information
+the student could not infer. The truth is that **the "better-informed teacher" was a 5-point WORSE model.**
+Gold-anchored self-distillation trained the student toward a degraded version of itself. Of course it lost
+21.6 points — every link in that chain was pointing the wrong way, and no amount of masking, curriculum
+filtering or divergence-choice could have fixed it.
+
+⚠️**Generalise carefully, because the scope is large.** This is a statement about the BASE, not about one
+objective: a 1.04B model that is *hurt* by having the correct answer placed in its context cannot benefit
+from anything whose mechanism is "put useful information in the context." That caps hindsight distillation
+(measured), STaR rationalisation, HDPO-style reference hints, consensus anchoring, retrieval augmentation
+and few-shot prompting on this base — all of them, for the same reason, before any of them is built. It also
+makes the 2026 process-verification result's phrasing look exactly right: meta-cognition and privileged
+context both "amplify confusion without sufficient model capacity".
+
+⚠️**And it is the strongest available argument for why the arm that WORKED, worked.** Per-token on-policy KD
+(§41p-ac) never puts anything in the student's context. The student's prompt is untouched; the teacher is a
+separate model and the only channel is a per-token distribution at states the student itself chose. That is
+precisely the one channel this base can still use — which is now a measured property rather than a lucky
+design choice.
+
+### §41ag — WHAT THE GAIN ACTUALLY IS: mostly learned abstention, partly real selection, and coverage untouched
+
+Round 2's generation pass re-sampled 93,912 rollouts from `think_opd35anchor` on the same train pools with
+the same settings as the baseline's, so the two rollout distributions are directly comparable. This is the
+sharpest available look at what the objective did, and it qualifies the headline:
+
+| | combo | opd35anchor | Δ |
+|---|---:|---:|---:|
+| correct | 23.31% | 25.37% | **+2.05** |
+| **wrong** | 59.39% | 44.87% | **−14.52** |
+| unclosed | 15.90% | 21.48% | +5.58 |
+| no_answer | 1.40% | 8.29% | +6.89 |
+| `acc\|ANSWERED` (train pools) | 28.2% | **36.1%** | **+7.9pp** |
+
+**14.52pp of confidently-wrong rollouts were converted — and 12.47pp of that went to ABSTENTION
+(unclosed + no_answer), only 2.05pp to correct.** So a large share of the `acc|ANSWERED` gain is precision
+bought by declining to answer, not by getting more answers right. The train-pool `acc|ANS` gain (+7.9pp)
+matches the eval pools' +7.8pp exactly, so this is the same effect seen from the other side.
+
+**Three reasons it is nonetheless not ONLY abstention:**
+1. **Greedy accuracy ROSE** (+3.40 five-pool, +2.78 four-pool). An abstention-only change must LOWER greedy,
+   because an abstained answer scores zero. Real answers got better.
+2. **Selection among covered answers improved independently:** gold is the plurality answer in **65.2% →
+   69.5%** of solvable-but-unreliable problems (+4.3pp), and problems solved 8/8 went **2.1% → 3.5%**. Those
+   are properties of the answer distribution, not of the abstention rate.
+3. `correct` itself rose +2.05pp.
+
+**And coverage is untouched, which is the third independent confirmation of §41r's central claim:**
+never-solved-in-8 went **44.1% → 44.6%** and solved-at-least-once **55.9% → 55.4%** — flat. The eval pools
+said `pass@8` −0.93 (n.s.); the train pools say the same thing in a completely different measurement. **The
+objective moved selection and commitment, and added no new coverage whatsoever.**
+
+⚠️**This also explains why force-closing gains MORE than plain greedy** (+4.85 vs +3.40 four-pool): the
+abstentions are recoverable. Force-closing converts a refusal back into the model's best guess, and those
+guesses are drawn from a distribution whose precision improved — so the wrapper harvests exactly the 12.5pp
+that abstention parked.
+
+⚠️**And where there is no coverage, there is no gain.** On `math_train_hard` the correct rate went **7.71% →
+7.38%** while unclosed went **28.47% → 35.65%**: pure abstention, no improvement. That is the train-pool
+mirror of math500's eval behaviour (§41ad) and the same limitation stated twice — **on problems the model
+cannot solve, this objective teaches it to stop pretending, which is worth nothing on an accuracy metric and
+would be worth something on a calibration one.**
+
+### §41ah — Round 2: the teacher has almost nothing left to say, and a third launcher bug of the same family
+
+**The signal is largely exhausted after one round.** Round 2 re-sampled 93,912 rollouts from
+`think_opd35anchor` and distilled on them with the same teacher. Reverse KL at step 1: **0.1326**, against
+round 1's 0.1872 — the student is already much closer to the teacher on the states its improved policy
+visits. And it does not fall over the epoch (0.1326 → 0.1385 at step 1900, argmax agreement 90.9% → 89.9%).
+Round 1's fell 0.1872 → 0.1512.
+
+~~That is the honest read on iteration: **one round captures most of what this teacher can transfer.**~~
+⚠️⚠️**WRONG — REFUTED BY §41ai, and the error is methodological, not arithmetic.** Round 2's own rollouts
+show large improvements on every measure, including coverage. A flat per-token divergence does NOT imply a
+flat policy: **the divergence is measured AT THE STUDENT'S OWN STATES, so it is a moving target by
+construction.** As the student improves, the states it visits improve, and the distance to the teacher at
+those *better* states can stay constant while the policy gets substantially better. **On-policy divergence
+is not a progress metric.** See §41ai.
+
+Closure smoke, 200 asdiv items: greedy **65.00%**, unclosed 15.5%, mean decoded **267** — against its own
+starting point's 62.50% / 13.5% / **241**. So round 2 is +2.50 on a subset whose noise band is ±3.4pp
+(inconclusive), and it **re-lengthened traces by 26 tokens despite `--ce-weight 0.5` being carried through**.
+Each round re-accumulates part of the length cost, which is exactly what §41y's mechanism predicts: the CE
+anchor pulls toward a4's own traces, but "a4's own traces" is a moving target that got longer in round 1.
+
+⚠️**Third launcher bug of the same family, found while the job was running.** The gate line named
+`think_opd35` while `START` had been repointed to `think_opd35anchor`, so round 2 would be paired against a
+checkpoint it does not descend from — the McNemar would have measured **two differences at once** (the extra
+round AND the CE anchor) and been read as one. Fixed to `$START`. The three bugs were:
+* `a4_entbranch.sh` auto-including every checkpoint on disk in its model list;
+* `a4_opd_iter.sh`'s retention guard exempting a checkpoint **by name** that no longer existed, which would
+  have deleted the session's one positive result;
+* this one.
+All three are the same defect: **a hardcoded name that was correct when written and is not re-checked when
+its referent moves.** The repo has recorded this failure mode before for untracked `.sh` carrying a dead
+worktree path. Every one of these was caught by reading the launcher against the current checkpoint
+inventory rather than by any test, which is an argument for doing that read every time a checkpoint is
+deleted or repointed.
+
+### §41ai — ⭐ITERATION WORKS, AND IT MOVES COVERAGE. On-policy divergence is not a progress metric.
+
+Round 3's generation pass re-sampled 93,912 rollouts from round 2's checkpoint, giving three directly
+comparable rollout distributions on identical problems and settings:
+
+| metric | combo | round 1 (`anchor`) | **round 2** |
+|---|---:|---:|---:|
+| rollouts correct | 23.31% | 25.37% | **29.10%** |
+| rollouts wrong | 59.39% | 44.87% | **40.98%** |
+| rollouts unclosed | 15.90% | 21.48% | 24.15% |
+| rollouts no_answer | 1.40% | 8.29% | 5.77% |
+| **`acc\|ANSWERED`** | 28.2% | 36.1% | **41.5%** |
+| **never solved in 8** | 44.1% | 44.6% | **42.0%** |
+| solved ALL 8 | 2.1% | 3.5% | **5.9%** |
+| gold is the PLURALITY (solvable) | 65.2% | 69.5% | **72.9%** |
+| **gold appears in SOME trace** | 70.0% | 71.9% | **73.6%** |
+| gsm8k_train correct rate | 30.86% | 35.33% | **41.88%** |
+| math_train_hard correct rate | 7.71% | 7.38% | **8.28%** |
+
+**1. Round 2 improved everything, including the things round 1 did not.** `acc|ANSWERED` +5.4pp on top of
+round 1's +7.9pp (cumulative **+13.3pp**), correct rollouts +3.73pp (round 1: +2.06pp), and — the important
+one — **never-solved-in-8 fell 44.6% → 42.0% and gold-appears-somewhere rose 71.9% → 73.6%.** Round 1 left
+coverage exactly where it found it (§41ag, and `pass@8` −0.93 n.s. at the gate). **Round 2 moved it.** The
+model is now finding answers it had never found in 8 samples before. Even `math_train_hard`, which round 1
+made *worse* (7.71% → 7.38%), improved to 8.28%.
+
+**2. ⚠️SO §41ah's "the signal is exhausted" READ WAS WRONG, and the mistake is worth more than the result.**
+I inferred exhaustion from the reverse KL starting at 0.1326 (vs round 1's 0.1872) and staying flat across
+the epoch. But:
+
+> **On-policy divergence is measured AT THE STUDENT'S OWN STATES, so it is a moving target by construction.**
+> As the student improves, the states it visits improve, and its distance to the teacher *at those better
+> states* can hold constant while the policy gets substantially better. A flat KL means "the student is as
+> close to the teacher as before, on harder-won ground" — not "nothing was learned."
+
+**On-policy divergence is not a progress metric and must not be read as one.** The only honest progress
+metrics here are the ones measured on the policy's own behaviour: the rollout distribution above, and the
+gate. This is the same species of error as §41f (a statistic conditioned on the failure being absent) and
+§41j (pricing a lever by an exhausted family's best) — **three times this session, the mistake was trusting
+a convenient proxy over a direct measurement of the thing itself.**
+
+**3. Consequence: iterate further.** Round 3 is already training as part of the same job (`ROUNDS=2` runs
+R=2 and R=3). The trend across two rounds is monotone on nine of ten measures, so the run to make next is
+another round, not a new mechanism — and the earlier plan to "stop at one round because the KL flattened"
+would have thrown that away on the basis of a metric that cannot see it.
+
+### §41aj — Round 3, and the retention fix paying off in the very next job
+
+Round 3's smoke test on the same 200 asdiv items completes a monotone progression:
+
+| | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| think_combo (baseline, full pool) | 64.30 | 6.9% | 212 |
+| round 1 (`think_opd35anchor`) | 62.50 | 13.5% | 241 |
+| round 2 (`think_opd_r2`) | 65.00 | 15.5% | 267 |
+| **round 3 (`think_opd_r3`)** | **65.50** | **13.0%** | 277 |
+
+Unclosed came back DOWN in round 3 (15.5% → 13.0%) while accuracy kept rising, so the trace-length cost is
+not compounding monotonically — the CE anchor is holding, even though `t_len` drifts up 10 tokens per round.
+Round 3's reverse KL also fell again (0.1676 → 0.1305, agreement 87.7% → 90.4%), which after §41ai should be
+read as "the new states are further from the teacher and it closed most of that", not as a progress number.
+
+✅**And the retention fix from earlier this session fired in the very next job and protected the artifact.**
+`a4_opd_iter.sh`'s guard originally exempted `"$ROOT/think_opd"` from deletion **by name** — a checkpoint
+that no longer exists — which with `START` repointed at `think_opd35anchor` would have deleted the session's
+best result at the end of round 2. I changed it to compare against `$START` *before* submitting, and the log
+confirms the outcome: only `[retention] dropping consumed rollouts .../a4_opd_r2` fired, and
+`think_opd35anchor` is still on disk. The bug and its fix were separated by about an hour and one job.
+
+⚠️`think_opd_r2` survives because the loop ends before it can rotate — it is a rotation candidate once
+round 3's gate has recorded its successor's numbers, and it has no published number of its own.
+
+### §41ak — What to run next, and why it is "more rounds" rather than a new idea
+
+The queue is reordered one last time by what §41ai measured. Iteration is the working lever, so the next job
+is **more of it**, and the question it answers is where the trend saturates:
+
+    START=/project/rcc/youzhi/models/a4_think_final/think_opd_r3 ROUNDS=3 sbatch reasoning/a4_opd_iter.sh
+
+Three more rounds at ~1.2 h each (30 min generation + 38 min distillation) plus one gate ≈ 4.6 h, inside the
+10 h limit. Each round prints `fail_taxonomy.py` on its own fresh rollouts before training, so the
+saturation point is visible round by round from a direct behavioural measurement rather than from the
+divergence — which §41ai established cannot see it.
+
+**Why not the other queued arms first:**
+* `pre50`/`pre33` (prefix-only KD) — targets the residual `t_len` drift of ~10 tokens per round. Worth
+  running, but the drift is not currently costing anything: round 3's unclosed came DOWN to 13.0% while
+  accuracy rose. Fix a problem when it starts costing.
+* `a4_opdsoup.sh` (averaging `opd35 ⊗ opd35s47`, the two same-recipe seeds) — still well-motivated by the
+  +0.693 update correlation, and nearly free, but it averages two ROUND-1 checkpoints and round 3 has since
+  moved well past both. Re-point it at two seeds of the *current* round before spending a slot.
+* Qwen3-4B-Thinking with the terminator mask — the 4.5x-more-informative teacher. ⚠️Now known to be a worse
+  bet than it looked: §41w showed the terminator mask does NOT control trace length (that is body-level), so
+  the protection that would let a 20-30x-longer-trace teacher in **does not exist yet**. `--kd-prefix-frac`
+  is the candidate, and it should be validated on the SAFE teacher first (`pre50`) before being trusted with
+  the dangerous one.
+* A trained verifier (V-STaR) — §41ae measured the free selectors at +1.60 over voting with 15.7pt of oracle
+  headroom left, so a verifier is the only route to the rest. But it is also the arm this base is least
+  likely to support: §41af showed the model is *damaged* by information placed in its context, and a
+  verifier prompt is exactly that. Rank it last until something contradicts §41af.
+
+⚠️**And the one thing that should NOT be inferred from this session.** The mechanism that worked does not put
+anything in the student's context and does not add data — it re-weights the model's own next-token
+distribution at states it chose itself. Every arm that tried to *inform* the model failed (long-CoT teacher,
+Llama text, gold hints, reference derivations, verification prompts), and every arm that tried to *sharpen*
+it worked. On this base, sharpening is the channel that is open.
+
+### §41al — ⭐⭐SESSION RESULT: round 3 is the artifact. Gap to released 3.5-think 14.25 → 10.55.
+
+Paired gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend1 | +extend2 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 71.00 | 73.40 | 73.25 | 73.65 | 80.65 | 92.00 | 79.6% | 8.45 | 236.4 |
+| **a4opdi_a100 (round 3)** | **60.45** | 64.60 | **65.15** | 65.00 | **70.45** | **85.40** | **71.2%** | 14.60 | 271.4 |
+| a4opd35_a100 (round 1) | 58.45 | 62.65 | 63.10 | 63.20 | 68.95 | 83.95 | 68.6% | 14.05 | 265.6 |
+| a4combo_a100 (session start) | 56.75 | 57.60 | 57.50 | 57.55 | 68.10 | 85.45 | 61.1% | 6.95 | 199.9 |
+
+Pooled paired McNemar over 2,000 items:
+
+| comparison | greedy | +extend2 | sc@8 | pass@8 |
+|---|---|---|---|---|
+| **r3 vs session start** | **+3.70** (p=6.85e-04) | **+7.45** (p=2.55e-12) | +2.35 (p=9.67e-03) | **−0.05** (p=1.00) |
+| r3 vs round 1 | +2.00 (p=4.99e-02) | +1.80 (p=6.49e-02) | +1.50 (p=7.96e-02) | **+1.45** (p=4.69e-02) |
+
+**1. `pass@8` is EXACTLY where it started** — 85.40 against 85.45, p=1.00 — **while greedy rose 3.70 and
+`acc|ANSWERED` rose 10.1pp.** That is the cleanest available statement of the whole result: the ceiling did
+not move and the floor came up to meet it. The thirteen arms before this session did the reverse.
+
+**2. Iteration recovered what round 1 cost.** Round 1 gave up 1.5pt of `pass@8` for its capability gain;
+round 3 got it back (+1.45 vs round 1, p=0.047) and is better than round 1 on every single column.
+
+**3. Where the a4 line now stands against the released 3.5-think:** the greedy gap closes **14.25 → 10.55**
+and the force-closed gap **16.35 → 8.80**, with `acc|ANSWERED` **18.5pp → 8.4pp**. On a base measured at
+−16.79pt against 3.5's (§40).
+
+**THE SESSION, on asdiv+svamp:**
+
+| | start (`a4combo_a100`) | end (`think_opd_r3`) | Δ |
+|---|---:|---:|---:|
+| greedy | 56.75 | **60.45** | **+3.70** |
+| best decode | 57.60 | **65.15** | **+7.55** |
+| self-cons@8 | 68.10 | **70.45** | +2.35 |
+| `acc\|ANSWERED` | 61.1% | **71.2%** | **+10.1pp** |
+| pass@8 | 85.45 | 85.40 | −0.05 |
+
+⚠️Four-pool and five-pool means for round 3 are pending the gate's second stage. The four-pool figures for
+round 1 (§41ac) were consistently ~6pt below the two-pool ones, so expect the same offset rather than the
+numbers above.
+
+### §41am — ⭐⭐⭐DEFINITIVE: four clean pools, 3,000 items. Deployable +7.30, `pass@8` untouched.
+
+| model | greedy | +budget | +extend1 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.75 | 62.15 | **63.12** | 68.88 | 80.60 | 73.3% | 12.33 |
+| **a4opdi_a100 (round 3)** | **52.17** | 55.20 | **55.87** | **60.42** | 74.35 | **64.6%** | 17.55 |
+| a4opd35_a100 (round 1) | 50.62 | 53.17 | 53.25 | 59.43 | 73.42 | 62.2% | 16.68 |
+| a4combo_a100 (session start) | 48.02 | 48.40 | 48.20 | 56.70 | 74.03 | 53.2% | 9.12 |
+
+Pooled paired McNemar over all 3,000 items, round 3 against the session's starting checkpoint:
+
+| config | round 3 | start | Δ | p |
+|---|---:|---:|---:|---:|
+| greedy | 54.93 | 50.93 | **+4.00** | 3.66e-06 |
+| +budget | 58.33 | 51.47 | +6.87 | 6.31e-16 |
+| **+extend1** | 58.97 | 51.30 | **+7.67** | **7.35e-20** |
+| +extend2 | 58.80 | 51.53 | +7.27 | 1.36e-17 |
+| self-cons@8 | 63.77 | 60.50 | +3.27 | 3.27e-06 |
+| **pass@8** | 78.03 | 77.83 | **+0.20** | **7.90e-01 (unchanged)** |
+
+**THE SESSION, four clean pools:**
+
+| | start | end | Δ |
+|---|---:|---:|---:|
+| greedy (pool-mean) | 48.02 | **52.17** | **+4.15** |
+| **best decode** | 48.58 | **55.87** | **+7.30** |
+| self-cons@8 | 56.70 | **60.42** | +3.72 |
+| **`acc\|ANSWERED`** | 53.2% | **64.6%** | **+11.4pp** |
+| pass@8 | 74.03 | 74.35 | +0.32 |
+
+**Gap to the released argonne-3.5-think: greedy 12.73 → 8.58, best-decode 14.74 → 7.45, `acc|ANSWERED`
+20.1pp → 8.7pp.** On a base measured at −16.79pt against 3.5's (§40), a 1.04B model against a 2.88B one.
+
+**For scale against everything that came before:** the thirteen arms preceding this session moved the
+five-pool deployable number 39.21 → 44.17, **+4.96 in total across ~10 GPU-days**. This session's
+**+7.30** came from one objective in three iterations, and `extend1`'s p = 7.35e-20 makes it the most
+significant result the line has produced.
+
+**And the shape of it is the point.** `pass@8` moved +0.20 (p=0.79) — the model knows exactly what it knew
+at the start of the session. Everything gained was in *committing to what it already knew*: `acc|ANSWERED`
++11.4pp, self-consistency +3.72, greedy +4.15, best-decode +7.30. §41j opened this session by measuring
+that a4 "reaches answers it cannot select" and pricing the fix at +1.24. The fix was worth +7.30, and it
+worked by changing which answer the argmax lands on rather than by teaching the model anything new.
+
+### §41an — FIVE POOLS, ALL POSITIVE. Iteration repaired the two pools round 1 regressed on.
+
+Five-pool means (math500 included; still near-duplicate-contaminated for every model on this line):
+
+| model | greedy | +budget | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.25 | 56.43 | **58.37** | 61.49 | 75.20 | 69.7% | 16.76 |
+| **a4opdi_a100 (round 3)** | **47.01** | 49.49 | **50.73** | **54.11** | 68.76 | **62.0%** | 22.75 |
+| a4opd35_a100 (round 1) | 44.95 | 47.81 | 48.12 | 52.05 | 66.64 | 59.6% | 23.50 |
+| a4combo_a100 (session start) | 43.31 | 43.92 | 44.15 | 51.13 | 68.94 | 49.6% | 13.32 |
+
+**Five-pool session totals: greedy 43.31 → 47.01 (+3.70), best-decode 44.15 → 50.73 (+6.58), `acc|ANSWERED`
+49.6% → 62.0% (+12.4pp), `pass@8` 68.94 → 68.76 (−0.18, unchanged).**
+
+**And the per-pool table settles §41ad's limitation:**
+
+| pool | r1 greedy | **r3 greedy** | r1 best-decode | **r3 best-decode** |
+|---|---:|---:|---:|---:|
+| asdiv | **−2.40** | **+0.80** | +3.00 | **+5.50** |
+| svamp | +5.80 | +6.60 | +8.00 | **+9.50** |
+| gsmplus | +2.80 | +6.40 | +3.40 | **+7.60** |
+| mawps | +4.20 | +2.80 | +4.20 | **+6.00** |
+| math500 | **−2.19** | **+1.88** | +0.94 | **+4.39** |
+
+**Round 1 was negative on two pools; round 3 is positive on all five, on both metrics**, with best-decode
+gains from +4.39 to +9.50. §41ad concluded that "this method's benefit is bounded by the pool's headroom to
+the token cap" and warned it could cost more than it buys on long-derivation problems. **Iteration repairs
+that**: math500 — the longest-derivation, least-headroom pool — went from −2.19 to **+1.88** on greedy and
++0.94 to **+4.39** on best-decode, with unclosed falling 50.8% → 43.6%. The abstention that round 1 parked on
+those problems (§41ag) was partly converted back into correct answers by rounds 2 and 3.
+
+⚠️So §41ad's caveat is **narrowed rather than withdrawn**: it describes a single round, not the method. The
+residual is that a4's unclosed rate is still 22.75% against the baseline's 13.32%, so `budget`/`extend`
+remains worth +3.7 to the artifact and the deployed configuration should use it.
+
+**Gap to the released argonne-3.5-think, five-pool: greedy 11.94 → 8.24, best-decode 14.22 → 7.64,
+`acc|ANSWERED` 20.1pp → 7.7pp.**
+
+Rounds 4-6 are now running from round 3 (job 53255641) to find where the trend saturates. Each round prints
+`fail_taxonomy.py` on its own fresh rollouts before training, so saturation will be visible round by round
+from behaviour rather than from the divergence (§41ai).
+
+### §41ao — ⚠️A FOURTH NAME COLLISION, and this one silently corrupted a running job
+
+`a4_opd_iter.sh`'s round counter restarts at 2 in **every** invocation, so per-round artifact names are
+unique within a job and collide across jobs. Submitting a second chain from `think_opd_r3` therefore:
+
+1. **overwrote** `report/a4_opd_r2_taxonomy.json` — the anchor-round rollout distribution, which now survives
+   only in §41ag/§41ai's write-ups (the numbers are recorded, the JSON is gone);
+2. and then hit `if [ ! -f "$OUT/.opd_complete" ]` on `$ROOT/think_opd_r2`, **which already existed from the
+   previous job**, printed `>>> round 2 already trained`, and **skipped training entirely** — followed by
+   `>>> round 3 rollouts already present`, reusing a stale dump generated from a different policy.
+
+So the job generated 94k fresh rollouts, threw them away, re-smoke-tested two old checkpoints, and would
+have gated them as if they were new. **Cancelled and resubmitted after fixing the naming** (`TAG` derived
+from `$START`, so paths carry the chain they belong to: `a4_opd_opd_r3_r2`, `think_opd_opd_r3_r2`, …).
+
+⚠️**This is the FOURTH instance of one defect in a single session**, and it is worth stating as a rule
+because the four look superficially unrelated:
+
+| where | the name | what it would have cost |
+|---|---|---|
+| `a4_entbranch.sh` | model list globbed from disk | 4x the job, on three known regressions |
+| `a4_opd_iter.sh` | retention exempted `think_opd` **by name** | **deleting the session's best artifact** |
+| `a4_opd_iter.sh` | gate baseline hardcoded to a non-ancestor | a McNemar measuring two differences as one |
+| `a4_opd_iter.sh` | per-round artifacts unique only *within* a job | a job silently training nothing |
+
+> **A name that is unique within the scope you were thinking about is not unique within the scope that
+> matters.** Every one of these was correct when written, and became wrong when a checkpoint was deleted,
+> repointed, or re-run. None was caught by a test; all four were caught by reading the launcher against the
+> current on-disk inventory.
+
+⚠️And the specific trap in the last one is worth its own line: **an idempotence guard (`skip if
+.opd_complete exists`) turns a name collision from an overwrite into a SILENT NO-OP.** Resume-safety and
+unique naming are the same requirement, not two; a launcher that can skip completed work must key that skip
+on something that identifies the work, not merely its position in a loop.
+
+**The one real measurement the cancelled job produced** — a fresh rollout distribution from `think_opd_r3` —
+is preserved as `report/a4_opd_r3policy_taxonomy.json`: **never-solved 40.8%** (round 2's was 42.0%),
+`acc|ANSWERED` **42.6%** (41.5%), correct rollouts **29.50%** (29.10%), gold-appears-somewhere **74.3%**
+(73.6%). The trend is still improving and clearly flattening: `acc|ANSWERED` per round is **+14.4pp → +5.4pp
+→ +1.1pp**, never-solved **−0.5 → −2.6 → −1.2pp**. That is what the resubmitted chain is measuring.
+
+### §41ap — The length residual is a TAIL, and the objective is growing an EMPTY-THINK mode (1.4% → 9.2%)
+
+Think-token lengths by label, 40,000 rollouts from `think_opd_r3` at T=0.9:
+
+| label | n | median | mean | p90 |
+|---|---:|---:|---:|---:|
+| correct | 16,416 | **183** | 185.8 | 330 |
+| wrong | 16,568 | **184** | 183.0 | 384 |
+| unclosed | 4,908 | **512** (= the cap) | 506.5 | 512 |
+| **no_answer** | 2,108 | **2** | 22.2 | 2 |
+
+**1. Correct and wrong traces are the same length (183 vs 184).** Length does not discriminate correctness —
+a third independent confirmation of §41h, which found every text-derived selector 10-14pt worse than voting.
+Anyone tempted to filter or rerank by length on this model has now been told three times.
+
+**2. The unclosed 24% is a TAIL, not a shift.** Those traces sit at the 512-token cap; the body of the
+distribution has not moved much (median 198 across all rollouts). So the residual gap between plain greedy
+and force-closed (five-pool **+3.70 vs +6.58**, a 2.88pt spread) is bought entirely by traces that run to the
+cap. A CE anchor on the model's OWN correct traces targets median 183 / p90 **330** against the unclosed
+tail's 512 — the pull is in the tail, which is where it needs to be, and the targets are the model's current
+style rather than a stale checkpoint's.
+
+**3. ⚠️A REGRESSION NOT PREVIOUSLY NOTED: the empty-think mode is growing.** `no_answer` traces have a
+**2-token** think block — the model emits `<think>\n\n</think>` and then fails to produce a `\boxed{}`. That
+is the degenerate mode the 3.5 line already had to filter (§33's "empty-think-guess filter mandatory"), and
+across rounds it goes **1.40% (combo) → 8.29% (r1) → 5.77% (r2) → 9.20% (r3)** of sampled rollouts.
+
+⚠️This is the same failure §41n predicted for hindsight distillation — "trained to match a distribution sharp
+on digits it cannot predict, it learns to commit to no digit" — appearing at ~6x the baseline rate in the
+arms that WORKED. It is mild at greedy (`no_answer` 0.5-1.5% in the smoke tests) and shows up mainly under
+temperature, so it costs self-consistency rather than greedy: roughly 9% of the K=8 candidates are wasted on
+empty traces, which is a direct tax on the `sc@8` and `pass@8` columns.
+
+**Consequences, ranked:**
+* The next repair is a **CE pass on the model's own current verified-correct traces** (`--kd-weight 0
+  --ce-weight 1`, targets from the round-3 rollout dump, which has 16,416 of them). It attacks the unclosed
+  tail *and* the empty-think mode at once, because a verified-correct trace is neither 512 tokens long nor
+  empty. `opd_train.py` already supports it with no new code.
+* `--kd-prefix-frac` remains the other candidate, but §41ap says the problem is the tail of the length
+  distribution rather than the body, and prefix-only KD acts on the body.
+* Any future gate on this artifact should read the `no_answer` column, not just `unclosed` — they are
+  different defects with different fixes and this session's tooling only warns about one of them.
+
+### §41aq — ⚠️"Round 4 looks like the turn" — WRONG, see §41ar. I ranked checkpoints with a guardrail.
+
+Closure smoke, same 200 asdiv items, across the whole chain:
+
+| round | greedy | unclosed | mean decoded |
+|---|---:|---:|---:|
+| session start (combo, full pool) | 64.30 | 6.9% | 212 |
+| r1 (`think_opd35anchor`) | 62.50 | 13.5% | **241** |
+| r2 | 65.00 | 15.5% | **267** |
+| **r3** | **65.50** | 13.0% | **277** |
+| r4 | 62.50 | 15.0% | **288** |
+
+⚠️**62.50 against r3's 65.50 is inside the n=200 noise band (±3.4pp), so this is not yet a measured decline.**
+What IS monotone and outside noise is the trace length: **241 → 267 → 277 → 288**, +47 tokens over three
+rounds, ~16 per round, while the baseline sits at 212. Every round buys capability and pays in length, and
+§41ap showed the payment comes out of the tail — traces pinned at the 512 cap, which is where the unclosed
+rate lives.
+
+**So the saturation the chain was run to find is arriving, and it is arriving as a length problem rather than
+a capability one.** The acc|ANSWERED trend was already flattening (+14.4pp → +5.4pp → +1.1pp per round) while
+`t_len` kept climbing linearly. Two more rounds are running; if r5/r6 confirm the turn, the artifact is r3 and
+the next move is not another round.
+
+**The prepared next move is the §41ap repair pass, and it is now runnable with no teacher at all:**
+
+    --student think_opd_r3 --rollouts <r3's own dump> --labels correct --kd-weight 0 --ce-weight 1
+
+`opd_train.py` no longer requires `--teacher` when `--kd-weight 0`, so it does not load a 2.88B model to
+multiply its output by zero. That pass targets median 183 / p90 330 traces drawn from the model's own current
+behaviour, so it should cut the 512-token tail and the empty-think mode together without pulling toward a
+stale checkpoint — the two defects §41ap identified, in one pass, with no new data and no teacher.
+
+### §41ar — ⚠️§41aq RETRACTED: round 4 improved on EVERY policy metric, and `no_answer` self-corrected
+
+Round 4's own rollouts, 93,912 from each policy on identical problems:
+
+| metric | combo | r2 | r3 | **r4** |
+|---|---:|---:|---:|---:|
+| correct rollouts | 23.31% | 29.10% | 29.50% | **32.32%** |
+| wrong | 59.39% | 40.98% | 39.81% | **38.09%** |
+| unclosed | 15.90% | 24.15% | 21.50% | 23.60% |
+| **no_answer** | 1.40% | 5.77% | **9.20%** | **5.99%** |
+| **`acc\|ANSWERED`** | 28.2% | 41.5% | 42.6% | **45.9%** |
+| **never solved in 8** | 44.1% | 42.0% | 40.8% | **39.1%** |
+| solved ALL 8 | 2.1% | 5.9% | 5.2% | **7.4%** |
+| gold is the PLURALITY | 65.2% | 72.9% | 72.7% | **75.7%** |
+| gold appears somewhere | 70.0% | 73.6% | 74.3% | **75.0%** |
+
+**Round 4 is better than round 3 on every single line.** `acc|ANSWERED` +3.3pp, correct rollouts +2.8pp,
+never-solved −1.7pp, solved-8/8 +2.2pp, gold-is-plurality +3.0pp. And the per-round `acc|ANSWERED` deltas are
+**+13.3 / +1.0 / +3.3** — not the monotone flattening §41aq asserted; the trend *re-accelerated*.
+
+**Two claims in §41aq are withdrawn:**
+1. **"Round 4 looks like the turn."** It is not. The 200-item smoke greedy read 62.50 against r3's 65.50, and
+   I said in the same paragraph that ±3.4pp covered it — then led with the turn anyway.
+2. **"The acc|ANSWERED trend was already flattening."** +13.3 → +1.0 → +3.3 is not a flattening trend.
+
+⚠️**THE OPERATIONAL LESSON, and it is one I had already written down.** §41y says of these same smoke tests:
+*"the n=200 noise band is ±3.4pp, so those three are not separable here and the smoke test cannot rank them —
+it was only ever asked whether they terminate."* Twenty subsections later I used it to rank checkpoints
+anyway. **`closure_smoke.py` is a guardrail, not a ranking instrument.** The ranking instrument is the
+93,912-rollout taxonomy — a 470x larger sample, free, and already printed by every round of the chain.
+
+⚠️**And §41ap's empty-think regression partly self-corrected: `no_answer` went 9.20% → 5.99%.** It is still 4x
+the baseline's 1.40% and still worth the repair pass, but it is not monotonically worsening and should not be
+described as a runaway. The one thing that IS monotone across all four rounds is trace length
+(241 → 267 → 277 → 288 at greedy), which is the real cost and the thing the repair pass targets.
+
+**Consequence: do not stop the chain.** Rounds 5 and 6 are still running and the policy is still improving on
+every measure that has the sample size to say so.
+
+### §41as — Two flag-shadowing bugs, the same defect as the four name collisions
+
+Staging §41ap's repair pass as an arm of `a4_kd3.sh` surfaced two more, both caught by reading rather than by
+running:
+
+1. **`--kd-weight 1.0` was hardcoded in the training call, AFTER `$EXTRA` on the command line.** argparse
+   takes the last occurrence, so the repair arm's `--kd-weight 0.0` would have been silently overridden and
+   the arm would have run as an ordinary KD pass — producing a plausible checkpoint that was not the
+   experiment. Fixed by moving `--kd-weight` into each arm's own `EXTRA`. This is the second flag-shadowing
+   instance today; the first was a duplicate `--ce-weight 0.0` in `a4_opd_iter.sh` that would have overridden
+   the CE anchor in every iterated round.
+2. **The repair arm silently accepted the wrong rollout dump.** It must train on the STUDENT's own traces;
+   pointed at the default (`a4_dpo_all.jsonl`, generated by a checkpoint four rounds back) it would train on
+   stale targets — *exactly* the "pull toward a stale checkpoint" the arm exists to avoid — and would look
+   like it ran correctly. Now a hard `FATAL` rather than a comment.
+
+⚠️**Six bugs of one family in one session** (four name collisions, two flag shadowings), and the unifying
+statement is worth more than any of them individually:
+
+> **Wherever the same thing can be specified in two places, the later one wins silently.** A hardcoded
+> checkpoint name and a `$START` variable; a per-round counter and a per-job scope; a fixed `--kd-weight` and
+> a per-arm `EXTRA`. In every case the code was correct when written, kept running afterwards, and produced
+> output that looked right.
+
+None of the six was caught by a test. All six were caught by reading a launcher against the current on-disk
+inventory and against the arm it was supposed to be running. On a line where one job is ~4 GPU-hours and a
+silent no-op is indistinguishable from a null result, **that read is the cheapest instrument available and
+should happen every time a checkpoint is deleted, repointed, or re-run.**
+
+### §41at — The chain has NOT converged, and the CE anchor is measurably a TRADE, not a free fix
+
+Weight-space trajectory of the whole chain, computed on CPU from the safetensors (`||combo|| = 1235.9`):
+
+| step | size (rel. ‖combo‖) | cumulative from combo |
+|---|---:|---:|
+| combo → opd35 (KD round 1) | 0.914% | 0.914% |
+| opd35 → anchor (CE 0.5) | 0.661% | **0.747%** |
+| anchor → r3 (two KD rounds) | 1.167% | 1.592% |
+| r3 → r4 | **0.666%** | 1.942% |
+| r4 → r5 | **0.656%** | 2.274% |
+
+**1. The chain has not converged.** Per-round steps are essentially constant (0.666%, 0.656%) rather than
+shrinking, and net displacement from the start grows linearly at **+0.33% per round** (1.592 → 1.942 → 2.274).
+A converging process would show step sizes decaying; this one is walking at a steady rate. Together with the
+taxonomy still improving at round 4 (§41ar), that says iteration remains productive — and also that it will
+keep drifting rather than settling, including in the one monotone cost, trace length (+16 tokens/round).
+
+**2. The rounds move in a CONSISTENT direction.** Cosine between consecutive steps: **+0.391** then **+0.319**
+for the iterated rounds. Not oscillation, not random walk — a persistent preferred direction with noise on top,
+which is exactly what the +0.693 seed-to-seed correlation of §41aa predicted at the single-round level.
+
+**3. ⚠️And the CE anchor is measurably OPPOSED to the KD direction: cos = −0.592.** That is the sharpest
+statement of what §41ab's numbers implied. The anchor is not a free repair that removes a side effect; it is a
+**controlled trade that walks partly back along the KD direction** — which is precisely why `anchor` kept
+**7.0pp of the 7.6pp** capability gain rather than all of it, and why it landed *closer* to the baseline in
+weight space (0.747% vs 0.914%).
+
+**Consequences for the repair pass (§41ap), stated before it runs:**
+* It will cost some capability. A pure-CE pass is the anchor step taken further, and the anchor step has
+  cos −0.592 with the direction that produced the gain. **Expect a trade, not a free fix**, and read
+  `acc|ANSWERED` alongside `t_len` to price it.
+* But the trade should be *favourable* here, because the current artifact is paying 2.88pt of five-pool
+  greedy to force-closing (§41ap) — i.e. the length cost is now larger than a −0.59-correlated step is likely
+  to cost in capability. That is the bet, and it is falsifiable in one job.
+* And the chain should keep running in parallel with that reasoning, because §41ar established the policy is
+  still improving and §41at now shows it has not converged. **Neither the repair pass nor another round is the
+  obvious single next move; they address different costs and both are cheap.**
+
+### §41au — SATURATION FOUND: round 4 is the peak. Round 5 is flat-to-negative on answer quality.
+
+Policy rollout distributions, 93,912 per checkpoint on identical problems — the ranking instrument §41ar
+established:
+
+| metric | combo | r2 | r3 | **r4** | r5 |
+|---|---:|---:|---:|---:|---:|
+| correct rollouts | 23.31% | 29.10% | 29.50% | **32.32%** | 32.32% |
+| wrong | 59.39% | 40.98% | 39.81% | **38.09%** | 39.66% |
+| unclosed | 15.90% | 24.15% | 21.50% | 23.60% | 22.02% |
+| no_answer | 1.40% | 5.77% | 9.20% | 5.99% | 6.01% |
+| **`acc\|ANSWERED`** | 28.2% | 41.5% | 42.6% | **45.9%** | 44.9% |
+| never solved in 8 | 44.1% | 42.0% | 40.8% | 39.1% | **38.6%** |
+| solved ALL 8 | 2.1% | 5.9% | 5.2% | **7.4%** | 7.4% |
+| gold is the PLURALITY | 65.2% | 72.9% | 72.7% | **75.7%** | 75.7% |
+
+Per-round deltas — `acc|ANSWERED` **+13.3 / +1.0 / +3.3 / −1.0**, `correct` **+5.8 / +0.4 / +2.8 / −0.0**,
+never-solved **−2.1 / −1.2 / −1.7 / −0.5**.
+
+**Round 4 is the peak.** Round 5 is the first round to fail to improve answer quality: flat on `correct`,
+`solved-8/8` and gold-is-plurality, **−1.0pp on `acc|ANSWERED`**, and +1.6pp *worse* on `wrong`. Only coverage
+still moved, and only by −0.5pp against the previous round's −1.7pp. **This is the saturation point the chain
+was run to find**, and it is four rounds in, measured on 93,912 rollouts rather than inferred.
+
+⚠️**An honest note on how I got here, because it is not flattering and it matters.** §41aq claimed the turn at
+round 4 from a 200-item greedy read; §41ar retracted that, correctly, because round 4's taxonomy was better on
+every line. §41au now finds the turn one round later on proper evidence. So the *instinct* that a turn was
+near was right, the *claim* was wrong, and **the retraction was correct on the evidence available at the
+time.** Being right for the wrong reason is still wrong; had I not retracted, I would have stopped the chain
+before round 4 — the peak — on the strength of noise.
+
+**Consequence for the artifact.** The gated checkpoint is round 3 (`think_opd_r3`, +7.30 four-pool
+best-decode, p=7.35e-20). The taxonomy says **round 4 is better than round 3 on every answer-quality measure**
+(`acc|ANS` 45.9% vs 42.6%, correct 32.32% vs 29.50%, plurality 75.7% vs 72.7%, never-solved 39.1% vs 40.8%).
+The chain's own final gate compares round 6 against round 3, so **round 4 needs its own paired gate against
+round 3 to settle which is the artifact** — one job, three models, and the last measurement this line needs
+before it has a final answer.
+
+### §41av — ⚠️THE RETENTION RULE DELETED THE PEAK. "Latest-only" assumes later is better; saturation is the case where it isn't.
+
+Thirty minutes after §41au identified **round 4** as the chain's peak on 93,912 rollouts per policy, and while
+a gate for it was being written, `a4_opd_iter.sh`'s retention step printed:
+
+    [retention] dropping superseded /project/rcc/youzhi/models/a4_think_final/think_opd_opd_r3_r2
+
+and deleted it. The rule did exactly what it was told. **The rule is what was wrong.**
+
+> **"Keep the newest, delete the previous" encodes the assumption that LATER IS BETTER. A saturating chain
+> violates precisely that assumption — and finding where a process stops improving is the entire purpose of
+> running it.**
+
+Cost: ~1.2 GPU-hours to reproduce (regenerate the rollouts, retrain), recoverable **only** because
+`rft_generate` is deterministic given model + seed. A non-deterministic generator would have made the peak of
+a six-round chain unrecoverable. Disk saved: **2 GB.**
+
+**Fixed by disabling CHECKPOINT rotation in this launcher specifically, and saying why in the code:**
+* **Rollout dumps are still rotated** — 120 MB each, genuinely regenerable, never a result.
+* **Checkpoints are kept**, and pruned by hand *after* the gate says which one matters, under the
+  four-question audit. On this chain that is at most 6 x 2 GB against a 1.9 PB filesystem with 70% free.
+
+⚠️**This is the seventh defect of the session's recurring family, and the most instructive**, because unlike
+the six name/flag collisions it was not a mistake in the code at all — the code was correct, the *policy* it
+implemented was correct in general, and it was wrong for this one job because of something the job had just
+measured. **A correct rule applied outside its assumptions is indistinguishable from a bug, and cheaper to
+cause.** The retention rule's own stated exception — "a checkpoint that IS a result" — did apply to round 4 the
+moment §41au was written; nothing propagated that fact into the running job.
+
+**Practical consequence, and the reason this is logged rather than quietly fixed:** any chain-style launcher on
+this line that rotates checkpoints should be assumed to be able to delete its own best result. The other two
+chain launchers (`a4_kd2.sh`, `a4_kd3.sh`) do not rotate at all, so they are fine; `a4_opd_iter.sh` was the
+only one, and it is now fixed.
+
+`a4_pick.sh` — written to gate round 4 against round 3 — is repointed at what survives (**round 6, round 5,
+round 3, baseline**) and takes `R4=` so it can be pointed at a regenerated round 4 later. Round 6's smoke was
+the best of the whole chain (greedy 66.50, unclosed 13.5%, 282 tok), but §41ar forbids ranking on that, so the
+gate decides.
+
+### §41aw — FINAL: the DEPLOYED metric saturated at round 3; rounds 4-6 bought CEILING instead
+
+Chain's final gate, asdiv + svamp n=1000, identical items:
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 71.00 | 73.40 | 73.25 | **73.95** | 80.65 | 92.00 | 79.6% | 8.45 | 236.4 |
+| **a4opdi (round 6)** | **61.25** | 63.90 | 64.60 | 64.65 | **71.60** | **87.35** | 71.1% | 13.50 | 264.9 |
+| a4start (round 3) | 60.45 | 64.60 | **65.15** | 64.90 | 70.45 | 85.40 | 71.2% | 14.60 | 271.4 |
+| a4combo (session start) | 56.75 | 57.60 | 57.50 | 57.45 | 68.10 | 85.45 | 61.1% | 6.95 | 199.9 |
+
+Pooled paired McNemar over 2,000 items, **round 6 vs the session start**: greedy **+4.50** (p=1.90e-05),
+budget +6.30 (3.02e-09), extend1 +7.10 (1.34e-11), extend3 **+7.20** (1.18e-11), sc@8 +3.50 (1.74e-04),
+**pass@8 +1.90 (9.77e-03)**.
+
+**Round 6 vs round 3** — and this is the finding: greedy +0.80 (p=0.43), extend1 **−0.55** (p=0.59), sc@8
++1.15 (p=0.17), **pass@8 +1.95 (p=6.09e-03)**.
+
+**So the two are statistically indistinguishable on every deployed metric, and round 6 is significantly better
+on `pass@8` alone.** Three extra rounds (~3.6 GPU-hours) bought **ceiling, not floor.** The deployed metric
+saturated at round 3; coverage kept improving through round 6.
+
+⚠️**That reconciles §41au with the gate rather than contradicting it.** §41au found the *sampling* distribution
+peaking at round 4 (T=0.9 rollouts); the gate finds the *greedy/force-closed* metric flat from round 3 and
+`pass@8` still rising. **Saturation is metric-specific — a chain can stop improving what you deploy while still
+improving what it covers**, and reading one as the other is the same class of error as §41ah and §41aq. Both
+measurements are correct; they are measuring different things.
+
+**⭐THE SESSION, asdiv + svamp, start → best available:**
+
+| | start (`a4combo_a100`) | best | Δ | 3.5-think |
+|---|---:|---:|---:|---:|
+| greedy | 56.75 | **61.25** (r6) | **+4.50** | 71.00 |
+| best decode | 57.60 | **65.15** (r3) | **+7.55** | 73.95 |
+| self-cons@8 | 68.10 | **71.60** (r6) | +3.50 | 80.65 |
+| pass@8 | 85.45 | **87.35** (r6) | +1.90 | 92.00 |
+| `acc\|ANSWERED` | 61.1% | **71.2%** | **+10.1pp** | 79.6% |
+
+**Either round 3 or round 6 is defensible as the artifact** — r3 by best-decode (65.15 vs 64.65, n.s.), r6 by
+ceiling and self-consistency. r6 also has the lower unclosed rate (13.50% vs 14.60%) and shorter traces (264.9
+vs 271.4), so **r6 is the better artifact on every axis except a non-significant 0.55 of best-decode**, and it
+is the one to prefer. The gap to the released 3.5-think closes from **16.35 → 8.80** on the deployable number.
+
+### §41ax — Can a better Qwen3 teacher help? The candidate set, verified, and why STRENGTH is not the constraint
+
+Checked rather than assumed, because the whole method rests on token-identical tokenisation:
+
+| candidate | params | tokenizer matches a4 | verdict |
+|---|---:|:---:|---|
+| **`Qwen/Qwen3-4B` (plain hybrid, in the HF cache)** | 4.0B | ✅ len 151,669; `<think>`=151667 | **untested; best structural bet** |
+| `Qwen3-4B-Thinking-2507` (on disk) | 4.0B | ✅ | tested: 4.5x signal, **collapsed termination** (§41f) |
+| Qwen3-8B / 14B / 32B / 30B-A3B | 8-32B | ✅ (same Qwen3 vocab) | not on disk; downloadable |
+| ⛔ `Qwen3.5-9B` | 9.7B | ❌ **`<think>`=248068**, vocab ~248k | disqualified |
+| ⛔ `Qwen3.5-0.8B-Base` | 0.9B | ❌ same break | disqualified |
+| ⛔ `Qwen2.5-7B-Instruct` | 7B | ❌ 151,665 entries, **no `<think>` at all** | disqualified |
+| ⛔ Qwen3-0.6B/1.7B-Base | <2B | ✅ | weaker than the current teacher |
+
+**Qwen3.5 broke the tokenizer.** The vocabulary grew to ~248k between Qwen3 and Qwen3.5, so `<think>` moved
+151667 → 248068 and a real trace no longer round-trips. Per-token KD is undefined across different
+tokenisations; `opd_train.py` refuses to start. That rules out the strongest same-family model on disk on
+grounds that have nothing to do with its quality. ⚠️Worth remembering as a planning constraint for this line:
+**the Qwen3 → Qwen3.5 boundary is a hard wall for any method requiring token alignment**, and argonne4's whole
+KD story depends on staying on the Qwen3 side of it.
+
+**And the reframe, which is the substantive answer.** §41f already measured a teacher with **4.5x more
+per-token signal** than the current one (revKL 0.85 vs 0.20; argmax disagreement 23% vs 12%) producing greedy
+**1.75** with a 96.95% unclosed rate — because its trace-length distribution is 20-30x the student's. So
+"get a stronger teacher" is not the open lever; **"decouple a strong teacher's content signal from its length
+signal" is.** Two candidates for that now exist, neither tested:
+* **`Qwen3-4B` plain** — the hybrid rather than the long-CoT-specialised variant, same size class, same
+  tokenizer, natively supports non-thinking mode. Structurally the better bet on exactly the variable that
+  killed the last attempt.
+* **`--kd-prefix-frac`** — built after §41w pinned trace length as body-level, verified numerically, never run.
+
+**`reasoning/a4_teacher_audition.sh`** scores candidates in ~3 minutes each instead of ~4 GPU-hours each, on
+the two axes that decide it, both already printed by `opd_train.py` at step 1:
+* `revKL` / `agree` — how much the teacher has to say about a4's own tokens;
+* **`haz s` vs `haz t`** — the marginal closure hazard of student and teacher, the statistic whose absence cost
+  §41f its entire run.
+
+Read it as: **prefer the highest `revKL` among teachers whose `haz t` is within ~2x of `haz s`.** A
+high-signal teacher with a collapsed hazard is not usable as-is and becomes a `--kd-prefix-frac` question
+instead. Six steps at lr 1e-6 barely moves the student, so the audition is a measurement, not a training run.
+
+### §41ay — FOUR-POOL FINAL: round 6 is the artifact. Session closes ~half the gap to 3.5-think.
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 60.75 | 62.15 | 63.12 | **63.32** | 68.88 | 80.60 | 73.3% | 12.33 |
+| **a4opdi_a100 (round 6)** | **54.32** | 55.55 | 56.15 | **56.27** | **62.55** | **76.38** | **66.1%** | 16.30 |
+| a4start_a100 (round 3) | 52.17 | 55.20 | 55.87 | 55.65 | 60.42 | 74.35 | 64.6% | 17.55 |
+| a4combo_a100 (session start) | 48.02 | 48.40 | 48.20 | 48.58 | 56.70 | 74.03 | 53.2% | 9.12 |
+
+Pooled paired McNemar, 3,000 items:
+
+| | greedy | +extend1 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| r6 vs session start | **+5.70** (8.44e-12) | **+7.67** (4.22e-20) | **+5.07** (4.06e-12) | **+2.20** (4.76e-04) |
+| r6 vs round 3 | +1.70 (2.99e-02) | +0.00 (1.00) | +1.80 (5.66e-03) | +2.00 (6.34e-04) |
+
+**Round 6 is the artifact.** §41aw could only call r6 and r3 indistinguishable because it had two pools; on four
+it is **better on greedy, self-consistency and pass@8, and exactly tied on best-decode** — plus a lower
+unclosed rate (16.30% vs 17.55%). ⚠️Note this REVISES §41aw's "either is defensible": with 3,000 items instead
+of 2,000 the ordering resolves. A two-pool read was not enough to rank two checkpoints 1.7pt apart, which is
+the same sample-size lesson as §41ar, one rung up.
+
+**⭐THE SESSION, four clean pools:**
+
+| | start | round 6 | Δ | 3.5-think | gap closed |
+|---|---:|---:|---:|---:|---:|
+| greedy | 48.02 | **54.32** | **+6.30** | 60.75 | 12.73 → **6.43** (49%) |
+| best decode | 48.58 | **56.27** | **+7.69** | 63.32 | 14.74 → **7.05** (52%) |
+| self-cons@8 | 56.70 | **62.55** | **+5.85** | 68.88 | 12.18 → 6.33 (48%) |
+| pass@8 | 74.03 | **76.38** | +2.35 | 80.60 | 6.57 → 4.22 (36%) |
+| `acc\|ANSWERED` | 53.2% | **66.1%** | **+12.9pp** | 73.3% | 20.1 → **7.2pp** (64%) |
+
+**About half the gap to the released argonne-3.5-think is gone**, on every metric, from a 1.04B model against a
+2.88B one, on a base measured at −16.79pt with the identical recipe (§40). `acc|ANSWERED` closed the most
+(64%) — which is the axis §41j identified at the start of the session as the whole deficit.
+
+For scale one last time: the thirteen arms preceding this session moved the deployable number **+4.96 in total**
+across ~10 GPU-days. This session moved it **+7.69** on the same basis, and **+2.35 of `pass@8`** which no
+previous arm had moved at all.
+
+### §41az — ⭐⭐⭐FIVE-POOL FINAL. Positive on every pool, on both metrics. Gap closed 54%.
+
+| model | greedy | +budget | +extend1 | +extend3 | sc@8 | pass@8 | acc\|ANS | uncl% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a35think_a085 (target) | 55.25 | 56.43 | 57.90 | **58.37** | 61.49 | 75.20 | 69.7% | 16.76 |
+| **a4opdi_a100 (round 6) ← ARTIFACT** | **49.48** | 50.83 | 51.13 | **51.73** | **56.62** | **71.07** | **63.8%** | 21.13 |
+| a4start_a100 (round 3) | 47.01 | 49.49 | 50.59 | 50.73 | 54.11 | 68.76 | 62.0% | 22.75 |
+| a4combo_a100 (session start) | 43.31 | 43.92 | 43.64 | 44.00 | 51.13 | 68.94 | 49.6% | 13.32 |
+
+**Per-pool, round 6 against the session start — positive everywhere, on both metrics:**
+
+| pool | greedy Δ | best-decode Δ |
+|---|---:|---:|
+| asdiv | +2.00 | +5.70 |
+| svamp | +7.00 | +8.50 |
+| mawps | +7.80 | +8.00 |
+| gsmplus | +8.40 | +8.60 |
+| math500 (contaminated) | +5.64 | +7.52 |
+
+**⭐THE SESSION, five-pool — the campaign's historical basis:**
+
+| | start | round 6 | Δ | 3.5-think | gap closed |
+|---|---:|---:|---:|---:|---:|
+| greedy | 43.31 | **49.48** | **+6.17** | 55.25 | 11.94 → **5.77** (52%) |
+| **best decode** | 44.00 | **51.73** | **+7.73** | 58.37 | 14.37 → **6.64** (54%) |
+| self-cons@8 | 51.13 | **56.62** | **+5.49** | 61.49 | 10.36 → 4.87 (53%) |
+| pass@8 | 68.94 | **71.07** | +2.13 | 75.20 | 6.26 → 4.13 (34%) |
+| **`acc\|ANSWERED`** | 49.6% | **63.8%** | **+14.2pp** | 69.7% | 20.1 → **5.9pp** (71%) |
+
+**Round 6 (`think_opd_opd_r3_r4`) is the artifact.** It is better than round 3 on greedy (+2.47), sc@8 (+2.51),
+pass@8 (+2.31) and best-decode (+1.00), with a lower unclosed rate (21.13% vs 22.75%).
+
+⚠️**And note the one remaining structural cost, unchanged all session:** unclosed is **21.13% against the
+baseline's 13.32%**, which is why `+extend3` is worth +2.25 to the artifact and the deployed configuration must
+use force-closing. That is the residual §41ap diagnosed as a 512-token TAIL and the prepared CE repair pass
+targets. It is the last identified opportunity on this artifact and it is one job.
+
+**Where the line stands.** Post-training on this base moved the deployable number **44.00 → 51.73** in one
+session — against **+4.96 total** from the thirteen arms that preceded it across ~10 GPU-days — and closed
+**52-54%** of the distance to a 2.88B model from a 1.04B one whose base measures −16.79pt with the identical
+recipe. `acc|ANSWERED` closed **71%**, which was §41j's whole diagnosis. It is still **6.6 points short** of the
+released argonne-3.5-think on best-decode, and §41ax's audition is the next thing that could move that.
+
+### §41ba — The audition CALIBRATED ITS OWN THRESHOLD, and the answer about a stronger teacher is now sharp
+
+`reasoning/a4_teacher_audition.sh`, 6 steps at lr 1e-6 per candidate, against the **round-6 artifact's own**
+rollouts:
+
+| teacher | params | revKL | agree | `haz s` | `haz t` | ratio | known outcome |
+|---|---:|---:|---:|---:|---:|---:|---|
+| released 3.5-think | 2.88B | **0.1057** | 92.7% | 0.0052 | 0.0052 | **1.00** | ✅ worked, +7.73 five-pool |
+| Qwen3-4B-Thinking-2507 | 4.02B | **0.9434** | 78.4% | 0.0052 | 0.0039 | **0.75** | ⛔ greedy 1.75, 96.95% unclosed |
+
+**Three findings, and together they settle the "get a better teacher" question.**
+
+**1. ⚠️My audition threshold was wildly wrong, and its own first run says so.** I wrote "prefer the highest
+`revKL` among teachers whose `haz t` is within ~2x of `haz s`." The teacher that destroyed termination has a
+ratio of **0.75** — comfortably inside 2x. A **25% hazard deficit, integrated over ~1,700 steps, was enough to
+drive closure to zero.** The threshold is now `haz_t/haz_s >= ~0.95`, anchored on one known-good point (1.00,
+worked) and one known-fatal point (0.75, catastrophic). ⚠️A criterion invented before any calibration data is
+a guess wearing a number; this one was wrong by more than a factor of four in the quantity that matters.
+
+**2. The safe teacher is now genuinely, measurably exhausted.** 3.5-think's reverse KL against the round-1
+student was 0.1872; against the **round-6** student it is **0.1057** — the artifact is nearly twice as close to
+its teacher as when the session started. Combined with §41aw (deployed metric flat from round 3) and §41au
+(sampling metrics peaking at round 4), the chain did not stop for want of iterations; **it stopped because the
+teacher ran out of things to say.**
+
+**3. The strong teacher's headroom is large and completely untouched.** Qwen3-4B-Thinking still measures
+**revKL 0.9434 — 8.9x** what 3.5-think has left — with 78.4% argmax agreement against 92.7%. That signal is
+real, it is on the current policy's own states, and the ONLY thing standing between it and the model is a
+0.75 closure hazard.
+
+> **So the capability lever is not closed; it is gated on exactly one unsolved problem — making a
+> longer-trace teacher safe.** `--kd-prefix-frac` was built for precisely that (§41x), verified numerically,
+> and has never been run. It is now the single highest-value experiment on this line, and the audition gives
+> it a cheap pass/fail: run the probe with `--kd-prefix-frac 0.5` and see whether the effective hazard ratio
+> comes back to ~1.0 while `revKL` stays high.
+
+⚠️**And two bugs the audition surfaced on its first run, both of which made a crash look like a clean result:**
+* `opd_train.py`'s argonne2 detection opened `<teacher>/config.json` as a local path, so the hub ID
+  `Qwen/Qwen3-4B` died with `FileNotFoundError` before `from_pretrained`. Guarded with `os.path.isdir`.
+* the launcher printed `exit=$?` **inside the same `echo` as a `$(basename ...)`**, and bash runs command
+  substitutions during word expansion — so `$?` held *basename's* status. It reported **`exit=0` for a
+  candidate that crashed and printed nothing.** Demonstrated: `false; echo "$(basename /x/y) -> $?"` prints
+  `0`; capturing `rc=$?` first prints `1`. Every audition would have reported success. Fixed, and a non-zero
+  status now prints "FAILED to audition — NOT a verdict about the teacher", because a broken probe and a bad
+  teacher must never read the same.
+
+### §41bb — ⛔THE STRONG-TEACHER LEVER IS CLOSED. Prefix-masking is the WORST possible protection, and my own §41w null said so.
+
+§41ba ended with the strong-teacher question sharp: `Qwen3-4B` (plain) carries 9.3× the per-token signal
+3.5-think has left (revKL 0.979 vs 0.106, argmax agreement 78.3% vs 92.7%) but sits at hazard ratio 0.85,
+outside the band the audition had just calibrated. The protection was `--kd-prefix-frac 0.5` — apply the KD
+loss only over the first half of each completion — on the theory that closure mass lives at the *end* of a
+trace, so masking the tail removes the closure pressure while keeping the early decisions where §41b located
+the failure (79% of wrong traces diverge at equation index 0). Job 53274157, both arms, from the round-6
+artifact on its own rollout dump:
+
+| arm | prefix | CE anchor | greedy | unclosed | mean decoded | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| round-6 student (baseline) | — | — | **66.50** | **13.50%** | 282 | — |
+| `pre50a` | 0.5 | 0.5 | 9.50 | 88.50% | 505 | ⛔FAIL closure |
+| `pre50` | 0.5 | 0.0 | 3.00 | 96.50% | 511 | ⛔FAIL closure |
+
+**Both protections worked in the predicted direction and were nowhere near enough.** The CE anchor bought
+8.0pp of unclosed (96.5 → 88.5); prefix-masking bought ~0.5pp over §41f's unmasked long-CoT arm (96.95%).
+Against a 6× gap, those are rounding errors. And the KD itself fit *beautifully* — argmax agreement
+76.2% → 85.7%, revKL 1.148 → 0.339 over 1,942 steps. The student learned the teacher extremely well. What it
+learned was to be Qwen3-4B, which writes 500+ tokens inside a `<think>` block.
+
+**⚠️THE SELF-CORRECTION, AND IT IS THE WHOLE LESSON. I had already measured that prefix-masking was the wrong
+protection and did not connect it.** §41w tested `--exclude-terminators`, which strips every scrap of gradient
+from the `</think>`/eos logit columns, and it was a NULL: trace length moved by *one token* (212 → 280 became
+212 → 279) while the body-level CE anchor moved 39. The conclusion recorded there was **"trace length on this
+line is BODY-level, not a closure-probability phenomenon."** Prefix-KD transfers exactly the body — a prefix
+*is* body tokens. So masking to the prefix deletes the region where closure mass lives while *preserving*
+the region that sets how long the body wants to run. Of all the maskings available it is the one that keeps
+100% of the harmful signal and discards the part that was harmless. I reasoned about it as "removing closure
+pressure" when my own prior measurement had already said closure pressure is not the mechanism.
+
+**The hazard ratio is a PROXY for body-style mismatch, not a cause.** That is why `haz_t/haz_s` at step 1
+predicted the outcome (1.00 worked, 0.85 and 0.75 fatal) while *intervening on* the hazard changed nothing:
+the ratio is a cheap readout of "does this teacher want to write traces the length of the student's," and the
+only way to fix it is to change the teacher's trace-length distribution, not to hide part of the loss.
+
+**Three points on the axis, all from the same step-1 instrument, now with outcomes:**
+
+| teacher | revKL | agree | `haz_t/haz_s` | protection | outcome |
+|---|---:|---:|---:|---|---|
+| 3.5-think (length-matched) | 0.106 | 92.7% | **1.00** | CE 0.5 | ✅ +7.73 five-pool best-decode |
+| Qwen3-4B plain | 0.979 | 78.3% | 0.85 | prefix 0.5 + CE 0.5 | ⛔88.5% unclosed |
+| Qwen3-4B plain | 0.979 | 78.3% | 0.85 | prefix 0.5 | ⛔96.5% unclosed |
+| Qwen3-4B-Thinking-2507 | 0.943 | 78.4% | 0.75 | none | ⛔96.95% unclosed |
+
+⛔**VERDICT: a stronger same-tokenizer teacher cannot be used by per-token on-policy KD at any masking
+fraction, because the quantity being transferred and the quantity that must not transfer are the same
+tokens.** This closes the lever §41ax opened. It is 0-for-3 and the three failures span both Qwen3-4B
+variants and both protections. Downloading Qwen3-8B/14B/32B is now pointless *by this channel* — they are
+larger models with the same long-form think style, i.e. further outside the band, not closer to it.
+
+**What is NOT ruled out, and the one thing that would reopen it:** make the teacher's think-block style
+short. The teacher is only ever run forward on the student's own tokens, so the intervention has to be in
+the teacher's *context* — and `opd_train.py --hint-template` already puts arbitrary text there (it was built
+for §41m's gold-anchored arm). A brevity instruction is a *style* constraint rather than privileged
+information, so it does not repeat §41n's failure mode of making the teacher a worse model. It is a
+3-minute audition: condition Qwen3-4B on a brevity instruction and read `haz_t/haz_s`. If it lands ≥0.95 the
+strong teacher becomes usable; if it does not, the lever is dead by every means available here and should be
+recorded that way.
+
+### §41bc — ⛔THE REPAIR PASS TRAINS ON EXACTLY THE SUBSET THAT DOES NOT NEED REPAIRING. Its own loss curve says so.
+
+The largest number left on the board was never capability, it was the **answered rate**. `greedy =
+acc|ANSWERED × answered-rate`, and at round 6 the five-pool split is 49.48 = 63.8% × 77.6%. That 22.4% of
+items producing no extractable answer is worth, if recovered to the pre-KD 90%, `0.638 × 0.90 = 57.4` —
+which is *above* released 3.5-think's 55.25, from a mechanism that needs no teacher at all. So the prepared
+repair pass (`--kd-weight 0 --ce-weight 1 --labels correct`, pure CE on the model's own verified-correct
+traces, 17,898 rows from round 6's own dump) ran as a two-LR dose-response, job 53283716.
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | **66.50** | **13.50%** | 1.50% | 282 |
+| `repair` (lr 1e-5) | 62.50 | 15.00% | **0.00%** | 291 |
+
+It killed the empty-think mode outright (1.50% → 0.00%) and did nothing else — greedy −4.00 and unclosed
+*worse*, both inside the n=200 smoke's ±3.4pp but pointing the wrong way.
+
+**The training curve is the diagnosis, and it is unambiguous: CE went 0.1964 → 0.1884 over 800 steps.** A 4%
+drop. There is no gradient signal in the model's own correct traces because *the model already assigns them
+high likelihood* — they are its own samples. Pure rejection-sampling SFT on own output asks the policy to do
+more of what it already does, and "it already does it" is exactly why the loss is flat.
+
+**⚠️THE STRUCTURAL FLAW, which was predictable from the label filter alone and which I did not predict.**
+`--labels correct` selects traces that are, by construction, **closed** — a trace cannot be graded correct
+without producing an answer. The 22.4% of items that fail to close produce *no correct trace*, so they
+contribute **zero rows** to the repair set. The arm trains on the closed subset in order to fix the unclosed
+one, and the two sets are disjoint by definition. Any gain would have had to arrive by generalization from
+the wrong population.
+
+**What actually attacks the unclosed tail: the target has to CLOSE, and the model does not produce one.** So
+construct it — truncate an unclosed trace at a natural boundary inside the budget and append `</think>` plus
+a gold-verified answer, restricted to problems where the model has demonstrated it can reach that answer
+(≥1 of its 8 rollouts graded correct). Two reasons this is principled rather than a hack:
+* **It internalizes a gain that is already measured.** `clean_eval.py`'s force-closing decoders
+  (`budget`/`extend1-3`) do precisely this at inference and are worth +2.25 five-pool (best-decode 51.73 vs
+  greedy 49.48). Training the behavior the decode wrapper simulates converts a serving-time trick into a
+  model property.
+* **Converting unclosed → guess is free in expectation.** An unclosed trace scores 0 and a wrong answer
+  scores 0, so there is no accuracy downside to committing; the only cost is `acc|ANSWERED` as a *reported*
+  statistic, which is why both must be read together.
+⚠️The failure mode to instrument is hallucinated confidence: teaching "emit an answer after N tokens"
+generalizes to problems where the model has derived nothing. Restricting construction to demonstrated-solvable
+problems bounds it on the train side; the gate's `acc|ANSWERED` column is what detects it on the test side.
+
+### §41bd — ⚠️RETRACTION OF §41bc's PRICING. The answered-rate lever is worth ≤2pt, not ≈8, and the TARGET MODEL is the reason.
+
+§41bc opened by pricing the repair lever at `0.638 × 0.90 = 57.4` greedy, "above released 3.5-think's 55.25."
+That 0.90 came from `a4combo`, the pre-KD baseline. **It should have come from the model being chased.**
+Pooling the `fm` (failure-mode) dicts every gate JSON already stores, over the same 3,319 items:
+
+| model | greedy | `acc\|ANS` | answered% | unanswered% |
+|---|---:|---:|---:|---:|
+| a35think_a085 (**target**) | 61.07 | 74.74 | **81.71** | 18.29 |
+| a4start_a100 (round 6) | 52.18 | 66.13 | **78.91** | 21.09 |
+| a4combo_a100 (pre-KD) | 48.42 | 54.92 | 88.16 | 11.84 |
+
+**The model I am chasing has an 18.29% unanswered rate of its own.** The answered-rate gap between round 6
+and 3.5-think is **2.8pp**; the `acc|ANSWERED` gap is **8.6pp**. Recovering the answered rate to the target's
+own value at unchanged acc|ANS gives greedy 54.0 — **+1.8, not +7.9.** Per pool, round 6 vs 3.5-think
+unanswered: asdiv 15.5 vs 11.4, svamp 14.5 vs 10.3, mawps 24.0 vs 22.8, gsmplus 24.8 vs **28.2** (round 6 is
+*better*), math500 48.9 vs 42.3.
+
+**⚠️THE ERROR HAS A NAME AND I HAVE MADE IT BEFORE: I priced a lever against a WORSE model's value on that
+axis.** `a4combo`'s 88.16% answered rate is not a target to aspire to — it is what a model looks like when it
+gives up early, and it came packaged with `acc|ANS` 54.92 against round 6's 66.13. Six rounds of KD *bought*
+11.2pp of acc|ANS by *spending* 9.2pp of answered rate, and that trade was strongly positive (+3.76 greedy).
+Reading the spent side as a defect to be refunded, at the pre-trade price, double-counts it. This is the same
+shape as §41j's withdrawn "+1.2 capability" row (priced by an exhausted family's best) — **a lever's value is
+set by the gap to the reference model on that axis, and by nothing else.**
+
+⛔**So the repair line is closed as a headline**, and its flat CE curve was telling the truth. `no_answer` is
+worth a real but small amount (round 6 loses 39/500 on gsmplus and 17/319 on math500 to it, ~1.7% pooled, and
+the repair arm did drive it to 0.00% on the asdiv smoke). Everything else is `unclosed`, and the target model
+is unclosed at nearly the same rate.
+
+✅**THE BINDING CONSTRAINT IS CONFIRMED AS `acc|ANSWERED` — 8.6pp of it — and that is capability.** Which puts
+the whole remaining question back on the one channel §41bb just closed, and therefore on the one repair to
+that channel that has not been tried: making a strong teacher's think-block style short enough to use.
+
+**A secondary free-ish gain, now measured and sized rather than guessed:** the eval path extracts answers with
+`extract_boxed` ONLY (`clean_eval.py:44`), while `--max-new-tokens` is 512. Over the 93,912 round-6 rollouts,
+a fallback chain (`\boxed{}` → "answer is N" → `#### N`) recovers gold from **9.47% of `no_answer`** and
+**5.35% of `unclosed`** rows — 1,640 rollouts, 1.75pp. The false-positive control is what makes this usable:
+on the 37,242 rows the strict parser already graded WRONG, the permissive chain flips only **17 (0.05%)** to
+gold, and it agrees with the strict parser on 98.76% of correct rows. Implemented as a *fallback* (strict
+first, permissive only when strict returns nothing) it cannot touch an already-graded row at all. Applied to
+asdiv's eval `fm` split that is ≈+0.9pp. Worth doing, not worth calling a result.
+
+⚠️And one hypothesis died on inspection: the first `unclosed` trace I read was a degenerate loop repeating
+"Thus answer: 12 minutes before 2:00" eight times to the cap, and I started designing a cut-before-the-loop
+target around it. Over all 20,681 unclosed rows, **93.18% contain no repeated line at all** (median loop
+fraction 0.000). It is a truncated derivation, not a loop. **n=1 is not a failure mode.**
+
+### §41be — ⛔THE EXTRACTION FALLBACK IS WORTH +0.18pp AT EVAL TIME. Measured, dropped, and closed.
+
+§41bd sized a parser fallback at "≈+0.9pp, worth doing." Two code facts kill it, and both were free to check.
+
+**1. `extract_boxed` already has an "answer is" fallback** (`star_generate.py:99`), so the earlier 1.75pp was
+not incremental. Re-measured with the real function over all 93,912 round-6 rollouts, adding only what it
+genuinely lacks (`#### N`, `answer: N`, fraction/`$`-wrapped forms) and only on rows it returns `None` for:
+
+| label | n | boxed parses | boxed NONE | fallback→**gold** | fallback→wrong |
+|---|---:|---:|---:|---:|---:|
+| correct | 30,348 | 30,348 | 0 | — | — |
+| wrong | 37,242 | 37,242 | 0 | — | — |
+| unclosed | 20,681 | 3,709 | 16,972 | 306 | 1,187 |
+| no_answer | 5,641 | 0 | 5,641 | **535** | 638 |
+
+Incremental: **+841 / 93,912 = +0.90pp**, with zero exposure on already-graded rows by construction.
+
+**2. But `clean_eval.grade()` credits an unclosed trace whose pred matches gold** — `fm` is an `elif` chain
+that classifies (closure checked first, line 171) while `corr` is computed independently at line 180. So the
+`unclosed` half of the recovery is already banked at eval time. Verified empirically rather than by reading:
+across 15 (model, pool) rows, **`sum(ok) == fm["correct"]` exactly, every time**, i.e. no unclosed *eval* item
+ever carries a recoverable gold answer (unlike the sampled train dump, where 3,709 unclosed rows do — greedy
+at temperature 0 is a different distribution). That leaves only `no_answer`, which is **1.93%** of eval items
+for round 6, times the 9.5% of them the fallback rescues = **+0.18pp**. Below the ±0.87 seed-noise floor.
+
+✅**Two things this settles as a side effect, both of which I could have gotten wrong:** the §41bd
+`greedy / acc|ANSWERED / answered%` decomposition is exact (it was derived from `fm`, and `fm["correct"]` is
+provably identical to `sum(ok)` here), and no historical number needs recomputing — which is also the reason
+the fallback was written as an opt-in rather than a patch to `extract_boxed`. **Silently changing a grading
+primitive would have re-based every number in §41 for +0.18pp.**
+
+### §41bf — ⭐79% OF THE REMAINING GAP IS COVERAGE, NOT SELECTION. The sharpening lever is nearly exhausted BY CONSTRUCTION.
+
+`greedy` decomposes exactly into three additive gaps, and every term is already in the gate JSONs:
+`pass@8` is coverage (can the model reach gold at all in 8 samples), `sc@8 − pass@8` is selection (can it pick
+the right one), `greedy − sc@8` is the floor (does a single greedy decode realise the vote). Five-pool means,
+largest-n record per (model, pool):
+
+| model | greedy | best-decode | sc@8 | pass@8 | never-solved | selection gap |
+|---|---:|---:|---:|---:|---:|---:|
+| a4combo (pre-KD) | 43.44 | 44.17 | 50.94 | 68.94 | 31.06 | 18.00 |
+| **a4 round 6** | 47.01 | 50.73 | 54.11 | 68.76 | 31.24 | **14.65** |
+| 3.5-think (target) | 55.10 | 58.85 | 61.58 | 75.12 | 24.88 | 13.54 |
+
+**Decomposition of the +8.09 greedy gap that remains:**
+
+| component | gap | what targets it |
+|---|---:|---|
+| **COVERAGE** (pass@8) | **+6.36** | new solutions the model cannot currently produce |
+| SELECTION (sc@8 given pass@8) | +1.11 | sharpening / mode-seeking KD |
+| FLOOR (greedy vs sc@8) | +0.62 | closure, termination, the repair pass |
+
+⚠️(Absolute values differ by ~2pt from §41az's five-pool table because this takes the largest-n record per
+cell across every gate JSON rather than one matched run; the *decomposition* is a within-table contrast and is
+unaffected. Do not quote these as the headline — §41az's matched numbers are the headline.)
+
+**✅THIS EXPLAINS §41aw AND RE-ORDERS EVERYTHING LEFT.** Six rounds of on-policy KD took the selection gap
+from **18.00 to 14.65** against the target's 13.54 — i.e. a4's ability to pick among what it can reach is now
+within **1.11pt** of 3.5-think's. That is why the deployed metric saturated at round 3 and why every
+sharpening arm since has returned ~1pt: **the lever is nearly exhausted because the quantity it moves is
+nearly closed.** Mode-seeking reverse KL was the right objective and it did its job.
+
+**What remains is that a4 never solves 31.24% of problems in 8 samples against the target's 24.88%.** The
+lever with the big number on it is now COVERAGE, and that reframes the audition running right now: a stronger
+teacher is worth having not mainly because it sharpens, but because §41ai already measured per-token KD moving
+coverage (never-solved 44.6% → 42.0% in one round). Both remaining ideas point the same direction —
+* **per-token KD from a stronger same-tokenizer teacher** (auditioning: `Qwen3-1.7B-Base`, `Qwen3-0.6B-Base`,
+  brevity-conditioned `Qwen3-4B`), and
+* **prefix + expert completion** — let a stronger same-tokenizer model *complete* a4's own partial traces,
+  keep the splices that reach gold, and SFT on them. Distinct from both refuted arms: unlike off-policy
+  imitation of Llama-3.1-8B (§41c, a null) the prefix is a4's own, so style and length stay a4's; unlike
+  gold-anchored self-distillation (§41m, refuted) the completion comes from a genuinely better model rather
+  than from a4 with privileged context. It attacks the 31.24% directly, which nothing else here does.
+
+⚠️And the honest caveat on that +6.36: a 1.04B model reaching a 2.88B model's coverage may simply not be
+available at this parameter count. §39 measured a4's phase-C base at −26.5 mmlu / −41.2 gsm8k against
+Qwen3-0.6B-Base, so the coverage deficit is inherited from pretraining, which is the one thing post-training
+cannot rewrite. Coverage is the biggest target left; it is not therefore an achievable one.
+
+### §41bg — THE FULL AUDITION TABLE. Six candidates, one survivor, and a base model fails for a reason no instruct model does.
+
+Job 53285354, six candidates × 6 steps against the round-6 student on its own dump, ~3 min each. `haz_s` /
+`haz_t` are the marginal closure hazards over every completion position; the ratio is what predicts survival.
+
+| candidate | revKL | agree | `haz_s` | `haz_t` | **ratio** | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `a35ref` released 3.5-think | 0.1057 | 92.7% | 0.0052 | 0.0052 | **1.000** | ✅the arm that worked (+7.73) |
+| `plain` Qwen3-4B | 0.9793 | 78.3% | 0.0052 | 0.0044 | 0.846 | ⛔§41bb: 88–97% unclosed |
+| `nothink` Qwen3-4B + `/no_think` | 1.1754 | 73.4% | 0.0038 | 0.0031 | 0.816 | ⛔worse than plain |
+| `brief` Qwen3-4B + brevity hint | 0.9809 | 76.0% | 0.0074 | 0.0046 | 0.622 | ⛔worse than plain |
+| `q3_17b_base` Qwen3-1.7B-Base | 0.7458 | 78.7% | 0.0052 | **0.0000** | **0.000** | see below |
+| `q3_06b_base` Qwen3-0.6B-Base | 0.8164 | 78.6% | 0.0052 | **0.0000** | **0.000** | see below |
+
+The 3.5-think anchor reproduced to four decimals across two independent jobs, so the instrument is stable and
+the ratios are comparable. ⚠️One caveat: a hint lengthens the teacher's sequences, which changes micro-batch
+packing, so `haz_s` is not constant between hinted and unhinted rows (0.0074 / 0.0038 vs 0.0052). The *ratio*
+is paired within the same rows and stays valid; the absolute hazards are not comparable across that boundary.
+
+⛔**"MAKE THE TEACHER SHORT BY CONDITIONING ITS CONTEXT" IS REFUTED.** §41bb's one remaining repair was to put
+a brevity instruction in the teacher's context. Both forms made it **worse**: the explicit instruction
+dropped the ratio 0.846 → 0.622, and Qwen3's own `/no_think` control token dropped it to 0.816 while
+agreement fell 78.3% → 73.4%. Conditioning did not shorten the teacher, it degraded it — the same failure
+§41n found when a4-derived context was added to a hinted self-teacher. **Doing nothing to Qwen3-4B is the
+best version of Qwen3-4B for this purpose, and it is still fatal.**
+
+⭐**THE BASE MODELS FAIL FOR A COMPLETELY DIFFERENT REASON, AND IT IS THE ONLY ONE THAT IS FIXABLE.** Their
+teacher hazard is not merely low, it is **exactly 0.0000**, with p(`</think>` | closed) = **0.00**. `</think>`
+and `<|im_end|>` are instruct-only control tokens; a base model was never trained to emit them, so it assigns
+them ~no mass anywhere. Under reverse KL that is not a mismatch but a divergence — `p_s log(p_s/p_t)` blows
+up wherever the student wants to close and the teacher assigns ≈0 — which would drive closure to zero *harder*
+than any long-CoT teacher managed. **But the pathology is confined to two columns of 151,669**, and
+`--exclude-terminators` removes exactly those two, leaving revKL 0.75/0.82 at 78.7% agreement — as much signal
+as Qwen3-4B carries — in the columns that remain.
+
+⚠️**WHY §41w's NULL DOES NOT LICENSE SKIPPING THIS.** `--exclude-terminators` was measured as a null, but
+with the 3.5-think teacher, whose hazard already *matched* the student's at ratio 1.00. Masking a column the
+teacher is not abusing changes nothing — correctly. **That null was measured in the regime where the mask is
+unnecessary; this is the regime where it is the entire mechanism.** A null does not generalise outside the
+regime it was measured in, and treating it as though it did is how §41bb wasted a job on prefix-masking.
+
+**The falsifiable prediction, stated before the result:** a base model has no think-length *policy* to
+transfer — conditioned on a4's own partial trace it continues that trace's style, because in-context
+imitation is what base-model next-token prediction is. So the body-level lengthening that killed §41bb's
+arms should NOT appear once the two terminator columns are masked. `closure_smoke.py` is the arbiter.
+Job 53286497 runs `q17base` (Qwen3-1.7B-Base, ~1.7× a4's params) and `q06base` (Qwen3-0.6B-Base) as an
+explicit **capability control**: if the 0.6B teacher moves the gate as much as the 1.7B one, the gain is not
+teacher capability and must not be attributed to it. `repairlo` rides along to bank §41bc's one useful arm.
+
+### §41bh — THE COVERAGE HOLE IS 57% COMPETITION MATH, which makes the pool filter a DECONTAMINATION decision
+
+Before building coverage data, where the hole actually lives. Round 6's own dump, 11,738 train problems,
+a problem counted "never-solved" when 0 of its 8 rollouts grade correct:
+
+| train pool | problems | never-solved | rate | share of the hole |
+|---|---:|---:|---:|---:|
+| gsm8k_train | 4,000 | 991 | 24.8% | 21.9% |
+| math_train_easy | 3,908 | 954 | 24.4% | 21.1% |
+| **math_train_hard** | 3,830 | **2,586** | **67.5%** | **57.1%** |
+| TOTAL | 11,738 | 4,531 | 38.6% | |
+
+**57.1% of the coverage hole is competition MATH**, and **MATH-train near-dups MATH-500 in every
+self-generated mix on this line** (a standing warning in the a4 memory, and invisible to exact-match
+decontamination). So generating verified completions on `math_train_hard` and training on them would leave
+the four CLEAN grade-school pools (asdiv/svamp/mawps/gsmplus) unaffected while making the **math500 column
+uninterpretable** — one of the five pools in the headline. That is a measurement-integrity question, not a
+transfer question, and it has to be decided before the data is built rather than caveated afterwards.
+
+**Decided: `--pools gsm8k_train math_train_easy`, 1,945 problems instead of 4,531.** Three reasons, and the
+first is the one that would stand alone:
+1. It keeps math500 interpretable. Training on near-dups of an eval pool is not a trade to make for fuel.
+2. **The four clean pools are grade-school word problems**, so gsm8k_train + math_train_easy is the
+   better-*matched* signal, not merely the safer one. Improving grade-school arithmetic reasoning by
+   training on competition MATH is an indirect bet; the matched version is a direct one.
+3. A 1.04B model is least likely to absorb the hardest traces anyway — 67.5% never-solved on that pool says
+   those problems are far outside its reach, so the yield would be lowest exactly where the risk is highest.
+
+The hard half stays available as an explicit follow-up (`POOLS=` in `reasoning/a4_pfxcomp.sh`) if the matched
+version works. ⚠️It must never be *mixed in silently*: `build_prefix_completions.py --pools` exists so the
+decision is recorded in the command line and in the stats JSON, rather than living in a comment.
+
+### §41bi — THE COMPLETE TEACHER-ELIGIBILITY AUDIT, and a correction: I ASSERTED where a 3-minute measurement existed
+
+Asked why the base-teacher arm used Qwen3-1.7B-Base when stronger models are on disk. The answer is a hard
+constraint plus a mistake, and both are worth recording so the candidate set is never re-derived from memory.
+
+**THE CONSTRAINT.** Per-token reverse KL compares two distributions over the same vocabulary at the same
+token positions, so it is undefined unless teacher and student assign **identical ids**. Every local model,
+tested by `len(tok)`, `<think>`/`</think>`/`<|im_end|>` ids, and a real 44-token trace round-trip:
+
+| ✅tokenizer-identical (151,669, `<think>`=151667) | ⛔ineligible, and why |
+|---|---|
+| Qwen3-4B, Qwen3-4B-Thinking-2507 | Qwen3.5-9B / 3.5-0.8B-Base — **248,077**, `<think>`=248068 |
+| Qwen3-1.7B-Base, Qwen3-0.6B-Base | gemma-4-31B-it — 262,144 |
+| **Qwen3-8B, Qwen3-14B, Qwen3-32B, Qwen3-30B-A3B** (verified, then downloaded 8B+14B) | Llama-3.3-70B / 3.1-8B / 3.2-3B — 128,256, no `<think>` |
+| argonne-3.0-think / 2.5-think / 3.0-base (own line) | Mistral-Small-24B / 3.2-24B — 131,072, no `<think>` |
+| Qwen3-0.6b-thinking (own line) | Nemotron-3-Nano-30B / 3.5-Lightning-30B — 131,072 |
+| | gpt-oss-20b — 200,019 · Muse-Glimmer-30B — 202,048 · Qwen2.5-* — 151,665, **no `<think>` at all** |
+
+So the entire 20-70B tier on disk is ineligible **for this channel**, and among tokenizer-identical models
+that were already local the largest was Qwen3-4B — whose both variants were already measured fatal (0.85 and
+0.75). 1.7B-Base was not picked as "the strongest available"; it was picked for a structural property (a base
+model has no think-length policy), with 0.6B-Base as the explicit control for whether capability matters.
+
+⚠️**THE MISTAKE.** §41bb concluded "downloading Qwen3-8B/14B/32B is now pointless *by this channel*" —
+reasoning from mechanism that scale cannot change the long-form `<think>` habit per-token KD transfers. That
+argument may be right, but **it is an argument, and the audition that would settle it costs 3 minutes per
+candidate.** Substituting a mechanism story for a cheap measurement is the same error as §41bb's own
+prefix-masking decision and §41ah's "signal exhausted" read. Qwen3-8B (16.4 GB) and Qwen3-14B (29.6 GB) are
+now local, tokenizer-verified, and first in the next audition's `SPECS`.
+
+⭐**THE BIGGER CORRECTION IS THE COMPLETER, NOT THE TEACHER.** The coverage arm carries **+6.36 of the +8.09
+gap** and it never computes a divergence — it takes generated TEXT, filters by gold, and trains plain CE. **No
+hazard ratio, no terminator columns, no length-distribution constraint applies to it at all**, so the only
+property of the completer that matters is how often it solves a problem a4 cannot. There, capability is the
+whole point and `a4_pfxcomp.sh` had been left defaulting to Qwen3-4B for no reason; it now uses **Qwen3-14B**.
+And because that channel needs only text, the ineligible 20-70B tier above is *not* ineligible for it — a
+non-Qwen completer would just need its prefix passed as text rather than spliced as ids. Tokenizer identity
+is a convenience there, not a requirement. **The constraint that shaped six arms does not extend to the arm
+with the largest number on it, and I had been carrying it over by habit.**
+
+### §41bj — ⛔BASE-MODEL TEACHER REFUTED: greedy 0.00, unclosed 100.00%. And BOTH closure diagnostics read HEALTHY at the end.
+
+§41bg's prediction, stated before the run: a base model has no think-length policy, so once the two terminator
+columns are masked the body-level lengthening that killed §41bb's arms should not appear. **Wrong, and by the
+largest margin of any arm in this campaign.** `q17base` = Qwen3-1.7B-Base teacher, `--exclude-terminators 1`,
+`--ce-weight 0.5`, from round 6 on its own dump, 1,942 steps:
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | 66.50 | 13.50% | 1.50% | 282 |
+| **`q17base`** | **0.00** | **100.00%** | 0.00% | 492 |
+
+200 of 200 items unclosed. Worse than §41f's long-CoT arm (96.95%) and §41bb's prefix arms (88.5/96.5%).
+
+⚠️⚠️**THE INSTRUMENTATION FAILURE IS THE REAL FINDING, AND IT IS WORSE THAN §41f's.** Both training-time
+closure diagnostics ended *healthy*:
+
+| step | 1 | 200 | 700 | 1500 | **1800** |
+|---|---:|---:|---:|---:|---:|
+| `haz s` (marginal closure hazard) | 0.0067 | 0.0034 | 0.0058 | 0.0040 | **0.0065** |
+| `p(</think>` \| closed) | 1.00 | 0.89 | 0.96 | 0.97 | **0.98** |
+
+The hazard dipped, **recovered to within 3% of its step-1 value**, and I read that as the CE anchor winning a
+tug-of-war. The checkpoint terminates **never**. §41f's diagnostic at least had an excuse — it conditioned on
+the failure being absent. This one is the *marginal* hazard, the statistic built to replace it, and it was
+just as wrong.
+
+**WHY, and it generalises: both diagnostics are measured under TEACHER FORCING on the PREVIOUS policy's
+traces.** `haz s` is the student's probability of emitting a terminator at positions inside rollouts that an
+*earlier* checkpoint generated. Free-running generation walks the *updated* policy's own trajectory, and after
+1,942 steps of matching a base model that never stops writing, that trajectory goes somewhere those forced
+positions never visit. A per-position probability measured at stale states says nothing about the integral
+along a new trajectory. This is §41ah's lesson mirrored: there, on-policy KL was measured at states that
+*moved* and I misread flatness as exhaustion; here, the hazard is measured at states that *did not move* and I
+misread recovery as safety. **Neither is a progress metric, and only `closure_smoke.py` — which actually
+generates — is a closure metric.** Nothing about closure should ever again be concluded from the training log.
+
+⛔**`--exclude-terminators` DOES NOT RESCUE A ZERO-MASS TEACHER, and this completes §41bg's regime argument in
+the direction I did not expect.** Masking removes *gradient* from the two terminator logits; it cannot remove
+the *softmax normalisation* that a divergence over the other 151,667 columns imposes. Reverse KL against a
+teacher that always continues drives the kept logits up, and the terminators — now with no gradient to defend
+themselves — are squeezed out. So masking is not neutral here (§41w's hazard-matched null) and not sufficient
+either; **it is actively worse than nothing, because it silences the only channel that could have pushed back.**
+That also explains why the arm is worse than the unmasked long-CoT arm.
+
+**Running tally for per-token KD from a stronger same-tokenizer teacher: 0-for-7.** Qwen3-4B plain, Qwen3-4B
+prefix-50, Qwen3-4B prefix-50 + anchor, Qwen3-4B-Thinking, Qwen3-4B + brevity, Qwen3-4B `/no_think`,
+Qwen3-1.7B-Base + mask. Every protection tried — column masking, prefix masking, CE anchoring, context
+conditioning — and the only teacher that ever worked is the one whose trace-length distribution already
+matched (`haz_t/haz_s = 1.00`). ⚠️`q06base` was CANCELLED rather than run: its step-1 line printed the same
+`teacher 0.00000 vs student 0.00665` warning, so as a capability control it could only distinguish
+"weaker teacher fails identically" from "weaker teacher fails slightly less", neither of which changes a
+decision. That is 35 GPU-minutes not spent on a foregone conclusion.
+
+### §41bk — ⛔SCALE IS MEASURED FLAT ON THE HAZARD AXIS, and the "more signal from a bigger teacher" premise is FALSE TOO
+
+§41bi recorded that I had asserted bigger Qwen3 was pointless rather than measuring it. Measured now, same
+instrument, same student, same rows (job 53286878, 8 candidates):
+
+| teacher | params | revKL | agree | `haz_t` | **ratio** | `p(</think>`\|closed) t |
+|---|---:|---:|---:|---:|---:|---:|
+| **3.5-think** (the one that worked) | 2.88B | 0.1057 | **92.7%** | 0.0052 | **1.000** | 1.00 |
+| Qwen3-4B plain | 4.02B | 0.9793 | 78.3% | 0.0044 | 0.846 | 0.98 |
+| **Qwen3-8B** | 8.19B | 0.9024 | 78.6% | 0.0044 | **0.846** | 0.92 |
+| **Qwen3-14B** | 14.8B | 0.8766 | 78.5% | 0.0043 | **0.827** | **0.73** |
+| Qwen3-4B + brevity | 4.02B | 0.9809 | 76.0% | 0.0046 | 0.622 | 1.00 |
+| Qwen3-4B `/no_think` | 4.02B | 1.1754 | 73.4% | 0.0031 | 0.816 | 0.98 |
+| Qwen3-1.7B-Base | 1.72B | 0.7458 | 78.7% | **0.0000** | 0.000 | 0.00 |
+| Qwen3-0.6B-Base | 0.60B | 0.8164 | 78.6% | **0.0000** | 0.000 | 0.00 |
+
+⛔**SCALE DOES NOTHING TO THE HAZARD RATIO: 0.846 → 0.846 → 0.827 across 4B → 8B → 14B.** Flat, faintly
+declining, and all three sit in the zone already measured fatal twice (0.85 gave 88.5%/96.5% unclosed, 0.75
+gave 96.95%). `p(</think>` | closed) for the teacher falls **0.98 → 0.92 → 0.73** with size — the long-form
+habit *strengthens* with scale, exactly the mechanism §41bb proposed. **The argument was right; it is now a
+measurement, which is what it needed to be.** 3.5B–15B is not a knob that reaches 0.95.
+
+⭐**AND THE PREMISE BEHIND WANTING A BIGGER TEACHER IS ALSO FALSE.** revKL *falls* with teacher scale —
+**0.979 (4B) → 0.902 (8B) → 0.877 (14B)** — while argmax agreement holds flat at ~78.5%. A bigger teacher has
+**less** to say about a4's own tokens, not more. Plausibly because a larger model is better calibrated and so
+less confidently different on the tokens a4 emits. Either way it kills the framing this whole line of arms
+came from: §41ax priced the strong-teacher lever by "Qwen3-4B carries 9.3× the signal 3.5-think has left," and
+the natural extrapolation — that 14B carries more still — is simply not true. **Per-token divergence is not
+monotone in teacher capability, so it cannot be used as a proxy for how much a teacher can teach.**
+
+✅**THE CHANNEL IS CLOSED, WITH DATA RATHER THAN REASONING.** Per-token on-policy KD from a stronger
+same-tokenizer teacher: **0-for-7 arms**, four distinct protections (column masking, prefix masking, CE
+anchoring, context conditioning), and the scale axis now measured flat across 4B/8B/14B with 32B and 30B-A3B
+ruled out by the same trend. The only teacher that ever worked is the one whose trace-length distribution
+already matched the student's. Nothing further should be spent here; `reasoning/a4_teacher_audition.sh` will
+say in 3 minutes if a genuinely length-matched candidate ever appears, and that is the only condition worth
+re-opening it for.
+
+**→ The line moves to COVERAGE (§41bf: +6.36 of the +8.09 gap), job 53287082**, which computes no divergence
+at all and is therefore unaffected by every constraint in this table.
+
+### §41bl — ⚠️I VERIFIED OFFLINE MODEL RESOLUTION THROUGH THE WRONG RESOLVER, and it cost a job launch
+
+Job 53287082 died at engine init: `IncompleteSnapshotError: The cached snapshot for 'Qwen/Qwen3-14B' is
+incomplete: 3 file(s) are missing (.gitattributes, LICENSE, README.md)`.
+
+**The cause is not the missing files, it is how I checked for them.** I downloaded the new teachers with
+`allow_patterns=["*.json","*.safetensors","*.txt","*.model"]` — weights and configs only, no LICENSE or
+README. I then hit this exact error once, on a manual `snapshot_download(..., local_files_only=True)`, and
+reasoned: *"Not a weight problem — `from_pretrained` requests specific files, not the whole snapshot, so it
+should work."* To confirm, I ran `AutoConfig.from_pretrained` and `AutoTokenizer.from_pretrained` offline for
+both models and got ✅ on both. That check was real, it passed, and **it exercised a resolver nothing in this
+job uses.** vLLM goes `LLM(model=...)` → `EngineArgs.__post_init__` → `get_model_path` →
+**`snapshot_download`**, which validates the *entire* snapshot and is exactly the strict path whose error I
+had just explained away.
+
+⚠️**THE GENERALISABLE MISTAKE: I diagnosed a failure, formed a hypothesis about which code path mattered, and
+then tested the path my hypothesis named instead of the path the consumer actually calls.** The tell was
+available and I walked past it — the failing call and my verification call were *different functions*, and I
+never asked which one vLLM invokes. Worse, the evidence looked strong from both directions: the 8B/14B
+**audition had already run successfully** on these same incomplete snapshots, because `opd_train.py` loads a
+teacher with `from_pretrained`. So the model demonstrably worked in one job and could not load in another, and
+I read the working case as general.
+✅**Rule: when a dependency resolves a resource, verify through the resolver the CONSUMER calls, by name.** Here
+that is one line — `snapshot_download(repo_id=m, local_files_only=True)` — and it now passes for both models
+after a re-download with no `allow_patterns`. Cost: one job launch and ~4 minutes; it would have been ~40
+minutes had it failed after the data build instead of before it.
+
+### §41bm — COVERAGE ARM, stage 1: Qwen3-14B solves 71.6% of what a4 never solves. And the prefix does NOT help the completer.
+
+`build_prefix_completions.py` with Qwen3-14B, 1,945 never-solved gsm8k_train + math_train_easy problems,
+2 a4-prefixes + 1 empty-prefix control per problem, 2 samples each = 11,670 generations:
+
+**4,303 verified traces over 1,392 of 1,945 problems = 71.6% of a4's coverage hole newly solvable.**
+Trace tokens median 271, p90 320 — inside the student's own distribution (round 6 means 282), so no length
+regression is being imported. Empty-think mode went to zero.
+
+| kind | yield | wrong | no_answer | **too_long** | yield EXCLUDING too_long |
+|---|---:|---:|---:|---:|---:|
+| `pfx` (a4's own opening) | 2,541/7,780 = **32.66%** | 2,959 | 210 | **2,070** | **44.50%** |
+| `empty` (control) | 1,762/3,890 = **45.30%** | 2,081 | 47 | **0** | 45.30% |
+
+⚠️**THE RAW CONTROL LOOKS LIKE THE PREFIX HURT, AND THAT READING IS AN ARTIFACT OF MY OWN LENGTH CAP.**
+`too_long` is 2,070 for prefixed splices and **exactly zero** for prefix-free ones — the prefix consumes up to
+96 of the 330-token budget, so prefixed traces hit a cap the others never approach. Correcting for it, the two
+are within a point: **44.50% vs 45.30%**. So the honest finding is that **an a4 prefix does not improve the
+completer's ability to solve the problem; it only spends budget.** That kills one of the two motivations.
+The other is untouched by this measurement: a prefixed target starts at a state a4 *actually visits*, which is
+a claim about TRANSFER, not about the completer's accuracy, and only the gate tests it.
+
+⚠️**A DESIGN WEAKNESS I SHOULD HAVE CAUGHT BEFORE BUILDING, NOT AFTER: this run trains on the UNION of both
+kinds, so its gate cannot attribute the result to either.** Fixed for the follow-up rather than papered over —
+`a4_pfxcomp.sh` gained `KIND=pfx|empty|all`, filtering the existing dump by the `kind` field each row already
+carries (no regeneration). `KIND=empty` is precisely §41c — plain external-teacher imitation — rerun with a
+same-tokenizer 14B, which makes it the right control for the whole method.
+
+**Stage 2/3 — plain CE on (coverage traces ∪ a4's own verified-correct rollouts), lr 5e-6, 970 steps:**
+
+| | greedy | unclosed | no_answer | mean decoded |
+|---|---:|---:|---:|---:|
+| round-6 student | 66.50 | 13.50% | 1.50% | 282 |
+| **`pfxcomp`** | 64.50 | **12.50%** | **0.00%** | **279** |
+
+✅**Closure PASSED, and the CE curve is the diagnostic that separates this from §41bc's repair pass: CE fell
+0.2892 → 0.2304 (−20%) here versus 0.1964 → 0.1884 (−4%) there.** The repair pass had no gradient signal
+because it trained on the model's own samples, which are already high-likelihood by construction. These traces
+solve problems the model has *never* solved, so they are genuinely new information. That was the predicted
+difference and it showed up in the loss.
+⚠️asdiv greedy −2.00 is inside the smoke's ±3.4pp and is **uninformative for this arm** — asdiv is a pool a4
+already scores ~65% on, while this arm only added traces for problems it never solved. **The success criterion
+is `pass@8`** (§41bf: coverage is +6.36 of the +8.09 gap). An arm that moves only the floor has failed at what
+it was built for, which is the exact inverse of how the KD arms had to be read.
+
+### §41bn — ⛔COVERAGE-BY-CE IS A NULL ON pass@8. Injecting the answers does not install the capability.
+
+Four clean pools, 3,000 items, paired McNemar against round 6. `pfxcomp` = 4,303 Qwen3-14B-completed,
+gold-verified traces for problems a4 had **never** solved in 8 samples, trained as plain CE alongside a4's own
+correct rollouts.
+
+| | greedy | best-dec | sc@8 | **pass@8** | `acc\|ANS` | uncl% | noans% | t_len |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| round 6 (baseline) | 54.15 | 56.33 | 62.58 | **76.22** | 67.77 | 15.27 | 1.37 | 275.5 |
+| **`pfxcomp`** | 55.02 | **57.75** | **64.58** | **76.62** | 67.11 | 14.33 | **0.03** | 275.3 |
+| **`repairlo`** | **55.70** | 57.10 | 64.22 | 75.90 | 67.40 | **13.13** | 0.17 | 276.5 |
+| combo (pre-KD) | 47.95 | 48.62 | 56.62 | 74.02 | 56.43 | 8.70 | 1.17 | 213.3 |
+
+| pooled paired vs round 6 | greedy | extend1 | sc@8 | **pass@8** |
+|---|---:|---:|---:|---:|
+| `pfxcomp` | +0.97 (p=0.19) | +0.03 (p=1.0) | **+1.93 (p=1.6e-3)** | **−0.03 (p=1.00)** |
+| `repairlo` | **+1.93 (p=3.0e-3)** | +1.13 (p=0.086) | +1.60 (p=0.012) | −0.97 (p=0.10) |
+
+⛔**THE ARM FAILED AT WHAT IT WAS BUILT FOR, and the criterion was stated in advance** (§41bm: "pass@8 is the
+criterion; an arm that moves only the floor has failed"). pass@8 moved **−0.03, p=1.00** — not a small
+positive, a dead flat null, on 3,000 paired items. 4,303 verified solutions to never-solved problems, at
+71.6% coverage of the hole, median trace length inside the student's own distribution, closure intact — and
+the ceiling did not move by any amount.
+
+✅**What it DID do is move SELECTION: sc@8 +1.93 at p=1.6e-3, and best-decode +1.42 (the best of any
+checkpoint today).** So the traces were absorbed as *better choosing among what it can already reach*, not as
+new reach. That is the same axis §41bf measured as nearly closed (+1.11 left), which is why the gain is ~2pt
+and not ~6.
+
+⭐**THE REAL RESULT OF THE DAY IS `repairlo`: greedy +1.93 at p=3.0e-3**, from pure CE at lr 3e-6 on the
+model's *own* verified-correct traces — the cheapest arm attempted, no teacher, no new data. §41bd capped that
+lever at ≈+1.8 and it landed at +1.93. **Both** arms also drove the empty-think mode to ~zero (1.37% →
+0.03%/0.17%), and `repairlo` cut unclosed 15.27% → 13.13%.
+
+⚠️**WHAT THIS MEANS FOR §41bf's ROADMAP, stated plainly: the coverage deficit is not a data-availability
+problem.** The obvious reading of "+6.36 lives in pass@8" was "find solutions the model lacks and show them to
+it." Solutions were found for 71.6% of the hole by a 14B model, verified against gold, length-matched, and CE
+on them bought exactly zero pass@8. This corroborates §41bf's own caveat — coverage is inherited from
+pretraining (§39: a4's base is −26.5 mmlu / −41.2 gsm8k against Qwen3-0.6B-Base) — and it means scaling the
+coverage corpus (the hard-MATH half, more samples, shorter prefixes) is **not** justified: the first 4,303
+traces moved the target metric by nothing, so 10,000 more will not either. That branch of the roadmap is
+withdrawn rather than scaled.
+⚠️One confound I am NOT claiming away: training used the UNION of coverage traces and a4's own correct rows,
+so the coverage rows were ~27% of the mix, and it was one epoch at lr 5e-6. A dilution/undertraining
+explanation is not excluded by this run. But it is not worth chasing at the same cost, because the *shape* of
+the result (selection up, ceiling exactly flat) is the signature of absorbing style rather than capability,
+not the signature of too little of a good thing.
+
+**→ The line moves to the FIRST STEP (job 53290470)**, the one failure the taxonomy names precisely (79.0% of
+wrong traces diverge at equation index 0) and the last untried mechanism with a measured diagnosis behind it.
+And the coverage data is not wasted: as **contrast** rather than imitation it supplies the winning opening on
+2,020 problems where a4 had none, which is what §41bo tests.
+
+### §41bo — FOUR-POOL STANDING: the session has closed 61-62% of the gap to 3.5-think, ~5pt remain
+
+Four CLEAN pools (asdiv, svamp, gsmplus, mawps; math500 excluded as contaminated for this line):
+
+| model | greedy | best-decode | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| a4 `combo` — session start | 47.95 | 48.62 | 56.62 | 74.02 |
+| a4 round 6 | 52.17 | 55.88 | 60.42 | 74.35 |
+| a4 **`pfxcomp`** | 55.02 | **57.75** | **64.58** | 76.62 |
+| a4 **`repairlo`** | **55.70** | 57.10 | 64.22 | 75.90 |
+| **argonne-3.5-think** — target | 60.73 | 63.38 | 68.90 | 80.50 |
+
+**greedy 47.95 → 55.70 (+7.75), best-decode 48.62 → 57.75 (+9.12); 61% and 62% of the gap closed.** Remaining
+≈5.02 greedy and ≈5.62 best-decode. For scale, the thirteen arms preceding this campaign moved the deployable
+number +4.96 in total.
+
+⚠️⚠️**THIS TABLE MIXES RUNS, AND THAT ARTIFACT WOULD LET ME CLAIM A COVERAGE GAIN I DID NOT GET.** 3.5-think is
+not in today's gate, so the only way to include it is the largest-n record per (model, pool) across every gate
+JSON — which means round 6's row here comes from a different run than `pfxcomp`'s. Read naively, round 6's
+pass@8 74.35 against `pfxcomp`'s 76.62 looks like **+2.27 of coverage**. The PAIRED measurement on identical
+items (§41bn) is **−0.03 at p=1.00**. The paired number is authoritative and the coverage null stands; the
+apparent gain is entirely an artifact of comparing across runs, and the same caveat applies to round 6's
+greedy (52.17 here vs 54.15 in the paired gate). ⚠️Use this table for *distance to the external reference*
+only, never for arm-vs-arm deltas — those require one gate call on identical items, which is what §41bn is.
+
+### §41bp — step-pair data: 19.5% of the signal is the 14B enrichment, and `--min-group 2` is UNAVAILABLE at K=8
+
+Attribution of the 6,565 pairs in `a4_step_pairs_r6x14b`, by whether the problem was one a4 never solved and
+a Qwen3-14B coverage trace supplied the winning opening:
+
+| source of the CHOSEN opening | pairs | share |
+|---|---:|---:|
+| a4's own contrast (problem solved sometimes) | 5,285 | **80.5%** |
+| **14B winning opening vs a4's dead opening** | 1,280 | **19.5%** |
+
+So four fifths of the signal is self-contrast — which is exactly what the prepared, never-run 5,897-pair set
+contained *alone*. The enrichment is a real fifth of the data and covers 2,020 problems that previously could
+not yield a pair at all, but any gain must not be attributed wholly to it.
+
+⚠️**A NOISE WEAKNESS, MEASURED: `chosen_rate` is 1.00 for 91.7% of pairs and only 25.0% have the chosen opening
+backed by more than one rollout.** So three quarters of the value estimates rest on a single sample. The
+rejected side is better supported by construction (it requires rate exactly 0.0 and picks the dead group with
+the MOST rollouts behind it), but the chosen side is thin.
+
+⛔**And the obvious fix does not exist at this sample size.** `--min-group 2` collapses the set from 6,565 to
+**673 pairs**, with `fewer_than_two_openings` rising to 9,109: at K=8 with diverse openings, almost every
+opening group is a singleton, so demanding two well-supported groups per problem eliminates nearly everything.
+673 pairs is not trainable. **This is a data-requirement finding, not a flag to tune** — Monte-Carlo value
+estimates over openings need K=16+ rollouts per problem to support a min-group filter, which doubles
+generation cost. The 673-pair set was deleted; its stats remain in `report/a4_step_pairs_mg2.json`.
+Recorded so the idea is not re-proposed as cheap.
+
+### §41bq — ⭐⭐SELECTION IS CLOSED. The remaining gap is ~90% COVERAGE, and coverage-by-CE is a measured null.
+
+`greedy` decomposes exactly into coverage + selection + floor. Using the PAIRED gate (§41bn — round 6,
+`pfxcomp`, `repairlo` on identical items) plus 3.5-think's own internally-consistent run, four clean pools:
+
+| model | greedy | sc@8 | pass@8 | never-solved | selection (sc@8−pass@8) | floor (greedy−sc@8) |
+|---|---:|---:|---:|---:|---:|---:|
+| a4 `combo` (session start) | 47.95 | 56.62 | 74.02 | 25.98 | −17.40 | −8.67 |
+| a4 round 6 | 54.15 | 62.58 | 76.22 | 23.78 | −13.64 | −8.43 |
+| a4 **`pfxcomp`** | 55.02 | 64.58 | 76.62 | 23.38 | **−12.04** | −9.56 |
+| a4 **`repairlo`** | 55.70 | 64.22 | 75.90 | 24.10 | **−11.68** | −8.52 |
+| **3.5-think** (target) | 60.73 | 68.90 | 80.50 | 19.50 | −11.60 | −8.17 |
+
+**Gap to target by component** (each row sums to the greedy gap exactly):
+
+| model | greedy gap | **coverage** | **selection** | floor |
+|---|---:|---:|---:|---:|
+| `combo` (session start) | +12.77 | +6.48 | **+5.80** | +0.50 |
+| round 6 | +6.58 | +4.28 | +2.04 | +0.26 |
+| **`pfxcomp`** | +5.71 | **+3.88** | **+0.44** | +1.39 |
+| **`repairlo`** | **+5.03** | +4.60 | **+0.08** | +0.35 |
+
+⭐**THE SELECTION DEFICIT IS GONE: +5.80 at session start → +2.04 at round 6 → +0.08 (`repairlo`) / +0.44
+(`pfxcomp`).** a4-think now converts what it can reach into a chosen answer as well as a model 2.8× its size.
+That is the entire content of this campaign's gains, and it is finished — there is no more than half a point
+left on that axis by any method.
+
+⛔**AND WHAT REMAINS IS COVERAGE, WHICH TODAY'S BEST-EQUIPPED ATTEMPT MOVED BY NOTHING.** Coverage is +3.88 to
++4.60 of the ~5pt gap — **76-91% of it** — essentially unchanged from round 6's +4.28. §41bn threw the strongest
+available tool at it (Qwen3-14B verified solutions for 71.6% of the never-solved set, gold-filtered,
+length-matched) and pass@8 moved −0.03 at p=1.00.
+
+✅**So the honest position: post-training on this base is approaching its limit, and the limit is REACH.**
+Every remaining mechanism I can name targets selection or shape — the two components already at parity — and
+the one component that matters is the one §39 attributes to pretraining (a4's phase-C base is −26.5 mmlu /
+−41.2 gsm8k against Qwen3-0.6B-Base). This is not a reason to stop post-training: `repairlo` (+1.93, p=3.0e-3)
+and step-DPO (smoke 68.00 → 71.00) are real and cheap. It is a reason to stop expecting post-training to
+deliver the remaining 4pt of pass@8, and to price the base decision (§41bf Tier D) as the thing that actually
+governs the ceiling.
+⚠️Read this table's coverage column only as *distance to the external reference*: round 6's pass@8 is 76.22
+here (paired) versus 74.35 in the largest-n merge of §41bo, and quoting the merge would have shown `pfxcomp`
+gaining +2.27 of coverage that the paired test says is −0.03.
+
+### §41br — ⛔STEP-LEVEL DPO IS A NULL, and §41bq's decomposition PREDICTED it. The n=200 smoke misled a third time.
+
+`sdpo` = step-level DPO on 6,565 length-neutral first-step preference pairs (on-policy from round 6, enriched
+with Qwen3-14B winning openings on 2,020 problems a4 could not contrast), from the `repairlo` policy.
+
+| four clean pools, 3,000 items | greedy | best-dec | sc@8 | pass@8 | uncl% | t_len |
+|---|---:|---:|---:|---:|---:|---:|
+| round 6 | 54.15 | 56.33 | 62.58 | 76.22 | 15.27 | 275.5 |
+| `repairlo` (the policy) | 55.70 | 57.10 | 64.22 | 75.90 | 13.13 | 276.5 |
+| `sdpo_b04` (β=0.4) | 55.73 | **57.77** | 63.58 | 75.25 | 13.30 | 268.8 |
+| `sdpo_b01` (β=0.1) | 54.95 | 56.50 | 62.97 | 76.23 | 13.90 | 260.6 |
+
+Paired vs its own policy: b04 greedy **−0.27 (p=0.70)**, extend1 +0.10 (p=0.91), sc@8 −0.57, pass@8 −0.13;
+b01 greedy **−0.80 (p=0.24)**, extend1 −1.27 (p=0.062). **Both null-to-negative.** The apparent +1.67 greedy
+(p=0.016) against round 6 is `repairlo`'s own gain carried through — `sdpo` = repairlo + DPO, and repairlo
+alone was +1.93.
+
+✅**THE DECOMPOSITION PREDICTED THIS AND I RAN THE ARM ANYWAY.** §41bq measured `repairlo`'s SELECTION deficit
+at **+0.08pt**. Step-level DPO over first-step *choice* is a selection method by construction, so its available
+headroom was 0.08pt before a single GPU-second was spent. It returned −0.27. **The additive
+coverage/selection/floor decomposition is therefore a usable PRIOR, not just a post-hoc description** — it
+priced this arm correctly in advance, and had I applied it to the queue rather than to the write-up I would
+have skipped a 2.5-hour job. That is the lesson worth keeping: run levers against components that still have
+headroom, and the decomposition says which.
+⚠️The taxonomy's diagnosis is not refuted — 79.0% of wrong traces really do diverge at equation index 0 — but a
+correct *description* of where traces fail does not imply a *lever*: the model already picks among its
+reachable derivations as well as a model 2.8× its size, so improving the choice cannot pay.
+
+⚠️⚠️**THE n=200 SMOKE POINTED THE WRONG WAY, FOR THE THIRD TIME TODAY.** b01's asdiv smoke read greedy **71.00
+vs the policy's 68.00 (+3.00)** and the gate says **−0.80**; b04 read 69.00 (+1.00) and the gate says −0.27.
+`closure_smoke.py` is a GUARDRAIL — it answers "does this checkpoint terminate" — and at ±3.4pp it cannot rank
+checkpoints that differ by ~1pt. This is already recorded twice (§41ai, §41aq) and I still let a +3.00 read as
+encouraging. **The only correct use of the smoke number is the unclosed column.**
+✅One thing it did show truthfully: trace length fell 276.5 → 268.8 → 260.6 as β dropped, so the length-neutral
+pair construction worked exactly as designed — whole-trace RLVR-DPO went 230 → 312 and lost greedy to drift.
+The mechanism was sound; the target had no headroom.
+
+### §41bs — ⭐⭐"NEVER SOLVED IN 8" IS MOSTLY THE DRAW, NOT THE PROBLEM. And the coverage arm DID learn — on the trained problems only.
+
+The probe (`reasoning/coverage_probe.py`, job 53292218): K=8 at T=0.9 on the **1,392 problems `pfxcomp` was
+trained on**, all of them verified 0/8 in round 6's own rollout dump.
+
+| | pass@8 | per-sample solve rate | solved all 8 |
+|---|---:|---:|---:|
+| round 6 | **30.03%** | 5.48% | 0.00% |
+| `pfxcomp` | **35.78%** | **7.91%** | 0.00% |
+| Δ | **+5.75pt** | **+2.43pp (+44% relative)** | — |
+
+**FINDING 1 — the original question is answered, and it is (b) with a sharper mechanism.** CE on verified
+solutions raised the per-sample solve rate on the trained problems by **44% relative**, and moved held-out
+pass@8 by **−0.03 (p=1.00)**. So the learning happened and transferred **nothing**. This is a pure
+generalisation failure, not an optimisation failure — the null is not "too little training".
+
+⭐**FINDING 2, WHICH I WAS NOT LOOKING FOR AND WHICH REFRAMES THE WHOLE COVERAGE STORY: round 6 re-solves
+30.03% of its own "never-solved" set on a fresh draw of 8.** Those 1,392 problems were *selected* by scoring
+0/8 in a single K=8 pass from this very checkpoint. At the measured 5.48% per-sample rate,
+`(1−p)^8 = 0.637`, so **36.3%** of them should show ≥1 hit on any re-draw — and 30.03% do (slightly lower
+because p is heterogeneous, which concentrates the misses). The arithmetic per problem:
+
+| true per-sample p | looks "never-solved in 8" |
+|---|---:|
+| 0.02 | 85.1% |
+| 0.05 | 66.3% |
+| 0.10 | 43.0% |
+| 0.15 | 27.2% |
+| 0.25 | 10.0% |
+
+⚠️**So "0/8" is largely a statement about the DRAW, not about reachability, and the "coverage hole" selected by
+one K=8 pass is substantially the low-probability TAIL re-sampled.** Three consequences:
+1. **The coverage arm's target selection was noisy** — it mixed genuinely-hard problems with easy-but-unlucky
+   ones, so an unknown share of the 4,303 traces taught things the model could already do sometimes.
+2. **The §41bf/§41bq decomposition survives intact**, because pass@8 there is measured on identical items with
+   the same seed for every model — a *paired* comparison of a noisy estimator is still valid. What does **not**
+   survive is the gloss "31.24% of problems are unreachable"; they are **low-probability, not unreachable**.
+3. ⚠️**And that makes the withdrawal of the coverage-scaling branch weaker than §41bn stated.** If the problems
+   are reachable-but-improbable and training genuinely raises per-sample probability (+44% relative, measured),
+   then the barrier is generalisation from **4,303 examples** — and generalisation is exactly what scales with
+   data. §41bn withdrew the branch on "the first 4,303 moved nothing, so 10,000 will not either", which is
+   sound against a reachability wall and *not* sound against a generalisation deficit.
+
+✅**Honest revised position.** The withdrawal stands for the *never-solved-only* corpus: the reachable extra
+data there is ~4,531 problems (3.5× at best), which will not change a generalisation regime. The remaining
+honest version of the branch is **full-corpus distillation from Qwen3-14B** — all 11,738 problems, ~30-50k
+verified traces, CoT-SFT scale — which is a materially larger job whose nearest precedent (§41c, whole-trace
+imitation of Llama-3.1-8B) was a NULL that pushed `acc|ANSWERED` *down*. That is the fair statement: not
+"coverage is impossible", but "coverage needs a corpus an order of magnitude larger than anything tried here,
+and the one comparable attempt failed."
+
+⚠️**A BUG IN MY OWN SUMMARY, worth recording because it inverted a result.** The launcher printed
+`delta pass@8 = −5.75pt` for what is `+5.75pt`: it computed `rows[-1] − rows[0]` over a *sorted glob*, and
+`a4_covprobe_pfxcomp.json` sorts before `a4_covprobe_r6.json`, so the arm was treated as the baseline. Now
+keyed by label. **A summary line that silently flips the sign of the result is worse than no summary line.**
+
+### §41bt — ⚠️THE TRAINING POOL'S GOLD WAS 6.6% WRONG, and pricing it honestly costs the fix most of its story
+
+Went to expand the problem pool (§41bs: the coverage null is a GENERALISATION failure, and diversity is
+what generalisation scales with) and found the pool both smaller and wronger than it looked.
+`effort_probe.load_pool` built `gsm8k_train` gold as `extract_boxed(o["answer"])` over
+`gsm8k_main_curated` — but that `answer` field is a **MODEL-WRITTEN solution**, not GSM8K's gold. Against
+the dataset's own `#### N`, all 7,473 train rows:
+
+| | count | share |
+|---|---:|---:|
+| golds it produced that are WRONG | **280 / 4,229** | **6.62%** |
+| ├ generator arithmetic errors (parsed 2125, gold 2210) | 197 | 4.66% |
+| └ `extract_boxed`'s `[^}]*` stopping at a nested brace (`\boxed{\$14{,}000}` -> "14") | 83 | 1.96% |
+| rows DROPPED because the generated solution had no `\boxed` at all | **3,152 / 7,473** | **42%** |
+
+Pool: **11,968 -> 15,212 problems (+27.1%)**, 280 golds corrected. Gold now comes from `#### N`,
+materialised to `data/gsm8k_train_authoritative/train.jsonl` so offline nodes need no hub access.
+
+⭐**AND THE SAME DEFECT IS IN THE CoT-SFT PATH.** All three mix builders (v6/v11/v13) carry their own
+`canonicalize_gsm`, and each "verifies" with `extract_boxed(content) == gold` where **both sides came out
+of the same generated text** — a self-consistency check that catches a broken reconstruction and cannot
+catch a wrong answer. **4.00% of the rows v6's gsm8k tier emitted (110 of 2,748) have a wrong final
+answer**, handed to CoT-SFT as ground truth in the tier v6's own docstring calls "contamination-SAFE".
+Contamination-safe it was; correct it was not. All three now check an external gold and report drops.
+
+⚠️**`extract_boxed`'s brace bug is NOT fixed.** It is the shared MODEL-answer parser behind
+clean_eval/effort_gate/vllm_grade, so changing it would shift every published gate number mid-campaign.
+It underscores all arms equally, so paired comparisons stay valid. Recorded, not touched.
+
+✅**NOW THE PRICE, MEASURED, AND IT IS SMALL.** Re-scored round 6's OWN 32,000 gsm8k_train rollouts with
+nothing changed but the gold:
+
+| gsm8k_train, identical rollouts | never-solved in 8 |
+|---|---:|
+| scored with the curated (wrong) gold | 991 / 4,000 = **24.77%** |
+| scored with GSM8K's own `#### N` | 950 / 4,000 = **23.75%** |
+
+**The wrong golds explain 1.02pp of a 24.77pp hole.** At most ~77 of §41bm's 1,392-problem never-solved
+set (5.5%) were gold artifacts, so **§41bn's coverage null stands essentially unweakened.** I had written
+that bad gold "can park a solvable problem in the coverage hole permanently — a live concern for §41bm's
+set"; directionally right, and I gave no magnitude. The magnitude refutes the concern. 263 of 4,000 golds
+wrong on this independent sample (6.58%, confirming 6.62%) and 405 of 32,000 rollouts (1.27%) labelled
+`wrong` while in fact correct — real corruption of the RFT keep-filter and every DPO pair, and still not
+a coverage story.
+
+⭐**THE MECHANISM DETAIL WORTH KEEPING: 77 problems were rescued but the net is only 41, because 36 went
+the OTHER WAY.** On those 36, a4 made the *same* arithmetic error as the model that wrote the curated
+solution, so the wrong gold scored a wrong answer **correct**. Student and teacher-of-record sharing a
+mistake is invisible to any self-consistency check, and it is exactly why the mix-builder guard had to
+reach for an external gold rather than a stricter internal one.
+
+⚠️⚠️**AND THE TRAP I WALKED INTO WHILE READING THE FIX.** Round 6 -> round 7 never-solved on gsm8k_train
+fell 24.77% -> 22.69% and I read it as the fuel fix working. It is not: `math_train_easy`, which the gold
+fix **does not touch at all**, fell further (−2.97pp vs −2.08pp). The drop is `repairlo` being a better
+policy than round 6. **A change that coincides with a fix is not evidence for the fix unless the
+untouched arm holds still** — and here the untouched arm moved more.
+
+✅Decontamination re-measured for the 27%-larger question set (the old 0.0% reading does not transfer):
+max Jaccard vs judged eval items asdiv **0.812** (1 item >=0.70), svamp 0.550, gsmplus 0.593, mawps
+0.417, math500 0.433. **Zero items >=0.85 anywhere**; gsmplus at 0.593 confirms GSM8K-train and
+GSM8K-test-derived GSM-Plus are disjoint. The gate stays fair.
+
+### §41bu — ⭐⭐REACH IS NOT THE CONSTRAINT: pass@32 is 94.67 where pass@8 is 88.38, and only 5% is never solved
+
+The first measurement above K=8 for **any** a4-think post-training arm. `repairlo`, n=300/pool, T=0.9,
+top-p 0.95, one K=32 draw subsampled:
+
+| k | 1 | 2 | 4 | 8 | 16 | 32 | never-solved @32 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **asdiv** pass@k | 67.54 | 76.79 | 82.50 | 88.38 | 92.12 | **94.67** | **16 / 300 = 5.33%** |
+| asdiv majority@k | 67.54 | 70.79 | 74.17 | 76.67 | 80.04 | 82.00 | |
+| **svamp** pass@k | 58.88 | 69.42 | 78.67 | 85.17 | 90.75 | **93.67** | **19 / 300 = 6.33%** |
+| svamp majority@k | 58.88 | 60.50 | 66.33 | 69.33 | 71.33 | 73.00 | |
+
+⭐**Reach does not flatten past k=8 — it is still gaining +2.55 (asdiv) and +2.92 (svamp) on the last
+doubling, and 94-95% of problems are solved within 32 samples.** So the derivations exist inside a4's own
+distribution and the deficit is **probability MASS, not reachability.** This is the discriminating
+measurement §41bq wanted: it says keep spending on probability concentration (more distillation rounds,
+more problem diversity) rather than jumping to the base rebuild, and it corroborates §41bs's
+reinterpretation of the "coverage hole" as a low-probability tail rather than a wall.
+⚠️Do NOT quote this against 3.5-think's pooled pass@8 of 92.00 as if it were a win: that number is
+asdiv+svamp pooled at n=1000 under the gate's own sampling, this is per-pool n=300 at T=0.9/top-p 0.95.
+Suggestive, not matched. The load-bearing claim is the SHAPE of a4's own curve, which needs no baseline.
+
+⚠️**AND A NUANCE THAT QUALIFIES §41bq's "SELECTION IS CLOSED".** The vote→oracle gap **widens** with k:
+asdiv 11.71pt at k=8 -> 12.67 at k=32, svamp 15.84 -> 20.67. "Selection is closed" was always a statement
+about a4's deficit *relative to 3.5-think at k=8* (+0.08), never about the absolute gap — in absolute
+terms there is 13-21pt of oracle headroom that majority voting does not capture at k=32. That headroom is
+not newly available: §41j measured text-feature selectors 10-14pt WORSE than voting, and §25's reranker
+that did capture it was a two-model SERVING win, not a single-checkpoint one. Recorded so the two
+statements are not read as contradicting each other.
+
+### §41bv — ⛔ROUNDS 7-9 ARE A NULL, and the two-pool read that said otherwise is the finding worth keeping
+
+Three more rounds of on-policy KD from `repairlo`, on the §41bt-corrected pool (15,212 problems, +27.1%),
+run as a 17-step chain of ~1-hour jobs. Four clean pools, 3,000 identical items, paired McNemar:
+
+| vs `repairlo` | greedy | extend1 | sc@8 | pass@8 |
+|---|---:|---:|---:|---:|
+| **round 8** | +0.57 (p=0.479) | +1.07 (p=0.171) | −1.17 (p=0.080) | +0.83 (p=0.156) |
+| **round 9** | −0.07 (p=0.964) | −0.27 (p=0.755) | **−1.43 (p=0.033)** | +0.93 (p=0.132) |
+
+⛔**Nothing moved.** Standing on four pools: `combo` 50.87 -> `repairlo` **58.43** -> r8 59.00 / r9 58.37,
+against 3.5-think's 64.10. The remaining gap decomposes as **5.40 coverage + 0.23 selection + 0.03 floor**
+for `repairlo` — materially where §41bq left it. Round 8 traded selection (0.23 -> 2.23 deficit) for
+coverage (5.40 -> 4.57) and floor (0.03 -> −1.70, better than the target's), netting nothing.
+
+⚠️⚠️**THE MISTAKE, AND IT IS THE MOST TRANSFERABLE THING HERE. I read gate call 1 (asdiv+svamp, 2,000
+items) as `pass@8 +2.05 at p=0.003` and reported COVERAGE MOVED. On four pools it is +0.83 at p=0.156.**
+Adding 1,000 items did not merely fail to confirm it — it reversed it, which means the effect is
+heterogeneous, not underpowered:
+
+| pool | pass@8 Δ, r8 vs `repairlo` | p |
+|---|---:|---:|
+| svamp | **+2.70** | **0.013** |
+| asdiv | +1.40 | 0.125 |
+| mawps | +0.60 | 0.701 |
+| **gsmplus** | **−3.80** | **0.040** |
+
+**Two nominally-significant effects in OPPOSITE directions, cancelling under pooling.** The same split
+shows up independently in the k=32 reach probes: on asdiv r9 goes 94.67 -> 92.67 and never-solved 16 -> 22,
+while on svamp it goes 93.67 -> **97.00** and never-solved 19 -> **9**. Three independent instances in one
+day of *svamp likes this arm, asdiv/gsmplus do not*.
+
+⭐**THE RULE THIS ESTABLISHES: on this line the pool-to-pool spread (±3pt) is LARGER than the effect sizes
+being chased (~1pt), so any readout narrower than the four-pool pooled paired test can be made to say
+whatever the chosen pools prefer.** §41bo recorded this hazard for cross-RUN merges; it applies just as
+hard to pool SUBSETS inside a single run, and with ~30 tests run across metrics/arms/pools today, a couple
+of p<0.05 readings are expected from noise alone. Report the four-pool pooled number first, always.
+
+✅**REACH probes (k=32, n=600 pooled, T=0.9), the counterpart to §41bu's baseline:** `repairlo` 94.17 /
+never 35, r8 **95.67** / never **26**, r9 94.83 / never 31. So r8 does hold a small tail gain — and
+`majority@32` is FLAT across all three (77.50 / 77.33 / 76.83), i.e. **the extra reach is entirely
+unconverted**, which is §41bu's widening vote→oracle gap showing up as a null on the deployed metric.
+
+⚠️**PREDICTION SCORECARD, stated before the gate ran and mostly WRONG.** I predicted (a) r9 lands ~1.5
+below `repairlo` on greedy because the 1e-5 KD overwrote `repairlo`'s LR-fragile 3e-6 repair gain, and
+(b) pass@8 rises. On four pools (a) is **−0.07 at p=0.964** — no overwrite — and (b) is **not
+significant**. The mechanism story was clean, plausible, and unsupported.
+⚠️**AND THE WARNING I RAISED MID-RUN DID NOT MATERIALISE EITHER.** On-policy sampling at T=0.9 showed
+`acc|gradeable` **54.35 -> 49.42 -> 49.36** across 121,696 rollouts and `no_answer` tripling 2.38% ->
+6.40%; I flagged it as a likely regression. The gate says greedy is flat. **That is the THIRD instance of
+§41au's divergence — a large, high-n, paired decline in the SAMPLING distribution that does not appear in
+the deployed metric.** Sampling statistics on train pools are not a preview of the gate; stop reading
+them as one.
+✅One thing the rounds did close: termination converged to the teacher — unclosed 11.0% -> 8.5% (teacher
+8.45%) and t_len 283 -> 251, stable between r8 and r9. That axis is finished, and it bought no accuracy.
+
+⭐**THE ONE LIVE LEVER LEFT BY THIS ARM IS ORDERING, and it is cheap.** `repairlo`'s +1.93 (§41bn) came
+from pure CE at **lr 3e-6**, and §41bn also recorded that **1e-5 on the same data DAMAGES it**. This chain
+ran 1e-5 KD *starting from* `repairlo` — i.e. the fragile gain was the FIRST thing the chain wrote over.
+Running that repair pass LAST, on round 8's own correct traces, is one generation + one ~50-min CE pass
+(~1.6h) and stacks the two effects instead of trading them. Choosing the best-greedy checkpoint as START
+without asking HOW it earned its greedy is the planning error to avoid repeating.
+
+✅**INFRASTRUCTURE (`reasoning/a4_chunk.sh`), which outlives the null.** 17 steps of <=55 min each,
+self-resubmitting, state derived entirely from on-disk artifacts so any death resumes correctly; measured
+overhead ~5% against the monolith, and only ~3 min of queue gap across 17 handoffs. Three bugs were caught
+in a DRY RUN before costing GPU time: (1) retention deletes the dir holding the round's own `.done`
+markers, so keying the skip on them regenerates a finished round forever — the marker must be
+`report/*_smoke.json`, which retention never touches; (2) a step exiting 0 without producing its artifact
+resubmits until the step budget is gone, so `finish` now asserts its artifact; (3) `closure_smoke.py`
+writes its JSON and THEN raises SystemExit(3), so a failed round left a completion marker that would make
+a resubmit skip it and iterate on a non-terminating checkpoint.
+⚠️**And retention had to be overridden mid-run.** Latest-only would have deleted round 8 before the gate
+read it; gate call 1 then showed r8 beating r9 on extend1 (+1.33, p=0.048 four-pool). That is §41au's
+incident exactly, so the penultimate round is now HELD through the gate. **A checkpoint queued for a gate
+is a pending result, not a superseded one.**
+
+### §41bw — ⭐A NULL SCORE IS NOT A NULL INTERVENTION: 17% of items changed answer for +0.57pt
+
+Two loose ends from §41bv, both closed with data already on disk.
+
+⛔**FIRST: the gsmplus regression is NOT a robustness failure.** r8 lost pass@8 −3.80 (p=0.040) there, and
+gsmplus is adversarially perturbed GSM8K, so the obvious hypothesis is that six rounds of KD on
+GSM8K/MATH-train overfit the clean distribution and gave up perturbation robustness. Cross-tabulating the
+flips against GSM-Plus's own `perturbation_type` (downloaded for this; the local `gsmplus_test` keeps only
+question+gold) says no:
+
+| perturbation type | n | gained | lost | net |
+|---|---:|---:|---:|---:|
+| distraction insertion | 60 | 3 | 8 | −5 |
+| problem understanding | 75 | 4 | 9 | −5 |
+| adding operation | 60 | 3 | 6 | −3 |
+| reversing operation | 82 | 5 | 7 | −2 |
+| integer-decimal-fraction | 59 | 4 | 6 | −2 |
+| numerical substitution | 78 | 4 | 5 | −1 |
+| digit expansion | 86 | 6 | 7 | −1 |
+
+**Diffuse across every type**, largest net −5 on n=60. No mechanism, and it supports §41bv's reading of the
+−3.80 as the unlucky tail of a high-churn zero-net process rather than something the arm broke.
+
+⭐⭐**SECOND, AND THIS IS THE REUSABLE ONE. The arms disagree at the ITEM level far more than their scores
+differ**, four pools / 3,000 items:
+
+| pair | greedy disagreement | net |
+|---|---:|---:|
+| r8 vs `repairlo` | **17.0%** (511 items) | **+0.57** |
+| r9 vs `repairlo` | 16.8% (504) | −0.07 |
+| r8 vs `combo` | 23.3% (700) | +8.13 |
+| `repairlo` vs `combo` | 22.4% (673) | +7.57 |
+
+**Three rounds of KD changed the answer on 17% of items — 76% as much item-level movement as the entire
+prior campaign that gained +7.57pt — and netted +0.57.** So the arm is emphatically not a no-op: it
+relocated a large amount of capability symmetrically. ⚠️**A null delta cannot distinguish "did nothing"
+from "did a lot, in both directions"; only the discordance count can, and b≈c is what makes the paired
+test read null.** Report discordance alongside any null on this line from now on. It also sets the real
+scale of the problem: two checkpoints from the same lineage differ on ~1 item in 6, which is the variance
+the ~1pt effects being chased are sitting on, and it is the same story §41bv told with pool heterogeneity.
+
+⚠️**AND THE DEFLATION, because the churn looks like free headroom and is not.** An oracle picking the
+better of {r8, `repairlo`} per item scores **67.23** greedy — above 3.5-think's 64.10, and far above
+either model alone (59.00 / 58.43). But `repairlo`'s OWN `sc@8` is **67.20**. **The perfect
+cross-checkpoint chooser is worth exactly what self-consistency on one checkpoint already delivers**, at
+twice the inference cost and requiring an oracle that §41j measured as unavailable (text-feature selectors
+are 10-14pt WORSE than voting). Cross-checkpoint diversity ≈ sampling diversity here; it is not a new
+axis. Recorded so the 67.23 is never quoted as accessible.
+
+### §41bx — ⚠️⚠️RETRACTION: the cross-round SAMPLING decline was a SEED CONFOUND, not a policy effect
+
+An accidental control. The repair-last arm regenerated rollouts from `think_r8` — the same checkpoint
+`a4_r9`'s dump was generated from, on the same 15,212 problems, same pools, same K=8, same
+T=0.9/top-p 0.95/top-k 50, same caps, **same node (midway3-0372)**. The only difference in the recorded
+args is `--seed`: 1243 vs 1250.
+
+| think_r8, 60,848 rollouts, shard 0 | seed 1243 | seed 1250 | Δ |
+|---|---:|---:|---:|
+| correct | 37.80% | 34.49% | **−3.31pp** |
+| wrong | 38.48% | 40.06% | +1.58 |
+| unclosed | 17.12% | 14.02% | −3.10 |
+| no_answer | 6.60% | 11.43% | **+4.83** |
+
+⚠️**AND THAT IS THE SAME MAGNITUDE AS THE "POLICY EFFECT" I REPORTED MID-RUN.** The iter/chunk launchers
+seed generation as `1234 + R`, so **every round used a different seed and policy was perfectly confounded
+with seed**:
+
+| sampled from | seed | corr% | acc\|grad |
+|---|---|---:|---:|
+| `repairlo` | 1241 | 41.01 | 54.35 |
+| round 7 | 1242 | 37.67 | 49.42 |
+| round 8 | 1243 | 37.81 | 49.36 |
+| **round 8 again** | **1250** | **34.48** | **46.27** |
+
+The step I attributed to round 7 (`repairlo` -> r7, −3.34pp corr) is **indistinguishable in size from what
+the seed does at FIXED policy (−3.31pp)**. So the mid-run alarm — "acc|gradeable 54.35 -> 49.36,
+`no_answer` tripling, likely regression" — was reading a confound, and I raised it as evidence.
+
+⛔**THIS ALSO WITHDRAWS §41bv's "third instance of §41au's sampling-vs-gate divergence."** There was no
+divergence to explain: the gate was flat because nothing much changed, and the sampling series was not
+measuring the policy. Reaching for a known phenomenon to explain an artifact is worse than having no
+explanation, because it launders the artifact into the record as a confirmed pattern. §41au's real
+instances stand; this was not one of them.
+
+✅**RULES THIS SETS.**
+1. **Never compare generation statistics across rounds** while `--seed` varies with the round. The varying
+   seed is CORRECT for training-data diversity (it stops successive rounds resampling identical traces)
+   and fatal for measurement. If a sampling comparison is wanted, run a fixed-seed probe.
+2. **Two draws from one checkpoint differ by ~3pp on these aggregates**, so a sampling-stat gap under
+   ~5pp says nothing about a policy. That is a floor on the whole family of "rollout dump" diagnostics
+   (`fail_taxonomy`, keep-rates, label mixes), all of which have been read across rounds in this campaign.
+3. Together with §41bw (17% item churn for +0.57pt) and §41bv (pool spread ±3pt), the picture is
+   consistent: **this line's measurements are far noisier per-item than the effects being chased, and only
+   the four-pool pooled PAIRED gate has ever been trustworthy.** Everything else is a guardrail.
+
+⚠️Mechanism, offered as a hypothesis and not measured: `unclosed` fell 3.10pp while `no_answer` rose
+4.83pp, i.e. mass moved between two truncation-adjacent labels rather than appearing from nowhere. At
+t_len ~251 against a 512-token generation cap and `--max-tok 768`, the model may sit near a truncation
+cliff where small sampling shifts reclassify many traces. Worth a fixed-seed length-sweep before trusting
+any label-mix diagnostic again.
+
+### §41by — REPAIR-LAST: the ordering hypothesis is REFUTED as stated, and the arm is still the best checkpoint
+
+§41bv's lever: `repairlo`'s +1.93 is CE at lr 3e-6 and 1e-5 damages it, so running a 1e-5 KD chain FROM
+`repairlo` overwrote it. Test: the identical repair recipe (`--kd-weight 0.0 --ce-weight 1.0
+--labels correct`, lr 3e-6, seed 46) applied LAST, to round 8, on 24,787 of its own correct on-policy
+traces. Four clean pools, 3,000 identical items:
+
+| model | greedy | sc@8 | pass@8 | gap | = coverage | + selection | + floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `combo` (session start) | 50.87 | 60.43 | 77.83 | 13.23 | 6.50 | 5.90 | 0.83 |
+| `repairlo` (prior best) | 58.43 | 67.20 | 78.93 | 5.67 | 5.40 | 0.23 | 0.03 |
+| round 8 | 59.00 | 66.03 | 79.77 | 5.10 | 4.57 | 2.23 | −1.70 |
+| **repair-last** | **59.17** | **67.60** | **80.23** | **4.93** | **4.10** | 1.13 | −0.30 |
+| 3.5-think | 64.10 | 72.83 | 84.33 | — | — | — | — |
+
+⛔**THE PREDICTION, WHICH WAS PRE-REGISTERED IN THE LAUNCHER, IS REFUTED.** Stated before the run: TRUE ->
+~60.5-61.0 greedy (+2 over `repairlo`); FALSE -> within noise of round 8. **Result: 59.17, i.e. +0.17 from
+round 8 at p=0.85.** `repairlo`'s +1.93 was a property of round 6's state, not a reusable polish, and the
+"the chain overwrote a recoverable gain" story is dead. Two pre-registered predictions today, both wrong
+(§41bv's overwrite prediction, this one) — the mechanism stories keep being cleaner than the model.
+
+✅**AND YET IT IS THE BEST a4-think CHECKPOINT ON EVERY METRIC**, and unlike §41bv the movement is
+HOMOGENEOUS. vs `repairlo`: pass@8 **+1.30 (p=0.026)**, extend1 **+1.57 (p=0.039)**, greedy +0.73
+(p=0.359), and per-pool greedy is **+0.60 / +1.20 / +0.20 / +0.60 — all four positive**, no
+svamp-vs-gsmplus cancellation. vs round 8: `sc@8` **+1.57 (p=0.008)**. So the CE pass DID add selection on
+top of the KD rounds' reach; the stacking is real, just ~1pt rather than the ~2pt predicted.
+⚠️**Discipline note: greedy — the DEPLOYED metric — is not significant**, and 8 tests were run here with
+two under 0.05. The defensible claim is "best checkpoint, small homogeneous gains on ceiling and
+best-decode", NOT "+1.30 pass@8 confirmed".
+⚠️Churn again (§41bw): repair-last vs round 8 disagree on **445 of 3,000 greedy items for a net of +0.17**.
+
+⭐**WHAT THE DECOMPOSITION NOW SAYS.** Gap to 3.5-think **5.67 -> 4.93**, and it is *still* ~83% coverage
+(4.10 of 4.93). Round 8 bought coverage (5.40 -> 4.57) at the cost of selection (0.23 -> 2.23); the repair
+pass bought half that selection back (2.23 -> 1.13) without giving up the coverage (4.57 -> 4.10).
+**That is the first time in this campaign that two arms have composed rather than traded** — which is the
+one piece of the ordering thesis that survives: repair AFTER, not before, because CE-on-own-correct-traces
+repairs SELECTION and KD moves COVERAGE, and applying the selection fix first means the coverage arm
+undoes it.
+
+**Artifact: `think_r8repair`.** Retention: round 8 is superseded by its own child, which dominates it on
+every metric, so r8 goes; `repairlo` stays as the published prior best and the gate baseline.
+
+### §41bz — ⚠️⚠️NuminaMath CONTAINS THE EVAL SETS VERBATIM. The decontamination sweep was not a formality.
+
+§41by leaves the gap at 4.93 with **4.10 of it coverage**, and §41bs attributes the coverage null to
+GENERALISATION across distinct problems while this line has recycled the same 15,212 all campaign. So:
+build a diverse pool. `reasoning/build_numina_pool.py` streams NuminaMath-CoT (859,494 rows), keeps rows
+whose `\boxed` gold survives `norm()`, and drops the sources that are out of range for a model at ~59% on
+grade-school word problems (olympiads / aops_forum / amc_aime / synthetic_amc) plus its `math` and `gsm8k`
+sources. Result **341,832 problems** — orca_math 150,114 / synthetic_math 99,287 / cn_k12 92,431.
+
+⚠️⚠️**THEN THE SWEEP, AND IT IS THE FINDING.** `reasoning/decontam_pool.py` (exact prefix filtering:
+J(A,B)>=t implies |A∩B| >= t|A|, so B must hit one of A's ceil((1-t)|A|)+1 rarest tokens — a filter, not
+a sample, every survivor gets a real Jaccard):
+
+| eval pool | judged | max Jaccard | pairs >= 0.70 |
+|---|---:|---:|---:|
+| svamp | 1000 | **1.000** | 7,998 |
+| asdiv | 1000 | **1.000** | 2,409 |
+| math500 | 319 | **1.000** | 968 |
+| mawps | 500 | **1.000** | 208 |
+| gsmplus | 500 | 0.684 | **0** |
+
+**J = 1.000 is not a near-duplicate, it is the same string.** `"There are 544 pots in each of the 10
+gardens. Each pot has 32 flowers in it."` is simultaneously a svamp eval item and a NuminaMath training
+row. **Four of the five eval pools are present verbatim in the corpus.** Training on it unswept would have
+put the test set in the training data and voided every gate number taken afterwards — and the arm would
+have looked like a triumph on the way down. 5,842 rows dropped (1.709%) -> **335,990 clean problems, 22x
+the current pool.**
+✅gsmplus is the ONLY untouched pool (max J 0.684), which is a consistency check rather than luck: it is
+adversarially perturbed GSM8K, so verbatim copies cannot exist. The one pool built to resist reuse is the
+one that resisted.
+
+⚠️**A BROADER FLAG, stated as a question and not a claim.** If a public corpus this widely used contains
+asdiv/svamp/mawps/math500 verbatim, then any model trained on it is contaminated on those pools. This line
+compares against Qwen3 constantly — §39's "a4's phase-C base is −26.5 mmlu / −41.2 gsm8k vs
+Qwen3-0.6B-Base", §41bm's Qwen3-14B completer, §41bk's teacher audition. I do not know Qwen3's training
+data and am not asserting anything about it, but **"our eval pools are in the public math-corpus
+bloodstream" is now measured, and every cross-model comparison on this line inherits that uncertainty.**
+Our own numbers are unaffected: a4 and 3.5-think were never trained on this corpus, and gsmplus is clean
+for everyone.
+
+⚠️Mechanics worth keeping: `datasets` streaming threw `Bad file descriptor` mid-pull and segfaults at
+interpreter teardown (with or without torch imported), so the builder defaults to downloading the 1.15 GB
+parquet — a silently truncated corpus is the worst failure mode for a corpus whose point is size.
+
+### §41ca — BUILDING A DIVERSE POOL TOOK FOUR FILTERS, and three of them changed the answer
+
+§41bz decontaminated the NuminaMath pool. Two further filters were needed before it was usable, and the
+funnel is the record:
+
+| stage | problems | what it removes |
+|---|---:|---|
+| NuminaMath-CoT raw | 859,494 | — |
+| numeric-verifiable gold, in-range sources | 341,832 | non-numeric gold; olympiad/AMC tiers a 59%-greedy model cannot touch |
+| **− eval decontamination** (§41bz) | 335,990 | 5,842 rows that are eval items **verbatim** |
+| **− novelty filter** | 279,330 | 56,660 near-dups of problems this line ALREADY trains on |
+| **− well-formedness filter** | **233,675** | 45,655 not answerable as a single number |
+
+⭐**NOVELTY, measured (`reasoning/pool_novelty.py`, same exact prefix filter):** 16.86% of the
+decontaminated pool near-dups (J>=0.70) a problem already in the 15,212. By source: **synthetic_math
+30.33%, orca_math 18.29%, cn_k12 0.27%.** The two synthetic sources ARE partly restatements of MATH and
+GSM8K, exactly as suspected — but only partly, and `cn_k12` is a genuinely foreign distribution. §41bs's
+constraint is diversity across DISTINCT problems, so paraphrases of the existing pool are dilution, not
+signal, and they are dropped. **83.14% genuinely new.**
+
+⚠️**WELL-FORMEDNESS, and this one is a data-integrity issue rather than an efficiency one.** The first
+generation shard on the unfiltered pool read `no_answer` **25.85%** against 11.42% on the familiar pool.
+Inspection found multi-part exam items whose gold is only part (1)'s answer (`"(1) find the range of m.
+(2) Prove that..."` with gold `-2`), `prove that` prompts, "express in simplest fractional form", and
+float-noise golds like `0.32420000000000004` that a correct `0.3242` scores WRONG against. **16.34% of
+the novel pool, and 39.88% of cn_k12** — Chinese K-12 questions are routinely multi-part.
+⛔**`--labels correct` does NOT protect against this**, because the label is the thing that is wrong: on
+a multi-part item a trace that happens to emit part (1)'s number is marked CORRECT and trained on, i.e. a
+wrong derivation banked as ground truth. Same defect family as §41bt's gold bug — a value derived from
+the wrong thing, trusted.
+
+✅**The filter is validated but only partial**, which is itself the finding. Re-running shard 0 on the
+filtered pool: `no_answer` **25.85% -> 19.16%**, correct 17.21% -> 19.60%, kept 2,300 -> 2,698. So
+malformation was ~1/3 of the excess; the remaining gap to the familiar pool's 11.42% is DIFFICULTY
+(never-solved 54.73%, acc|gradeable 31.94% vs 46.27%). Harder problems mean longer reasoning against a
+512-token generation cap, which is §41bx's truncation-cliff hypothesis showing up a second time and is
+worth a fixed-seed length sweep before any label-mix diagnostic is trusted again.
+
+⚠️**Carry into the read of the arm:** its ~21,600 training traces come from the easier ~45% of a harder
+distribution, and on a problem solved 1-in-8 some "correct" traces are coincidentally-right reasoning.
+That is the standing RFT trade-off, mitigated only partly by the keep-tier cap of 3 traces per hard
+problem. If the arm reads positive, this is the first alternative explanation to rule out.
+
+### §41cb — ⭐"UNCLOSED" IS 98% TRUNCATION, so the termination story is really a BREVITY story
+
+§41bx and §41ca both ended with a truncation-cliff hypothesis. Measured directly on the divrep shard-0
+dump (8,000 sampled traces, tokenised with the model's own tokenizer; generation cap `--max-new-tokens
+512`):
+
+| label | n | median tokens | p90 | **>= 500 tokens** |
+|---|---:|---:|---:|---:|
+| correct | 1,594 | 235 | 486 | 9.1% |
+| wrong | 3,245 | 311 | 491 | 8.3% |
+| **unclosed** | 1,815 | **512** | 512 | **98.2%** |
+| **no_answer** | 1,346 | **512** | 512 | **89.7%** |
+
+⭐**`unclosed` and `no_answer` are not reasoning failures, they are BUDGET failures** — the trace hit the
+cap and stopped, either before `</think>` or after it but before `\boxed{}`. The gate uses the same
+`--max-new-tokens 512`, so every "unclosed%" in this campaign is substantially a *did the trace fit in
+512 tokens* measurement.
+
+⭐**THAT SHARPENS THE CAMPAIGN'S CENTRAL MECHANISM RATHER THAN CONTRADICTING IT.** §41p-r's finding is
+that a length-MATCHED teacher works and a long-CoT teacher collapses the student; §41f measured the
+long-CoT arm at 96.95% unclosed. Read through this table, per-token KD from a short teacher does not
+install a "termination policy" — **it makes the student BRIEF ENOUGH TO FINISH inside the budget.**
+Unclosed 11.0% -> 8.5% across rounds 7-9 (§41bv) is the student's traces fitting in 512 as often as the
+teacher's do, and t_len 283 -> 251 is the same fact stated directly.
+
+⛔**AND THE OBVIOUS "FREE WIN" IS NOT ONE.** Raising the cap looks tempting until you notice correct
+traces have median 235 / p90 486: a trace still running at 512 is usually a LOST trace, not an
+almost-finished one. The campaign already has the right mitigation in the gate's force-close `budget`
+config, and it is worth a real amount — four pools, 3,000 items:
+
+| model | greedy | +force-close | gain | p |
+|---|---:|---:|---:|---:|
+| repair-last | 59.17 | 60.73 | +1.57 | 1.9e-06 |
+| `repairlo` | 58.43 | 59.80 | +1.37 | 6.6e-05 |
+| 3.5-think | 64.10 | **66.00** | **+1.90** | 8.3e-07 |
+
+**Every model gains, the TARGET gains most, and the gap WIDENS 4.93 -> 5.27.** So truncation is real,
+costs ~1.5pt, is already recoverable by a deployed wrapper, and is NOT a differential a4 weakness. ⚠️Price
+a lever by the target's value on that axis (§41bf's lesson) — I nearly recorded this as free headroom.
+
+✅Practical rules: quote `unclosed` as "did not fit the budget", never as "failed to terminate"; and when
+a label-mix diagnostic moves, check the length distribution before attributing it to behaviour.
+
+### §41cc — ⛔DIVERSITY IS NOT THE CONSTRAINT: 15.4x the distinct problems moved pass@8 −0.20
+
+The direct test of §41bs's generalisation diagnosis. `repair-last`'s exact recipe (CE only, lr 3e-6,
+`--labels correct`) from `think_r8repair`, on 48,000 problems drawn from the §41ca pool — 233,675
+decontaminated, genuinely-novel, well-formed problems from orca_math / synthetic_math / cn_k12, i.e.
+**15.4x the 15,212 this line had been recycling**, from sources it had never seen. Four clean pools,
+3,000 identical items, paired:
+
+| vs `r8repair` | Δ | p | disagree |
+|---|---:|---:|---:|
+| **pass@8** (pre-registered criterion) | **−0.20** | 0.743 | 7.7% |
+| greedy | +0.43 | 0.523 | 11.8% |
+| extend1 | −1.07 | 0.096 | 11.6% |
+| sc@8 | −0.73 | 0.214 | 9.5% |
+
+Per-pool greedy signs **MIXED** (+0.30 / −0.40 / +1.80 / +1.00). Standing unchanged: `r8repair` 59.17
+greedy remains the best checkpoint, `a4divrep` 59.60 greedy / 80.03 pass@8 is inside noise of it.
+
+⛔**THE PRE-REGISTERED PREDICTION RESOLVES TO THE "SATURATED" BRANCH.** Stated in the launcher before the
+run: diversity binds -> pass@8 **>= +1pt** with a homogeneous per-pool sign; recipe saturated -> noise on
+everything. It is noise, slightly negative, mixed-sign. **§41bs's hypothesis — that the coverage null was
+a generalisation failure fixable with more distinct problems — is REFUTED at this scale.**
+
+✅**AND THE DOSE CONFOUND, WHICH I CAUGHT LATE, DOES NOT MATTER HERE.** I had told myself the dose was
+0.86x by comparing this arm's KEPT TRACES (21,318) to `repair-last`'s TRAINING ROWS (24,787) — different
+units. Like for like it is **48,579 rows / 2,262 steps against 24,787 / 1,055, i.e. ~2x**. That would have
+made a POSITIVE result unattributable between diversity and dose. Because the arm is null, **both** the
+diversity and the 2x update produced nothing, which is the unambiguous case. ⚠️Design lesson: the
+confound was avoidable and I only noticed it from the training stats after the run.
+
+⚠️**ONE ALTERNATIVE REMAINS, AND IT IS PRE-SPECIFIED AND CHEAP** (job 53322325, `--solve-band 4 8`).
+Measured on this arm's own dump: correct traces from problems solved 1/8 carry a **16.42% per-equation
+arithmetic error rate against 9.49% for 8/8 problems — 1.7x after controlling for equations per trace**
+(1.47 vs 1.09). The split is not a smooth gradient: 1/8 through 7/8 all sit at 15-17% and only the
+always-solved band drops. So a low-probability "correct" is disproportionately a coincidentally-right
+answer reached by false arithmetic — and on this harder pool the mode of the SOLVABLE set is 1/8 (13.1%
+of all problems), while `--keep-hard 3` deliberately over-samples that band. The control reruns the CE
+step on problems solved 4-7 of 8, reusing the retained dump (kept for exactly this; deleting it would
+have turned a 1-hour question into a 3.4-hour one).
+✅Health is fine either way — `divrep` smoke: unclosed **8.00%**, t_len 245.2, the best of any a4 arm.
+Retention: `think_divrep` deleted (null, dominated, numbers preserved in the gate JSON); `think_r8repair`
+and `think_opd35repairlo` kept.
+
+---
+
+## §42 — RELEASING `argonne-4.0-base`: the finished stage confirms §39, and a FIFTH release-config defect (2026-08-13)
+
+The argonne4.0 phase-C run ended at **step 112,674 / 65.12B tokens**; §39 measured step **112,412**,
+which was 262 steps and 0.26B tokens short of that and still mid-cooldown at LR 6.1e-5. §39 labelled
+its own numbers "a lower bound on the finished stage" and said the trade "may soften". This round
+published the model, so the released weights had to be measured rather than inherited. Jobs 53327912
+(lm-eval, 1h08, MaxRSS 23.6 GB) and 53328723 (long-context + gate).
+
+### 42a. THE COOLDOWN CHANGED NOTHING — §39's caveat was honest, and its conclusion holds
+
+Byte-identical task list, few-shot counts and vLLM backend to §39d/§39f, so the rows merge.
+
+| | a4 step 112,412 (§39) | **a4 step 112,674 (RELEASED)** | Δ |
+|---|---:|---:|---:|
+| 8-task mean | 49.94 | **49.86** | −0.08 |
+| mmlu | 25.95 | **26.15** | +0.20 |
+| gsm8k strict | 8.11 | **7.51** | −0.60 |
+
+The remaining 0.26B tokens of cooldown moved the mean by less than a tenth of a point. **"May soften"
+was the right hedge and the answer is no.** Two things this settles:
+
+- **MMLU is at chance on the finished stage** (26.15 vs 25.0). Not a mid-cooldown artifact.
+- **The generative-math regression is real and slightly worse at the end.** vs phase B: gsm8k
+  **9.70 → 7.51 (−2.19)** while the 14-cell MC mean rose. §39d read −1.59 at 1.4σ and declined to
+  call it; on the finished stage it is −2.19 in the same direction, alongside §39b's 7-of-8 worse
+  reasoning tiers. **Phase C is a domain trade.** That is now measured on the artifact, not predicted.
+
+Anchors are unchanged (not re-run): a4 is behind **Qwen3-0.6B-Base on all nine cells** — −8.24 mean,
+−26.34 mmlu, −41.77 gsm8k at 1.7× the params — and beats **Llama-3.2-1B** on gsm8k 7.51 vs 1.82
+(4.1×) while losing the commonsense/knowledge tasks. §39f's retraction stands.
+
+### 42b. THE FIFTH RELEASE-CONFIG DEFECT — publishing a sliding window the weights never saw
+
+§37 catalogued four silent config defects (`auto_map` popped, `block_size` capped at 4096,
+`eos_token_id` wrong for chat, `use_cache` false). Here is the fifth, and it is the only one that
+would have shipped a model computing something different from what was trained:
+
+`interleaved_local_attention: true` / `local_attention_window: 256` are in **every** Argonne config,
+including the published 3.0-base and 3.5-base — and the window has **never been active in any Argonne
+pretrain.** `model.py` implements it only on the flash-attn-2 path (`flash_attn.flash_attn_interface`);
+this cluster's env is flash-attn-4, which does not expose that module, so every slice since 3.0 fell
+back to SDPA and printed `local_attention_window=256 is configured but IGNORED on this path`. The
+vLLM port ignores the window for the same reason and is token-for-token exact against `model.py`.
+
+The defect is not in training — full attention is what all these models are — it is in **publishing
+the flag**. A downstream user with flash-attn-2 installed gets a 256-token window on odd layers,
+silently, at an advertised 65,536-token context. `push_model_to_hf.py` now sets
+`interleaved_local_attention: false` / `local_attention_window: null` at release time and **asserts**
+on them, alongside a sixth normalisation: `loss_chunk_size` → 0, because a nonzero value makes
+`forward()` return `logits=None` whenever `self.training and labels is not None` — inert at inference,
+a footgun on a base model whose whole purpose is to be fine-tuned.
+
+Verified end-to-end, not just in the JSON: a standalone `trust_remote_code` load of the staged
+release (empty `PYTHONPATH`, only the bundled `model.py` + `auto_map`) logs `full attention` with no
+"IGNORED" warning, reports `sliding_window=None` on all 32 blocks, `max_position_embeddings=65536`,
+450/450 tensors and 1,038,492,672 params. ⚠️**The already-published 3.0-base and 3.5-base configs
+still carry the flags** — they were not re-pushed in this round.
+
+### 42c. TOOLING — two fixes and two new scripts, because a release table typed by hand is a defect
+
+- ⚠️`exp_longctx_learning.py`'s a4 arms all pointed at `/home/youzhi/ArgonneAI-4.0`, the worktree
+  **deleted on 2026-08-08** when argonne4.0 consolidated into the main clone. Every a4 arm would have
+  died on a missing `pretrain.py`. Now derived from `__file__`.
+- `reasoning/release_table.py` (new) — emits the card's benchmark table from lm-eval JSONs under ONE
+  metric rule (`acc_norm`; `acc` for winogrande/mmlu). Validated by reproducing §39f's banked table
+  cell-for-cell before being used. This exists because `lmeval_summary.py`'s docstring already records
+  what hand-mixing `acc` and `acc_norm` costs: a 3.74pt phantom regression.
+- `reasoning/plot_a4_loss.py` (new) — the four-stage loss figure. Two a4-specific traps: phase C ran
+  from a **different launcher** (`midtrain_c_a4.sh`) that prints no `Stage:` banner, so banner-only
+  parsing drops it entirely; and stage 1's per-step loss **alternates 1.0↔2.8** because
+  `WeightedMultiLoader` draws ONE source per step and edu/math/code have very different entropies.
+  That sawtooth is the sampler, not the optimization — the figure draws raw faint + a rolling median.
+- `model_cards/argonne-4.0-base.md` is committed, so the published card is versioned in the repo
+  instead of existing only on the Hub.
+
+### 42d. LONG CONTEXT ON THE RELEASED WEIGHTS — the window is real, but the phase-C GAIN is not extension
+
+Three arms **paired on the same 24 held-out arXiv windows** (`arXiv_09*`, 49,152 tokens each), pinned
+checkpoints, one job. This is the comparison §39c could not make: it ran phase B vs phase C, both of
+which are already context-extended, so it had no 1,024-only control.
+
+| bucket | a4_anneal (103,457, ctx 1,024) | a4_phaseb (109,622) | **a4_phasec (112,674) = RELEASE** |
+|---|---:|---:|---:|
+| 0–1,024 | 2.5611 | 2.4009 | **1.9704** |
+| 1,024–2,048 | **5.0859** | 2.0611 | **1.6711** |
+| 8,192–13,568 | 5.9643 | 1.2417 | **0.9798** |
+| 24,576–32,768 | 5.9900 | 1.1978 | **0.8643** |
+| 40,960–49,152 | 6.0749 | 1.2998 | **0.8203** |
+
+**H2 confirmed, decisively: RoPE θ=1e6 does not extrapolate on this arch.** The 1,024-only anneal
+checkpoint is coherent in-window (2.56) and **flat at 5.1–6.2 nats for the next 48,000 tokens**. Same
+result the 3.5 line got; it now has a 1.04B replication. At the full 65,536 window (10 windows, same
+seeded document set) the tail bucket 49,152–65,536 reads **anneal 5.2153 · phaseb 1.0972 · phasec
+0.7737**, so the advertised window is usable end to end.
+
+⚠️**H3 FAILS for phase C, and it fails the same way §39c found.** The phaseb→phasec gap is **U-shaped**:
+−0.4305 at 0–1,024, minimum −0.2619 in the middle, −0.4795 in the 40,960–49,152 tail. A real extension
+predicts a gap that GROWS with position. It is as large at position 0 as at position 49,000, and phase
+C had no need to extend 0–1,024. **The extension proper is PHASE B's** — that is where the ~6-nat
+plateau collapses to 1.2–2.1. Phase C is a distribution move toward arXiv, which is the same
+conclusion §39b/§39d reached from tier CE and gsm8k. Three instruments, one story, now measured on the
+released artifact.
+
+Also: finishing the cooldown improved long-context NLL **uniformly by ~0.02 nats** vs §39c's step
+112,412 at every bucket — real but negligible, and in the opposite direction to the benchmark mean
+(−0.08). Do not read either as movement.
+
+**GATE on the released weights** (`a4_gate_probe.py`, MAXNEW=60): math 17/20 std · 17/20 ext = **34/40**;
+general **14/15** std · 14/15 ext = 28/30 → **CLEARED**. ⚠️Note §39a recorded 15/15 general for the two
+mid-cooldown phase-C arms; the released weights read 14/15 (the miss is "king of the jungle" → jaguar).
+That is inside the probe's ±2 noise floor and is exactly why this gate is a footnote in the model card:
+the general axis has a ceiling of 15 and every a4 checkpoint ever tested sits at 14 or 15.
+
+### 42e. OPS — a 24G OOM that left NO traceback, and the fix that was not the memory bump
+
+⚠️Job 53328723 completed the 49,152 stage (3 arms) and then **died silently** partway through the 65,536
+stage: no Python traceback, and no `[exit=]` echo despite the call being wrapped in `set +e`. No
+traceback AND no exit code = **SIGKILL from the cgroup OOM killer**, not a Python error. `sacct`
+reported MaxRSS **6.4 GB against a 24G limit**, which is why it looked safe — sstat SAMPLES, and the
+spike lives inside one interval. Cause: `load_ckpt()` mmaps a 12.46 GB `.pt` and materialises ~4 GB of
+fp32 CPU weights before `.to(bfloat16).to(cuda)`, and **three arms in one process** accumulate mmap
+page cache the cgroup charges back.
+
+The fix that mattered was **one arm per python process** (53332877: 5:58, MaxRSS 7.9 GB), not the 24G→32G
+bump — 32G was over-provisioned once the process was split. **Lesson, and it generalises: a
+multi-arm probe that loads a large checkpoint per arm should fork per arm.** Also ⚠️`set +e` does not
+protect against SIGKILL, so "the echo is missing" is itself the diagnostic — treat a missing exit-code
+line as a kill, not as a puzzle.

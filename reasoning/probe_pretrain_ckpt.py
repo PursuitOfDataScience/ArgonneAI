@@ -31,8 +31,11 @@ import sys
 import torch
 import torch.nn as nn
 
-REASONING_DIR = "/home/youzhi/ArgonneAI/reasoning"
-REPO_ROOT = "/home/youzhi/ArgonneAI"
+# Derived from this file's location, NOT hardcoded: the argonne4.0 worktree carried its own copy
+# with the paths rewritten to /home/youzhi/ArgonneAI-4.0, which is exactly the edit that has to be
+# redone by hand every time the tree moves. This version works from any checkout.
+REASONING_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(REASONING_DIR)
 for _p in (REASONING_DIR, REPO_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -42,18 +45,15 @@ from transformers import AutoTokenizer
 from model import ArgonneConfig, ArgonneModel
 # Reuse the probe sets + graders verbatim (math/20 from quick_base_probe, general/15 here).
 import base_probe_general as bpg
+# Only the arch FLAGS come from continue_pretrain; the DIMS are read off the checkpoint itself
+# (see load_ckpt), so this probe works on a 3.5 and a 4.0 checkpoint without editing constants.
 from continue_pretrain import (
     ENABLE_INTERLEAVED_LOCAL_ATTENTION,
     ENABLE_QK_NORM,
     ENABLE_SANDWICH_NORM,
     ENABLE_V_NORM,
-    HIDDEN_SIZE,
-    INTERMEDIATE_SIZE,
     LOCAL_ATTENTION_WINDOW,
     LOGIT_SOFTCAP,
-    NUM_HEADS,
-    NUM_KV_HEADS,
-    NUM_LAYERS,
     Z_LOSS_WEIGHT,
 )
 
@@ -76,12 +76,24 @@ def _strip_prefixes(state):
 def load_ckpt(path, theta, tok):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = _strip_prefixes(ckpt["model_state_dict"])
-    # Infer vocab from the checkpoint's OWN embedding (3.5 pads 151669 -> 151680).
+    # Infer the whole ARCHITECTURE from the checkpoint's own tensors, not from whichever
+    # continue_pretrain module happened to get imported -- the built dims MUST match the ckpt or
+    # load_state_dict(strict=False) silently leaves a randomly-initialised model and the probe
+    # scores noise. head_dim is a fixed 256 across this arch family (3.5: 3072/12; 4.0: 1536/6),
+    # so it pins n_heads. Vocab comes from the embedding too (3.5 pads 151669 -> 151680).
     ck_vocab = state["embed_tokens.weight"].shape[0]
+    hidden = state["embed_tokens.weight"].shape[1]
+    n_layers = 1 + max(int(k.split(".")[1]) for k in state if k.startswith("blocks."))
+    inter = state["blocks.0.mlp.gate_proj.weight"].shape[0]
+    HEAD_DIM = 256
+    n_heads = hidden // HEAD_DIM
+    n_kv = state["blocks.0.attn.k_proj.weight"].shape[0] // HEAD_DIM
+    print(f"  inferred arch: hidden={hidden} layers={n_layers} heads={n_heads} "
+          f"kv={n_kv} inter={inter} vocab={ck_vocab}", flush=True)
     cfg = ArgonneConfig(
-        vocab_size=ck_vocab, hidden_size=HIDDEN_SIZE, num_hidden_layers=NUM_LAYERS,
-        num_attention_heads=NUM_HEADS, num_key_value_heads=NUM_KV_HEADS,
-        intermediate_size=INTERMEDIATE_SIZE, max_position_embeddings=13568,
+        vocab_size=ck_vocab, hidden_size=hidden, num_hidden_layers=n_layers,
+        num_attention_heads=n_heads, num_key_value_heads=n_kv,
+        intermediate_size=inter, max_position_embeddings=13568,
         rope_theta=theta, use_flash_attention=True, qk_norm=ENABLE_QK_NORM,
         v_norm=ENABLE_V_NORM, sandwich_norm=ENABLE_SANDWICH_NORM,
         z_loss_weight=Z_LOSS_WEIGHT,
@@ -111,7 +123,7 @@ def load_ckpt(path, theta, tok):
 
 
 def main():
-    print(f"{'=' * 78}\nARGONNE3.5 BASE-QUALITY GATE PROBE\n  ckpt : {CKPT}\n"
+    print(f"{'=' * 78}\nARGONNE BASE-QUALITY GATE PROBE\n  ckpt : {CKPT}\n"
           f"  theta: {THETA:g}\n  tok  : {TOK}\n{'=' * 78}", flush=True)
     tok = AutoTokenizer.from_pretrained(TOK, trust_remote_code=True)
     model, ckpt = load_ckpt(CKPT, THETA, tok)

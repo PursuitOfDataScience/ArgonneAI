@@ -847,6 +847,29 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
                     the published config matches the rest of the family and stays correct if
                     transformers ever starts honouring it. The three above are the real defects.
 
+    A FIFTH, added 2026-08-13 while releasing argonne-4.0-base:
+
+      interleaved_local_attention / local_attention_window
+                    Every Argonne pretrain since 3.0 ran with `interleaved_local_attention: true,
+                    local_attention_window: 256` in the config and FULL causal attention in the
+                    actual computation. model.py implements the window ONLY on the flash-attn-2
+                    path (`flash_attn.flash_attn_interface`), and this cluster's env has
+                    flash-attn-4, which does not expose that module -- so the model falls back to
+                    SDPA and logs "local_attention_window=256 is configured but IGNORED on this
+                    path" on every single training slice. reasoning/vllm_argonne.py ignores the
+                    window for the same reason and is token-for-token exact against model.py.
+
+                    Publishing the flags as-is is therefore a description of a model that was
+                    never trained: a downstream user who happens to have flash-attn-2 installed
+                    gets a 256-token window on odd layers, silently, on weights that only ever saw
+                    full attention. At an advertised 65,536-token context that is not a subtle
+                    degradation. The release config is set to `interleaved_local_attention: false`
+                    and `local_attention_window: null`, which makes model.py take the full-attention
+                    branch on EVERY path (model.py ~line 559 gates the window on both fields) and
+                    makes the config match the weights. Nothing else changes -- `use_flash_attention`
+                    stays true, so flash-attn is still used for speed where available, just without
+                    a window it was never trained with.
+
     So this normalises them and then ASSERTS, because "the release quietly had a 4096 context" is not
     something to discover from a user's bug report.
     """
@@ -859,6 +882,15 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     config["torch_dtype"] = dtype_name
     config["auto_map"] = AUTO_MAP
     config["use_cache"] = True
+    # Describe the attention the weights were TRAINED with -- see the docstring's fifth item.
+    config["interleaved_local_attention"] = False
+    config["local_attention_window"] = None
+    # loss_chunk_size is a TRAINING memory knob and the a4 checkpoints carry 10240. It is inert at
+    # inference (model.py gates the chunked path on `self.training and labels is not None`), but a
+    # base model exists to be fine-tuned, and on that path a nonzero value makes forward() return
+    # `logits=None` -- a silent surprise for any loop that reads them. Ship the default; a
+    # downstream trainer that wants chunking sets it deliberately. (3.5-base shipped 0 already.)
+    config["loss_chunk_size"] = 0
 
     if profile in ("instruct", "ctx13568_instruct"):
         config["eos_token_id"] = CHAT_EOS_TOKEN_ID
@@ -873,6 +905,11 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
         problems.append("auto_map missing//wrong -> standalone trust_remote_code load will fail")
     if not config.get("use_cache"):
         problems.append("use_cache is false in the JSON (cosmetic for this arch, but keep the family consistent)")
+    if config.get("interleaved_local_attention") or config.get("local_attention_window") is not None:
+        problems.append(
+            "interleaved_local_attention/local_attention_window still advertise a sliding window "
+            "-> a flash-attn-2 user gets attention the weights never saw"
+        )
     if profile in ("instruct", "ctx13568_instruct") and config.get("eos_token_id") != CHAT_EOS_TOKEN_ID:
         problems.append(f"eos_token_id {config.get('eos_token_id')} != {CHAT_EOS_TOKEN_ID} (<|im_end|>)")
     if profile == "ctx13568_instruct":
@@ -881,7 +918,8 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
                 problems.append(f"{k} {config.get(k)} != {CTX13568}")
     if problems:
         raise SystemExit("release config is wrong:\n  - " + "\n  - ".join(problems))
-    print(f"[config] normalised for release (profile={profile}): auto_map set, use_cache=True"
+    print(f"[config] normalised for release (profile={profile}): auto_map set, use_cache=True, "
+          "full attention (sliding window disabled to match training)"
           + (f", eos={CHAT_EOS_TOKEN_ID}" if profile in ("instruct", "ctx13568_instruct") else "")
           + (f", ctx={CTX13568}" if profile == "ctx13568_instruct" else ""))
 

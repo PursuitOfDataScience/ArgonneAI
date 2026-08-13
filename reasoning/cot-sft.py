@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import time
 import random
 import re
@@ -1653,10 +1654,16 @@ class ShiftedLossTrainer(Trainer):
         attention_mask = inputs.get("attention_mask")
         labels = inputs["labels"]
 
-        x = input_ids[:, :-1].contiguous()
-        y = labels[:, 1:].contiguous()
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, :-1].contiguous()
+        # Shift ONCE, wherever the shift lives. ArgonneModel.forward does not shift, so this
+        # trainer must; a stock HF CausalLM already does, so shifting again would corrupt it.
+        base = getattr(model, "module", model)
+        if getattr(base, "_hf_internal_shift", False):
+            x, y = input_ids, labels
+        else:
+            x = input_ids[:, :-1].contiguous()
+            y = labels[:, 1:].contiguous()
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :-1].contiguous()
 
         if self.autocast_dtype is not None and torch.cuda.is_available():
             with torch.autocast("cuda", dtype=self.autocast_dtype):
@@ -1887,6 +1894,42 @@ def load_quality_questions_from_file(path: str) -> List[str]:
 # Main
 # ---------------------------------------------------------------------------
 
+def prune_intermediate_checkpoints(output_dir: str) -> None:
+    """After a PHASE finishes, drop its resumable `checkpoint-*` dirs.
+
+    HF Trainer writes `checkpoint-N/` under output_dir when --save_strategy=steps; each holds
+    optimizer + scheduler state that exists solely to resume a stage that is now complete. The
+    final export in output_dir/ is what downstream consumes and is strictly NEWER, so the
+    intermediate is a superseded copy, not a second reference point. (With this repo's default
+    --save_strategy=no there are none, and this is a no-op safeguard.)
+
+    Called only after the final export has landed, so the newest weights are never deleted.
+    Never fatal: a phase that trained successfully must not be failed by cleanup.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return
+        if not os.path.exists(os.path.join(output_dir, "model.safetensors")):
+            print("[retention] final export missing -- keeping intermediate checkpoints", flush=True)
+            return
+        freed = 0.0
+        for name in sorted(os.listdir(output_dir)):
+            full = os.path.join(output_dir, name)
+            if not os.path.isdir(full) or not re.search(r"checkpoint-\d+$", name):
+                continue
+            gib = sum(os.path.getsize(os.path.join(full, f))
+                      for f in os.listdir(full)
+                      if os.path.isfile(os.path.join(full, f))) / 2**30
+            shutil.rmtree(full)
+            freed += gib
+            print(f"[retention] phase complete -- removed {name} ({gib:.1f} GiB); "
+                  f"the final export supersedes it", flush=True)
+        if freed:
+            print(f"[retention] freed {freed:.1f} GiB", flush=True)
+    except Exception as e:  # cleanup must never take down a phase that just finished
+        print(f"[retention] prune skipped: {e}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -2005,50 +2048,80 @@ def main() -> None:
             )
         config_dict["vocab_size"] = vocab_size
 
-    config = ArgonneConfig(**config_dict)
-    model = ArgonneModel(config)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    print(
-        f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}",
-        flush=True,
-    )
-    model.tie_weights()
-    print("Weights tied (embed_tokens <-> lm_head).", flush=True)
+    # --- STANDARD HF BASE (Qwen3, Llama, ...) vs the custom argonne2 arch ------------------
+    # Everything in the IS_ARGONNE branch is welded to ArgonneModel: manual construction to
+    # re-tie lm_head, `model.blocks[].attn`, and replace_rotary_embeddings(). None of it applies
+    # to a standard HF base, whose RoPE/tying/attention are already correct from_pretrained.
+    # Purely additive -- an argonne2 config takes the original path byte-for-byte, so the
+    # released 3.5 recipe and every a4 launcher are unaffected.
+    IS_ARGONNE = config_dict.get("model_type", "argonne2") == "argonne2"
+    if IS_ARGONNE:
+        config = ArgonneConfig(**config_dict)
+        model = ArgonneModel(config)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}",
+            flush=True,
+        )
+        model.tie_weights()
+        print("Weights tied (embed_tokens <-> lm_head).", flush=True)
 
-    print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters ({args.precision})")
-    print(f"Tied: embed_tokens == lm_head -> {model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()}")
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters ({args.precision})")
+        print(f"Tied: embed_tokens == lm_head -> {model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()}")
 
-    # ---- Extend RoPE / context ----
-    loaded_context_length = int(getattr(model.config, "max_position_embeddings", 0) or 0)
-    model_context_length = (
-        args.model_context_length
-        if args.model_context_length > 0
-        else max(args.max_seq_length, loaded_context_length)
-    )
-    model.config.rope_theta = args.rope_theta
-    model.config.max_position_embeddings = model_context_length
-    model.config.block_size = model_context_length
-    replace_rotary_embeddings(model, RotaryEmbedding, args.rope_theta, model_context_length)
-    print(
-        "Context setup: "
-        f"training max_seq_length={args.max_seq_length}, "
-        f"model max_position_embeddings={model_context_length}, "
-        f"loaded max_position_embeddings={loaded_context_length}, "
-        f"rope_theta={args.rope_theta}",
-        flush=True,
-    )
+        # ---- Extend RoPE / context ----
+        loaded_context_length = int(getattr(model.config, "max_position_embeddings", 0) or 0)
+        model_context_length = (
+            args.model_context_length
+            if args.model_context_length > 0
+            else max(args.max_seq_length, loaded_context_length)
+        )
+        model.config.rope_theta = args.rope_theta
+        model.config.max_position_embeddings = model_context_length
+        model.config.block_size = model_context_length
+        replace_rotary_embeddings(model, RotaryEmbedding, args.rope_theta, model_context_length)
+        print(
+            "Context setup: "
+            f"training max_seq_length={args.max_seq_length}, "
+            f"model max_position_embeddings={model_context_length}, "
+            f"loaded max_position_embeddings={loaded_context_length}, "
+            f"rope_theta={args.rope_theta}",
+            flush=True,
+        )
 
-    # ---- Flash attention + gradient checkpointing ----
-    model.config.use_flash_attention = True
-    if hasattr(model, "blocks"):
-        for blk in model.blocks:
-            if hasattr(blk, "attn") and hasattr(blk.attn, "use_flash_attention"):
-                blk.attn.use_flash_attention = True
-    model.config.use_cache = False
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    model.to(device)
-    model.train()
+        # ---- Flash attention + gradient checkpointing ----
+        model.config.use_flash_attention = True
+        if hasattr(model, "blocks"):
+            for blk in model.blocks:
+                if hasattr(blk, "attn") and hasattr(blk.attn, "use_flash_attention"):
+                    blk.attn.use_flash_attention = True
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        model.train()
+    else:
+        from transformers import AutoModelForCausalLM
+        print(f"Non-Argonne base (model_type={config_dict['model_type']}); "
+              f"loading via AutoModelForCausalLM", flush=True)
+        dt = torch.bfloat16 if args.precision == "bf16" else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, dtype=dt, trust_remote_code=True)
+        # The recipe pins rope_theta; honour it if the base exposes one.
+        if hasattr(model.config, "rope_theta"):
+            model.config.rope_theta = args.rope_theta
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.to(device)
+        model.train()
+        # ⚠️A stock HF CausalLM shifts labels ITSELF inside forward(); ShiftedLossTrainer also
+        # shifts, because ArgonneModel does not. Without this flag an HF base is shifted TWICE
+        # and predicts token t+2 from position t -- silent, and it reads as "bad base" (loss
+        # pinned at ln(vocab)). Same defect found in sft.py by an 8-step Qwen3-0.6B probe.
+        model._hf_internal_shift = True
+        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters "
+              f"({args.precision}), rope_theta={getattr(model.config, 'rope_theta', None)}", flush=True)
 
     # ---- Data ----
     print(f"Loading dataset from: {args.data_path}", flush=True)
@@ -2085,6 +2158,15 @@ def main() -> None:
     # Trainer for GradScaler support.
     train_args = TrainingArguments(
         output_dir=args.output_dir,
+        # ⚠️`seed` MUST be passed here, not just to seed_everything(). HF Trainer builds its data
+        # sampler from TrainingArguments.seed and defaults to 42 -- so without this, --seed was a
+        # NO-OP for every CoT-SFT run: the model loads from a checkpoint (no random init), the
+        # sampler order is fixed, and two runs at different --seed are BIT-IDENTICAL. Verified
+        # 2026-08-10: seeds 46 and 47 produced the same loss at every logged step (3.403, 2.889,
+        # 3.173, ...) and the same train_loss 2.388. That silently turned a seed-replicate into a
+        # rerun, and made the "reshuffled epochs" of the dose-response replays of one fixed order.
+        seed=args.seed,
+        data_seed=args.seed,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -2163,6 +2245,9 @@ def main() -> None:
             print(f"Wrote completion marker: {completion_path}")
         except OSError as e:
             print(f"  warn: could not write completion marker: {e}")
+
+        # Phase is done and exported -- drop the resumable intermediates.
+        prune_intermediate_checkpoints(args.output_dir)
 
 
 if __name__ == "__main__":
