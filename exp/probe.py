@@ -27,6 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import ArgonneConfig, ArgonneModel
 
 VOCAB = 151680                      # len(Qwen3 tokenizer) padded to a mult of 128 for fp8 lm_head
+EOS = 151643                        # Qwen3 <|endoftext|>; the flat bins use it as the doc separator.
+# Measured density in the first 20M tokens of each source: edu 1 doc / 1,008 tok,
+# finemath 1 / 1,505, code 1 / 1,875 -> a block-2048 window spans ~1.1-2.0 documents, so the
+# packed batch really is letting tokens attend across document boundaries.
 DATA = "/project/rcc/youzhi/data/argonne4_pretrain"
 SOURCES = [("edu_flat.bin", 50), ("finemath_flat.bin", 30), ("code_flat.bin", 20)]
 VALS = [("edu", "val_edu.bin"), ("math", "val_math.bin"), ("code", "val_code.bin")]
@@ -75,7 +79,13 @@ class Mix:
 
 @torch.no_grad()
 def eval_ce(model, path, B, T, device, windows=64):
-    """I2: pure next-token CE. Forward WITHOUT labels so no auxiliary term can leak in."""
+    """I2: pure next-token CE. Forward WITHOUT labels so no auxiliary term can leak in.
+
+    Called at MULTIPLE T (see eval_lengths). Evaluating past the training block is the only way
+    to see length generalisation, which is the entire reason the NoPE-global layout was proposed:
+    CE at the training length is blind to it. Batch is chosen so B*T is constant, keeping the
+    fp32 logit transient the same size at every length.
+    """
     model.eval()
     toks = load_bin(path)
     tot, n = 0.0, 0
@@ -162,6 +172,7 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_l)
 
     mix = Mix(B, T, rank, world, seed=cfg.get("data_seed", 1337))
+    use_doc = bool(cfg.get("doc_mask", False))
     if main_proc:
         print(f"[probe] {cfg['id']} params={nparams:,} steps={steps} eff_batch={eff:,} "
               f"block={T} micro={B}x{accum} world={world} node={socket.gethostname()}", flush=True)
@@ -176,10 +187,17 @@ def main():
         for m in range(accum):
             x, y = mix.next()
             x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+            # Document ids for intra-document masking: doc_id[i] = how many EOS tokens occur
+            # strictly BEFORE position i, so the separator belongs to the document it terminates.
+            # Ids only need to be unique within a row; each row is an independent window.
+            kw = {}
+            if use_doc:
+                is_eos = (x == EOS)
+                kw["document_ids"] = torch.cumsum(is_eos.long(), dim=1) - is_eos.long()
             sync = (m == accum - 1)
             with model.no_sync() if not sync else torch.enable_grad():
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = model(x, labels=y).loss / accum
+                    loss = model(x, labels=y, **kw).loss / accum
                 loss.backward()
             acc += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("grad_clip", 0.4))
@@ -191,6 +209,16 @@ def main():
             torch.cuda.synchronize(); t_steady = time.time(); tok_steady = 0
         elif t_steady is not None:
             tok_steady += eff
+        # Live progress, so a stalled or slower-than-budget arm is visible from squeue-time rather
+        # than only at the end. Also the only place the wall-guard ETA is observable mid-run.
+        if main_proc and (s % 25 == 0 or s == steps - 1) and t_steady is not None and s > STEADY_FROM:
+            el = time.time() - t_steady
+            tps_now = tok_steady / max(1e-9, el)
+            eta = (steps - 1 - s) * eff / max(1.0, tps_now)
+            print(f"[probe] step {s}/{steps} loss={acc:.4f} tok/s={tps_now:,.0f} "
+                  f"eta={eta/60:.1f}min guard_left={(deadline - time.time())/60:.1f}min "
+                  f"hbm={torch.cuda.max_memory_allocated()/torch.cuda.get_device_properties(local).total_memory:.1%}",
+                  flush=True)
         if time.time() > deadline:
             aborted = True
             if main_proc:
@@ -203,10 +231,22 @@ def main():
     hbm = torch.cuda.max_memory_allocated() / torch.cuda.get_device_properties(local).total_memory
 
     base = model.module._orig_mod if hasattr(model.module, "_orig_mod") else model.module
-    ces = {}
+    ces, len_ces = {}, {}
     if main_proc and not aborted:
         for name, f in VALS:
             ces[name] = eval_ce(base, os.path.join(DATA, f), max(1, 8), T, dev)
+        # Length generalisation: same held-out text, longer windows. Anything past the training
+        # block T is extrapolation. B*T held at 16,384 so the logit transient does not grow.
+        for L in cfg.get("eval_lengths", []):
+            if L == T:
+                len_ces[str(L)] = float(np.mean(list(ces.values())))
+                continue
+            try:
+                vals = [eval_ce(base, os.path.join(DATA, f), max(1, 16384 // L), L, dev, windows=16)
+                        for _, f in VALS]
+                len_ces[str(L)] = float(np.mean(vals))
+            except Exception as e:
+                len_ces[str(L)] = f"ERR {type(e).__name__}"
 
     if main_proc:
         rec = dict(
@@ -216,6 +256,7 @@ def main():
             tokens=done_steps * eff, eff_batch=eff, block=T, micro_batch=B, grad_accum=accum,
             train_loss_ema=float(np.mean(losses[-20:])) if losses else None,
             ce=ces, tgt=float(np.mean(list(ces.values()))) if ces else None,
+            tgt_by_length=len_ces,
             tokens_per_sec=round(tps, 1), hbm_frac=round(hbm, 4),
             startup_sec=round(t_first - t_job, 1) if t_first else None,
             compile_and_first_step_sec=round(t_first - t_compile0, 1) if t_first else None,
