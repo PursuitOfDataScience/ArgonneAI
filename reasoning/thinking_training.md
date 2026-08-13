@@ -9760,3 +9760,45 @@ instances stand; this was not one of them.
 t_len ~251 against a 512-token generation cap and `--max-tok 768`, the model may sit near a truncation
 cliff where small sampling shifts reclassify many traces. Worth a fixed-seed length-sweep before trusting
 any label-mix diagnostic again.
+
+### §41by — REPAIR-LAST: the ordering hypothesis is REFUTED as stated, and the arm is still the best checkpoint
+
+§41bv's lever: `repairlo`'s +1.93 is CE at lr 3e-6 and 1e-5 damages it, so running a 1e-5 KD chain FROM
+`repairlo` overwrote it. Test: the identical repair recipe (`--kd-weight 0.0 --ce-weight 1.0
+--labels correct`, lr 3e-6, seed 46) applied LAST, to round 8, on 24,787 of its own correct on-policy
+traces. Four clean pools, 3,000 identical items:
+
+| model | greedy | sc@8 | pass@8 | gap | = coverage | + selection | + floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `combo` (session start) | 50.87 | 60.43 | 77.83 | 13.23 | 6.50 | 5.90 | 0.83 |
+| `repairlo` (prior best) | 58.43 | 67.20 | 78.93 | 5.67 | 5.40 | 0.23 | 0.03 |
+| round 8 | 59.00 | 66.03 | 79.77 | 5.10 | 4.57 | 2.23 | −1.70 |
+| **repair-last** | **59.17** | **67.60** | **80.23** | **4.93** | **4.10** | 1.13 | −0.30 |
+| 3.5-think | 64.10 | 72.83 | 84.33 | — | — | — | — |
+
+⛔**THE PREDICTION, WHICH WAS PRE-REGISTERED IN THE LAUNCHER, IS REFUTED.** Stated before the run: TRUE ->
+~60.5-61.0 greedy (+2 over `repairlo`); FALSE -> within noise of round 8. **Result: 59.17, i.e. +0.17 from
+round 8 at p=0.85.** `repairlo`'s +1.93 was a property of round 6's state, not a reusable polish, and the
+"the chain overwrote a recoverable gain" story is dead. Two pre-registered predictions today, both wrong
+(§41bv's overwrite prediction, this one) — the mechanism stories keep being cleaner than the model.
+
+✅**AND YET IT IS THE BEST a4-think CHECKPOINT ON EVERY METRIC**, and unlike §41bv the movement is
+HOMOGENEOUS. vs `repairlo`: pass@8 **+1.30 (p=0.026)**, extend1 **+1.57 (p=0.039)**, greedy +0.73
+(p=0.359), and per-pool greedy is **+0.60 / +1.20 / +0.20 / +0.60 — all four positive**, no
+svamp-vs-gsmplus cancellation. vs round 8: `sc@8` **+1.57 (p=0.008)**. So the CE pass DID add selection on
+top of the KD rounds' reach; the stacking is real, just ~1pt rather than the ~2pt predicted.
+⚠️**Discipline note: greedy — the DEPLOYED metric — is not significant**, and 8 tests were run here with
+two under 0.05. The defensible claim is "best checkpoint, small homogeneous gains on ceiling and
+best-decode", NOT "+1.30 pass@8 confirmed".
+⚠️Churn again (§41bw): repair-last vs round 8 disagree on **445 of 3,000 greedy items for a net of +0.17**.
+
+⭐**WHAT THE DECOMPOSITION NOW SAYS.** Gap to 3.5-think **5.67 -> 4.93**, and it is *still* ~83% coverage
+(4.10 of 4.93). Round 8 bought coverage (5.40 -> 4.57) at the cost of selection (0.23 -> 2.23); the repair
+pass bought half that selection back (2.23 -> 1.13) without giving up the coverage (4.57 -> 4.10).
+**That is the first time in this campaign that two arms have composed rather than traded** — which is the
+one piece of the ordering thesis that survives: repair AFTER, not before, because CE-on-own-correct-traces
+repairs SELECTION and KD moves COVERAGE, and applying the selection fix first means the coverage arm
+undoes it.
+
+**Artifact: `think_r8repair`.** Retention: round 8 is superseded by its own child, which dominates it on
+every metric, so r8 goes; `repairlo` stays as the published prior best and the gate baseline.
