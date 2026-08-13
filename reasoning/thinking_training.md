@@ -9708,3 +9708,55 @@ cross-checkpoint chooser is worth exactly what self-consistency on one checkpoin
 twice the inference cost and requiring an oracle that §41j measured as unavailable (text-feature selectors
 are 10-14pt WORSE than voting). Cross-checkpoint diversity ≈ sampling diversity here; it is not a new
 axis. Recorded so the 67.23 is never quoted as accessible.
+
+### §41bx — ⚠️⚠️RETRACTION: the cross-round SAMPLING decline was a SEED CONFOUND, not a policy effect
+
+An accidental control. The repair-last arm regenerated rollouts from `think_r8` — the same checkpoint
+`a4_r9`'s dump was generated from, on the same 15,212 problems, same pools, same K=8, same
+T=0.9/top-p 0.95/top-k 50, same caps, **same node (midway3-0372)**. The only difference in the recorded
+args is `--seed`: 1243 vs 1250.
+
+| think_r8, 60,848 rollouts, shard 0 | seed 1243 | seed 1250 | Δ |
+|---|---:|---:|---:|
+| correct | 37.80% | 34.49% | **−3.31pp** |
+| wrong | 38.48% | 40.06% | +1.58 |
+| unclosed | 17.12% | 14.02% | −3.10 |
+| no_answer | 6.60% | 11.43% | **+4.83** |
+
+⚠️**AND THAT IS THE SAME MAGNITUDE AS THE "POLICY EFFECT" I REPORTED MID-RUN.** The iter/chunk launchers
+seed generation as `1234 + R`, so **every round used a different seed and policy was perfectly confounded
+with seed**:
+
+| sampled from | seed | corr% | acc\|grad |
+|---|---|---:|---:|
+| `repairlo` | 1241 | 41.01 | 54.35 |
+| round 7 | 1242 | 37.67 | 49.42 |
+| round 8 | 1243 | 37.81 | 49.36 |
+| **round 8 again** | **1250** | **34.48** | **46.27** |
+
+The step I attributed to round 7 (`repairlo` -> r7, −3.34pp corr) is **indistinguishable in size from what
+the seed does at FIXED policy (−3.31pp)**. So the mid-run alarm — "acc|gradeable 54.35 -> 49.36,
+`no_answer` tripling, likely regression" — was reading a confound, and I raised it as evidence.
+
+⛔**THIS ALSO WITHDRAWS §41bv's "third instance of §41au's sampling-vs-gate divergence."** There was no
+divergence to explain: the gate was flat because nothing much changed, and the sampling series was not
+measuring the policy. Reaching for a known phenomenon to explain an artifact is worse than having no
+explanation, because it launders the artifact into the record as a confirmed pattern. §41au's real
+instances stand; this was not one of them.
+
+✅**RULES THIS SETS.**
+1. **Never compare generation statistics across rounds** while `--seed` varies with the round. The varying
+   seed is CORRECT for training-data diversity (it stops successive rounds resampling identical traces)
+   and fatal for measurement. If a sampling comparison is wanted, run a fixed-seed probe.
+2. **Two draws from one checkpoint differ by ~3pp on these aggregates**, so a sampling-stat gap under
+   ~5pp says nothing about a policy. That is a floor on the whole family of "rollout dump" diagnostics
+   (`fail_taxonomy`, keep-rates, label mixes), all of which have been read across rounds in this campaign.
+3. Together with §41bw (17% item churn for +0.57pt) and §41bv (pool spread ±3pt), the picture is
+   consistent: **this line's measurements are far noisier per-item than the effects being chased, and only
+   the four-pool pooled PAIRED gate has ever been trustworthy.** Everything else is a guardrail.
+
+⚠️Mechanism, offered as a hypothesis and not measured: `unclosed` fell 3.10pp while `no_answer` rose
+4.83pp, i.e. mass moved between two truncation-adjacent labels rather than appearing from nowhere. At
+t_len ~251 against a 512-token generation cap and `--max-tok 768`, the model may sit near a truncation
+cliff where small sampling shifts reclassify many traces. Worth a fixed-seed length-sweep before trusting
+any label-mix diagnostic again.
