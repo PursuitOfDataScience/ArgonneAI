@@ -9932,3 +9932,46 @@ a lever by the target's value on that axis (§41bf's lesson) — I nearly record
 
 ✅Practical rules: quote `unclosed` as "did not fit the budget", never as "failed to terminate"; and when
 a label-mix diagnostic moves, check the length distribution before attributing it to behaviour.
+
+### §41cc — ⛔DIVERSITY IS NOT THE CONSTRAINT: 15.4x the distinct problems moved pass@8 −0.20
+
+The direct test of §41bs's generalisation diagnosis. `repair-last`'s exact recipe (CE only, lr 3e-6,
+`--labels correct`) from `think_r8repair`, on 48,000 problems drawn from the §41ca pool — 233,675
+decontaminated, genuinely-novel, well-formed problems from orca_math / synthetic_math / cn_k12, i.e.
+**15.4x the 15,212 this line had been recycling**, from sources it had never seen. Four clean pools,
+3,000 identical items, paired:
+
+| vs `r8repair` | Δ | p | disagree |
+|---|---:|---:|---:|
+| **pass@8** (pre-registered criterion) | **−0.20** | 0.743 | 7.7% |
+| greedy | +0.43 | 0.523 | 11.8% |
+| extend1 | −1.07 | 0.096 | 11.6% |
+| sc@8 | −0.73 | 0.214 | 9.5% |
+
+Per-pool greedy signs **MIXED** (+0.30 / −0.40 / +1.80 / +1.00). Standing unchanged: `r8repair` 59.17
+greedy remains the best checkpoint, `a4divrep` 59.60 greedy / 80.03 pass@8 is inside noise of it.
+
+⛔**THE PRE-REGISTERED PREDICTION RESOLVES TO THE "SATURATED" BRANCH.** Stated in the launcher before the
+run: diversity binds -> pass@8 **>= +1pt** with a homogeneous per-pool sign; recipe saturated -> noise on
+everything. It is noise, slightly negative, mixed-sign. **§41bs's hypothesis — that the coverage null was
+a generalisation failure fixable with more distinct problems — is REFUTED at this scale.**
+
+✅**AND THE DOSE CONFOUND, WHICH I CAUGHT LATE, DOES NOT MATTER HERE.** I had told myself the dose was
+0.86x by comparing this arm's KEPT TRACES (21,318) to `repair-last`'s TRAINING ROWS (24,787) — different
+units. Like for like it is **48,579 rows / 2,262 steps against 24,787 / 1,055, i.e. ~2x**. That would have
+made a POSITIVE result unattributable between diversity and dose. Because the arm is null, **both** the
+diversity and the 2x update produced nothing, which is the unambiguous case. ⚠️Design lesson: the
+confound was avoidable and I only noticed it from the training stats after the run.
+
+⚠️**ONE ALTERNATIVE REMAINS, AND IT IS PRE-SPECIFIED AND CHEAP** (job 53322325, `--solve-band 4 8`).
+Measured on this arm's own dump: correct traces from problems solved 1/8 carry a **16.42% per-equation
+arithmetic error rate against 9.49% for 8/8 problems — 1.7x after controlling for equations per trace**
+(1.47 vs 1.09). The split is not a smooth gradient: 1/8 through 7/8 all sit at 15-17% and only the
+always-solved band drops. So a low-probability "correct" is disproportionately a coincidentally-right
+answer reached by false arithmetic — and on this harder pool the mode of the SOLVABLE set is 1/8 (13.1%
+of all problems), while `--keep-hard 3` deliberately over-samples that band. The control reruns the CE
+step on problems solved 4-7 of 8, reusing the retained dump (kept for exactly this; deleting it would
+have turned a 1-hour question into a 3.4-hour one).
+✅Health is fine either way — `divrep` smoke: unclosed **8.00%**, t_len 245.2, the best of any a4 arm.
+Retention: `think_divrep` deleted (null, dominated, numbers preserved in the gate JSON); `think_r8repair`
+and `think_opd35repairlo` kept.
