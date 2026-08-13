@@ -9802,3 +9802,47 @@ undoes it.
 
 **Artifact: `think_r8repair`.** Retention: round 8 is superseded by its own child, which dominates it on
 every metric, so r8 goes; `repairlo` stays as the published prior best and the gate baseline.
+
+### §41bz — ⚠️⚠️NuminaMath CONTAINS THE EVAL SETS VERBATIM. The decontamination sweep was not a formality.
+
+§41by leaves the gap at 4.93 with **4.10 of it coverage**, and §41bs attributes the coverage null to
+GENERALISATION across distinct problems while this line has recycled the same 15,212 all campaign. So:
+build a diverse pool. `reasoning/build_numina_pool.py` streams NuminaMath-CoT (859,494 rows), keeps rows
+whose `\boxed` gold survives `norm()`, and drops the sources that are out of range for a model at ~59% on
+grade-school word problems (olympiads / aops_forum / amc_aime / synthetic_amc) plus its `math` and `gsm8k`
+sources. Result **341,832 problems** — orca_math 150,114 / synthetic_math 99,287 / cn_k12 92,431.
+
+⚠️⚠️**THEN THE SWEEP, AND IT IS THE FINDING.** `reasoning/decontam_pool.py` (exact prefix filtering:
+J(A,B)>=t implies |A∩B| >= t|A|, so B must hit one of A's ceil((1-t)|A|)+1 rarest tokens — a filter, not
+a sample, every survivor gets a real Jaccard):
+
+| eval pool | judged | max Jaccard | pairs >= 0.70 |
+|---|---:|---:|---:|
+| svamp | 1000 | **1.000** | 7,998 |
+| asdiv | 1000 | **1.000** | 2,409 |
+| math500 | 319 | **1.000** | 968 |
+| mawps | 500 | **1.000** | 208 |
+| gsmplus | 500 | 0.684 | **0** |
+
+**J = 1.000 is not a near-duplicate, it is the same string.** `"There are 544 pots in each of the 10
+gardens. Each pot has 32 flowers in it."` is simultaneously a svamp eval item and a NuminaMath training
+row. **Four of the five eval pools are present verbatim in the corpus.** Training on it unswept would have
+put the test set in the training data and voided every gate number taken afterwards — and the arm would
+have looked like a triumph on the way down. 5,842 rows dropped (1.709%) -> **335,990 clean problems, 22x
+the current pool.**
+✅gsmplus is the ONLY untouched pool (max J 0.684), which is a consistency check rather than luck: it is
+adversarially perturbed GSM8K, so verbatim copies cannot exist. The one pool built to resist reuse is the
+one that resisted.
+
+⚠️**A BROADER FLAG, stated as a question and not a claim.** If a public corpus this widely used contains
+asdiv/svamp/mawps/math500 verbatim, then any model trained on it is contaminated on those pools. This line
+compares against Qwen3 constantly — §39's "a4's phase-C base is −26.5 mmlu / −41.2 gsm8k vs
+Qwen3-0.6B-Base", §41bm's Qwen3-14B completer, §41bk's teacher audition. I do not know Qwen3's training
+data and am not asserting anything about it, but **"our eval pools are in the public math-corpus
+bloodstream" is now measured, and every cross-model comparison on this line inherits that uncertainty.**
+Our own numbers are unaffected: a4 and 3.5-think were never trained on this corpus, and gsmplus is clean
+for everyone.
+
+⚠️Mechanics worth keeping: `datasets` streaming threw `Bad file descriptor` mid-pull and segfaults at
+interpreter teardown (with or without torch imported), so the builder defaults to downloading the 1.15 GB
+parquet — a silently truncated corpus is the worst failure mode for a corpus whose point is size.
