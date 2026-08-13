@@ -1011,16 +1011,24 @@ class ArgonneModel(PreTrainedModel):
         h_prev = hidden_states
         cap = float(self.config.logit_softcap)
         seq_len = labels.shape[1]
+        batch = labels.shape[0]
+        # fp8 `_scaled_mm` requires the flattened row count (batch * length) to be divisible by 16.
+        # Truncating by depth k breaks that -- at k=1, 8*2047 = 16,376 is not -- and the lm_head GEMM
+        # inside this loss then dies under torchao float8. Round the usable length DOWN so batch*L
+        # stays 16-aligned; that discards at most 15 of ~2047 positions, which is negligible against
+        # the alignment requirement. Costs nothing when fp8 is off.
+        align = 16 // math.gcd(batch, 16)
         for k, module in enumerate(self.mtp_modules, start=1):
-            if seq_len - k < 1:
+            usable = ((seq_len - k) // align) * align
+            if usable < 1:
                 break
-            h_in = h_prev[:, : seq_len - k, :]
-            tokens_in = labels[:, k - 1 : seq_len - 1]
-            targets = labels[:, k:]
+            h_in = h_prev[:, :usable, :]
+            tokens_in = labels[:, k - 1 : k - 1 + usable]
+            targets = labels[:, k : k + usable]
             # Ignored positions (-100) would index the embedding out of range; their targets are
             # ignored by cross_entropy anyway, so any in-range id works as a placeholder.
             embeds_in = self.embed_tokens(tokens_in.clamp_min(0))
-            rot_k = (rotary[0][: seq_len - k], rotary[1][: seq_len - k])
+            rot_k = (rotary[0][:usable], rotary[1][:usable])
             h_out = module(h_in, embeds_in, rot_k)
             mtp_logits = self.lm_head(h_out)
             if cap > 0:
