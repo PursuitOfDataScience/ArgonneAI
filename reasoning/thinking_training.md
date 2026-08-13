@@ -9659,3 +9659,52 @@ a resubmit skip it and iterate on a non-terminating checkpoint.
 read it; gate call 1 then showed r8 beating r9 on extend1 (+1.33, p=0.048 four-pool). That is §41au's
 incident exactly, so the penultimate round is now HELD through the gate. **A checkpoint queued for a gate
 is a pending result, not a superseded one.**
+
+### §41bw — ⭐A NULL SCORE IS NOT A NULL INTERVENTION: 17% of items changed answer for +0.57pt
+
+Two loose ends from §41bv, both closed with data already on disk.
+
+⛔**FIRST: the gsmplus regression is NOT a robustness failure.** r8 lost pass@8 −3.80 (p=0.040) there, and
+gsmplus is adversarially perturbed GSM8K, so the obvious hypothesis is that six rounds of KD on
+GSM8K/MATH-train overfit the clean distribution and gave up perturbation robustness. Cross-tabulating the
+flips against GSM-Plus's own `perturbation_type` (downloaded for this; the local `gsmplus_test` keeps only
+question+gold) says no:
+
+| perturbation type | n | gained | lost | net |
+|---|---:|---:|---:|---:|
+| distraction insertion | 60 | 3 | 8 | −5 |
+| problem understanding | 75 | 4 | 9 | −5 |
+| adding operation | 60 | 3 | 6 | −3 |
+| reversing operation | 82 | 5 | 7 | −2 |
+| integer-decimal-fraction | 59 | 4 | 6 | −2 |
+| numerical substitution | 78 | 4 | 5 | −1 |
+| digit expansion | 86 | 6 | 7 | −1 |
+
+**Diffuse across every type**, largest net −5 on n=60. No mechanism, and it supports §41bv's reading of the
+−3.80 as the unlucky tail of a high-churn zero-net process rather than something the arm broke.
+
+⭐⭐**SECOND, AND THIS IS THE REUSABLE ONE. The arms disagree at the ITEM level far more than their scores
+differ**, four pools / 3,000 items:
+
+| pair | greedy disagreement | net |
+|---|---:|---:|
+| r8 vs `repairlo` | **17.0%** (511 items) | **+0.57** |
+| r9 vs `repairlo` | 16.8% (504) | −0.07 |
+| r8 vs `combo` | 23.3% (700) | +8.13 |
+| `repairlo` vs `combo` | 22.4% (673) | +7.57 |
+
+**Three rounds of KD changed the answer on 17% of items — 76% as much item-level movement as the entire
+prior campaign that gained +7.57pt — and netted +0.57.** So the arm is emphatically not a no-op: it
+relocated a large amount of capability symmetrically. ⚠️**A null delta cannot distinguish "did nothing"
+from "did a lot, in both directions"; only the discordance count can, and b≈c is what makes the paired
+test read null.** Report discordance alongside any null on this line from now on. It also sets the real
+scale of the problem: two checkpoints from the same lineage differ on ~1 item in 6, which is the variance
+the ~1pt effects being chased are sitting on, and it is the same story §41bv told with pool heterogeneity.
+
+⚠️**AND THE DEFLATION, because the churn looks like free headroom and is not.** An oracle picking the
+better of {r8, `repairlo`} per item scores **67.23** greedy — above 3.5-think's 64.10, and far above
+either model alone (59.00 / 58.43). But `repairlo`'s OWN `sc@8` is **67.20**. **The perfect
+cross-checkpoint chooser is worth exactly what self-consistency on one checkpoint already delivers**, at
+twice the inference cost and requiring an oracle that §41j measured as unavailable (text-feature selectors
+are 10-14pt WORSE than voting). Cross-checkpoint diversity ≈ sampling diversity here; it is not a new
+axis. Recorded so the 67.23 is never quoted as accessible.
