@@ -745,28 +745,32 @@ class ArgonneModel(PreTrainedModel):
         rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "0"
         if not _attention_path_logged and rank == "0":
             _attention_path_logged = True
-            window = (
-                config.local_attention_window if config.interleaved_local_attention else None
-            )
+            # Report what the model ACTUALLY does, by reading the per-block state that was just
+            # assigned above -- never by re-deriving it from config. The old version hardcoded
+            # "full attention ... IGNORED on this path" whenever flash-attn was missing, which
+            # became a lie the moment the argonne4.5 SDPA fix (Finding A) taught the SDPA path to
+            # honor the window: a4.5 trained 12 of 24 layers at window 256 while this line
+            # insisted attention was full. A banner that can disagree with the model is worse
+            # than no banner.
+            windows = sorted({b.attn.sliding_window for b in self.blocks
+                              if b.attn.sliding_window is not None})
+            n_local = sum(1 for b in self.blocks if b.attn.sliding_window is not None)
             if _flash_attn_available and config.use_flash_attention:
-                note = (
-                    f"flash-attn-2; sliding window {window} active on odd layers"
-                    if window is not None
-                    else "flash-attn-2; full attention"
-                )
+                backend = "flash-attn-2"
             else:
-                reason = (
-                    "flash-attn unavailable"
-                    if config.use_flash_attention
+                backend = "SDPA/math ({})".format(
+                    "flash-attn unavailable" if config.use_flash_attention
                     else "use_flash_attention=False"
                 )
-                note = f"SDPA/math ({reason}); full attention"
-                if window is not None:
-                    note += (
-                        f" — local_attention_window={window} is configured but"
-                        " IGNORED on this path"
-                    )
-            print(f"[ArgonneModel] attention path: {note}", flush=True)
+            if n_local == 0:
+                layout = "full attention on all {} layers".format(len(self.blocks))
+            else:
+                sizes = ",".join(str(w) for w in windows)
+                layout = (
+                    f"sliding window {sizes} ACTIVE on {n_local}/{len(self.blocks)} layers"
+                    f" (pattern={config.attn_pattern or 'odd-layer legacy'})"
+                )
+            print(f"[ArgonneModel] attention path: {backend}; {layout}", flush=True)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens

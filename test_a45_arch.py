@@ -11,6 +11,7 @@ Two jobs:
 Run:  python test_a45_arch.py
 """
 
+import os
 import subprocess
 import sys
 
@@ -208,6 +209,45 @@ check("all flags together: finite loss", torch.isfinite(out.loss).item(), f"loss
 out.loss.backward()
 n_nograd = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
 check("all flags together: every parameter receives a gradient", not n_nograd, str(n_nograd[:3]))
+
+print("\n=== 9. PRODUCTION config trains FULL attention (regression guard) ===")
+# Section 2 proves the SDPA window fix works. That fix also silently re-activated the LEGACY
+# ENABLE_INTERLEAVED_LOCAL_ATTENTION=True / LOCAL_ATTENTION_WINDOW=256 that a4.5 inherited from
+# a4.0, where it had been dead code -- so on 2026-08-14 the production config was putting a
+# 256-token window on all 12 odd layers while the startup banner printed "full attention".
+# a4.5 is meant to be full attention (the arm-tested window was refuted: +0.038 CE, -14.6%
+# throughput), so pin what pretrain.py actually resolves, not what it intends.
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("pt_prod", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrain.py"))
+_pt = _ilu.module_from_spec(_spec)
+sys.modules["pt_prod"] = _pt
+_argv = sys.argv
+sys.argv = ["pretrain.py", "--tokenizer_path", "/dev/null", "--data_path", "/dev/null",
+            "--checkpoint_dir", "/dev/null", "--batch_size", "1", "--block_size", "8",
+            "--total_batch_size", "8"]
+try:
+    _spec.loader.exec_module(_pt)
+finally:
+    sys.argv = _argv
+check("pretrain.py resolves interleaved_local_attention=False",
+      _pt.ENABLE_INTERLEAVED_LOCAL_ATTENTION is False, str(_pt.ENABLE_INTERLEAVED_LOCAL_ATTENTION))
+check("pretrain.py resolves local_attention_window=None",
+      _pt.LOCAL_ATTENTION_WINDOW is None, str(_pt.LOCAL_ATTENTION_WINDOW))
+_cfg = new_model.ArgonneConfig(
+    vocab_size=151680, hidden_size=_pt.HIDDEN_SIZE, num_hidden_layers=_pt.NUM_LAYERS,
+    num_attention_heads=_pt.NUM_HEADS, num_key_value_heads=_pt.NUM_KV_HEADS,
+    intermediate_size=_pt.INTERMEDIATE_SIZE, max_position_embeddings=1024,
+    rope_theta=_pt.ROPE_THETA, qk_norm=_pt.ENABLE_QK_NORM, v_norm=_pt.ENABLE_V_NORM,
+    sandwich_norm=_pt.ENABLE_SANDWICH_NORM, logit_softcap=_pt.LOGIT_SOFTCAP,
+    interleaved_local_attention=_pt.ENABLE_INTERLEAVED_LOCAL_ATTENTION,
+    local_attention_window=_pt.LOCAL_ATTENTION_WINDOW, attn_pattern=_pt.ATTN_PATTERN,
+    mlp_type=_pt.MLP_TYPE, use_flash_attention=True)
+with torch.device("meta"):                      # no RAM, no GPU: shapes and wiring only
+    _prod = new_model.ArgonneModel(_cfg)
+_win = [b.attn.sliding_window for b in _prod.blocks]
+check("no production layer carries a sliding window", set(_win) == {None}, str(sorted(set(_win), key=str)))
+_n = sum(p.numel() for p in {id(p): p for p in _prod.parameters()}.values())
+check("production param count is still 2,063,667,712", _n == 2_063_667_712, f"{_n:,}")
 
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{'=' * 60}\n{len(results) - len(failed)}/{len(results)} passed")

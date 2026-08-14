@@ -61,6 +61,22 @@ LOGIT_SOFTCAP = 15.0
 # So: SwiGLU, tied embeddings, no gate, full attention, RoPE everywhere -- all a4.0 defaults.
 # The ONLY architecture change from a4.0 is the size (1536/32L -> 2560/24L, head_dim 256 kept).
 # Every fp8 GEMM dim stays /16-divisible: 2560, 10*256, 2*256, 7040.
+# ⚠️ THE LEGACY WINDOW MUST BE TURNED OFF EXPLICITLY, in BOTH branches. ENABLE_INTERLEAVED_LOCAL_
+# ATTENTION=True / LOCAL_ATTENTION_WINDOW=256 above are inherited from a4.0, where they were DEAD
+# CODE: only flash-attn-2 honored `window_size`, this env ships flash-attn-4 without the 2.x
+# interface, so every Argonne pretrain since 3.0 actually ran full attention. This tree's model.py
+# then gained the argonne4.5 SDPA fix (Finding A) that makes the window real on the SDPA path --
+# which silently RE-ACTIVATED the legacy flag here: verified 2026-08-14 that with these flags the
+# 256-token window goes live on all 12 odd layers and changes the logits (max|diff| 2.06), while
+# the startup banner still printed "full attention ... IGNORED on this path".
+#
+# That contradicts the intent stated below (full attention), contradicts every prior Argonne
+# pretrain, and contradicts our own measurement: arm-tested sliding window was REFUTED at +0.038
+# CE and -14.6% throughput, precisely because without flash-attn-2 the window forces an explicit
+# SDPA mask and loses the fused is_causal kernel. So leaving it on costs quality AND speed.
+ENABLE_INTERLEAVED_LOCAL_ATTENTION = False
+LOCAL_ATTENTION_WINDOW = None
+
 A45 = True    # argonne4.5 production. Set False to reproduce a4.0 exactly.
 if A45:
     HIDDEN_SIZE = 2560
