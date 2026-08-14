@@ -11,6 +11,7 @@ script (executing it would need SLURM, GPUs, module load and the marker files).
 
     python exp/preflight.py            # exits nonzero and explains if anything is wrong
 """
+import os
 import re
 import subprocess
 import sys
@@ -54,6 +55,37 @@ elif ngpus and block:
         notes.append(f"  {tag} {name:<16} micro {mb:>2} x accum {ga:>2} x {ngpus} x {block} = {eff:,}")
         if eff != WANT_EFFECTIVE:
             fails.append(f"{name}: effective batch {eff:,} != {WANT_EFFECTIVE:,}")
+
+# The token budget sets BOTH the WSD schedule length and the stop point, and it used to come
+# only from an exported shell variable -- so a relaunch from a fresh login silently became a
+# 2.9x shorter run. Assert the resolved default, that every configured shard exists with a valid
+# llm.c header, and that the implied repetition stays inside the ~4x free-repeat bound.
+WANT_TOKENS = 110_000_000_000
+budget = grab(src, r"^A45_TRAIN_TOKENS=\$\{A45_TRAIN_TOKENS:-(\d+)\}", "A45_TRAIN_TOKENS")
+if budget is not None and budget != WANT_TOKENS:
+    fails.append(f"A45_TRAIN_TOKENS resolves to {budget:,}, want {WANT_TOKENS:,} "
+                 f"(0 would silently shorten the run to the corpus size)")
+
+_shards = subprocess.run(
+    ["bash", "-c", f'eval "$(sed -n \'247,254p\' {WORKER})"; echo "$PRETRAIN_SOURCES"'],
+    capture_output=True, text=True).stdout.strip()
+_total = 0
+for _spec in [s for s in _shards.split(",") if s]:
+    _p, _w = _spec.rsplit(":", 1)
+    if not os.path.exists(_p):
+        fails.append(f"training shard MISSING: {_p}")
+        continue
+    with open(_p, "rb") as _f:
+        _magic = int.from_bytes(_f.read(4), "little")
+    if _magic != 20240801:
+        fails.append(f"training shard has bad llm.c magic {_magic}: {_p}")
+    _total += (os.path.getsize(_p) - 1024) // 4
+if _total:
+    _rep = (budget or 0) / _total
+    notes.append(f"  {'OK ' if _rep <= 4.0 else 'BAD'} corpus {_total:,} tok, budget {budget:,} "
+                 f"=> {_rep:.2f} passes, {int((budget or 0)/WANT_EFFECTIVE):,} steps")
+    if _rep > 4.0:
+        fails.append(f"budget implies {_rep:.2f} passes over the corpus, beyond the ~4x free-repeat bound")
 
 if chunk is not None and chunk != 0:
     fails.append(f"PRETRAIN_CHUNK={chunk}, want 0 — chunk=0 is the +22.9% systems win")
