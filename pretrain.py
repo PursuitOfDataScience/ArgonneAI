@@ -703,7 +703,16 @@ def _verify_written_checkpoint(path, expect_step, expect_tensors):
     if len(sd) != expect_tensors:
         return f"{len(sd)} tensors on disk, expected {expect_tensors}"
     names = list(sd)
-    for n in {names[0], names[-1], max(names, key=lambda k: sd[k].numel())}:
+    # Sample the ends, the biggest tensor, and 5 evenly spaced tensors through the stack. The
+    # ends+largest alone collapse to just the two tied embedding tensors on this arch, which
+    # would leave every transformer layer unread; spreading the sample forces real disk I/O
+    # across the whole file so a valid-header/bad-tail write cannot slip through. The .tmp is
+    # still in page cache at this point, so this costs well under a second.
+    idx = {0, len(names) - 1}
+    idx.update(round(i * (len(names) - 1) / 6) for i in range(1, 6))
+    sample = {names[i] for i in idx}
+    sample.add(max(names, key=lambda k: sd[k].numel()))
+    for n in sorted(sample):
         try:
             if not torch.isfinite(sd[n].float()).all():
                 return f"non-finite values in {n}"
@@ -772,6 +781,39 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
           flush=True)
     prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
+
+
+def cleanup_stale_tmp_checkpoints(checkpoint_dir, min_age_s=3600):
+    """Remove abandoned .tmp checkpoint writes left behind by a slice killed mid-save.
+
+    save_checkpoint writes to checkpoint_step_<N>.pt.tmp and renames it into place only after it
+    verifies. If SLURM kills the slice during that write (preemption, node failure, wall clock)
+    the .tmp survives -- and nothing else ever removes it, because prune_old_checkpoints
+    deliberately ignores .tmp so it can never delete an in-flight write. Each file is the full
+    checkpoint (~25 GB at 2.06B: fp32 weights + AdamW moments) and the name carries the step, so
+    they do not overwrite each other; a handful of preempted slices silently costs hundreds of GB
+    across a multi-week chain.
+
+    Only files older than min_age_s are removed, so this can never race a save that is genuinely
+    in progress -- a 25 GB torch.save takes minutes, not an hour.
+    """
+    try:
+        now = time.time()
+        for p in glob.glob(os.path.join(checkpoint_dir, "checkpoint_step_*.pt.tmp")):
+            try:
+                age = now - os.path.getmtime(p)
+                if age < min_age_s:
+                    print(f"[retention] leaving {os.path.basename(p)} alone "
+                          f"({age/60:.1f} min old -- may be an active write)", flush=True)
+                    continue
+                gib = os.path.getsize(p) / 2**30
+                os.remove(p)
+                print(f"[retention] removed abandoned partial write {os.path.basename(p)} "
+                      f"({gib:.1f} GiB freed, {age/3600:.1f} h old)", flush=True)
+            except OSError as e:
+                print(f"[retention] could not remove {p}: {e}", flush=True)
+    except Exception as e:  # cleanup must never take down a slice before it even starts
+        print(f"[retention] stale-tmp cleanup skipped: {e}", flush=True)
 
 
 def get_latest_checkpoint_path(checkpoint_dir):
@@ -988,6 +1030,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume from checkpoint
+    # A previous slice killed mid-save leaves a multi-GB .pt.tmp that nothing else collects.
+    if IS_MAIN:
+        cleanup_stale_tmp_checkpoints(args.checkpoint_dir)
+
     resume_from = args.resume_from or get_latest_checkpoint_path(args.checkpoint_dir)
 
     if resume_from and os.path.exists(resume_from):

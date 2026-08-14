@@ -159,6 +159,29 @@ for tree in TREES:
             ck = torch.load(p6, map_location="cpu", weights_only=False)
             check("committed checkpoint is loadable and correct",
                   ck["global_step"] == 600 and all(torch.isfinite(v).all() for v in ck["model_state_dict"].values()))
+
+            # 7. abandoned .tmp writes must be collected, or a preempted slice leaks ~25 GB each.
+            #    prune_old_checkpoints deliberately ignores .tmp, so this is the only collector.
+            stale = os.path.join(d, "checkpoint_step_555.pt.tmp")
+            fresh = os.path.join(d, "checkpoint_step_777.pt.tmp")
+            for f in (stale, fresh):
+                with open(f, "wb") as fh:
+                    fh.write(b"partial")
+            os.utime(stale, (0, 0))                      # ancient => definitely abandoned
+            mod.cleanup_stale_tmp_checkpoints(d)
+            check("abandoned .tmp removed", not os.path.exists(stale))
+            check("recent .tmp left alone (could be an active write)", os.path.exists(fresh))
+            check("cleanup did not touch the real checkpoint", steps_on_disk(d) == ["checkpoint_step_600.pt"],
+                  str(steps_on_disk(d)))
+            check("cleanup does not disturb checkpoint_last.pt",
+                  os.path.realpath(os.path.join(d, "checkpoint_last.pt")).endswith("checkpoint_step_600.pt"))
+            os.remove(fresh)
+            # a .tmp must never be mistaken for a resumable checkpoint
+            with open(os.path.join(d, "checkpoint_step_999.pt.tmp"), "wb") as fh:
+                fh.write(b"partial")
+            check("resume ignores .tmp and picks the committed checkpoint",
+                  os.path.realpath(mod.get_latest_checkpoint_path(d)).endswith("checkpoint_step_600.pt"),
+                  str(mod.get_latest_checkpoint_path(d)))
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
