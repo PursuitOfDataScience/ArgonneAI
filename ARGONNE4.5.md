@@ -36,6 +36,16 @@ or `PRETRAIN_CARD=`). Micro-batch and grad-accum follow the card so the **effect
 | H100 (default) | 94 GB NVL | 16 × 11 | 540,672 |
 | H200 (`--h200`) | 141 GB | 22 × 8 | 540,672 |
 
+**Runtime card adaptation.** The worker reads HBM at slice start and picks micro/accum to hold the
+effective batch at 540,672 on any card — H200 141GB → 22×8, H100 94GB → 16×11, H100 80GB → 11×16.
+This matters because `0426` and `0372` advertise an IDENTICAL feature string but are 94GB and 80GB,
+which OOM'd a probe arm before it was caught. Detection failure falls back to the smallest batch.
+
+⚠️ **This cluster REJECTS OR-constraints.** `--constraint="H100|H200"` and `"[H100|H200]"` both fail
+verification with "Access/permission denied" (plain `H100` passes), so a single job cannot take
+whichever card frees first — it must commit to one. `--any-card` exists in the launchers but is
+non-functional here.
+
 ⚠️ **H200 availability is the practical catch.** Only `midway3-0600` / `0601` survive the node
 policy, and through this whole campaign they were **8/8 booked** by other users' multi-day jobs —
 the first free 3-GPU slot was ~7.5 h out. H100 `0426` was idle throughout, which is why every probe
