@@ -1067,7 +1067,9 @@ def main():
     while not completed_max_epochs:
         start_time = time.time()
         optimizer.zero_grad()
-        step_loss_total = 0.0
+        # GPU-resident accumulator: .item() inside the micro-step loop forces a device sync per
+        # micro-batch, stalling CPU run-ahead right after backward. One sync per step instead.
+        step_loss_total = torch.zeros((), device=DEVICE, dtype=torch.float32)
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             x, y = train_loader.next_batch()
@@ -1089,10 +1091,10 @@ def main():
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
-            step_loss_total += micro_loss.detach().float().item()
-            train_losses.append(micro_loss.detach().float().item())
+            step_loss_total += micro_loss.detach().float()   # stays on GPU, no sync
 
-        step_loss = step_loss_total / GRAD_ACCUM_STEPS
+        step_loss = (step_loss_total / GRAD_ACCUM_STEPS).item()   # the single sync per step
+        train_losses.append(step_loss)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
