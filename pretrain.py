@@ -665,10 +665,73 @@ def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new
     return generated_text
 
 
+def _nonfinite_params(base_model, limit=5):
+    """GATE 1 (pre-write): does the LIVE model contain NaN/Inf?
+
+    This is the gate that makes latest-only retention safe. model.py deliberately turns a NaN
+    loss into a zero-gradient no-op and keeps training, so a diverged run looks healthy from the
+    loss curve alone -- and without this check the next save would write the corrupt weights and
+    the prune would then delete the last GOOD checkpoint. GPU-side reduction, well under a second.
+    """
+    bad = []
+    for name, prm in base_model.named_parameters():
+        if not torch.isfinite(prm.detach()).all():
+            bad.append(name)
+            if len(bad) >= limit:
+                break
+    return bad
+
+
+def _verify_written_checkpoint(path, expect_step, expect_tensors):
+    """GATE 2 (post-write, pre-commit): re-open the bytes we just wrote and prove they are a
+    complete, loadable checkpoint. Returns None if good, else a reason string.
+
+    Catches the truncated/partial write -- a slice killed mid-torch.save previously left a file
+    that LOOKED like a checkpoint. mmap keeps this cheap; reading a sample of tensors forces real
+    disk I/O so a file with a valid header but missing tail is still caught.
+    """
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception as e:  # unreadable, truncated, or not a zip at all
+        return f"unreadable ({type(e).__name__}: {e})"
+    for k in ("global_step", "tokens_processed", "model_state_dict", "optimizer_state_dict"):
+        if k not in ck:
+            return f"missing key {k!r}"
+    if ck["global_step"] != expect_step:
+        return f"global_step {ck['global_step']} != {expect_step}"
+    sd = ck["model_state_dict"]
+    if len(sd) != expect_tensors:
+        return f"{len(sd)} tensors on disk, expected {expect_tensors}"
+    names = list(sd)
+    for n in {names[0], names[-1], max(names, key=lambda k: sd[k].numel())}:
+        try:
+            if not torch.isfinite(sd[n].float()).all():
+                return f"non-finite values in {n}"
+        except Exception as e:
+            return f"could not read {n} ({type(e).__name__}: {e})"
+    return None
+
+
 def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, loss, data_position, checkpoint_dir):
+    """Save ONE checkpoint, verify it, and only then delete the previous one.
+
+    Order is the whole point (owner directive 2026-08-14): latest-only retention is only safe if
+    the new checkpoint is proven good BEFORE the old one is removed. Any failure leaves the
+    previous checkpoint untouched and returns None -- a run that cannot save is far better than a
+    run whose only checkpoint is corrupt.
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
     base_model = get_base_model(model)
+
+    bad = _nonfinite_params(base_model)
+    if bad:
+        print(f"REFUSING TO SAVE at step {global_step}: non-finite parameters in {bad}"
+              f"{' (and more)' if len(bad) >= 5 else ''}. The previous checkpoint is left intact.",
+              flush=True)
+        return None
+
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+    tmp_path = checkpoint_path + ".tmp"
     checkpoint = {
         'global_step': global_step,
         'tokens_processed': tokens_processed,
@@ -678,7 +741,22 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
-    torch.save(checkpoint, checkpoint_path)
+    n_tensors = len(checkpoint['model_state_dict'])
+    # write to .tmp so a mid-write kill can never leave a plausible-looking checkpoint_step_N.pt
+    torch.save(checkpoint, tmp_path)
+
+    why = _verify_written_checkpoint(tmp_path, global_step, n_tensors)
+    if why is not None:
+        print(f"REFUSING TO COMMIT checkpoint at step {global_step}: {why}. "
+              f"Discarding {tmp_path}; the previous checkpoint is left intact.", flush=True)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+
+    os.replace(tmp_path, checkpoint_path)   # atomic: the file appears complete or not at all
+
     latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
     latest_tmp_path = latest_path + ".tmp"
     try:
@@ -688,6 +766,10 @@ def save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, 
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+
+    # ONLY NOW is it safe to delete the previous checkpoint.
+    print(f"[retention] checkpoint at step {global_step} verified; pruning older checkpoints",
+          flush=True)
     prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
 
