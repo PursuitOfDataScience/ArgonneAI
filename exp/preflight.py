@@ -129,7 +129,8 @@ for sh in ("weekend.sh", "night.sh"):
 # test_loader_resume.py guards the other silent-corruption path: ~576 chained slices all
 # resume, and a resume that restarts a cursor or overlaps two ranks trains on a fraction of
 # the corpus with no crash and no loss spike to give it away.
-for _test in ("exp/test_ckpt_safety.py", "exp/test_loader_resume.py", "test_a45_arch.py"):
+for _test in ("exp/test_ckpt_safety.py", "exp/test_loader_resume.py",
+              "exp/test_no_dead_flags.py", "test_a45_arch.py"):
     _t = subprocess.run([sys.executable, _test], capture_output=True, text=True)
     if _t.returncode != 0:
         tail = (_t.stdout + _t.stderr).strip().splitlines()[-6:]
