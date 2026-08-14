@@ -1101,6 +1101,7 @@ def main():
         return float(np.mean(losses)) if losses else float("nan")
 
     train_losses = []
+    export_refused = False   # set on rank 0 if the final checkpoint fails its integrity gates
     completed_max_epochs = train_loader.epoch >= args.max_epochs
 
     pbar = None
@@ -1196,7 +1197,11 @@ def main():
                 print("Saving checkpoint...")
                 data_position = train_loader.get_position()
                 checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
-                print(f"Checkpoint saved: {checkpoint_path}")
+                if checkpoint_path is None:
+                    # save_checkpoint already printed the reason it refused.
+                    print("Checkpoint REFUSED at this step; continuing to train on the previous one.")
+                else:
+                    print(f"Checkpoint saved: {checkpoint_path}")
 
                 print("\nGenerating sample text...")
                 generated = generate_text(model, tokenizer, DEVICE, prompt="Long long time ago")
@@ -1228,7 +1233,10 @@ def main():
                     print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
                     checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir)
-                    print(f"Wall time checkpoint saved: {checkpoint_path}")
+                    if checkpoint_path is None:
+                        print("Wall-time checkpoint REFUSED; exiting on the previous good checkpoint.")
+                    else:
+                        print(f"Wall time checkpoint saved: {checkpoint_path}")
                 if WORLD_SIZE > 1:
                     dist.barrier()
                 break
@@ -1274,42 +1282,52 @@ def main():
             print("\nSaving final checkpoint...")
             data_position = train_loader.get_position()
             checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, train_loss, data_position, args.checkpoint_dir)
-            print(f"Final checkpoint saved: {checkpoint_path}")
+            if checkpoint_path is None:
+                # The gate refused these weights. Exporting them to final_model_dir would publish
+                # exactly the corrupt model the gate exists to stop, so skip the export. Do NOT
+                # raise here: this block is rank-0 only, and bailing out would strand the other
+                # ranks on the barrier below until SLURM killed the job at the wall clock. Flag it
+                # and exit nonzero after every rank has cleaned up.
+                export_refused = True
+                print("Final checkpoint REFUSED — skipping HF export. The last good checkpoint in "
+                      f"{args.checkpoint_dir} is the deliverable; investigate before exporting.")
+            else:
+                print(f"Final checkpoint saved: {checkpoint_path}")
 
-            final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
-            os.makedirs(final_model_dir, exist_ok=True)
-            save_model = get_base_model(model)
-            if args.fp8 == 1:
-                # Export a clean nn.Linear model so the shipped HF checkpoint needs no torchao at
-                # inference. Dynamic tensorwise FP8 keeps weights in high precision → state_dict is 1:1.
-                clean = ArgonneModel(config)
-                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
-                assert not missing, (
-                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
-                if hasattr(clean, "tie_weights"):
-                    clean.tie_weights()
-                if IS_MAIN:
-                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
-                save_model = clean.to(DEVICE)
+                final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
+                os.makedirs(final_model_dir, exist_ok=True)
+                save_model = get_base_model(model)
+                if args.fp8 == 1:
+                    # Export a clean nn.Linear model so the shipped HF checkpoint needs no torchao at
+                    # inference. Dynamic tensorwise FP8 keeps weights in high precision → state_dict is 1:1.
+                    clean = ArgonneModel(config)
+                    missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                    assert not missing, (
+                        f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                    if hasattr(clean, "tie_weights"):
+                        clean.tie_weights()
+                    if IS_MAIN:
+                        print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
+                    save_model = clean.to(DEVICE)
 
-            actual_vocab = len(tokenizer)
-            embed = save_model.get_input_embeddings()
-            if embed.weight.shape[0] > actual_vocab:
-                print(f"Trimming embeddings from {embed.weight.shape[0]} to {actual_vocab}")
-                embed.weight = nn.Parameter(embed.weight[:actual_vocab])
-                lm_head = save_model.get_output_embeddings()
-                if lm_head is not None:
-                    lm_head.weight = nn.Parameter(lm_head.weight[:actual_vocab])
-                save_model.config.vocab_size = actual_vocab
+                actual_vocab = len(tokenizer)
+                embed = save_model.get_input_embeddings()
+                if embed.weight.shape[0] > actual_vocab:
+                    print(f"Trimming embeddings from {embed.weight.shape[0]} to {actual_vocab}")
+                    embed.weight = nn.Parameter(embed.weight[:actual_vocab])
+                    lm_head = save_model.get_output_embeddings()
+                    if lm_head is not None:
+                        lm_head.weight = nn.Parameter(lm_head.weight[:actual_vocab])
+                    save_model.config.vocab_size = actual_vocab
 
-            save_model.save_pretrained(final_model_dir)
-            tokenizer.save_pretrained(final_model_dir)
-            config.save_pretrained(final_model_dir)
-            print(f"Final model + tokenizer + config saved to: {final_model_dir}")
+                save_model.save_pretrained(final_model_dir)
+                tokenizer.save_pretrained(final_model_dir)
+                config.save_pretrained(final_model_dir)
+                print(f"Final model + tokenizer + config saved to: {final_model_dir}")
 
-            if args.completion_marker:
-                write_completion_marker(args.completion_marker, global_step, tokens_processed, final_model_dir)
-                print(f"Completion marker written to: {args.completion_marker}")
+                if args.completion_marker:
+                    write_completion_marker(args.completion_marker, global_step, tokens_processed, final_model_dir)
+                    print(f"Completion marker written to: {args.completion_marker}")
         else:
             print("\nFinal checkpoint/model export skipped because training stopped before completing max_epochs.")
 
@@ -1322,6 +1340,11 @@ def main():
         dist.barrier()
 
     cleanup_distributed()
+
+    # Every rank has now cleaned up, so it is safe to fail the job. Nonzero tells the resubmit
+    # chain NOT to treat a refused final checkpoint as a successful finish.
+    if export_refused:
+        sys.exit(1)
 
 def prune_old_checkpoints(checkpoint_dir, keep_path):
     """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).

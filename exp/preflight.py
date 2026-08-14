@@ -89,6 +89,16 @@ for sh in ("weekend.sh", "night.sh"):
     if r.returncode != 0 or "command not found" in (r.stdout + r.stderr):
         fails.append(f"{sh} --dry-run failed: {(r.stderr or r.stdout).strip().splitlines()[-1:] }")
 
+# The checkpoint integrity contract is the one thing whose failure is UNRECOVERABLE: latest-only
+# retention means a bad commit deletes the last good checkpoint. Execute the gates, don't just
+# read them. ~10s on CPU, and it covers continue_pretrain.py too (the phase A/B trainer, which
+# had NO gates at all until 2026-08-14).
+_t = subprocess.run([sys.executable, "exp/test_ckpt_safety.py"], capture_output=True, text=True)
+if _t.returncode != 0:
+    tail = (_t.stdout + _t.stderr).strip().splitlines()[-6:]
+    fails.append("exp/test_ckpt_safety.py FAILED — checkpoint safety is not intact:\n      "
+                 + "\n      ".join(tail))
+
 print("preflight: run_full_training.sh + pretrain.py")
 print("\n".join(notes))
 print(f"  chunk={chunk} stride={stride} stride94={stride94} A45=True guard-ordering=ok")

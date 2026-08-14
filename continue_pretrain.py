@@ -156,6 +156,53 @@ def generate_text(model, tokenizer, device, prompt="Long long time ago", max_new
     return generated_text
 
 
+def _nonfinite_params(base_model, limit=5):
+    """GATE 1 (pre-write): does the LIVE model contain NaN/Inf?
+
+    This is the gate that makes latest-only retention safe. model.py deliberately turns a NaN
+    loss into a zero-gradient no-op and keeps training, so a diverged run looks healthy from the
+    loss curve alone -- and without this check the next save would write the corrupt weights and
+    the prune would then delete the last GOOD checkpoint. GPU-side reduction, well under a second.
+    """
+    bad = []
+    for name, prm in base_model.named_parameters():
+        if not torch.isfinite(prm.detach()).all():
+            bad.append(name)
+            if len(bad) >= limit:
+                break
+    return bad
+
+
+def _verify_written_checkpoint(path, expect_step, expect_tensors):
+    """GATE 2 (post-write, pre-commit): re-open the bytes we just wrote and prove they are a
+    complete, loadable checkpoint. Returns None if good, else a reason string.
+
+    Catches the truncated/partial write -- a slice killed mid-torch.save previously left a file
+    that LOOKED like a checkpoint. mmap keeps this cheap; reading a sample of tensors forces real
+    disk I/O so a file with a valid header but missing tail is still caught.
+    """
+    try:
+        ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception as e:  # unreadable, truncated, or not a zip at all
+        return f"unreadable ({type(e).__name__}: {e})"
+    for k in ("global_step", "tokens_processed", "model_state_dict", "optimizer_state_dict"):
+        if k not in ck:
+            return f"missing key {k!r}"
+    if ck["global_step"] != expect_step:
+        return f"global_step {ck['global_step']} != {expect_step}"
+    sd = ck["model_state_dict"]
+    if len(sd) != expect_tensors:
+        return f"{len(sd)} tensors on disk, expected {expect_tensors}"
+    names = list(sd)
+    for n in {names[0], names[-1], max(names, key=lambda k: sd[k].numel())}:
+        try:
+            if not torch.isfinite(sd[n].float()).all():
+                return f"non-finite values in {n}"
+        except Exception as e:
+            return f"could not read {n} ({type(e).__name__}: {e})"
+    return None
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -171,9 +218,24 @@ def save_checkpoint(
     dataset_num_tokens,
     dataset_path,
 ):
+    """Write a checkpoint only if it is provably good, then prune.
+
+    Same two-gate contract as pretrain.py: gate the LIVE weights, write to .tmp, re-read and
+    verify the bytes, and only then atomically commit and delete the previous checkpoint. On any
+    failure this leaves the previous checkpoint untouched and returns None -- a run that cannot
+    save is far better than a run whose only surviving checkpoint is corrupt.
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
     base_model = get_base_model(model)
+
+    bad = _nonfinite_params(base_model)
+    if bad:
+        print(f"REFUSING TO SAVE at step {global_step}: non-finite parameters in {bad}"
+              f"{' (and more)' if len(bad) >= 5 else ''}. The previous checkpoint is left intact.",
+              flush=True)
+        return None
+
     checkpoint = {
         'global_step': global_step,
         'tokens_processed': tokens_processed,
@@ -188,7 +250,23 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
-    torch.save(checkpoint, checkpoint_path)
+    n_tensors = len(checkpoint['model_state_dict'])
+    tmp_path = checkpoint_path + ".tmp"
+    # write to .tmp so a mid-write kill can never leave a plausible-looking checkpoint_step_N.pt
+    torch.save(checkpoint, tmp_path)
+
+    why = _verify_written_checkpoint(tmp_path, global_step, n_tensors)
+    if why is not None:
+        print(f"REFUSING TO COMMIT checkpoint at step {global_step}: {why}. "
+              f"Discarding {tmp_path}; the previous checkpoint is left intact.", flush=True)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+
+    os.replace(tmp_path, checkpoint_path)   # atomic: the file appears complete or not at all
+
     latest_path = os.path.join(checkpoint_dir, "checkpoint_last.pt")
     latest_tmp_path = latest_path + ".tmp"
     try:
@@ -198,6 +276,10 @@ def save_checkpoint(
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+
+    # only now is deleting the previous checkpoint safe
+    print(f"[retention] checkpoint at step {global_step} verified; pruning older checkpoints",
+          flush=True)
     prune_old_checkpoints(checkpoint_dir, keep_path=checkpoint_path)
     return checkpoint_path
 
@@ -376,7 +458,7 @@ def main():
 
     # Wrap with DDP
     if WORLD_SIZE > 1:
-        model = DDP(model, device_ids=[LOCAL_RANK])
+        model = DDP(model, device_ids=[LOCAL_RANK], gradient_as_bucket_view=True)
         if IS_MAIN:
             print(f"Using {WORLD_SIZE} GPUs with DistributedDataParallel")
 
@@ -411,6 +493,7 @@ def main():
         lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
+        fused=True,
     )
 
     # Scheduler with warmup (cosine or WSD)
@@ -540,6 +623,7 @@ def main():
     last_checkpoint_time = time.time()
     training_start_time = time.time()
     train_losses = []
+    export_refused = False   # set on rank 0 if the final checkpoint fails its integrity gates
     completed_max_epochs = train_loader.epoch >= args.max_epochs
 
     pbar = None
@@ -554,7 +638,11 @@ def main():
     while not completed_max_epochs:
         start_time = time.time()
         optimizer.zero_grad()
-        step_loss_total = 0.0
+        # accumulate on the GPU: a float accumulator would force a device sync per micro-step,
+        # stalling the pipeline GRAD_ACCUM_STEPS times per optimizer step for a number only read
+        # once. Mean over micro-losses == mean over step-losses (fixed micro count), so the
+        # logged trajectory is unchanged.
+        step_loss_total = torch.zeros((), device=DEVICE, dtype=torch.float32)
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             x, y = train_loader.next_batch()
@@ -576,10 +664,11 @@ def main():
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
-            step_loss_total += micro_loss.detach().float().item()
-            train_losses.append(micro_loss.detach().float().item())
+            step_loss_total += micro_loss.detach().float()   # stays on GPU, no sync
 
-        step_loss = step_loss_total / GRAD_ACCUM_STEPS
+        # the single sync per optimizer step
+        step_loss = (step_loss_total / GRAD_ACCUM_STEPS).item()
+        train_losses.append(step_loss)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -626,10 +715,15 @@ def main():
                     num_tokens,
                     args.data_path,
                 )
-                print(f"Checkpoint saved: {checkpoint_path}")
-                if args.started_marker:
-                    write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
-                    print(f"Continued-pretrain progress marker written to: {args.started_marker}")
+                if checkpoint_path is None:
+                    # save_checkpoint already explained why. Do NOT advance the progress marker:
+                    # it would tell the resubmit chain we got further than the last good checkpoint.
+                    print("Checkpoint REFUSED at this step; continuing to train on the previous one.")
+                else:
+                    print(f"Checkpoint saved: {checkpoint_path}")
+                    if args.started_marker:
+                        write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
+                        print(f"Continued-pretrain progress marker written to: {args.started_marker}")
 
                 print("\nGenerating sample text...")
                 generated = generate_text(model, tokenizer, DEVICE, prompt="Long long time ago")
@@ -673,10 +767,13 @@ def main():
                         num_tokens,
                         args.data_path,
                     )
-                    print(f"Wall time checkpoint saved: {checkpoint_path}")
-                    if args.started_marker:
-                        write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
-                        print(f"Continued-pretrain progress marker written to: {args.started_marker}")
+                    if checkpoint_path is None:
+                        print("Wall-time checkpoint REFUSED; exiting on the previous good checkpoint.")
+                    else:
+                        print(f"Wall time checkpoint saved: {checkpoint_path}")
+                        if args.started_marker:
+                            write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
+                            print(f"Continued-pretrain progress marker written to: {args.started_marker}")
                 if WORLD_SIZE > 1:
                     dist.barrier()
                 break
@@ -770,45 +867,55 @@ def main():
                 num_tokens,
                 args.data_path,
             )
-            print(f"Final checkpoint saved: {checkpoint_path}")
+            if checkpoint_path is None:
+                # The gate refused these weights. Exporting them to final_model_dir would publish
+                # exactly the corrupt model the gate exists to stop, so skip the export. Do NOT
+                # raise here: this block is rank-0 only, and bailing out would strand the other
+                # ranks on the barrier below until SLURM killed the job at the wall clock. Flag it
+                # and exit nonzero after every rank has cleaned up.
+                export_refused = True
+                print("Final checkpoint REFUSED — skipping HF export. The last good checkpoint in "
+                      f"{args.checkpoint_dir} is the deliverable; investigate before exporting.")
+            else:
+                print(f"Final checkpoint saved: {checkpoint_path}")
 
-            final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
-            os.makedirs(final_model_dir, exist_ok=True)
-            save_model = get_base_model(model)
-            if args.fp8 == 1:
-                # Export a clean nn.Linear model (no torchao at inference). Dynamic tensorwise FP8 keeps
-                # weights in high precision -> state_dict loads 1:1; refuse to export if any weight missing.
-                clean = ArgonneModel(config)
-                missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
-                assert not missing, (
-                    f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
-                if hasattr(clean, "tie_weights"):
-                    clean.tie_weights()
-                if IS_MAIN:
-                    print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
-                save_model = clean.to(DEVICE)
+                final_model_dir = args.final_model_dir or os.path.join(args.checkpoint_dir, "final_model_complete")
+                os.makedirs(final_model_dir, exist_ok=True)
+                save_model = get_base_model(model)
+                if args.fp8 == 1:
+                    # Export a clean nn.Linear model (no torchao at inference). Dynamic tensorwise FP8 keeps
+                    # weights in high precision -> state_dict loads 1:1; refuse to export if any weight missing.
+                    clean = ArgonneModel(config)
+                    missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
+                    assert not missing, (
+                        f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                    if hasattr(clean, "tie_weights"):
+                        clean.tie_weights()
+                    if IS_MAIN:
+                        print(f"FP8 export: rebuilt clean nn.Linear model ({len(missing)} missing / {len(unexpected)} extra keys)")
+                    save_model = clean.to(DEVICE)
 
-            actual_vocab = len(tokenizer)
-            embed = save_model.get_input_embeddings()
-            if embed.weight.shape[0] > actual_vocab:
-                print(f"Trimming embeddings from {embed.weight.shape[0]} to {actual_vocab}")
-                embed.weight = nn.Parameter(embed.weight[:actual_vocab])
-                lm_head = save_model.get_output_embeddings()
-                if lm_head is not None:
-                    lm_head.weight = nn.Parameter(lm_head.weight[:actual_vocab])
-                save_model.config.vocab_size = actual_vocab
+                actual_vocab = len(tokenizer)
+                embed = save_model.get_input_embeddings()
+                if embed.weight.shape[0] > actual_vocab:
+                    print(f"Trimming embeddings from {embed.weight.shape[0]} to {actual_vocab}")
+                    embed.weight = nn.Parameter(embed.weight[:actual_vocab])
+                    lm_head = save_model.get_output_embeddings()
+                    if lm_head is not None:
+                        lm_head.weight = nn.Parameter(lm_head.weight[:actual_vocab])
+                    save_model.config.vocab_size = actual_vocab
 
-            save_model.save_pretrained(final_model_dir)
-            tokenizer.save_pretrained(final_model_dir)
-            config.save_pretrained(final_model_dir)
-            print(f"Final model + tokenizer + config saved to: {final_model_dir}")
+                save_model.save_pretrained(final_model_dir)
+                tokenizer.save_pretrained(final_model_dir)
+                config.save_pretrained(final_model_dir)
+                print(f"Final model + tokenizer + config saved to: {final_model_dir}")
 
-            if args.completion_marker:
-                write_completion_marker(args.completion_marker, global_step, tokens_processed, final_model_dir)
-                print(f"Completion marker written to: {args.completion_marker}")
-            if args.started_marker:
-                write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
-                print(f"Continued-pretrain progress marker written to: {args.started_marker}")
+                if args.completion_marker:
+                    write_completion_marker(args.completion_marker, global_step, tokens_processed, final_model_dir)
+                    print(f"Completion marker written to: {args.completion_marker}")
+                if args.started_marker:
+                    write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
+                    print(f"Continued-pretrain progress marker written to: {args.started_marker}")
         else:
             print("\nFinal checkpoint/model export skipped because training stopped before completing max_epochs.")
 
@@ -821,6 +928,11 @@ def main():
         dist.barrier()
 
     cleanup_distributed()
+
+    # Every rank has now cleaned up, so it is safe to fail the job. Nonzero tells the resubmit
+    # chain NOT to treat a refused final checkpoint as a successful finish.
+    if export_refused:
+        sys.exit(1)
 
 if __name__ == "__main__":
     # Parse arguments
