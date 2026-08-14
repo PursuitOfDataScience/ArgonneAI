@@ -1236,10 +1236,6 @@ def main():
 
     cleanup_distributed()
 
-if __name__ == "__main__":
-    main()
-
-
 def prune_old_checkpoints(checkpoint_dir, keep_path):
     """LATEST-ONLY retention (2026-08-05 owner directive, global CLAUDE.md).
 
@@ -1281,3 +1277,7 @@ def prune_old_checkpoints(checkpoint_dir, keep_path):
                 print(f"[retention] could not remove {p}: {e}", flush=True)
     except Exception as e:  # retention must never take down a run that just saved successfully
         print(f"[retention] prune skipped: {e}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
