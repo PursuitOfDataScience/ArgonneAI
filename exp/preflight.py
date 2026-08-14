@@ -77,8 +77,17 @@ if guards:
     if late:
         fails.append(f"defs after the __main__ guard, will NameError at runtime: {late}")
 
-if subprocess.run(["bash", "-n", WORKER]).returncode != 0:
-    fails.append("bash -n failed")
+for sh in (WORKER, "weekend.sh", "night.sh"):
+    if subprocess.run(["bash", "-n", sh]).returncode != 0:
+        fails.append(f"{sh}: bash -n failed")
+
+# night.sh builds its GPU submission inside a --wrap string array, so a correctly-quoted
+# night.sh can still emit a BROKEN body. weekend.sh does not use that construct, which is why
+# it passed while night.sh was broken for hours. Dry-run both and require a clean exit.
+for sh in ("weekend.sh", "night.sh"):
+    r = subprocess.run(["./" + sh, "--dry-run"], capture_output=True, text=True)
+    if r.returncode != 0 or "command not found" in (r.stdout + r.stderr):
+        fails.append(f"{sh} --dry-run failed: {(r.stderr or r.stdout).strip().splitlines()[-1:] }")
 
 print("preflight: run_full_training.sh + pretrain.py")
 print("\n".join(notes))
