@@ -34,6 +34,9 @@ EOS = 151643                        # Qwen3 <|endoftext|>; the flat bins use it 
 DATA = "/project/rcc/youzhi/data/argonne4_pretrain"
 SOURCES = [("edu_flat.bin", 50), ("finemath_flat.bin", 30), ("code_flat.bin", 20)]
 VALS = [("edu", "val_edu.bin"), ("math", "val_math.bin"), ("code", "val_code.bin")]
+# RHO-1 reference: the argonne4.0 1.04B checkpoint, trained on this exact 50/30/20 mixture and the
+# same tokenizer, so its per-token loss is a meaningful "what a competent model already finds easy".
+RHO1_REF = "/project/rcc/youzhi/models/a4_dose/a4_base_59723"
 
 
 def load_bin(path):
@@ -171,8 +174,30 @@ def main():
         return 1.0 - min(1.0, (s - (steps - cds)) / cds) * 0.9
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_l)
 
+    # Data mixture is a config knob now. It is the one axis the a4 campaign showed to be BOTH
+    # scale-robust AND growing with tokens ("the composition win is scale-robust and GROWING"),
+    # which is exactly the property the size question turned out to lack -- so unlike size, a
+    # probe-scale mixture result has a defensible claim to transfer.
+    if cfg.get("mix"):
+        global SOURCES
+        SOURCES = [(p_, w_) for p_, w_ in zip(
+            ["edu_flat.bin", "finemath_flat.bin", "code_flat.bin"], cfg["mix"])]
+        if main_proc:
+            print(f"[probe] mixture edu/math/code = {cfg['mix']}", flush=True)
     mix = Mix(B, T, rank, world, seed=cfg.get("data_seed", 1337))
     use_doc = bool(cfg.get("doc_mask", False))
+    # ---- RHO-1 selective language modelling -------------------------------------------------
+    # Backprop only the top-k% of tokens by EXCESS loss (student CE - reference CE). The claim is
+    # 2-10x data efficiency, which is the single biggest lever on the tokens/param constraint that
+    # arms 10/11 measured as dominant. Costs one frozen forward of a 1.04B reference per micro-step.
+    rho1_topk = float(cfg.get("rho1_topk", 0.0))
+    ref_model = None
+    if rho1_topk > 0:
+        ref_model = ArgonneModel.from_pretrained(RHO1_REF, dtype=torch.bfloat16).to(dev).eval()
+        for prm in ref_model.parameters():
+            prm.requires_grad_(False)
+        if main_proc:
+            print(f"[probe] RHO-1 on: keep top {rho1_topk:.0%} by excess loss, ref={RHO1_REF}", flush=True)
     if main_proc:
         print(f"[probe] {cfg['id']} params={nparams:,} steps={steps} eff_batch={eff:,} "
               f"block={T} micro={B}x{accum} world={world} node={socket.gethostname()}", flush=True)
@@ -197,7 +222,22 @@ def main():
             sync = (m == accum - 1)
             with model.no_sync() if not sync else torch.enable_grad():
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = model(x, labels=y, **kw).loss / accum
+                    if ref_model is not None:
+                        with torch.no_grad():
+                            # Read the vocab off the TENSOR: the exported a4 reference has the fp8
+                            # lm_head padding trimmed (151,669) while the student trains padded
+                            # (151,680). Targets max at 151,643 so CE is valid against either.
+                            rl = ref_model(x).logits
+                            ref_ce = F.cross_entropy(
+                                rl.reshape(-1, rl.size(-1)), y.view(-1), reduction="none")
+                        lg = model(x, **kw).logits
+                        tok_ce = F.cross_entropy(
+                            lg.reshape(-1, lg.size(-1)), y.view(-1), reduction="none")
+                        keep = max(1, int(rho1_topk * tok_ce.numel()))
+                        sel = torch.topk(tok_ce.detach() - ref_ce, keep).indices
+                        loss = tok_ce[sel].mean() / accum
+                    else:
+                        loss = model(x, labels=y, **kw).loss / accum
                 loss.backward()
             acc += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("grad_clip", 0.4))
@@ -232,7 +272,10 @@ def main():
 
     base = model.module._orig_mod if hasattr(model.module, "_orig_mod") else model.module
     ces, len_ces = {}, {}
-    if main_proc and not aborted:
+    # Evaluate even after a wall-guard trip. SLURM gives ~35 min and the guard fires at 27, so
+    # there is room, and a partial run WITH a TGT is usable -- compared at equal wall time it is
+    # exactly the iso-compute question. Without one it is a wasted arm; a05 and a11 both died here.
+    if main_proc:
         for name, f in VALS:
             ces[name] = eval_ce(base, os.path.join(DATA, f), max(1, 8), T, dev)
         # Length generalisation: same held-out text, longer windows. Anything past the training

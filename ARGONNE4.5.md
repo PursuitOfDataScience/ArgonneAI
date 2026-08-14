@@ -10,66 +10,82 @@ parameter names, which are considerably more informative than what either vendor
 
 ---
 
-## 0. The proposal, in one page
+## 0. FINAL CONFIG — set from 51 probe arms, 2026-08-14
 
-**Build argonne-4.5-base: 2,063,667,712 params — 2× argonne4.0, argonne4.0's data recipe,
-2.4–4.7× the tokens, and five things neither previous run had.**
+**a4.5 is argonne4.0's architecture at 2.06B with the systems settings fixed. Nothing else survived.**
 
-The line's whole diagnosis is that base capability is the wall (six post-training methods, two
-model generations). Parameters are part of that wall — 3.5's 2.88B beat a4.0's 1.04B by 16.79pt at
-the same token count — so 4.5 doubles a4.0. It stops at 2.06B rather than 2.88B because the loss
-curve is flat there and the saved compute is worth more spent on the five untried levers.
+Two probe campaigns (51 arms, 3× H100, `exp/EXPERIMENTS.md`) tested every lever proposed in the
+sections below. The result was almost entirely negative, and this page overrides them.
 
-| | argonne3.5 | argonne4.0 | **argonne4.5** |
-|---|---|---|---|
-| params | 2,882,196,480 | 1,038,509,568 | **2,063,667,712** |
-| shape | 3072 / 24L / 12Q-4KV | 1536 / 32L / 6Q-2KV | **2560 / 24L / 10Q-2KV** |
-| tokens | ~64B (22:1) | 62.1B (60:1) | **154B → 300B (75–145:1)** |
-| data | web 85 / math 15, no code | edu 50 / math 30 / code 20 | **edu 50 / math 30 / code 20 + synthetic** |
-| think 5-set greedy | 55.16 | 38.37 | *the thing being bought* |
+### What to run
 
-**Five changes, in value order.** (1) **RHO-1** selective loss — the tokens/param lever, and the
-cheapest thing on the list. (2) **Real MTP module** — denser signal per token plus a free
-speculative-decoding drafter, which multiplies every future self-consistency experiment.
-(3) **NoPE global layers + RoPE sliding layers** (`LLLG`, window 1024) — Muse Glimmer's answer to
-the length-generalization failure we have already measured. (4) **Intra-document masking** — a plain
-objective defect: packed documents currently attend across their own boundaries. (5) **ReLU² FFN**
-at inter 10560, exactly iso-param with SwiGLU 7040 so it is a clean single-variable test.
-Everything else — AdamW, LR 6e-4, WSD 8k/0.15, grad_clip 0.4, qk-norm, FP8, tied embeddings, the
-Qwen3 tokenizer — is held, because that is the part of Argonne that is genuinely well-searched.
+```bash
+cd /home/youzhi/ArgonneAI-4.5
+./weekend.sh --dry-run     # inspect
+./weekend.sh               # continuous self-resubmitting chain
+./night.sh                 # ONE slice at 23:00
+```
 
-**Order of work.**
+| axis | value | basis |
+|---|---|---|
+| params | **2,063,667,712** | hidden 2560 / 24L / 10Q-2KV / head_dim 256 / SwiGLU 7040 / tied |
+| architecture | **identical to a4.0** | every proposed change refuted or unresolved (below) |
+| `loss_chunk_size` | **0** | e01→e03: 32,205 → 39,593 tok/s, **+22.9%** |
+| ckpt stride | **2** | e03→e04: → 42,016 tok/s, **+6.1%**, HBM 65→84% |
+| micro-batch | **16** × block 1024 | forced by chunk=0: 16·1024 rows = 9.9 GiB fp32 logits (a4.0's 170 would need 105 GiB) |
+| effective batch | 16·3·1024·**11** = **540,672** | within 3% of the LR-6e-4-validated 524,288 |
+| LR / warmup / cooldown | **6e-4 / 8000 / 0.15** | inherited; probes could NOT resolve these (see σ below) |
+| data | 50/30/20 edu/math/code | inherited; mixture unresolved |
+| precision | fp8 + lm_head, bf16 autocast, torch.compile | a4.0 |
 
-| # | step | cost | blocks what |
-|---|---|---|---|
-| 1 | multi-node DDP in the launcher (QOS allows 16 GPU / 4 nodes; today it is `--nodes=1 --gres=gpu:3`) | ~1 day | **not a blocker at 2.06B** — halves the run if it lands |
-| 2 | 5-arm bake-off at 10B tokens, **one pinned card** | ~7 GPU-days | decides ReLU², gated attn, untie; catches a 450-step trap |
-| 3 | synthetic data expansion → ~75B unique (runs in parallel from day 1) | GPU-weeks, interruptible | the 300B budget; 154B can start without it |
-| 4 | main pretrain | **34 d @154B on 4×H200; 17 d on 8** | — |
-| 5 | reasoning anneal + MTP-boost phase | ~3 d | — |
+**Net measured gain over a4.0's settings: +30.5% throughput ≈ 7.9 days off a 34-day run.**
 
-**One thing must be true or the plan changes:** the bake-off has to run on a pinned GPU model. The
-retraction in §3b happened because the launcher silently switches H100↔H200 by time of day. Multi-node
-is no longer a gate at this size — 34 days on the 4 GPUs we already have — it just halves the run.
+### Every proposed lever, and what happened to it
 
-**Where an intermediate choice is free, take it: the token budget.** Nothing pins D up front except
-the WSD cooldown (`cooldown_frac × estimated_steps`). Run, read capability at 40 / 80 / 120B on
-`clean_eval.py`, and decide the endpoint *before* the cooldown starts — extend into the synthetic
-corpus if the curve is still climbing, cool down early if it flattens. That is exactly what
-`base-for-reasoning.md` §2.3 Option C did for 3.5, and it costs nothing. Size cannot be deferred this
-way; the token budget can, so defer the one that is deferrable.
+| lever | verdict |
+|---|---|
+| LLLG sliding window | **REFUTED** — +0.038 CE *and* −14.6% throughput. No flash-attn-2 here, so the window forces an explicit SDPA mask and abandons the fused `is_causal` kernel. |
+| NoPE global layers | **REFUTED** — worse at every length; my "improved slope" claim was retracted (an FFN-only control reproduced the same slope shift). |
+| intra-document masking | **REFUTED at iso-compute** — a real −0.034 iso-token win, but −27.5% throughput means the baseline wins by 0.353. |
+| real MTP module | **REFUTED** — +0.127 iso-compute. Its loss still reaches the trunk via `h_prev`. |
+| RHO-1 selective loss | **REFUTED** — +0.449 token-matched, 23% slower. Dropping 40% of tokens removes 40% of the gradient. |
+| ReLU² FFN | **UNRESOLVED** — three iso-param measurements, three different signs. |
+| gated attention / untied embeddings | **UNRESOLVED** — 0.7σ and 0.5σ against the true noise floor. Campaign 1 called both wins using a σ that was 4.6× too small. |
+| MoE | **not tested.** It is a capacity question, and the probe is provably blind to capacity (see below). |
 
-**Explicitly deferred:** MoE → argonne5.0 (start the design in parallel — if parameters are the
-shortage and compute is the wall, it is the only lever that buys parameters without buying training
-FLOPs); Mamba-2 hybrid (would invalidate the vLLM port); NVFP4 (needs Blackwell, we are on Hopper);
-multilingual; a new optimizer (neither reference model uses one).
+### ⚠️ Measurement caveats that bound all of the above
 
-**Honest bound.** 4.5 is a real bet, not a safe one: it gives up 0.82B parameters against 3.5 and
-has to win them back from 2.4× the tokens, a mix the campaign proved worth ~1.3 CE at proxy scale,
-and five unmeasured levers. At 3.5's size it would be near-certain; at 2.06B it is likely but not
-assured, and that is the trade being made deliberately. It will not approach Qwen3-0.6B's regime
-(~60,000 tokens/param); that is three orders of magnitude of data away, and no architecture on this
-list closes it.
+1. **σ = 0.130 at the probe operating point** (three runs of one config: 4.7263 / 4.8393 / 4.9858),
+   not the 0.028 measured at the *old* operating point. 2σ resolution is **0.368**. Anything smaller
+   than that in this campaign is unresolved, not null.
+2. **The probe cannot answer capacity questions.** It burns ~1 GPU-hour against production's ~24
+   GPU-days — 4,600× less — where the Chinchilla-optimal model is ~43M params. Both size and block
+   size came out "smaller is better," which is exactly what theory predicts down there and carries
+   no information about 154B tokens. MoE would fail the same way.
+3. **The batch finding is the one large surviving result** (61,440 beats 122,880 by 0.994 iso-token
+   and 0.569 iso-compute, 3–5σ) — but its mechanism is *step-limitation* at 568 steps, and
+   production runs ~147,000 steps and is not step-limited. **Direction transfers, magnitude does not.**
+   This is why the shipped batch stays near a4.0's, not at the probe optimum.
+4. Throughput on `midway3-0426` varies **±12%** with node co-tenancy, so any throughput delta under
+   ~15% measured across time is unusable.
+
+### Can a4.5 beat argonne3.5?
+
+Honestly: **coin flip at 154B tokens.** Pricing with the only slopes measured on this line —
+params 2.88B→2.06B is **−5.5 pt** (the sole *production-scale* datum, from a4-vs-3.5), tokens
+64B→154B is +3 to +6, mix is +2 to +4 ⇒ **net ≈ +2 pt**. The params term is the dominant negative
+and the probe cannot overturn it.
+
+**If the goal is specifically to beat 3.5, match its size.** At fixed compute 2.06B@154B ≈ 2.88B@110B,
+and the larger model deletes the −5.5 pt term instead of trying to out-token it (≈ +5 pt net).
+
+### The one thing to verify before committing 34 days
+
+A **scaled-up batch run** — a few billion tokens, not 35M — to test whether the batch direction
+survives outside the step-limited regime. That single assumption underpins the entire schedule
+recommendation and is the one thing a 30-minute probe structurally cannot test.
+
+---
 
 ---
 

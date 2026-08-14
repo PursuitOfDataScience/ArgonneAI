@@ -43,45 +43,41 @@ LOCAL_ATTENTION_WINDOW = 256
 LOGIT_SOFTCAP = 15.0
 
 # ---------------------------------------------------------------------------
-# argonne4.5 (2026-08-12). SIZE: 2,063,667,712 -- 2.0x argonne4.0, 0.72x argonne3.5.
+# argonne4.5 -- 2,063,667,712 params. SET FROM MEASUREMENT, 2026-08-14.
 #
-# Why bigger than a4.0: at essentially the same token count (62.1B vs ~64B), 3.5's 2.88B beat
-# a4.0's 1.04B by 16.79pt on 5-set think greedy despite a4 having 2.7x the tokens/param AND a
-# better data mix; pass@8 moved too (-12.72), so it is capability, not post-training. At our
-# compute budget the Chinchilla fit puts the loss optimum at 2.4-3.8B with a FLAT bottom across
-# 2.5-3.5B, and 2.0B costs only ~+0.003 predicted loss at fixed compute.
+# 51 probe arms on 3x H100 (exp/EXPERIMENTS.md) tested every lever proposed in ARGONNE4.5.md.
+# The result was almost entirely negative, and this block reflects that: a4.5 is a4.0's
+# ARCHITECTURE at a larger size, with the systems settings fixed. Nothing else survived.
 #
-# Why not larger: 2.0B runs 154B tokens in 34 days on FOUR GPUs, so the multi-node launcher
-# stops being a prerequisite, and the compute saved goes into actually ablating the five
-# untried levers -- which is the point of 4.5. Unmeasured upside from RHO-1 / real MTP / NoPE /
-# doc-masking / ReLU^2 plausibly exceeds 0.003 loss; 0.88B more dense params does not buy a
-# hypothesis, it buys a slightly lower number.
+#   REFUTED outright: LLLG sliding window (+0.038 CE AND -14.6% throughput -- no flash-attn-2 here,
+#     so the window forces an explicit SDPA mask and loses the fused is_causal kernel); NoPE global
+#     layers; intra-document masking (a real -0.034 iso-token win, but -27.5% throughput makes the
+#     baseline win by 0.353 iso-compute); a real DeepSeek-style MTP module (+0.127 iso-compute);
+#     RHO-1 selective loss (+0.449 token-matched, 23% slower).
+#   UNRESOLVED, therefore NOT adopted: ReLU^2 FFN (three measurements, three different signs);
+#     gated attention and untied embeddings (0.7 and 0.5 sigma against a measured sigma of 0.130 --
+#     campaign 1 called both wins using a noise floor that was 4.6x too small).
 #
-# Shape: head_dim 256 (Phase-1 confirmed), MLP 2.75x (the sweep's HIGH-confidence optimum),
-# 24 layers so "LLLG" divides evenly (6 global / 18 sliding, and the LAST layer is global),
-# GQA ratio 5 -> 48 KB/token KV cache, 2.5x smaller than ratio 2, which matters because the
-# deployable recipe is self-consistency at K=8-32. Both reference models run 16:1, so 5:1 is
-# conservative. FFN swap is exactly iso-param: SwiGLU 7040 (3 mat) == ReLU^2 10560 (2 mat).
-# Every fp8 GEMM dim is /16-divisible (2560, 10*256, 2*256, 7040, 10560).
-#
-# Set A45 = True only after the arch bake-off in ARGONNE4.5.md sec 4 has run.
-A45 = False
+# So: SwiGLU, tied embeddings, no gate, full attention, RoPE everywhere -- all a4.0 defaults.
+# The ONLY architecture change from a4.0 is the size (1536/32L -> 2560/24L, head_dim 256 kept).
+# Every fp8 GEMM dim stays /16-divisible: 2560, 10*256, 2*256, 7040.
+A45 = True    # argonne4.5 production. Set False to reproduce a4.0 exactly.
 if A45:
     HIDDEN_SIZE = 2560
     NUM_LAYERS = 24
     NUM_HEADS = 10
     NUM_KV_HEADS = 2
-    INTERMEDIATE_SIZE = 10560
-    MLP_TYPE = "relu2"
-    ATTN_PATTERN = "LLLG"        # Muse Glimmer's 3 sliding : 1 global
-    SLIDING_WINDOW_SIZE = 1024   # half of block 2048; ACTUALLY applied now (see model.py Finding A)
-    NOPE_GLOBAL = True           # global layers carry no RoPE -> nothing to extrapolate wrong
-    ROPE_THETA = 500000.0        # on the sliding layers only
-    DOC_MASK = True
-    MTP_MODULE_LAYERS = 1        # real MTP module, NOT the degenerate mtp_horizon path
-    MTP_LOSS_WEIGHT = 0.3
-    ATTN_GATE = False            # bake-off candidate; off until it wins an arm
+    INTERMEDIATE_SIZE = 7040
+    MLP_TYPE = "swiglu"
+    ATTN_PATTERN = None
+    SLIDING_WINDOW_SIZE = 2048
+    NOPE_GLOBAL = False
+    DOC_MASK = False
+    MTP_MODULE_LAYERS = 0
+    ATTN_GATE = False
 else:
+    # argonne4.0 reproduction path: every 4.5 flag off, so this file still builds the exact
+    # 1.04B a4.0 config and every existing a4.0 checkpoint/launcher keeps working.
     MLP_TYPE = "swiglu"
     ATTN_PATTERN = None
     SLIDING_WINDOW_SIZE = 2048
