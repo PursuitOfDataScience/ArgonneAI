@@ -93,11 +93,15 @@ for sh in ("weekend.sh", "night.sh"):
 # retention means a bad commit deletes the last good checkpoint. Execute the gates, don't just
 # read them. ~10s on CPU, and it covers continue_pretrain.py too (the phase A/B trainer, which
 # had NO gates at all until 2026-08-14).
-_t = subprocess.run([sys.executable, "exp/test_ckpt_safety.py"], capture_output=True, text=True)
-if _t.returncode != 0:
-    tail = (_t.stdout + _t.stderr).strip().splitlines()[-6:]
-    fails.append("exp/test_ckpt_safety.py FAILED — checkpoint safety is not intact:\n      "
-                 + "\n      ".join(tail))
+#
+# test_loader_resume.py guards the other silent-corruption path: ~576 chained slices all
+# resume, and a resume that restarts a cursor or overlaps two ranks trains on a fraction of
+# the corpus with no crash and no loss spike to give it away.
+for _test in ("exp/test_ckpt_safety.py", "exp/test_loader_resume.py"):
+    _t = subprocess.run([sys.executable, _test], capture_output=True, text=True)
+    if _t.returncode != 0:
+        tail = (_t.stdout + _t.stderr).strip().splitlines()[-6:]
+        fails.append(f"{_test} FAILED:\n      " + "\n      ".join(tail))
 
 print("preflight: run_full_training.sh + pretrain.py")
 print("\n".join(notes))

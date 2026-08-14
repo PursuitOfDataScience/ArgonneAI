@@ -771,9 +771,19 @@ def main():
                         write_progress_marker(args.started_marker, global_step, tokens_processed, args.data_path)
                         print(f"Continued-pretrain progress marker written to: {args.started_marker}")
 
+                # Pure telemetry, and it runs on rank 0 while every other rank is already
+                # waiting on the barrier below -- so an exception here would not just lose a
+                # sample, it would strand the whole slice until SLURM killed it at the wall
+                # clock, AFTER a good checkpoint had been written. Same treatment the post-save
+                # validation eval already gets. This path had never executed before 2026-08-14.
                 print("\nGenerating sample text...")
-                generated = generate_text(model, tokenizer, DEVICE, prompt="Long long time ago")
-                print(f"Generated: {generated}")
+                try:
+                    generated = generate_text(model, tokenizer, DEVICE, prompt="Long long time ago")
+                    print(f"Generated: {generated}")
+                except Exception as exc:  # noqa: BLE001 - never fail a slice on post-save sampling
+                    print(f"WARNING: sample generation failed and was skipped "
+                          f"({type(exc).__name__}: {exc})")
+                    torch.cuda.empty_cache()
                 print("=" * 60 + "\n")
 
             if WORLD_SIZE > 1:
