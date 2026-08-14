@@ -21,10 +21,26 @@ sections below. The result was almost entirely negative, and this page overrides
 
 ```bash
 cd /home/youzhi/ArgonneAI-4.5
-./weekend.sh --dry-run     # inspect
-./weekend.sh               # continuous self-resubmitting chain
-./night.sh                 # ONE slice at 23:00
+./weekend.sh --dry-run          # inspect
+./weekend.sh                    # continuous chain on H100 (default)
+./weekend.sh --h200             # same chain on H200
+./night.sh --h200               # ONE slice at 23:00, H200
 ```
+
+**Card selection.** a4.0 hardcoded pretrain to H100; a4.5 makes it selectable (`--h100` / `--h200`,
+or `PRETRAIN_CARD=`). Micro-batch and grad-accum follow the card so the **effective batch stays
+540,672 either way** and the LR-6e-4 recipe is unaffected:
+
+| card | HBM | micro × accum | effective |
+|---|---|---|---|
+| H100 (default) | 94 GB NVL | 16 × 11 | 540,672 |
+| H200 (`--h200`) | 141 GB | 22 × 8 | 540,672 |
+
+⚠️ **H200 availability is the practical catch.** Only `midway3-0600` / `0601` survive the node
+policy, and through this whole campaign they were **8/8 booked** by other users' multi-day jobs —
+the first free 3-GPU slot was ~7.5 h out. H100 `0426` was idle throughout, which is why every probe
+arm ran there and why H100 remains the default. Also note **all 51 probe measurements are H100 NVL
+numbers**; the +30.5% systems win is a ratio and should carry, but the absolute tok/s will not.
 
 | axis | value | basis |
 |---|---|---|
