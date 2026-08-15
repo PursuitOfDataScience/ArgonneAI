@@ -103,6 +103,32 @@ if _srcs and budget:
     notes.append(f"      corpus {_total:,} tok, budget {budget:,} => {budget/_total:.2f} passes "
                  f"aggregate / {_worst:.2f} worst-source, {int(budget/WANT_EFFECTIVE):,} steps")
 
+# A 26-day, ~628-slice run can die on 5 consecutive crashes, and until 2026-08-14 the only trace
+# was one line in one slice's .out. The worker now drops a .chain_stopped marker next to the
+# checkpoints and clears it whenever a slice starts. Assert both halves are present -- and refuse
+# to launch while a marker is sitting there, because relaunching would silently clear the only
+# record of why the last run stopped.
+if not re.search(r'rm -f "\$CHAIN_STOPPED_MARKER"', src):
+    fails.append("worker no longer clears CHAIN_STOPPED_MARKER at slice start — a stale marker "
+                 "would report a live run as dead")
+if not re.search(r'> "\$CHAIN_STOPPED_MARKER"', src):
+    fails.append("worker no longer writes CHAIN_STOPPED_MARKER on retry-budget exhaustion — a "
+                 "dead chain would again be invisible outside one slice's log")
+# CKPT_DIR is defined in terms of CHECKPOINT_ROOT, so both lines have to be eval'd -- grabbing
+# CKPT_DIR alone silently yields "/argonne45_pretrain" and the check below can never fire.
+_ckpt = subprocess.run(
+    ["bash", "-c",
+     f'eval "$(grep -E \'^(CHECKPOINT_ROOT|CKPT_DIR)=\' {WORKER} | head -2)"; echo "$CKPT_DIR"'],
+    capture_output=True, text=True).stdout.strip()
+if not _ckpt.startswith("/") or _ckpt.count("/") < 2:
+    fails.append(f"could not resolve CKPT_DIR from {WORKER} (got {_ckpt!r}) — the stale-chain "
+                 f"check would be vacuous")
+elif os.path.exists(os.path.join(_ckpt, ".chain_stopped")):
+    with open(os.path.join(_ckpt, ".chain_stopped")) as _f:
+        _why = " | ".join(l.strip() for l in _f if l.strip())
+    fails.append(f"a previous chain STOPPED and was never triaged: {_why}\n      "
+                 f"investigate, then rm {_ckpt}/.chain_stopped")
+
 if chunk is not None and chunk != 0:
     fails.append(f"PRETRAIN_CHUNK={chunk}, want 0 — chunk=0 is the +22.9% systems win")
 if stride is not None and stride != 2:
