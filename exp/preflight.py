@@ -129,6 +129,20 @@ elif os.path.exists(os.path.join(_ckpt, ".chain_stopped")):
     fails.append(f"a previous chain STOPPED and was never triaged: {_why}\n      "
                  f"investigate, then rm {_ckpt}/.chain_stopped")
 
+# weekend.sh and run_full_training.sh each carry their OWN copy of compute_slice_schedule, and
+# they drifted: the worker got the flat-hourly branch in 2026-07-29, weekend.sh never did. So the
+# launcher alone still sized the FIRST slice to the 23:00 boundary — a 22:44 launch on 2026-08-14
+# produced a 20-minute slice while every self-resubmitted slice after it ran a full hour. Require
+# both copies to honour SLICE_MODE, and both to floor at 1200s.
+for _sh in (WORKER, "weekend.sh"):
+    _s = open(_sh).read()
+    if 'SLICE_MODE:-hourly' not in _s:
+        fails.append(f"{_sh}: compute_slice_schedule has no SLICE_MODE hourly branch — it will "
+                     f"shrink the slice near the 23:00 boundary while the other copy does not")
+    if "SCHED_SECONDS=1200" not in _s:
+        fails.append(f"{_sh}: lost the 1200s slice floor — a sliver slice cannot finish "
+                     f"compile+save+resubmit and stalls the chain")
+
 if chunk is not None and chunk != 0:
     fails.append(f"PRETRAIN_CHUNK={chunk}, want 0 — chunk=0 is the +22.9% systems win")
 if stride is not None and stride != 2:
