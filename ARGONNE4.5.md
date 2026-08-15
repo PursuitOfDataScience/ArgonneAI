@@ -17,6 +17,30 @@ parameter names, which are considerably more informative than what either vendor
 Two probe campaigns (51 arms, 3× H100, `exp/EXPERIMENTS.md`) tested every lever proposed in the
 sections below. The result was almost entirely negative, and this page overrides them.
 
+### Measured throughput and how long the run takes
+
+From the real production slice (`report/1-train.out`, job 53353941, 3× 94GB H100, micro 16 ×
+accum 11), **not** from a probe:
+
+| quantity | measured |
+|---|---|
+| step time | **10.56 s** (324 steps in 3420 s of training) |
+| throughput | **51,222 tok/s** at 540,672 tok/step |
+| model FLOPs | 224 TFLOP/s per GPU ≈ **22.7% MFU** vs H100 bf16 dense peak |
+| slice startup | 72 s (warm inductor cache) |
+| checkpoint save | ~21 s (18 s write + 1.7 s verify), 23.1 GiB |
+| **full run** | **203,450 steps ≈ 24.9 days pure training, ~26 days wall clock** |
+
+Wall clock assumes ~628 one-hour slices at 95% duty. It is **card-dependent**: an H200 slice runs
+micro 22 × accum 8 (fewer accumulation boundaries) and should be faster; an 80GB H100 runs
+micro 11 × accum 16 and slower. The effective batch is pinned at 540,672 on all three, so only
+speed changes, never the schedule.
+
+22.7% MFU is modest but expected for a 2B model at seq 1024 with activation checkpointing — small
+matmuls and recompute, not idle silicon. The tested throughput levers are already banked
+(`loss_chunk_size=0` +22.9%, `checkpoint_stride=2` +6.1%, ≈+30.5% together). The one untested
+lever left is `torch.compile(mode="max-autotune")`, which needs a free GPU to A/B.
+
 ### What to run
 
 ```bash
