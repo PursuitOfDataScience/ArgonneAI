@@ -204,9 +204,17 @@ assert GRAD_ACCUM_STEPS >= 1, (
 )
 ACTUAL_TOTAL_BATCH = GRAD_ACCUM_STEPS * TOKENS_PER_MICRO
 
-# Wall time: save the checkpoint before the hard kill. argonne4.0 is ~1.04B (checkpoint
-# ~11 GB vs argonne3.5's ~32 GiB), so the flush is ~3x faster. This training-ELAPSED margin is now a
-# BACKUP; the PRIMARY save trigger is --save_deadline_epoch (absolute wall clock, startup-immune).
+# Wall time: save the checkpoint before the hard kill. This training-ELAPSED margin is a BACKUP;
+# the PRIMARY save trigger is --save_deadline_epoch (absolute wall clock, startup-immune).
+#
+# The 180s is MEASURED for a4.5, not inherited (2026-08-14). The a4.5 checkpoint is 23.1 GiB
+# (fp32 weights + AdamW moments for 2.06B), and the real slice in report/1-train.out wrote it in
+# ~18s (~1.3 GiB/s to /project). The save path then re-reads it to verify before committing --
+# that costs 1.7s in practice, because the bytes are still in page cache moments after the write,
+# and 29.5s only on a fully cold read. So:
+#     torch.save ~18s + gate1 <1s + gate2 1.7s typical (29.5s cold) = ~21s typical, ~49s worst
+# against a 180s reserve, i.e. 131s of headroom even in the worst case. Re-measure this if the
+# model grows or the checkpoint gains state; do not just scale the constant by feel.
 WALL_TIME_SAVE = args.wall_time - 180 if args.wall_time > 0 else 0
 
 # Autocast setup
