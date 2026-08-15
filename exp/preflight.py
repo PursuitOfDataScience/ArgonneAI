@@ -69,7 +69,7 @@ if budget is not None and budget != WANT_TOKENS:
 _shards = subprocess.run(
     ["bash", "-c", f'eval "$(sed -n \'247,254p\' {WORKER})"; echo "$PRETRAIN_SOURCES"'],
     capture_output=True, text=True).stdout.strip()
-_total = 0
+_srcs, _total = [], 0
 for _spec in [s for s in _shards.split(",") if s]:
     _p, _w = _spec.rsplit(":", 1)
     if not os.path.exists(_p):
@@ -79,13 +79,29 @@ for _spec in [s for s in _shards.split(",") if s]:
         _magic = int.from_bytes(_f.read(4), "little")
     if _magic != 20240801:
         fails.append(f"training shard has bad llm.c magic {_magic}: {_p}")
-    _total += (os.path.getsize(_p) - 1024) // 4
-if _total:
-    _rep = (budget or 0) / _total
-    notes.append(f"  {'OK ' if _rep <= 4.0 else 'BAD'} corpus {_total:,} tok, budget {budget:,} "
-                 f"=> {_rep:.2f} passes, {int((budget or 0)/WANT_EFFECTIVE):,} steps")
-    if _rep > 4.0:
-        fails.append(f"budget implies {_rep:.2f} passes over the corpus, beyond the ~4x free-repeat bound")
+    _n = (os.path.getsize(_p) - 1024) // 4
+    _srcs.append((os.path.basename(_p), float(_w), _n))
+    _total += _n
+
+# Repetition is PER SOURCE, not aggregate. The sampler draws each source at its weight, so a
+# source whose weight exceeds its share of the corpus is repeated harder than the corpus average.
+# Here the average is 2.89x but math is 3.32x, because it carries 30% of the draws from 26% of
+# the tokens -- the aggregate understates the real bound by 1.15x. That matters: at a 133B budget
+# math reaches 4.01x and at 154B it reaches 4.65x, both past the ~4x point where repeats stop
+# being ~free (Muennighoff). The 110B budget is set BY this constraint, not chosen round.
+if _srcs and budget:
+    _wsum = sum(w for _, w, _ in _srcs)
+    _worst = 0.0
+    for _name, _w, _n in _srcs:
+        _passes = budget * (_w / _wsum) / _n
+        _worst = max(_worst, _passes)
+        notes.append(f"  {'OK ' if _passes <= 4.0 else 'BAD'} {_name:<20} w={_w:<5g} "
+                     f"pool {_n:>15,} => {_passes:.2f} passes")
+        if _passes > 4.0:
+            fails.append(f"{_name} is repeated {_passes:.2f}x at budget {budget:,} — past the ~4x "
+                         f"free-repeat bound. Lower the budget or grow that source.")
+    notes.append(f"      corpus {_total:,} tok, budget {budget:,} => {budget/_total:.2f} passes "
+                 f"aggregate / {_worst:.2f} worst-source, {int(budget/WANT_EFFECTIVE):,} steps")
 
 if chunk is not None and chunk != 0:
     fails.append(f"PRETRAIN_CHUNK={chunk}, want 0 — chunk=0 is the +22.9% systems win")
