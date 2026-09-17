@@ -16185,3 +16185,31 @@ false. Both were parse failures, not query failures:
 `--this_flag_does_not_exist` into a copy of `ctx_chain_sn.pbs` produces exactly one finding with the
 right attribution. A checker that has only ever printed "ok" has not been tested.
 [[a-checker-inherits-its-authors-blind-spot]]
+
+### §M+396: two sophia nodes were sitting FREE with 8/8 GPUs while all four of our jobs pended. The premise was not stale; the nodes are tag-fenced. 2026-09-17 07:5x CDT.
+Pulled on the one lever that points straight at the standing goal (reduce pending time) and checked
+Sophia's real node state instead of the annotation's remembered claim. `pbsnodes -aSj`:
+```
+sophia-gpu-11   free   8/8 gpus       sophia-gpu-23   free   8/8 gpus
+```
+with 26 by-node jobs queued and ours pending on "No available resources". That is precisely the shape
+of a stale premise, so the tempting action was to submit something short and grab a node.
+⛔ **They are not available to us.** `resources_available.queue_tags` reads `infer-svc-test` on
+gpu-11 (comment: "Testing reservation") and `bigmem` on gpu-23, whose queue is `Ena=no`. A tagged node
+only accepts jobs from a queue carrying that tag, and ours are `single-node`/`by-node`. Same mechanism
+as Polaris `preemptable` never starting, which is already recorded as
+[[polaris-preemptable-is-a-dead-queue]] with the same instruction: **filter free nodes BY TAG before
+counting them.** A third node (gpu-05) came free mid-check tagged `prod`, and there is no `prod`
+queue on Sophia at all, so it is fenced for a queue that does not exist here.
+Also confirmed there is no fractional opening to exploit with a narrower shape
+([[fewer-gpus-can-beat-pending]]): every non-free node reports 0/8 GPUs available, so 8, 4 or 1 GPU
+all fail the same way. And the walls are not the obstacle either (12 h, 24 h, 24 h, 4 h queued; the
+4 h one has banked 6.5 h of eligible time and still cannot place), so §M+338's "do not shorten the
+Sophia request" stands unchanged.
+⭐ The fix is that the claim is now a MEASUREMENT. blockers.sh ended its escalation annotation with
+"sophia has no allocatable GPU (§M+252)", a citation to a days-old finding, in the very line whose job
+is to route an escalation. It now calls `~/bin/sophia_free_gpu.sh` each tick and prints
+`0 of 24 GPU nodes are placeable by us (free but tag-fenced: ...)`, naming the nodes and their tags,
+so the day a genuinely untagged node frees up the line says so instead of repeating history. The
+parse was verified on a fixture in both directions (tagged, untagged, busy, and a non-GPU node), and
+the tool is in `recipe_smoke.sh`'s liveness list because blockers now depends on it.
