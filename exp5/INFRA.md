@@ -16764,3 +16764,27 @@ figure is a running sum the filter wrote per shard as it accepted documents; the
 `stat` on the output files; the lengths figure is a sum over a separate `.npy` index. A bug that
 inflated one would have to inflate the other two identically to hide, which is why the agreement is
 informative rather than circular.
+
+### §M+419: read the checkpoint's OWN stored loss, which the standing instruction asks for and I had never done this run. It agrees with the log to 0.02. 2026-09-17 14:1x CDT.
+The standing prompt names this check explicitly ("compare against the checkpoint's OWN stored loss;
+a resume whose first logged loss is far above the stored value is broken by definition") and gives
+95055's 1.6228 as the pretrain anchor. Phase A has never had one. Read it off the /project mirror
+copy, not /eagle, with `torch.load(..., mmap=True)`: **30 s and a peak RSS of 0.46 GB**, so the
+standing warning about needing ~2x the .pt size in host RAM does not apply to a metadata read.
+
+| record | value |
+| --- | --- |
+| stored `loss` at `global_step` 216025 | **1.2314** |
+| logged `mean10` at the same wall time | 1.2258 to 1.2451 |
+⇒ **New anchor for phase A: 1.2314 at step 216025.** Quote it the way 1.6228/95055 is quoted.
+⭐ And the checkpoint's own bookkeeping cross-checks the progress figure from a completely independent
+direction:
+- `data_position / dataset_num_tokens` = 6,798,409,728 / 18,066,322,258 = **37.63%**
+- `(global_step - dataset_base_global_step) / 33414` = 12,574 / 33,414 = **37.63%**, identical
+- `dataset_num_tokens` = 18,066,322,258 = exactly `(72,265,290,056 - 1024)/4`, the flat file's own
+  byte count from §M+406, and `dataset_epoch = 0` confirms the single epoch
+- tqdm read 12,934/33,414 = 38.71% an hour later; the 360-step difference is 3,434 s at 9.54 s/step,
+  i.e. **exactly the elapsed gap**, so the instruments agree once the offset is applied
+That last row is the point worth keeping: two numbers that disagree by 1.1 percentage points are
+still consistent if they were taken an hour apart, and comparing them without aligning the clocks is
+how a healthy run gets called broken.
