@@ -16611,3 +16611,28 @@ build_reasoning_corpus.py flatten --include longctx_arxiv --budgets longctx_arxi
 `COOLDOWN` take it from there.
 ⚠️ Do NOT write a smoke output to `data/ctx_mix/ctx_mix_flat.bin`: the launcher's 4 GB floor would
 pass on a test file and phase B would train on it. Both smokes went to scratch names on purpose.
+
+### §M+413: the derived phase-B cooldown reproduces the hardcoded literal it replaced. Regression anchor, not a hope. 2026-09-17 12:2x CDT.
+§M+347 replaced `--cooldown 1658` with a derivation from the corpus size, in two launchers, and that
+code has never run. The right test is not "does it produce a plausible number" but **"does it
+reproduce the value it replaced, at the size that value was correct for"**:
+
+| mix | bytes | derived steps | `--cooldown` |
+| --- | --- | --- | --- |
+| **6.0B tokens, the original plan** | 24,000,001,024 | 11,055 | **1,658** = the literal, exactly |
+| r=1.0 (12.860B) | 51,441,734,876 | 23,696 | 3,554 |
+| r=0.9 (14.289B) | 57,157,483,080 | 26,329 | 3,949 |
+| r=0.75 (17.147B) | 68,588,979,492 | 31,595 | 4,739 |
+| truncated (0.9B) | 3,600,001,024 | 1,658 | 249, and the 4 GB floor **aborts** before training |
+
+The anchor row is the point: the derivation is not merely self-consistent, it agrees with the one
+number independently known to be right. The missing-file case falls back to 1,658 and then aborts on
+the floor, and `COOLDOWN=<n>` still overrides. The step counts also match the §M+407 table to within
+rounding, which cross-checks the two independent derivations.
+⚠️ The derivation uses `bytes/4` on the whole file, so it counts the 1024-byte header as 256 tokens.
+That is 0 steps of error at these sizes (256 tokens against 542,720 per step) and not worth a change,
+but it is the same forgotten-header class as the token-count error corrected in §M+403, so it is
+written down rather than left to be rediscovered.
+⚠️ My first harness split its labels on spaces and fed the label to the arithmetic, producing five
+`integer expression expected` errors and a column of 1,658s that looked like a suspicious constant.
+The code was fine; the test was not. Re-run with label:value pairs.
