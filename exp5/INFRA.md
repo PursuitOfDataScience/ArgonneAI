@@ -16398,3 +16398,19 @@ error is 0.00002%, but the raw byte number there should not be divided by 4 by a
 Phase B's data is now off the critical path entirely: the source is in place beside
 `reasoning_anneal_flat.bin` where `RC_OUT_ROOT` resolves it, and what remains is the flatten, which
 genuinely does wait on the mix ratio (~45 h out, at 85% of phase A).
+
+### §M+404: "quote inst" was wrong advice when the bound spans 11x. The rate line no longer picks a winner it cannot justify. 2026-09-17 10:1x CDT.
+The §M+390 bound worked as designed and then over-reached. At 10:12 the line read
+`10.00 s/step eff / 13.16 inst ... NOT resolvable over 5 min ... inst sits inside that. Quote inst`,
+and inst was 38% above Sophia's 9.53 baseline because `checkpoint_step_214894.pt` had been written
+one minute earlier: the classic §M+315 EMA poisoning. Nothing was wrong with the trainer (the save
+verified, retention pruned 214517), but the monitor endorsed the bad number.
+⛔ The cause is that the granularity bound degenerates as the step delta approaches `log_interval`:
+`hi/lo = (d+li)/(d-li)`, so d=30 against li=25 gives **[5.5, 60.0] s/step, an 11x range** in which
+"inst is inside the bound" carries no information whatsoever. A 1.5x bound needs `d >= 5*li = 125`
+steps, about 20 min at this rate, so a 15-min tick is usually not enough either. **A test whose
+acceptance region covers the whole plausible range is not a test**, and the fix is to say so rather
+than to pick a side: above 2x it now reports that neither number is quotable and names the EMA as the
+likely cause when inst sits far above the host reference.
+All six branches re-verified after the change: wide bound, tight bound, EMA above the bound, save
+inside the window, slice boundary, and agreement.
