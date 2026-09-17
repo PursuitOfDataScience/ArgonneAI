@@ -16551,9 +16551,14 @@ flatten --include longctx_arxiv --budgets longctx_arxiv=180000000,fineweb_edu=20
 | size | 800,001,024 bytes = 1024 header + 200,000,000 x 4, exact |
 | magic | **20240801**, which is what `continue_pretrain.py:83` demands |
 | token ids | 0 to 151,643, inside the 151,680 vocab |
-⭐ And it measures the build cost properly: **7.7M tok/s**, so the real flatten is ~31 min at r=0.9
-(14.3B), ~37 min at r=0.75, ~28 min at r=1.0. Consistent with the ~25 min on record, and it means the
-whole phase-B build stays comfortably inside a single slice boundary.
+⛔ **It does NOT measure the build cost, and my first version of this entry claimed it did, twice,
+with two numbers 13x apart.** The flatten's own first progress line printed `7.7M tok/s` and the
+wall clock said 2 s for 200M tokens, which is 100M tok/s: the former is an early instantaneous
+estimate before steady state, the latter is real but meaningless for extrapolation, because 800 MB
+of source and output both fit in page cache and 57 GB does not. Scaling either one gave a confident
+answer (31 min, or 2 min) and neither is justified. **The ~25 min on record (§M+318) came from an
+actual full-size flatten and remains the estimate.** A smoke test sized to run in seconds cannot
+price a job whose cost is dominated by I/O it never touches.
 ⚠️ `fineweb_edu` has only **2.201B tokens** available locally, against the 1.43B of non-arxiv the
 r=0.9 mix needs. It fits, but with little room: a lower r needs more replay than fineweb_edu alone can
 supply (r=0.75 needs 4.3B), so the conservative option would have to draw on a second general source.
