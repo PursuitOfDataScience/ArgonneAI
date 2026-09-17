@@ -16457,4 +16457,4 @@ which is the one I wanted.
 third int32, which reads 886,453,074 for a file holding 18.066B tokens and is ignored by the loader.
 Anyone dividing that field by anything gets a number 20x too small. And the check confirms phase A's
 corpus is sized to exactly one epoch: 18.0663B tokens available against 33,414 x 540,672 = 18.0654B
-required, a ratio of 1.00005.
+required, a ratio of 1.00002.
