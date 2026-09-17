@@ -16737,3 +16737,30 @@ for that string found neither, which looked like stale documentation. They grep
 `free.untagged +: +\K[0-9]+` -- the `+` is a regex metacharacter, so my search was the thing that was
 wrong. Confirmed at the real call site: both invoke it as `QUEUE_TAG=prod bash best_shape.sh` against
 POLARIS, which takes the unchanged branch and still extracts `10`.
+
+### §M+418: the phase-B corpus agrees with itself three independent ways, and the filter kept 17.8% of documents. 2026-09-17 13:5x CDT.
+Went looking for subject metadata that would quantify the forgetting risk in the r decision. There is
+none in the shards, so that side of §M+416 stays unquantified. What the per-shard `meta.json` does
+carry is the filter's own accounting, and comparing it against the bytes is an integrity check that
+had never been run:
+
+| source of the count | tokens |
+| --- | --- |
+| `qwen_tokens_kept` summed over 100 `meta.json` | 12,860,433,463 |
+| `.bin` file sizes / 4 | 12,860,433,463 |
+| `lengths.npy` arrays summed | 12,860,433,463 |
+
+**All three identical.** Three records written by different code paths at different times (the filter's
+bookkeeping, the raw byte layout, and the per-document length index) agreeing exactly is the strongest
+statement available that no shard is truncated and no document was dropped between the filter and the
+index. 100 of 100 shards report `status: ok`, and `min_doc_tokens` is 27,136 in every one, so the
+filter applied uniformly rather than to a subset.
+⭐ New number worth having: **1,542,673 documents seen, 274,362 kept, 17.8%**. That is the price of the
+>=27,136-token filter on proof-pile-2 arxiv, and it is the figure to reuse if a future stage wants a
+different length floor rather than re-deriving it from a new run.
+⚠️ An exact three-way match is the case my own rule says to distrust ("an exact 2x match with a known
+figure is a FAILED check"), so: these are not the same measurement wearing three hats. The metadata
+figure is a running sum the filter wrote per shard as it accepted documents; the byte figure is
+`stat` on the output files; the lengths figure is a sum over a separate `.npy` index. A bug that
+inflated one would have to inflate the other two identically to hide, which is why the agreement is
+informative rather than circular.
