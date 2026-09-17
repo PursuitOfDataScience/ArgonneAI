@@ -16494,3 +16494,20 @@ which says which domain to replay, not how much. My recommendation when the call
 (64% purity, 26,328 steps, ~70 h, 10% replay to hold general), with r=0.75 as the conservative
 alternative at 14 h more wall. Not acted on: the build is ~25 min and nothing is gained by committing
 early.
+
+### §M+408: the "monotone falling" mean10 was ten autocorrelated points, and the next reading was the highest of the day. 2026-09-17 11:1x CDT.
+Last tick's mean10 was 0.9360, the lowest of the day, and the ten readings I had quoted across the
+session fell monotonically from 1.2666. Ten monotone points is the kind of thing that reads as a
+trend. **This tick reads 1.4326, the highest of the day**, which settles it in one observation.
+Two reasons it was never a trend, both already on record and both worth re-applying rather than
+re-learning: `mean10` is a ROLLING window with ~0.9 autocorrelation, so a run of falls is worth
+about one independent observation ([[which-statistic-is-this-number]]); and the sequence I listed was
+in the order it appeared in my own messages, which is a selected path through the data, not a sample.
+The arithmetic closes it: the fitted phase-A slope is −1.02e-6 loss/step, so across the ~650 steps
+those readings span it predicts **−0.0007**, while the observed mean10 span is **0.4966**, roughly
+700x larger. The LR is constant until the cooldown at 85%, so there is no mechanism for a real move
+of that size either.
+⇒ The reportable statistic for the loss LEVEL remains the slice mean (sd 0.0766, §M+327) or the
+14-slice regression (residual sd 0.0577, §M+3xx), not mean10, which exists to catch a catastrophe in
+one tick and is too noisy for anything else. I caveated it correctly last tick; the lesson is that
+the caveat was load-bearing.
