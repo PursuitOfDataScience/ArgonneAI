@@ -16534,3 +16534,31 @@ swings 11x. **The mirror's duration tracks the link, not anything we run**, whic
 retraction asserted and now has three pairs behind it instead of one. Practical consequence for a
 future tick: a mirror copy anywhere between ~250 s and ~600 s is normal and needs no investigation;
 check `relay_probe.log` before suspecting the mirror.
+
+### §M+410: smoke-ran the phase-B flatten end to end. The last untested link in that pipeline now works, at the ratio I recommended. 2026-09-17 11:4x CDT.
+Everything else about phase B has been checked statically this morning (flags, data paths, header
+format, corpus relayed and md5-verified). The one link never exercised was `cmd_flatten` itself with
+a `longctx_arxiv` mix, and it carries code I wrote and never ran: the `--parts`/`--skips` overrides
+and a source that is `enabled=False`. Ran it small, to scratch, at exactly the recommended shape:
+```
+flatten --include longctx_arxiv --budgets longctx_arxiv=180000000,fineweb_edu=20000000
+```
+| check | result |
+| --- | --- |
+| disabled source re-enabled by `--include` | longctx_arxiv selected, tier=longctx |
+| `--budgets` as a source WHITELIST | only the two named sources appear, the other eight skipped |
+| ratio honoured | **0.180B / 0.020B = exactly 90/10** |
+| size | 800,001,024 bytes = 1024 header + 200,000,000 x 4, exact |
+| magic | **20240801**, which is what `continue_pretrain.py:83` demands |
+| token ids | 0 to 151,643, inside the 151,680 vocab |
+⭐ And it measures the build cost properly: **7.7M tok/s**, so the real flatten is ~31 min at r=0.9
+(14.3B), ~37 min at r=0.75, ~28 min at r=1.0. Consistent with the ~25 min on record, and it means the
+whole phase-B build stays comfortably inside a single slice boundary.
+⚠️ `fineweb_edu` has only **2.201B tokens** available locally, against the 1.43B of non-arxiv the
+r=0.9 mix needs. It fits, but with little room: a lower r needs more replay than fineweb_edu alone can
+supply (r=0.75 needs 4.3B), so the conservative option would have to draw on a second general source.
+That is a real constraint on r that the purity table did not show.
+⚠️ Smoke output (800 MB) deleted by name with `rm -f`, and the budgets used are NOT the phase-A
+registry values, so this run's windows are not disjoint from phase A. Harmless because the file is
+gone and nothing references it, but it is exactly the footgun the disjointness note in `cmd_flatten`
+warns about: never build a REAL mix with shrunken budgets.
