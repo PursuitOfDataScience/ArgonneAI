@@ -16559,11 +16559,30 @@ of source and output both fit in page cache and 57 GB does not. Scaling either o
 answer (31 min, or 2 min) and neither is justified. **The ~25 min on record (§M+318) came from an
 actual full-size flatten and remains the estimate.** A smoke test sized to run in seconds cannot
 price a job whose cost is dominated by I/O it never touches.
-⚠️ `fineweb_edu` has only **2.201B tokens** available locally, against the 1.43B of non-arxiv the
-r=0.9 mix needs. It fits, but with little room: a lower r needs more replay than fineweb_edu alone can
-supply (r=0.75 needs 4.3B), so the conservative option would have to draw on a second general source.
-That is a real constraint on r that the purity table did not show.
+⚠️ `fineweb_edu` holds only **2.201B tokens**, against the 1.43B of replay the r=0.9 mix needs. I
+first wrote that up as a real constraint on r; it is not. `fineweb_edu_a4` holds **20.607B**, so every
+r in the table is covered. Checking one source and generalising from it is the same mistake as
+quoting one slice as a rate. (The two overlap, though: the shard names are
+`fineweb-edu-train-NNNNN-of-00218` in both, so the 24-bin source is a PREFIX of the 218-bin one and a
+real mix must not draw from both without a skip.)
 ⚠️ Smoke output (800 MB) deleted by name with `rm -f`, and the budgets used are NOT the phase-A
 registry values, so this run's windows are not disjoint from phase A. Harmless because the file is
 gone and nothing references it, but it is exactly the footgun the disjointness note in `cmd_flatten`
 warns about: never build a REAL mix with shrunken budgets.
+
+### §M+411: the ALCF side could only see ONE source, so the replay corpus is relaying too. 2026-09-17 11:5x CDT.
+The flatten must run where `RC_OUT_ROOT` points, and on /eagle that directory holds exactly one
+docbin source: `longctx_arxiv`, the 100 shards relayed this morning. `reasoning_anneal_flat.bin` is
+there but it is a FLAT file and `cmd_flatten` globs docbin dirs, so it cannot serve as a source. With
+only the arxiv shards present, the only mix buildable on ALCF is r=1.0, which is not the recommended
+shape.
+Two ways to fix it, priced rather than guessed:
+- relay `fineweb_edu` (8.2 GB, 73 files) at ~8 min, then flatten on ALCF (~25 min): **~33 min**, and
+  the 57 GB output never crosses the WAN;
+- flatten on midway3 (~25 min) and relay the 57 GB result at 19.5 MB/s: **~75 min**.
+Started the first. Same argument as §M+400: the source is fixed regardless of the exact ratio, so
+this is unconditional work that comes off the critical path now rather than at 85% of phase A.
+Verification armed the same way, md5 on every file once the rsync exits.
+⚠️ 2.201B tokens of `fineweb_edu` covers the r=0.9 replay need (1.43B) but not r=0.75 (4.3B). If the
+call lands below ~0.85, `fineweb_edu_a4` has to come across too, and that is 82 GB, so it is worth
+knowing the direction of the decision before phase A ends rather than after.
