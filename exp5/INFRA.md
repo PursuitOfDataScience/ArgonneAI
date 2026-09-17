@@ -16788,3 +16788,35 @@ direction:
 That last row is the point worth keeping: two numbers that disagree by 1.1 percentage points are
 still consistent if they were taken an hour apart, and comparing them without aligning the clocks is
 how a healthy run gets called broken.
+
+### §M+420: the 11 vocab-pad rows are not anomalous, they are UNTRAINED, and the distribution says so where a ratio lied. 2026-09-17 14:2x CDT.
+Structural check of the mirrored checkpoint, all from an mmap metadata read (0.46 GB RSS): **339
+tensors, 2,451,968,512 parameters, 24 blocks**, `embed_tokens.weight` and `lm_head.weight` both
+`(151680, 2560)` fp32 and **bitwise identical on 7 sampled rows including the boundaries**, so the
+embedding tie that `continue_pretrain.py` guards ("FP8 conversion broke the embedding<->lm_head tie:
+do not train") is intact in the live run.
+Then: the 11 pad rows (151,669..151,679, added for the fp8 128-alignment,
+[[vocab-padding-was-coupled-to-fp8]]) are **not zero**. Those rows still enter the softmax
+denominator at every step and could in principle be emitted by a script that generates from the .pt
+rather than from the trimmed export.
+⛔ **My first comparison used 9 real rows and gave a pad/real norm ratio of 1.23, which I was about to
+write up as "pad rows are at or below the real scale, so they cannot outcompete a trained token".
+Both halves were wrong.** With n=2023 (stride 75, 52 MB of reads):
+
+| real row norms | value |
+| --- | --- |
+| p1 / p25 / p50 | 0.763 / 0.987 / **1.119** |
+| p95 / p99 / max | 1.362 / **1.3632** / 1.364 |
+| pad rows (all 11) | **1.3632** = the 97.6th percentile |
+
+⭐ The pad rows sit exactly at p99, and so does the compressed upper tail: that is the
+**initialisation** norm. Training with weight decay has pulled used rows DOWN (median 1.119 against
+init 1.363), so an untrained row is at the top of the distribution by construction. The pad rows are
+therefore indistinguishable from the few percent of REAL vocab ids that are never seen, and they
+carry no risk a rare-token row does not already carry. The export trims them regardless.
+⇒ Conclusion unchanged, reasoning replaced: no action. But the n=9 ratio pointed at "slightly too
+big, possibly a bug" and the n=2023 distribution pointed at "untrained, entirely expected". A ratio
+of two means is not a place in a distribution.
+⭐ Incidental and worth keeping: **embedding row norms have fallen from 1.363 at init to a median of
+1.119 after 116.8B tokens**, which is a direct read on what weight decay has done to the embedding
+table and is not recorded anywhere else.
