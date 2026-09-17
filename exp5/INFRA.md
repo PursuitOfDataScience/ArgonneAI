@@ -16104,3 +16104,38 @@ operation on executable text: the dash recast itself was fine, but the whitespac
 along with it edited code. If a sweep must touch code, its verification has to be semantic (the AST
 comparison I ran on the Python files) rather than syntactic, and shell has no AST, so the honest
 answer for `.sh` is to convert only lines that actually contain the character being removed.
+
+### §M+392: the node blacklist was append-only, so the pool could only ever shrink. It is now a derived file with a TTL. 2026-09-17 07:1x CDT.
+The 7-day window added in §M+313 bounded what the census SCANS, not what the file KEEPS: every hit
+was appended and nothing ever left, so a node repaired a month ago stays refused and the set of nodes
+the gap-filler can land on monotonically shrinks. That is backwards against the standing goal of
+reducing pending time, and it was the one deferred item on the list because the obvious mtime TTL does
+not work (the census appends continuously, so every entry looks fresh).
+⭐ The resolution is to stop treating the file as a store: `.slow_nodes` is now REBUILT each census
+run as `census evidence from the last BACKDAYS days` union `pre-flight failures inside PF_TTL_DAYS`,
+written atomically. No launcher changes, because they keep reading the same path.
+⛔ **Rebuilding from csvs alone would have silently re-admitted a node that threw a CUDA exception.**
+x3101c0s13b0n0 was blacklisted by the GPU pre-flight (§M+382), which leaves no csv evidence at all,
+so the rebuild needs a second store: the launchers append `node<space>epoch` to `.slow_nodes_pf`, and
+that file is what survives. Seeded by hand with the existing entry before the first rebuild ran, which
+is the only reason the change was not a regression on its own first execution.
+! An empty scan is ambiguous between "nothing is capped any more" (the state a TTL exists to reach)
+and "the ssh died", so the remote prints `SCANNED=<n>` and the rebuild only runs when at least one csv
+was actually read. Otherwise the existing list is kept and the tick says why.
+First run: 3 nodes preserved, correctly split into 2 census-derived and 1 pre-flight-derived, and no
+CHANGED line because the set was identical, which is the right quiet behaviour.
+
+### §M+393: the refusal-excuse marker works in production, and the strike it did not prevent was a spool artifact. 2026-09-17 07:13 CDT.
+The same sequence as §M+385 recurred at the next boundary and the mechanism can now be watched
+end to end. Slice 834 trained to 214150 and saved; slice 835 drew x3001c0s13b1n0, refused, hit the
+Q-limit, and exited to release the successor in **7 seconds**; slice 836 drew a clean pair, cleared the
+refusal counter, passed pre-flight and launched.
+836 still logged `NO PROGRESS (214150 -> 214150), strike 1/3`, which is correct given its inputs: 835
+was spooled at 11:17 from the pre-fix launcher and therefore never wrote the marker. PBS spools a copy
+at submit time ([[patching-a-script-does-not-patch-queued-jobs]]), so a launcher fix reaches the chain
+one slice later than the edit, and both jobs in flight at the time of an edit predate it. Verified that
+836 wrote `.chain_notrained_polaris = 214150` before the node gates and that the file is now ABSENT,
+i.e. the launch site deleted it, so the next refusal is the first one that will be excused.
+⚠️ The tempting second source is the predecessor's log (`launching N ranks`, which barren_slices.sh
+already parses), and it would have covered this transition. Declined: [[alarms-must-key-on-state-not-log-text]].
+The marker IS the state, and the transition costs one spurious strike out of three, once.
