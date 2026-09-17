@@ -16021,3 +16021,31 @@ was training. Ported with the identical 6-field schema (the census parses positi
 **Tick steady:** loss 1.0168, mean10 1.0944 over 8, **10.71 s/step / 50,482 tok/s / 6,310 per GPU**,
 HBM 39.0/42.4 GB (92.0%), phase A **31.5%** (local 10,512/33,414), mirror md5-verified at 213877 with
 213607 pruned, blacklist 3 nodes, all 7 monitors live, 0 NEEDS ATTENTION.
+
+### §M+389: the punctuation sweep reached 663 job logs, and my check said it had touched nothing. 2026-09-17 07:0x CDT.
+The owner's rules changed mid-session: commit and push finished work without asking, and no
+em-dash anywhere, with a standing obligation to clear a whole file when editing one that has them.
+INFRA.md alone held 2,684. A blind `sed` is explicitly banned (a swapped ` - ` "reads as a typo"),
+so the recast is rule-based: heading appositives and explanatory clauses take a colon, continuations
+take a comma, numeric ranges stay hyphens, and a lone dash in a table cell becomes `n/a`. Previewed
+14 random conversions and the damage patterns (`|: |`, `,:`) before applying, which is what caught
+the table-cell and in-cell-placeholder classes.
+⛔ **Then I widened the file list with a recursive scan and rewrote 663 `.out` job logs.** Those are
+records: the a4.5 probe logs, the fp8 campaign output. Nothing numeric moved (the measurements live
+in `[probe] RESULT {...}` JSON lines, which carry no dashes, and the six files matching a
+minus-glued-to-a-digit were pre-existing negatives like `-0.0017` and `-40`), and each log lost one
+dash from one banner line printed by `model.py`. Harmless in content, wrong in principle, and
+unrecoverable: `exp/logs` and `fp8/runs` are untracked under the `*/*` ignore rule, so there is no
+copy to restore from. **A formatting rule applies to what I author, not to the output of a run.**
+⛔⛔ **And the check I ran to size the damage reported ZERO files.** I used
+`find . -newermt "-3 minutes"`, which does not mean what it reads like; `-mmin -8` on the same tree
+listed 794. So the first thing I told myself about a mistake I had just made was that it had not
+happened. Same family as the `MIRROR_LAG_STEPS=1` and `bash -c '...' HIT="$H"` harnesses: **a check
+built in a hurry to confirm "nothing broke" is exactly the check that will agree with you.** The
+honest instrument was `git status` plus mtimes, and the proof that the Python files were untouched
+below the surface was an AST comparison with every string constant blanked, which came back
+identical on all four backed-up files and punctuation-only on the rest.
+⚠️ One real bug in the converter, found while auditing it rather than from a symptom: the
+whitespace-tidy substitutions (`\s+([,:])` and `,\s*,`) ran on **every** line, not only lines that
+held a dash, so they could have edited spacing inside an unrelated string literal. The AST check is
+what proves they did not.
