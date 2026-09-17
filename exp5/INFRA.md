@@ -16213,3 +16213,34 @@ is to route an escalation. It now calls `~/bin/sophia_free_gpu.sh` each tick and
 so the day a genuinely untagged node frees up the line says so instead of repeating history. The
 parse was verified on a fixture in both directions (tagged, untagged, busy, and a non-GPU node), and
 the tool is in `recipe_smoke.sh`'s liveness list because blockers now depends on it.
+
+### §M+397: Sophia claimed a node, and the handover threw away 250 steps of Polaris work. Measured the cost, kept the part that was free, and declined the rest. 2026-09-17 08:1x CDT.
+The trainer is back on Sophia (186168 placed at 08:03 after 26 h pending, 56,798 tok/s against the
+gap-filler's 50,958, an 11% upgrade). One trainer confirmed: Polaris has only a `W` job, no python on
+its login node, and the yield marker worked.
+**The handover cost, from the slice logs rather than from theory:** polaris slice 836 resumed 214150
+and reached **214400**; sophia slice 046 resumed **214150**. So 250 steps were redone, because a
+1 h polaris slice at `--checkpoint_interval 3600` saves only at its wall guard and this one was
+yielded at ~50 min.
+⛔ **The obvious mitigation is net-negative, and the arithmetic says so before any code.** Shortening
+the gap-filler's interval to 1800 s would cut the expected loss per handover from ~1575 s to ~900 s,
+a saving of 675 s, at a cost of one extra 84 s save on EVERY slice. At roughly one handover per 24
+slices that is 2,016 s spent to recover 675 s. Declined.
+⛔ **And save-on-yield, which IS positive (~90 s to recover ~1575 s), is blocked by two facts I
+checked before writing any of it:** `continue_pretrain.py` has no signal handling at all, so the
+yield kills the trainer outright; and Sophia resolves `RESUME` near the TOP of its launcher, ~100
+lines before it waits for `.gapfill_stopped`, so a save arriving during the wait would be ignored
+anyway. Building only the Polaris half would have produced a change that measured as doing nothing.
+Cost/benefit for the full three-part change (trainer signal handler, Polaris save-then-yield, Sophia
+re-resolution): ~2 handovers left in phase A, so ~500 steps ≈ 1.5 h of recovered work, against
+touching the one path whose failure mode is two writers on shared /eagle. Not taken now; the pieces
+and the ordering constraint are written down here so it is a decision rather than an oversight.
+⭐ **What WAS free is now done: Sophia re-resolves the resume after the handover wait.** The wait runs
+up to 5 minutes and the gap-filler's wall-guard save fires at wall-180s, so a yield landing near its
+wall writes a checkpoint that Sophia was discarding for no reason. Strictly monotone by construction:
+it accepts a step only if it is higher than the one already resolved AND the file is non-empty, so it
+cannot move the resume backwards and is a no-op in the normal case. Applied to both anneal Sophia
+launchers and the phase-B one, with the checkpoint dir taken per launcher (`ckpt_anneal` vs
+`ckpt_ctx`, asserted in the patch rather than assumed). Tested on a fixture in all four directions:
+forward on a newer save, no-op on nothing new, no move when an older file is present, and **refusal
+of a newer but empty file**, which is the torn-write case the §M+289 hardening exists for.
