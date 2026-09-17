@@ -25,7 +25,7 @@ import torch
 # login node without changing anything the test actually measures.
 torch.Tensor.pin_memory = lambda self, *a, **k: self
 
-TREES = ["/home/youzhi/ArgonneAI-4.5", "/home/youzhi/ArgonneAI"]
+TREES = ["/home/youzhi/ArgonneAI"]  # single tree since the 2026-08-23 worktree consolidation
 WORLD = 3
 T = 16          # block size
 B = 4           # micro batch
@@ -158,5 +158,5 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("ALL PASS — every slice resumes exactly where the last one stopped, on all 3 ranks,")
+print("ALL PASS: every slice resumes exactly where the last one stopped, on all 3 ranks,")
 print("           and survives the micro-batch change a different card forces.")

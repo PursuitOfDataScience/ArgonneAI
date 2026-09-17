@@ -78,14 +78,14 @@ def load_clean(source, n, seed=0):
             if g is not None:
                 probs.append((r["problem"], g))
     elif source == "mawps":
-        # MU-NLPC/Calc-mawps test (520) — independent classic word problems, CLEAN (no training mix).
+        # MU-NLPC/Calc-mawps test (520): independent classic word problems, CLEAN (no training mix).
         d = load_from_disk(f"{DATA}/mawps_clean")
         for r in d:
             g = norm(str(r["gold"]))
             if g is not None:
                 probs.append((r["question"].strip(), g))
     elif source in ("gsmplus", "gsm_plus"):
-        # qintongli/GSM-Plus test (9233) — ADVERSARIAL perturbations of GSM8K test. Semi-clean:
+        # qintongli/GSM-Plus test (9233): ADVERSARIAL perturbations of GSM8K test. Semi-clean:
         # gsm8k-DERIVED (the model was contaminated on gsm8k test, §23), but perturbations change
         # the answer so memorization doesn't transfer. Use as a robustness check, NOT a primary judge.
         d = load_from_disk(f"{DATA}/gsmplus_test")
@@ -276,11 +276,11 @@ def main():
 
         nn = len(probs)
         out(f"\n  ---- [{src}]  ({tag})  n={nn} ----")
-        out(f"    greedy pass@1            : {m_greedy['pass1']:.2f}% {wilson_ci(m_greedy['n_first'], nn)}   fm={m_greedy['fm']}")
-        out(f"    greedy + budget-forcing  : {m_bf['pass1']:.2f}% {wilson_ci(m_bf['n_first'], nn)}   fm={m_bf['fm']}")
-        out(f"    single-sample acc (T={args.temperature}) : {m_s['single_acc']:.2f}%")
-        out(f"    self-consistency (K={args.k}) : {m_s['majority']:.2f}% {wilson_ci(m_s['n_maj'], nn)}")
-        out(f"    pass@{args.k:<3}(latent ceiling) : {m_s['passk']:.2f}% {wilson_ci(m_s['n_pass'], nn)}")
+        out(f"    greedy pass@1: {m_greedy['pass1']:.2f}% {wilson_ci(m_greedy['n_first'], nn)}   fm={m_greedy['fm']}")
+        out(f"    greedy + budget-forcing: {m_bf['pass1']:.2f}% {wilson_ci(m_bf['n_first'], nn)}   fm={m_bf['fm']}")
+        out(f"    single-sample acc (T={args.temperature}): {m_s['single_acc']:.2f}%")
+        out(f"    self-consistency (K={args.k}): {m_s['majority']:.2f}% {wilson_ci(m_s['n_maj'], nn)}")
+        out(f"    pass@{args.k:<3}(latent ceiling): {m_s['passk']:.2f}% {wilson_ci(m_s['n_pass'], nn)}")
         summary.append((src, tag, m_greedy['pass1'], m_bf['pass1'], m_s['majority'], m_s['passk']))
 
     out("\n" + "=" * 78)

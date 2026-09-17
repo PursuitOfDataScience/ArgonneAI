@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Tool-call FORMAT eval — verifies the v7 tool_calc tier taught valid <tool_call> emission
+"""Tool-call FORMAT eval: verifies the v7 tool_calc tier taught valid <tool_call> emission
 (2026-07-12, §26). Held-out synthetic arithmetic queries (fresh numbers, NOT in training) + a
 calculator/python tool spec in the system message; the model should emit a parseable
 <tool_call>{"name":..,"arguments":..}</tool_call> whose expression computes the correct answer.
 
 Metrics: % emitting a valid tool_call JSON; % whose tool expression evaluates to gold; % that also
-reach the right \\boxed answer. This is a CAPABILITY check (not the ship gate — that stays clean math).
+reach the right \\boxed answer. This is a CAPABILITY check (not the ship gate, that stays clean math).
 """
 import argparse
 import ast
@@ -160,9 +160,9 @@ def main():
             n_boxed_ok += 1
     out("=" * 60)
     out(f"TOOL-CALL eval  model={Path(args.model).name}  n={n}")
-    out(f"  emitted valid <tool_call>     : {100*n_call/n:.1f}%  ({n_call}/{n})")
-    out(f"  tool expression == gold       : {100*n_expr_ok/n:.1f}%  ({n_expr_ok}/{n})")
-    out(f"  final \\boxed answer == gold   : {100*n_boxed_ok/n:.1f}%  ({n_boxed_ok}/{n})")
+    out(f"  emitted valid <tool_call>: {100*n_call/n:.1f}%  ({n_call}/{n})")
+    out(f"  tool expression == gold: {100*n_expr_ok/n:.1f}%  ({n_expr_ok}/{n})")
+    out(f"  final \\boxed answer == gold: {100*n_boxed_ok/n:.1f}%  ({n_boxed_ok}/{n})")
     out("=" * 60)
     if fh:
         fh.close()

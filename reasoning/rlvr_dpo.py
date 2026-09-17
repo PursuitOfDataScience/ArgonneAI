@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RLVR-DPO for Argonne-3.0-think (§22 lever #3) — de-risked, with an HONEST gate.
+"""RLVR-DPO for Argonne-3.0-think (§22 lever #3): de-risked, with an HONEST gate.
 
 WHY DPO AND NOT MORE GRPO: GRPO's group-relative advantage dies when all G rollouts share a
 reward (§9/§20: ~2.6% solve-rate -> most groups all-wrong -> zero gradient). DPO needs only ONE
@@ -8,7 +8,7 @@ base-limited learned verifier, which failed in §22i).
 
 TWO DE-RISKING CHOICES (from the 2026-07-09 adversarial audit):
   1. **correct-vs-WRONG pairs only.** The corpus also has correct-vs-UNCLOSED pairs, but those
-     teach *closure* — which budget-forcing already gives free at deploy (2.5->7.5%). Training on
+     teach *closure*, which budget-forcing already gives free at deploy (2.5->7.5%). Training on
      them would let DPO optimize the easily-separable FORMAT feature and reproduce the GRPO
      reward-proxy trap (moves the proxy, zero held-out gain).
   2. **step-verify the CHOSEN trace.** A trace can reach the gold answer *through* a verified-wrong
@@ -123,7 +123,7 @@ def resp_logps(model, ids, real, plens):
     """Sum log p over RESPONSE positions only. attention_mask is NOT passed (Argonne forces
     causal-only); right-padding makes that safe, and `real` masks pads out of the loss."""
     out = model(ids)
-    logits = out.logits[:, :-1, :]
+    logits = out.logits[:,:-1,:]
     tgt = ids[:, 1:]
     logp = torch.log_softmax(logits.float(), dim=-1)
     tok_logp = logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)

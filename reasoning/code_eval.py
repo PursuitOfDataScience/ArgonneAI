@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HumanEval pass@1 for the Argonne think models — verifies the v7 coding tier actually added a
+"""HumanEval pass@1 for the Argonne think models: verifies the v7 coding tier actually added a
 code-generation capability that v3 lacked (2026-07-12, §26).
 
 The shipped v3 had NO coding data; v7 adds code_magicoder. This grader measures whether that
@@ -128,8 +128,8 @@ def main():
     n = len(probs)
     out("=" * 60)
     out(f"HumanEval  model={Path(args.model).name}  n={n}")
-    out(f"  produced a function def : {100*n_code/n:.1f}%  ({n_code}/{n})")
-    out(f"  PASS@1                  : {100*n_pass/n:.1f}%  ({n_pass}/{n})")
+    out(f"  produced a function def: {100*n_code/n:.1f}%  ({n_code}/{n})")
+    out(f"  PASS@1: {100*n_pass/n:.1f}%  ({n_pass}/{n})")
     out("=" * 60)
     if fh:
         fh.close()

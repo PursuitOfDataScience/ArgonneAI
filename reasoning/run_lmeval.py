@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Open LLM Leaderboard v1 (+GSM8K) for Argonne-3.0-think via lm-eval-harness.
 
-Evaluates the local `soup_blend_a085` checkpoint (bf16 — byte-identical to the
+Evaluates the local `soup_blend_a085` checkpoint (bf16: byte-identical to the
 published `PursuitOfDataScience/Argonne-3.0-think`). Notes on this custom model:
 
 - The checkpoint config has NO `auto_map`, so `trust_remote_code` alone can't find
   the class. We `import model` (repo root) first, which self-registers the `argonne2`
-  arch with AutoModel — then `from_pretrained` resolves it.
+  arch with AutoModel, then `from_pretrained` resolves it.
 - The model has NO padding / attention-mask support, so we default to `batch_size=1`
   (right-padding is causal-safe in theory, but bs=1 removes all doubt; use --bs to test).
 - GSM8K is generative → greedy (`do_sample=False`). Anti-repeat decoding CORRUPTS this
@@ -39,10 +39,10 @@ class ArgonneHFLM(HFLM):
     """HFLM whose generation path fits ArgonneModel's custom `generate`.
 
     lm-eval's default `_model_generate` passes `stopping_criteria`, `pad_token_id`,
-    `use_cache`, etc. — but `ArgonneModel.generate` accepts only
+    `use_cache`, etc., but `ArgonneModel.generate` accepts only
     (input_ids, max_length, temperature, top_k, top_p, do_sample,
     repetition_penalty, no_repeat_ngram_size). We call it with just the supported
-    args (GREEDY, no repetition penalty — §18f: anti-repeat decoding corrupts this
+    args (GREEDY, no repetition penalty: §18f: anti-repeat decoding corrupts this
     model's arithmetic), and let lm-eval trim at the task's stop strings and extract
     the answer afterward. The model's own KV cache makes this fast.
     """

@@ -20,7 +20,7 @@ for _p in (RDIR, REPO):
 
 MODEL = "/project/rcc/youzhi/models/instruct/soup_blend_a085"
 MAX_NEW = 64
-# math + general, think and no-think — cover both code paths.
+# math + general, think and no-think: cover both code paths.
 PROMPTS = [
     ("What is 17 - 5?", True), ("What is 7 times 6?", False),
     ("If 2x + 5 = 17, what is x?", True),
@@ -38,7 +38,7 @@ def build_prompt_ids(tok):
         enc = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=True,
                                       add_generation_prompt=True, enable_thinking=think,
                                       return_tensors=None)
-        # transformers 5.x may return a BatchEncoding (dict) or nested list — extract flat ids.
+        # transformers 5.x may return a BatchEncoding (dict) or nested list: extract flat ids.
         if hasattr(enc, "keys"):
             enc = enc["input_ids"]
         if len(enc) > 0 and isinstance(enc[0], (list, tuple)):
@@ -91,7 +91,7 @@ def compare(vllm_path, ref_path, tok_path):
     tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     V = json.load(open(vllm_path))
     R = json.load(open(ref_path))
-    assert V["prompt_ids"] == R["prompt_ids"], "prompt ids differ — tokenization mismatch!"
+    assert V["prompt_ids"] == R["prompt_ids"], "prompt ids differ: tokenization mismatch!"
     n_exact = 0
     total_match_frac = 0.0
     print("=" * 70)
@@ -112,11 +112,11 @@ def compare(vllm_path, ref_path, tok_path):
             print(f"       vllm: ...{tok.decode(vg[max(0,div-3):div+3])!r}")
     n = len(V["gen"])
     print("-" * 70)
-    print(f"  EXACT-match prompts : {n_exact}/{n}")
-    print(f"  mean matched-prefix : {100*total_match_frac/n:.1f}% of tokens")
+    print(f"  EXACT-match prompts: {n_exact}/{n}")
+    print(f"  mean matched-prefix: {100*total_match_frac/n:.1f}% of tokens")
     print("  VERDICT:", "PASS (port is numerically faithful)" if n_exact == n
-          else ("CLOSE (accumulation drift — inspect)" if total_match_frac/n > 0.9
-                else "FAIL (arch bug — do NOT use the port)"))
+          else ("CLOSE (accumulation drift: inspect)" if total_match_frac/n > 0.9
+                else "FAIL (arch bug: do NOT use the port)"))
 
 
 def main():

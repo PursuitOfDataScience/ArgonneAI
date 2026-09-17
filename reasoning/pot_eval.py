@@ -6,11 +6,11 @@ is *arithmetic execution* inside *correct procedures* (`8+3=7`), and pass@256=82
 greedy=2.5% means the capability is latent but un-selectable. Both are fixed by moving
 computation OUT of the token stream and INTO a Python interpreter:
 
-  * GENERATION: the model writes a short Python program (the *procedure* — its strength);
+  * GENERATION: the model writes a short Python program (the *procedure*, its strength);
     Python does the *arithmetic* (its weakness). It never has to compute `8+3` itself.
   * SELECTION: executing K programs and voting over the *executed* answers is an
     EXTERNAL, non-base-limited verifier (the one §22i said was needed to capture the 82%
-    ceiling — a same-base learned verifier failed: best-of-N 13.5% ~= vote 13.0%).
+    ceiling: a same-base learned verifier failed: best-of-N 13.5% ~= vote 13.0%).
 
 This is a TRAINING-FREE probe: few-shot the existing model to emit code, execute, grade.
 It reuses the VALIDATED vLLM port (reasoning/vllm_argonne.py) for fast, HBM-filling
@@ -46,7 +46,7 @@ from star_generate import load_problems, norm  # noqa: E402
 SYSTEM = ("You are an expert at solving math word problems by writing a short Python "
           "program. Read the problem, then write a Python program that computes the "
           "answer step by step using variables, and prints ONLY the final numeric answer. "
-          "Do not do the arithmetic yourself — let Python compute it.")
+          "Do not do the arithmetic yourself: let Python compute it.")
 
 # Few-shot PoT exemplars: variables + expressions (NOT pre-computed literals) so the model
 # imitates OFFLOADING arithmetic to Python rather than doing it in its head.
@@ -179,12 +179,12 @@ def report(tag, per_problem, golds, out):
     k = len(per_problem[0]) if per_problem else 0
     out("  " + "-" * 68)
     out(f"  [{tag}]  n={n}  K={k}")
-    out(f"  single-sample acc      : {100*corr/max(tot,1):.2f}%  ({corr}/{tot} samples)")
-    out(f"  pass@1 (sample[0])     : {100*n_first_correct/n:.2f}%  ({n_first_correct}/{n})")
+    out(f"  single-sample acc: {100*corr/max(tot,1):.2f}%  ({corr}/{tot} samples)")
+    out(f"  pass@1 (sample[0]): {100*n_first_correct/n:.2f}%  ({n_first_correct}/{n})")
     if k > 1:
         out(f"  exec-verified self-cons: {100*n_maj/n:.2f}%  ({n_maj}/{n})   <- majority over EXECUTED answers")
         out(f"  pass@{k:<15}: {100*n_pass_k/n:.2f}%  ({n_pass_k}/{n})   <- latent ceiling")
-    out(f"  code health            : {dict(status_tally)}")
+    out(f"  code health: {dict(status_tally)}")
     has_code = tot - status_tally.get("no_code", 0)
     ran_ok = status_tally.get("ok", 0) + status_tally.get("no_number", 0)
     out(f"    has-code={100*has_code/max(tot,1):.0f}%  ran-without-error={100*ran_ok/max(tot,1):.0f}%  "

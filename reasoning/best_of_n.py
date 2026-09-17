@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Best-of-N reranking with the trained generative verifier (§22 lever #1 — the step-change).
+"""Best-of-N reranking with the trained generative verifier (§22 lever #1: the step-change).
 
 pass@256 ≈ 82% but single-sample ≈ 4%: the correct answer is in the sample set, unpicked.
 This harness: sample K candidates from the POLICY, score each with the VERIFIER (P('Yes')),
 and keep the highest-scored one. Unlike majority-vote (saturates ~K64), best-of-N keeps
-improving with K toward the pass@K ceiling — so large K is genuinely useful here (and uses the
+improving with K toward the pass@K ceiling, so large K is genuinely useful here (and uses the
 GPU well). Reports best-of-N vs majority-vote vs single-sample vs pass@K on the same samples.
 
 Two models loaded (policy + verifier). Generation is K identical copies of one prompt (KV-cached,
@@ -41,7 +41,7 @@ def verifier_p_yes(verifier, tok, question, solution, yes_id, no_id, dtype, max_
     ids = enc["input_ids"] if hasattr(enc, "keys") else enc
     ids = ids[:, -max_ctx:].to(verifier.embed_tokens.weight.device)
     with torch.autocast("cuda", dtype=dtype):
-        logits = verifier(ids).logits[0, -1, :].float()
+        logits = verifier(ids).logits[0, -1,:].float()
     two = torch.tensor([logits[yes_id], logits[no_id]])
     return float(F.softmax(two, dim=-1)[0])  # P(Yes)
 
@@ -144,10 +144,10 @@ def main():
             out(f"  [{i+1}/{n}] best-of-N={100*n_bon/(i+1):.1f}%  maj={100*n_maj/(i+1):.1f}%  "
                 f"single={100*n_single/(i+1):.1f}%  pass@{eff_k}={100*n_pass/(i+1):.1f}%")
 
-    out(f"\n  BEST-OF-N (verifier)   : {100*n_bon/n:.2f}%  ({n_bon}/{n})")
-    out(f"  majority vote          : {100*n_maj/n:.2f}%  ({n_maj}/{n})")
-    out(f"  single-sample          : {100*n_single/n:.2f}%  ({n_single}/{n})")
-    out(f"  pass@{eff_k} (ceiling)  : {100*n_pass/n:.2f}%  ({n_pass}/{n})")
+    out(f"\n  BEST-OF-N (verifier): {100*n_bon/n:.2f}%  ({n_bon}/{n})")
+    out(f"  majority vote: {100*n_maj/n:.2f}%  ({n_maj}/{n})")
+    out(f"  single-sample: {100*n_single/n:.2f}%  ({n_single}/{n})")
+    out(f"  pass@{eff_k} (ceiling): {100*n_pass/n:.2f}%  ({n_pass}/{n})")
     out(f"  verifier lift over vote: {100*(n_bon-n_maj)/n:+.2f} pts")
     if fh:
         fh.close()

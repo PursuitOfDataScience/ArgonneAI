@@ -2,7 +2,7 @@
 """Online RLVR via GRPO (Group Relative Policy Optimization) for Argonne 3.0.
 
 Why this and not more STaR: rejection-sampling SFT (star_generate.py + SFT)
-saturated — it sharpens FACT execution on the CoT path but never fixes
+saturated, it sharpens FACT execution on the CoT path but never fixes
 reasoning-CHAIN correctness (sum-loop, 2x+5, logic puzzles persist across
 think_mix2/star/star2). GRPO puts reward on the FULL rollout: sample a group
 of G traces per problem, reward = verified-correct \\boxed answer, and push the
@@ -35,7 +35,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # model.py lives at the repo ROOT (parent of reasoning/) and self-registers the
 # `argonne2` arch at import time. Put BOTH reasoning/ and root on the path so the
 # import resolves and AutoModel can load checkpoints that DON'T bundle model.py
-# (e.g. soup_blend_a085, built by build_ckpt_soup.py — config has no auto_map).
+# (e.g. soup_blend_a085, built by build_ckpt_soup.py: config has no auto_map).
 for _p in (SCRIPT_DIR, SCRIPT_DIR.parent):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -58,7 +58,7 @@ def shaped_reward(text, gold, has_eos):
     directly pressures the policy to CLOSE </think> and stop the enumeration
     loops that ate the token budget, even before it can solve the problem.
     is_correct is tracked separately so logged accuracy stays honest (the policy
-    can't game *that* — only the gold check counts).
+    can't game *that*: only the gold check counts).
     """
     closed = "</think>" in text
     pred = extract_boxed(text)
@@ -77,7 +77,7 @@ def seq_token_logp(model, ids, temp):
     """Per-token log-prob of ids[:,1:] under the model. ids: [B, L] right-padded.
     Returns [B, L-1]. Caller masks to real continuation tokens.
     """
-    logits = model(ids).logits[:, :-1, :].float() / temp
+    logits = model(ids).logits[:,:-1,:].float() / temp
     logp = F.log_softmax(logits, dim=-1)
     return logp.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
@@ -306,7 +306,7 @@ def main():
                     ids = torch.full((m, maxlen), eos_id, dtype=torch.long, device=dev)
                     genmask = torch.zeros((m, maxlen - 1), device=dev)
                     for i, s in enumerate(cseqs):
-                        ids[i, :len(s)] = torch.tensor(s, device=dev)
+                        ids[i,:len(s)] = torch.tensor(s, device=dev)
                         # token-logp index j predicts full position j+1; gen tokens live at
                         # full positions [plen, len(s)) -> indices [plen-1, len(s)-1)
                         genmask[i, plen - 1:len(s) - 1] = 1.0

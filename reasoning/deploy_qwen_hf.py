@@ -18,7 +18,7 @@ CHATML = ("{% for m in messages %}"
           "{{ '<|im_start|>' + m['role'] + '\n' + (m['content'] | trim) + '<|im_end|>' + '\n' }}"
           "{% endfor %}"
           "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}")
-IM_END = 151645   # <|im_end|> — ChatML end-of-turn; the model ends its response with this
+IM_END = 151645   # <|im_end|>: ChatML end-of-turn; the model ends its response with this
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
             shutil.copy2(src / fn, stage / fn)
             print(f"  aux: {fn}")
 
-    # embed the ChatML template in tokenizer_config.json (robust) — the bare .jinja isn't auto-loaded
+    # embed the ChatML template in tokenizer_config.json (robust): the bare .jinja isn't auto-loaded
     tc = json.load(open(stage / "tokenizer_config.json"))
     tc["chat_template"] = CHATML
     json.dump(tc, open(stage / "tokenizer_config.json", "w"), indent=2)
@@ -91,7 +91,7 @@ def main():
         enc = tok.apply_chat_template([{"role": "user", "content": "Ana has 3 boxes with 12 pencils each. She gives away 8. How many are left?"}],
                                       tokenize=True, add_generation_prompt=True, return_tensors="pt")
         ids = enc["input_ids"] if hasattr(enc, "keys") else enc
-        assert ids.shape[1] > 10, f"chat_template rendered only {ids.shape[1]} ids — template not applied!"
+        assert ids.shape[1] > 10, f"chat_template rendered only {ids.shape[1]} ids: template not applied!"
         gen = m.generate(ids, max_new_tokens=200, do_sample=False)
         txt = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=False)
         stopped = "<|im_end|>" in txt or gen.shape[1] < ids.shape[1] + 200

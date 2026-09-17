@@ -22,7 +22,7 @@ retrospectively explains §33's failure:
 
 In a self-verification trace the verification step comes AFTER the initial solve, inside the think
 block. Cutting at 128 think-tokens therefore removed the verification from ~100% of the rows meant to
-teach it — the model learned "solve, start re-checking, stop", which is exactly the double-application
+teach it: the model learned "solve, start re-checking, stop", which is exactly the double-application
 failure §33v documented and the −23.8pt one-step-arithmetic regression that blocked the §33 ship.
 Meanwhile `synth_arith` shows 0%: the arithmetic drill was never truncated, it was DROPPED by the other
 flag. Two separate mechanisms, and only a per-tier view separates them.

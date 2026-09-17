@@ -1,9 +1,9 @@
-"""Preflight for run_full_training.sh — run BEFORE every launch.
+"""Preflight for run_full_training.sh: run BEFORE every launch.
 
 Why this exists: on 2026-08-14 I edited the worker to add runtime card detection and the replaced
 text range silently swallowed `BLOCK_SIZE=1024`. `bash -n` passed (an undefined variable is legal
 bash), the job queued for 1.5 hours, won GPUs, computed
-TOTAL_BATCH_SIZE = 16 * 3 * 0 * 11 = 0, and died in under a second — wasting the slot and one of
+TOTAL_BATCH_SIZE = 16 * 3 * 0 * 11 = 0, and died in under a second: wasting the slot and one of
 five failure-retries, each of which blacklists the node it failed on.
 
 Syntax checking cannot catch that. This asserts the RESOLVED values instead, without executing the
@@ -26,7 +26,7 @@ fails, notes = [], []
 def grab(src, pattern, label, cast=int):
     m = re.search(pattern, src, re.M)
     if not m:
-        fails.append(f"{label}: NOT FOUND in {WORKER} — this is the BLOCK_SIZE failure mode")
+        fails.append(f"{label}: NOT FOUND in {WORKER}, this is the BLOCK_SIZE failure mode")
         return None
     try:
         return cast(m.group(1))
@@ -37,10 +37,40 @@ def grab(src, pattern, label, cast=int):
 
 src = open(WORKER).read()
 
-ngpus = grab(src, r"^NGPUS=(\d+)", "NGPUS")
+# NGPUS stopped being a literal when the beagle3 auto-shape picker landed: it is now
+# `NGPUS=$(( GPUS_PER_NODE * NNODES ))`, re-derived per slice from live availability. Resolve the
+# DEFAULT shape from the two `${VAR:-N}` fallbacks instead -- ngpus is only used below as a common
+# factor in the effective-batch printout, and the check that matters (every card branch landing on
+# the SAME effective batch) is invariant to it.
+ngpus = None
+if re.search(r"^NGPUS=\$\(\(\s*GPUS_PER_NODE\s*\*\s*NNODES\s*\)\)", src, re.M):
+    _gpn = re.search(r"GPUS_PER_NODE=\$\{GPUS_PER_NODE:-(\d+)\}", src)
+    _nn = re.search(r"^NNODES=\$\{NNODES:-(\d+)\}", src, re.M)
+    if _gpn and _nn:
+        ngpus = int(_gpn.group(1)) * int(_nn.group(1))
+    else:
+        fails.append("NGPUS is computed but GPUS_PER_NODE/NNODES defaults are not resolvable")
+else:
+    ngpus = grab(src, r"^NGPUS=(\d+)", "NGPUS")
 block = grab(src, r"^BLOCK_SIZE=(\d+)", "BLOCK_SIZE")
 chunk = grab(src, r"^PRETRAIN_CHUNK=\$\{A45_CHUNK:-(\d+)\}", "PRETRAIN_CHUNK")
-stride = grab(src, r"^PRETRAIN_CKPT_STRIDE=\$\{A45_CKPT_STRIDE:-(\d+)\}", "PRETRAIN_CKPT_STRIDE")
+# Same drift: the default is now an indirection (`${A45_CKPT_STRIDE:-$_CKPT_STRIDE_DEFAULT}`,
+# where the variable is 1 under ZeRO and 2 otherwise). Follow it to the non-ZeRO branch, which is
+# the production path this check is about.
+stride = None
+_m = re.search(r"^PRETRAIN_CKPT_STRIDE=\$\{A45_CKPT_STRIDE:-\$?(\w+)\}", src, re.M)
+if _m:
+    _d = _m.group(1)
+    if _d.isdigit():
+        stride = int(_d)
+    else:
+        _res = re.search(r"else\s+" + re.escape(_d) + r"=(\d+)", src)
+        if _res:
+            stride = int(_res.group(1))
+        else:
+            fails.append(f"PRETRAIN_CKPT_STRIDE defaults to ${_d}, whose non-ZeRO value is not resolvable")
+else:
+    fails.append("PRETRAIN_CKPT_STRIDE: NOT FOUND in " + WORKER + ", this is the BLOCK_SIZE failure mode")
 stride94 = grab(src, r"PRETRAIN_CKPT_STRIDE=\$\{A45_CKPT_STRIDE_94G:-(\d+)\}", "stride on >=90GB card")
 
 # every card branch must land on the SAME effective batch, or the LR recipe silently changes
@@ -50,7 +80,21 @@ if not branches:
     fails.append("card-detection branches (_MB/_GA): NOT FOUND")
 elif ngpus and block:
     for name, mb, ga in branches:
-        eff = int(mb) * ngpus * block * int(ga)
+        mb, ga = int(mb), int(ga)
+        if ga == 0:
+            # _GA=0 is a SENTINEL, not a value: the small-card branches derive the accumulation at
+            # runtime so the pinned effective batch is hit exactly (the live A100-40G slice resolved
+            # to micro 1 x accum 132 x 4 GPUs = 540,672). The invariant to check is therefore that an
+            # INTEGER accum exists -- a micro_batch that does not divide the pinned batch is what
+            # would silently change the LR recipe.
+            per_step = mb * ngpus * block
+            if per_step and WANT_EFFECTIVE % per_step == 0:
+                notes.append(f"  OK  {name:<16} micro {mb:>2} x accum {WANT_EFFECTIVE // per_step:>3} (derived) x {ngpus} x {block} = {WANT_EFFECTIVE:,}")
+            else:
+                notes.append(f"  BAD {name:<16} micro {mb:>2} x {ngpus} x {block} does not divide {WANT_EFFECTIVE:,}")
+                fails.append(f"{name}: micro {mb} x {ngpus} GPUs x {block} gives no integer accum for {WANT_EFFECTIVE:,}")
+            continue
+        eff = mb * ngpus * block * ga
         tag = "OK " if eff == WANT_EFFECTIVE else "BAD"
         notes.append(f"  {tag} {name:<16} micro {mb:>2} x accum {ga:>2} x {ngpus} x {block} = {eff:,}")
         if eff != WANT_EFFECTIVE:
@@ -98,7 +142,7 @@ if _srcs and budget:
         notes.append(f"  {'OK ' if _passes <= 4.0 else 'BAD'} {_name:<20} w={_w:<5g} "
                      f"pool {_n:>15,} => {_passes:.2f} passes")
         if _passes > 4.0:
-            fails.append(f"{_name} is repeated {_passes:.2f}x at budget {budget:,} — past the ~4x "
+            fails.append(f"{_name} is repeated {_passes:.2f}x at budget {budget:,}, past the ~4x "
                          f"free-repeat bound. Lower the budget or grow that source.")
     notes.append(f"      corpus {_total:,} tok, budget {budget:,} => {budget/_total:.2f} passes "
                  f"aggregate / {_worst:.2f} worst-source, {int(budget/WANT_EFFECTIVE):,} steps")
@@ -109,10 +153,10 @@ if _srcs and budget:
 # to launch while a marker is sitting there, because relaunching would silently clear the only
 # record of why the last run stopped.
 if not re.search(r'rm -f "\$CHAIN_STOPPED_MARKER"', src):
-    fails.append("worker no longer clears CHAIN_STOPPED_MARKER at slice start — a stale marker "
+    fails.append("worker no longer clears CHAIN_STOPPED_MARKER at slice start: a stale marker "
                  "would report a live run as dead")
 if not re.search(r'> "\$CHAIN_STOPPED_MARKER"', src):
-    fails.append("worker no longer writes CHAIN_STOPPED_MARKER on retry-budget exhaustion — a "
+    fails.append("worker no longer writes CHAIN_STOPPED_MARKER on retry-budget exhaustion: a "
                  "dead chain would again be invisible outside one slice's log")
 # CKPT_DIR is defined in terms of CHECKPOINT_ROOT, so both lines have to be eval'd -- grabbing
 # CKPT_DIR alone silently yields "/argonne45_pretrain" and the check below can never fire.
@@ -121,7 +165,7 @@ _ckpt = subprocess.run(
      f'eval "$(grep -E \'^(CHECKPOINT_ROOT|CKPT_DIR)=\' {WORKER} | head -2)"; echo "$CKPT_DIR"'],
     capture_output=True, text=True).stdout.strip()
 if not _ckpt.startswith("/") or _ckpt.count("/") < 2:
-    fails.append(f"could not resolve CKPT_DIR from {WORKER} (got {_ckpt!r}) — the stale-chain "
+    fails.append(f"could not resolve CKPT_DIR from {WORKER} (got {_ckpt!r}): the stale-chain "
                  f"check would be vacuous")
 elif os.path.exists(os.path.join(_ckpt, ".chain_stopped")):
     with open(os.path.join(_ckpt, ".chain_stopped")) as _f:
@@ -131,30 +175,30 @@ elif os.path.exists(os.path.join(_ckpt, ".chain_stopped")):
 
 # weekend.sh and run_full_training.sh each carry their OWN copy of compute_slice_schedule, and
 # they drifted: the worker got the flat-hourly branch in 2026-07-29, weekend.sh never did. So the
-# launcher alone still sized the FIRST slice to the 23:00 boundary — a 22:44 launch on 2026-08-14
+# launcher alone still sized the FIRST slice to the 23:00 boundary: a 22:44 launch on 2026-08-14
 # produced a 20-minute slice while every self-resubmitted slice after it ran a full hour. Require
 # both copies to honour SLICE_MODE, and both to floor at 1200s.
 for _sh in (WORKER, "weekend.sh"):
     _s = open(_sh).read()
     if 'SLICE_MODE:-hourly' not in _s:
-        fails.append(f"{_sh}: compute_slice_schedule has no SLICE_MODE hourly branch — it will "
+        fails.append(f"{_sh}: compute_slice_schedule has no SLICE_MODE hourly branch, it will "
                      f"shrink the slice near the 23:00 boundary while the other copy does not")
     if "SCHED_SECONDS=1200" not in _s:
-        fails.append(f"{_sh}: lost the 1200s slice floor — a sliver slice cannot finish "
+        fails.append(f"{_sh}: lost the 1200s slice floor, a sliver slice cannot finish "
                      f"compile+save+resubmit and stalls the chain")
 
 if chunk is not None and chunk != 0:
-    fails.append(f"PRETRAIN_CHUNK={chunk}, want 0 — chunk=0 is the +22.9% systems win")
+    fails.append(f"PRETRAIN_CHUNK={chunk}, want 0: chunk=0 is the +22.9% systems win")
 if stride is not None and stride != 2:
-    fails.append(f"PRETRAIN_CKPT_STRIDE={stride}, want 2 — the measured optimum (+6.1%)")
+    fails.append(f"PRETRAIN_CKPT_STRIDE={stride}, want 2: the measured optimum (+6.1%)")
 if stride94 is not None and stride94 != 2:
-    fails.append(f"94GB-card stride={stride94}, want 2 — a4.0's 16 was tuned for its 32-layer arch")
+    fails.append(f"94GB-card stride={stride94}, want 2: a4.0's 16 was tuned for its 32-layer arch")
 
 # the trainer must be building the 4.5 arch, and every top-level def must precede __main__
 # (the NameError that killed the first production slice).
 tsrc = open(TRAINER).read()
 if not re.search(r"^A45 = True", tsrc, re.M):
-    fails.append("pretrain.py has A45 = False — would train the 1.04B a4.0 arch into the 4.5 ckpt dir")
+    fails.append("pretrain.py has A45 = False: would train the 1.04B a4.0 arch into the 4.5 ckpt dir")
 import ast
 tree = ast.parse(tsrc)
 guards = [n.lineno for n in tree.body
@@ -200,4 +244,4 @@ if fails:
     for f in fails:
         print(f"  - {f}")
     sys.exit(1)
-print("\nPASS — safe to launch")
+print("\nPASS: safe to launch")

@@ -4,7 +4,7 @@
 pass@256 ≈ 82% but single-sample ≈ 4%: the right answer is usually IN the sample set, the model
 just can't pick it. A VERIFIER picks it. Since the base is a tied-embedding causal LM (no value
 head), we train a GENERATIVE verifier: given (problem, candidate solution), emit 'Yes'/'No'. Then
-best-of-N = sample N, verifier-score each, keep the highest — this is what reaches toward the 82%.
+best-of-N = sample N, verifier-score each, keep the highest, this is what reaches toward the 82%.
 
 Training data is nearly free: star_generate.py --all-out already labeled every rollout
 {correct, wrong, unclosed, no_answer}. We frame each as a chat:

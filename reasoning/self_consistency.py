@@ -4,11 +4,11 @@
 The deployed model answers a math question with GREEDY pass@1 ~3-6%, but pass@256 ~82%: the
 right answer is usually in the sample set, the model just can't pick it. Self-consistency is
 the cheapest picker: sample K traces, DISCARD the ~half that never close </think> or have no
-boxed answer, then MAJORITY-VOTE the rest. Measured ~14% on GSM8K vs ~3% greedy — a 2-4x gain,
+boxed answer, then MAJORITY-VOTE the rest. Measured ~14% on GSM8K vs ~3% greedy: a 2-4x gain,
 zero training. This is the deployable artifact (no gold needed) plus a --grade mode to measure.
 
 Optional --think-budget N force-closes </think> at N tokens (s1-style) so the ~half-that-loop
-still contribute a vote — stacks with voting. Reuses eval_math.sample_batch (budget-aware,
+still contribute a vote: stacks with voting. Reuses eval_math.sample_batch (budget-aware,
 KV-cached) + star_generate's verifier. No weights changed.
 """
 import argparse
@@ -125,7 +125,7 @@ def main():
                 out(f"  [{i+1}/{len(problems)}] vote-acc={100*n_vote_correct/(i+1):.1f}% "
                     f"pass@{args.k}(scorable)={100*n_pass_k/(i+1):.1f}%")
         n = len(problems)
-        out(f"\n  MAJORITY-VOTE accuracy : {100*n_vote_correct/n:.2f}%  ({n_vote_correct}/{n})")
+        out(f"\n  MAJORITY-VOTE accuracy: {100*n_vote_correct/n:.2f}%  ({n_vote_correct}/{n})")
         out(f"  gold-in-samples (pass@{args.k}): {100*n_pass_k/n:.2f}%  ({n_pass_k}/{n})")
         out(f"  questions with any scorable vote: {n_scorable_q}/{n}")
     else:

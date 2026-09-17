@@ -3,7 +3,7 @@
 
 Why this exists: `eval_numeracy.py` is a 10-item *eyeballed* probe (no auto-grading);
 the only honest quantitative numbers so far came from lm-eval (§20d). This is the
-missing programmatic judge — it reuses the verified `extract_boxed`/`norm`/`load_problems`/
+missing programmatic judge, it reuses the verified `extract_boxed`/`norm`/`load_problems`/
 `batched_sample` primitives from `star_generate.py` and reports:
 
   * single-sample accuracy  (matches §21's ~2.6% GSM8K)
@@ -72,7 +72,7 @@ def sample_batch(model, tok, input_ids, *, max_new_tokens, eos_id, do_sample,
     for step in range(max_new_tokens):
         out = model(step_in, past_key_values=past, use_cache=True)
         past = out.past_key_values
-        logits = out.logits[:, -1, :].float()
+        logits = out.logits[:, -1,:].float()
         if do_sample:
             logits = logits / max(temperature, 1e-6)
             if top_k:
@@ -82,7 +82,7 @@ def sample_batch(model, tok, input_ids, *, max_new_tokens, eos_id, do_sample,
                 sl, si = torch.sort(logits, descending=True)
                 cum = torch.cumsum(torch.softmax(sl, dim=-1), dim=-1)
                 rm = cum > top_p
-                rm[..., 1:] = rm[..., :-1].clone(); rm[..., 0] = False
+                rm[..., 1:] = rm[...,:-1].clone(); rm[..., 0] = False
                 logits = logits.masked_fill(rm.scatter(1, si, rm), float("-inf"))
             nxt = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
         else:
@@ -221,14 +221,14 @@ def grade_model(mp, problems, args, out):
         f"decode={'sample' if do_sample else 'greedy'} "
         f"think_budget={args.think_budget or 'off'} max_new={args.max_new_tokens} "
         f"peak_hbm={peak_hbm*100:.0f}%")
-    out(f"  single-sample accuracy : {100*fm['correct']/max(total_samples,1):.2f}%  "
+    out(f"  single-sample accuracy: {100*fm['correct']/max(total_samples,1):.2f}%  "
         f"({fm['correct']}/{total_samples} samples)")
-    out(f"  pass@1 (sample[0])     : {100*n_first_correct/n:.2f}%  ({n_first_correct}/{n})")
+    out(f"  pass@1 (sample[0]): {100*n_first_correct/n:.2f}%  ({n_first_correct}/{n})")
     out(f"  pass@{eff_k:<15}: {100*n_pass_k/n:.2f}%  ({n_pass_k}/{n})   <- latent-capability ceiling")
-    out(f"  filtered majority vote : {100*n_majority_correct/n:.2f}%  ({n_majority_correct}/{n} all) "
+    out(f"  filtered majority vote: {100*n_majority_correct/n:.2f}%  ({n_majority_correct}/{n} all) "
         f"| {100*n_majority_correct/max(n_majority_scorable,1):.2f}% of {n_majority_scorable} scorable")
     unclosed_pct = 100 * fm['unclosed'] / max(total_samples, 1)
-    out(f"  failure modes          : {fm}  (unclosed={unclosed_pct:.1f}%)")
+    out(f"  failure modes: {fm}  (unclosed={unclosed_pct:.1f}%)")
     out("  " + "-" * 66)
 
     del model
@@ -253,7 +253,7 @@ def main():
     ap.add_argument("--think-budget", type=int, default=0,
                     help="force-close </think> at N generated tokens (0=off). Requires think mode.")
     ap.add_argument("--max-new-tokens", type=int, default=1024,
-                    help="1024 (not eval_numeracy's 200 — CoT spans truncate at 200).")
+                    help="1024 (not eval_numeracy's 200: CoT spans truncate at 200).")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=50)
     ap.add_argument("--top-p", type=float, default=0.95)

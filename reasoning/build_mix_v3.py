@@ -2,7 +2,7 @@
 """Build cot_sft_mix_v3 = cot_sft_mix_v2 + a targeted MULTI-STEP tier.
 
 Why: data-calibration (mix v2), STaR, and a properly-configured GRPO all hit the
-SAME ceiling — the model handles single facts (mix v2's synth_arith fixed those)
+SAME ceiling: the model handles single facts (mix v2's synth_arith fixed those)
 but fails on multi-STEP chains. The four families the 4-quadrant eval keeps
 failing, across every checkpoint:
   1. two-operation linear algebra   (2x + 5 = 17  -> x = 6)
@@ -11,7 +11,7 @@ failing, across every checkpoint:
   4. divisor counting               (# positive divisors of 12 = 6)
 
 This tier supplies SHORT, CORRECT, multi-step <think> traces for exactly those
-families — correct BY CONSTRUCTION (every number is computed in Python; we then
+families: correct BY CONSTRUCTION (every number is computed in Python; we then
 re-verify each trace's \\boxed answer with the same extractor used for RLVR).
 We keep all of mix v2 as the anchor (the zero-sum-diet lesson: don't let a
 narrow tier erode general/no-think). Output: cot_sft_mix_v3, save_to_disk.

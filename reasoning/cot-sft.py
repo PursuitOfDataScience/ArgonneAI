@@ -17,7 +17,7 @@ Key features:
 - Masks loss so only assistant tokens contribute to training.
 - Manual input/label shift in ShiftedLossTrainer because ArgonneModel's
   forward() computes loss as cross_entropy(logits, labels) with NO
-  internal shift — the caller must align inputs and targets.
+  internal shift: the caller must align inputs and targets.
 - Auto-detects the end-of-turn token from the chat template and sets
   it as eos_token so generation stops correctly.
 - Supports DDP/multi-GPU when launched with torchrun.
@@ -375,7 +375,7 @@ def has_excessive_word_repetition(words: List[str]) -> bool:
         return True
 
     ngrams = [
-        tuple(words[i : i + TRAINING_REPEAT_NGRAM])
+        tuple(words[i: i + TRAINING_REPEAT_NGRAM])
         for i in range(0, len(words) - TRAINING_REPEAT_NGRAM + 1)
     ]
     if not ngrams:
@@ -542,7 +542,7 @@ def extract_first_answer_letter(text: str) -> Optional[str]:
 
 def maybe_expand_mcq_letter_answer(answer_line: str, user_text: str) -> str:
     stripped = answer_line.strip()
-    with_text = re.match(r"^([ABCD])\s*[\)\].:\-–]\s*(.+)$", stripped, flags=re.IGNORECASE)
+    with_text = re.match(r"^([ABCD])\s*[\)\].:\-, ]\s*(.+)$", stripped, flags=re.IGNORECASE)
     if with_text and with_text.group(2).strip():
         return with_text.group(2).strip()
 
@@ -927,7 +927,7 @@ def has_repeated_ngram_tail(token_ids: List[int], n: int, repeats: int) -> bool:
         return False
     tail = token_ids[-n:]
     for i in range(2, repeats + 1):
-        if token_ids[-i * n : -(i - 1) * n] != tail:
+        if token_ids[-i * n: -(i - 1) * n] != tail:
             return False
     return True
 
@@ -938,7 +938,7 @@ def get_no_repeat_ngram_banned_tokens(token_ids: List[int], n: int) -> List[int]
     prefix = tuple(token_ids[-(n - 1):]) if n > 1 else tuple()
     banned: List[int] = []
     for i in range(0, len(token_ids) - n + 1):
-        if tuple(token_ids[i : i + n - 1]) == prefix:
+        if tuple(token_ids[i: i + n - 1]) == prefix:
             banned.append(token_ids[i + n - 1])
     if not banned:
         return []
@@ -974,9 +974,9 @@ def generate_quality_sequence(
     answer_start_len: Optional[int] = None
 
     while generated.shape[1] < max_length:
-        chunk = generated[:, -model_to_eval.config.max_position_embeddings :]
+        chunk = generated[:, -model_to_eval.config.max_position_embeddings:]
         outputs = model_to_eval(chunk)
-        logits = outputs.logits[:, -1, :]
+        logits = outputs.logits[:, -1,:]
         gen_ids = generated[0].tolist()
         if QUALITY_NO_REPEAT_NGRAM > 1:
             banned_tokens = get_no_repeat_ngram_banned_tokens(gen_ids, QUALITY_NO_REPEAT_NGRAM)
@@ -995,7 +995,7 @@ def generate_quality_sequence(
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > QUALITY_TOP_P
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[...,:-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits = logits.masked_fill(indices_to_remove, float("-inf"))
@@ -1244,7 +1244,7 @@ def select_mcq_answer_letter(
         total = 0.0
         for tok in suffix_ids:
             chunk = torch.tensor([ids[-max_pos:]], dtype=torch.long, device=device)
-            logits = model_to_eval(chunk).logits[:, -1, :]
+            logits = model_to_eval(chunk).logits[:, -1,:]
             log_probs = torch.log_softmax(logits, dim=-1)
             total += float(log_probs[0, tok].item())
             ids.append(tok)
@@ -1302,7 +1302,7 @@ def select_yes_no_answer(
         total = 0.0
         for tok in suffix_ids:
             chunk = torch.tensor([ids[-max_pos:]], dtype=torch.long, device=device)
-            logits = model_to_eval(chunk).logits[:, -1, :]
+            logits = model_to_eval(chunk).logits[:, -1,:]
             log_probs = torch.log_softmax(logits, dim=-1)
             total += float(log_probs[0, tok].item())
             ids.append(tok)
@@ -1343,7 +1343,7 @@ def generate_open_ended_answer(
         input_ids=input_ids,
         max_length=max_length,
     )
-    gen_ids = out[0, input_ids.shape[1] :].tolist()
+    gen_ids = out[0, input_ids.shape[1]:].tolist()
     eos_id = tokenizer.eos_token_id
     if eos_id is not None and eos_id in gen_ids:
         gen_ids = gen_ids[: gen_ids.index(eos_id)]
@@ -1406,7 +1406,7 @@ def answer_questions(model, tokenizer, questions: List[str], tag: str, step: int
             input_ids=gen_kwargs["input_ids"],
             max_length=gen_kwargs["max_length"],
         )
-        gen_ids = out[0, input_ids.shape[1] :].tolist()
+        gen_ids = out[0, input_ids.shape[1]:].tolist()
         eos_id = tokenizer.eos_token_id
         if eos_id is not None and eos_id in gen_ids:
             gen_ids = gen_ids[: gen_ids.index(eos_id)]
@@ -1627,10 +1627,10 @@ class StopAfterCheckpointSaveCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 # Shifted-loss Trainer
 # ---------------------------------------------------------------------------
-# ArgonneModel.forward() does NOT shift internally — it computes:
+# ArgonneModel.forward() does NOT shift internally: it computes:
 #   loss = cross_entropy(logits.view(-1, V), labels.view(-1), ignore_index=-100)
 # So the caller must provide:
-#   x = input_ids[:, :-1]   (input tokens 0..N-2)
+#   x = input_ids[:,:-1]   (input tokens 0..N-2)
 #   y = labels[:, 1:]        (target tokens 1..N-1)
 # This way logits[i] (predicted from token i) is trained against token i+1.
 
@@ -1639,7 +1639,7 @@ class ShiftedLossTrainer(Trainer):
 
     Autocast is applied here instead of via TrainingArguments(bf16=True)
     because Accelerate's mixed-precision forward wrapper converts ALL model
-    outputs to fp32 — including the full [batch, seq, vocab] logits tensor,
+    outputs to fp32: including the full [batch, seq, vocab] logits tensor,
     a ~2 GiB/sample allocation at vocab 151k that training never reads
     (only the loss is used). That copy was the direct cause of step-1 OOMs
     at large batch sizes. sft.py's manual loop autocasts the same way.
@@ -1660,10 +1660,10 @@ class ShiftedLossTrainer(Trainer):
         if getattr(base, "_hf_internal_shift", False):
             x, y = input_ids, labels
         else:
-            x = input_ids[:, :-1].contiguous()
+            x = input_ids[:,:-1].contiguous()
             y = labels[:, 1:].contiguous()
             if attention_mask is not None:
-                attention_mask = attention_mask[:, :-1].contiguous()
+                attention_mask = attention_mask[:,:-1].contiguous()
 
         if self.autocast_dtype is not None and torch.cuda.is_available():
             with torch.autocast("cuda", dtype=self.autocast_dtype):
@@ -1692,7 +1692,7 @@ def replace_rotary_embeddings(model, RotaryEmbedding, rope_theta: float, max_seq
     rope_theta and max_position_embeddings."""
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
-    # Top-level (used by ArgonneModel — shared RoPE called in forward()).
+    # Top-level (used by ArgonneModel: shared RoPE called in forward()).
     if hasattr(model, "rotary_emb"):
         model.rotary_emb = RotaryEmbedding(
             head_dim,
@@ -2187,7 +2187,7 @@ def main() -> None:
     )
 
     # ShiftedLossTrainer because ArgonneModel.forward() does NOT shift
-    # labels internally — it computes cross_entropy(logits, labels) directly.
+    # labels internally: it computes cross_entropy(logits, labels) directly.
     trainer = ShiftedLossTrainer(
         model=model,
         args=train_args,

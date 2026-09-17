@@ -97,7 +97,7 @@ def main():
         ax[0].annotate(name, xy=(tb, ax[0].get_ylim()[0]), xytext=(4, 6),
                        textcoords="offset points", fontsize=8, color="#4a5568")
     ax[0].set_ylabel("train loss"); ax[0].legend(loc="upper right", fontsize=9)
-    ax[0].set_title("Argonne 3.5-base — training loss, perplexity, and LR vs cumulative tokens")
+    ax[0].set_title("Argonne 3.5-base: training loss, perplexity, and LR vs cumulative tokens")
     ax[1].set_ylabel("perplexity"); ax[1].set_yscale("log")
     ax[2].set_ylabel("learning rate"); ax[2].set_yscale("log")
     ax[2].set_xlabel("cumulative tokens (billions)")

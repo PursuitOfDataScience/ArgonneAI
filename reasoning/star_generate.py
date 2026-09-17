@@ -4,7 +4,7 @@
 Sample K traces per gsm8k problem from the current think model, keep only the
 ones whose final \\boxed{} answer matches the gold, and save the correct
 (question, model-trace) pairs as an SFT dataset. Fine-tuning on these
-reinforces the model's OWN correct reasoning — the offline, stable form of
+reinforces the model's OWN correct reasoning: the offline, stable form of
 RLVR (reward = verified-correct).
 
 Batching note: ArgonneModel.forward forces attention_mask=None (pure causal,
@@ -117,7 +117,7 @@ def batched_sample(model, input_ids, *, max_new_tokens, eos_id, temperature, top
     for _ in range(max_new_tokens):
         out = model(step_in, past_key_values=past, use_cache=True)
         past = out.past_key_values
-        logits = out.logits[:, -1, :].float() / temperature
+        logits = out.logits[:, -1,:].float() / temperature
         if top_k:
             kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
             logits = logits.masked_fill(logits < kth, float("-inf"))
@@ -125,7 +125,7 @@ def batched_sample(model, input_ids, *, max_new_tokens, eos_id, temperature, top
             sl, si = torch.sort(logits, descending=True)
             cum = torch.cumsum(torch.softmax(sl, dim=-1), dim=-1)
             rm = cum > top_p
-            rm[..., 1:] = rm[..., :-1].clone(); rm[..., 0] = False
+            rm[..., 1:] = rm[...,:-1].clone(); rm[..., 0] = False
             logits = logits.masked_fill(rm.scatter(1, si, rm), float("-inf"))
         nxt = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)  # [B,1]
         for b in range(B):
@@ -148,7 +148,7 @@ def autofit_k(model, prompt_ids, *, eos_id, target_frac=0.85, max_k=512,
     given (ideally longest) prompt so the prefill logit spike is captured; OOM-safe.
 
     Returns K>=1. Note: generation on a small model is HBM-light AND compute-scales with K,
-    so a high target may pick a K that is slow per problem — cap via max_k for time budgets.
+    so a high target may pick a K that is slow per problem: cap via max_k for time budgets.
     """
     total = torch.cuda.get_device_properties(0).total_memory
     best = 1

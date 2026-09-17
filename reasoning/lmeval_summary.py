@@ -9,7 +9,7 @@ WHY THIS EXISTS. The summary loop copy-pasted into the campaign launchers (`323_
 
 `acc,none` and `acc_norm,none` both start with "acc", so which one it reports depends on dict order.
 On 2026-08-04 that produced a released-model mean of **51.47** against §33i's recorded **55.21** for
-the same checkpoint — a 3.74pt phantom regression that is entirely arc_easy/hellaswag/openbookqa
+the same checkpoint: a 3.74pt phantom regression that is entirely arc_easy/hellaswag/openbookqa
 being length-normalised or not:
 
     task            acc     acc_norm

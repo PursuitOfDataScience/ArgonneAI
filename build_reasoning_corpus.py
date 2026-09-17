@@ -185,6 +185,35 @@ SOURCES = {
         require_think_closure=False, decontam=False,
         dedup_key=None,
     ),
+    # ---- PHASE B: genuinely LONG documents (added 2026-09-16, INFRA M+314) -----------
+    # Already tokenized by reasoning/build_longctx_arxiv.py (proof-pile-2 arxiv, 28.633B tok,
+    # 1.54M docs) and then LENGTH-FILTERED by reasoning/filter_docbin_by_length.py to docs
+    # >= 27,136 = 2x phase B's block_size -> 274,362 docs / 12.860B tokens / 48 GB.
+    # ⛔ THE FILTER IS A SEPARATE PASS BECAUSE `min_doc_tokens` BELOW IS TOKENIZE-TIME ONLY.
+    # cmd_flatten globs `$RC_OUT_ROOT/<name>/*.bin` and memmaps it densely -- it never reads
+    # min_doc_tokens, _source_manifest.json, or the per-doc lengths. So on a PRE-TOKENIZED source
+    # the knob is inert, and M+286's "docs >= 13,568 is min_doc_tokens=13568, not a script" was
+    # wrong in the one way that matters. It is kept here as documentation of what the .bin holds.
+    # ⭐ 2x the block size, not 1x, and it was MEASURED: P(a 13,568-token window lies inside ONE
+    # document) is 41.6% unfiltered, 53.0% at >=13,568, 71.1% at >=27,136, 84.5% at >=54,272 --
+    # and 54,272 leaves only 4.9B tokens, under phase B's ~6.0B budget. A doc of exactly one
+    # window still straddles unless the stream offset happens to align to it, which is why the
+    # 1x filter barely helps.
+    # ⚠️ enabled=False DELIBERATELY: with enabled=True this source would join any future rebuild
+    # of the PHASE-A reasoning_anneal corpus and silently change a recipe that is mid-run. Include
+    # it explicitly (`--include longctx_arxiv --budgets longctx_arxiv=<N>,...`).
+    # ⚠️ budget_tokens=0 means "the ratio has NOT been chosen" -- the arxiv:reasoning split is
+    # deferred until phase A's curve is in (M+260). Note flatten reads 0 as "use everything
+    # available", i.e. 12.860B, so the `--budgets` number is mandatory, not optional.
+    "longctx_arxiv": dict(
+        tier="longctx", fmt="docbin", renderer=None, enabled=False,
+        files=lambda: [],          # tokenization + filtering are done; flatten globs the outdir
+        columns=None, renderer_args=None,
+        budget_tokens=0, n_shards=100,
+        min_doc_tokens=27136, max_doc_tokens=10_429_200,
+        require_think_closure=False, decontam=False,
+        dedup_key=None,
+    ),
     # ---- Defined but OFF by default (medium quality, chatty; tangential to anneal) ---
     "instruct_chat": dict(
         tier="instruction", fmt="jsonl", renderer="chat", enabled=False,
@@ -725,6 +754,25 @@ def cmd_flatten(args):
             overrides[k.strip()] = int(float(v))
     if overrides:
         print(f"[flatten] budget overrides: {overrides}")
+    def _kvmap(raw):
+        d = {}
+        for kv in (raw or "").split(","):
+            if kv.strip():
+                k, v = kv.split("=", 1)
+                d[k.strip()] = v.strip()
+        return d
+    _parts = _kvmap(getattr(args, "parts", ""))
+    _skips = _kvmap(getattr(args, "skips", ""))
+    for k, v in _parts.items():
+        if v not in ("all", "main", "holdout"):
+            raise SystemExit(f"[flatten] --parts {k}={v}: must be all|main|holdout")
+        if k not in SOURCES:
+            raise SystemExit(f"[flatten] --parts names unknown source {k!r}")
+    for k in _skips:
+        if k not in SOURCES:
+            raise SystemExit(f"[flatten] --skips names unknown source {k!r}")
+    if _parts or _skips:
+        print(f"[flatten] per-source part={_parts or '-'} skip={_skips or '-'}")
     srcs = []
     for name, cfg in SOURCES.items():
         if not cfg.get("enabled", True) and name not in (args.include or []):
@@ -742,20 +790,29 @@ def cmd_flatten(args):
         use = min(avail, budget) if budget > 0 else avail
         frac = max(0.0, min(1.0, args.holdout_frac))
         split = int(round((1.0 - frac) * use))            # main=[0,split)  holdout=[split,use)  (DISJOINT)
-        if args.part == "main":
+        # ⛔ DISJOINTNESS IS A PROPERTY OF `use`, NOT OF THE WORD "holdout". split is computed from
+        # min(avail, budget), so a SMALLER budget than the earlier run's moves the split EARLIER and
+        # the resulting "holdout" lands INSIDE the previous run's main window -- i.e. it re-serves
+        # data that was already trained on, silently. To stay disjoint from phase A, pass each
+        # reasoning source the SAME budget phase A used (the registry values reproduce it, since
+        # use=min(avail,budget) and avail<=budget for every source but github_code, where they are
+        # equal). Shrink a source's contribution with --skips, never by lowering its budget.
+        _part = _parts.get(name, args.part)
+        if _part == "main":
             start, end = 0, split
-        elif args.part == "holdout":
+        elif _part == "holdout":
             start, end = split, use
         else:
             start, end = 0, use
         # Drop the already-consumed front of the window (see --skip_frac).
-        skip = max(0.0, min(1.0, getattr(args, "skip_frac", 0.0)))
+        skip = max(0.0, min(1.0, float(_skips.get(name, getattr(args, "skip_frac", 0.0)))))
         if skip > 0:
             start += int(round(skip * (end - start)))
         srcs.append(dict(name=name, tier=cfg["tier"], mms=mms, use=(end - start),
                          emitted=0, idx=0, off=0, start=start))
         print(f"[flatten] {name:22} tier={cfg['tier']:11} avail={avail/1e9:6.3f}B "
-              f"part={args.part} window=[{start/1e9:.3f}B,{end/1e9:.3f}B) emit={(end - start)/1e9:6.3f}B ({len(bins)} bins)")
+              f"part={_part}{'' if skip <= 0 else f' skip={skip:g}'} "
+              f"window=[{start/1e9:.3f}B,{end/1e9:.3f}B) emit={(end - start)/1e9:6.3f}B ({len(bins)} bins)")
 
     # Pre-skip each source to the start of its window (the holdout part starts mid-stream). This is
     # what makes main/holdout share NO source tokens -> genuinely DISJOINT, same-composite slices.
@@ -860,6 +917,16 @@ def main():
     p.add_argument("--budgets", default="",
                    help="Per-source budget override, 'name=tokens,name=tokens'. Sets the mix without "
                         "editing SOURCES (emitted ~= budget * (1-holdout_frac) * (1-skip_frac)).")
+    # ⭐ PER-SOURCE part/skip (added 2026-09-16, INFRA M+318). --part and --skip_frac are GLOBAL, and
+    # that is exactly wrong for a mix whose sources have different histories: phase B needs the
+    # DISJOINT holdout of the reasoning sources (which phase A already read the main 75% of) mixed
+    # with ALL of a long-context source phase A never touched. With only the global flag, `--part
+    # holdout` also truncates the new source to its last 25%, and the phase-B reasoning contribution
+    # is pinned at exactly 0.25 x budget with no way to take less while staying disjoint.
+    p.add_argument("--parts", default="",
+                   help="Per-source --part override, 'name=all|main|holdout,...'. Falls back to --part.")
+    p.add_argument("--skips", default="",
+                   help="Per-source --skip_frac override, 'name=frac,...'. Falls back to --skip_frac.")
     args = ap.parse_args()
     {"list": cmd_list, "inspect": cmd_inspect, "tokenize": cmd_tokenize,
      "finalize": cmd_finalize, "flatten": cmd_flatten}[args.cmd](args)

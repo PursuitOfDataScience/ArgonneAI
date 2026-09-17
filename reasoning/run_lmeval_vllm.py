@@ -1,4 +1,4 @@
-"""lm-eval-harness via the VALIDATED vLLM backend (fast + 90% HBM) — the right way to benchmark
+"""lm-eval-harness via the VALIDATED vLLM backend (fast + 90% HBM): the right way to benchmark
 the custom argonne2 arch. Same task suite as run_lmeval.py (the published card), but uses
 lm_eval's native VLLM model (continuous batching) instead of the bs=1 HF path (~10-50x faster).
 Builds the vLLM engine ONCE and reuses it across tasks; isolates per-task failures."""

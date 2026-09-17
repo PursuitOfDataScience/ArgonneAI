@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""v9 mix — cot_sft_mix_v9. BREVITY self-distillation (§30).
+"""v9 mix: cot_sft_mix_v9. BREVITY self-distillation (§30).
 
 Hypothesis (from the n=500 frontier audit): the dominant greedy loss is unclosed/no-answer
-(15-30% of greedy attempts never emit an answer — thinking loops past the 256 budget at temp 0).
+(15-30% of greedy attempts never emit an answer: thinking loops past the 256 budget at temp 0).
 v6/v7/v8 all TRADED because the TEACHER tier homogenized the answer distribution (self-cons down).
 
 v9 removes the homogenizer and makes the reasoning signal ENTIRELY v3's OWN verified-correct traces
@@ -27,7 +27,7 @@ SEED = 20260713
 MAX_TOK = 640
 
 # v6-backbone tiers KEPT (general anchor + procedure/format + with-think general). gsm8k_train_short
-# is DROPPED — the fresh short self-anchor replaces it with model-own concise traces.
+# is DROPPED: the fresh short self-anchor replaces it with model-own concise traces.
 V9_CAPS = {
     "direct_tulu": 14500,       # no-think general anchor (hold guardrail)
     "ms_algebra": 1000, "ms_series": 1000, "ms_geometry": 1000, "ms_divisors": 1000,  # procedure/format

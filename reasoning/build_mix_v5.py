@@ -6,7 +6,7 @@ accuracy flat) and is generation-bound (HBM idle most of each step). A pure CoT-
 keeps the GPU HBM-full continuously AND is the highest-leverage lever we've found (data).
 
 This reuses build_mix_v3's correct-by-construction multi-step generators (algebra / series /
-geometry / divisors — the four §10 residual families) but amplifies PER_FAMILY 5000 -> 12000
+geometry / divisors: the four §10 residual families) but amplifies PER_FAMILY 5000 -> 12000
 (48k multi-step vs 20k), so the model drills the exact multi-step chains it fails on, with
 every trace re-verified by the RLVR \\boxed extractor. Anchor = all of mix v2 (zero-sum-diet
 guard: keep general/no-think intact). No self-generation -> no HBM-light generation phase.

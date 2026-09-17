@@ -16,6 +16,14 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 
 
+# argonne4.5: the SDPA OOM guard below must work on CUDA *and* Intel XPU, where
+# `torch.cuda.OutOfMemoryError` is not defined at all. torch.OutOfMemoryError is
+# the backend-agnostic form (torch >= 2.5); fall back for older CUDA builds.
+_OOM_ERRORS = tuple(e for e in (
+    getattr(torch, "OutOfMemoryError", None),
+    getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
+) if isinstance(e, type)) or (RuntimeError,)
+
 flash_attn_func = None
 _flash_attn_available = False
 if importlib.util.find_spec("flash_attn") is not None:
@@ -135,7 +143,7 @@ class ArgonneConfig(PretrainedConfig):
             int(local_attention_window) if local_attention_window is not None and int(local_attention_window) > 0 else None
         )
         # argonne4.5 attention layout. `attn_pattern` is a cycled string of 'L' (local/sliding)
-        # and 'G' (global/full) -- Muse Glimmer's layout is "LLLG" (3 sliding@2048 : 1 full).
+        # and 'G' (global/full) -- Muse Glimmer's layout is "LLLG" (3 sliding@2048: 1 full).
         # When set it OVERRIDES interleaved_local_attention/local_attention_window. `nope_global`
         # strips RoPE from the global layers (Muse sets layer_rope_theta=0 on exactly those),
         # so the layers that see the whole sequence carry no frequency basis to extrapolate wrong.
@@ -243,8 +251,8 @@ class RotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x1 = x[...,: x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -329,7 +337,7 @@ class GroupedQueryAttention(nn.Module):
         if self.num_key_value_groups == 1:
             return x
         bsz, num_kv, seqlen, head_dim = x.shape
-        x = x[:, :, None, :, :].expand(bsz, num_kv, self.num_key_value_groups, seqlen, head_dim)
+        x = x[:,:, None,:,:].expand(bsz, num_kv, self.num_key_value_groups, seqlen, head_dim)
         return x.reshape(bsz, num_kv * self.num_key_value_groups, seqlen, head_dim)
 
     def forward(
@@ -377,7 +385,7 @@ class GroupedQueryAttention(nn.Module):
         if is_decode:
             q_pos = torch.arange(kv_len - seqlen, kv_len, device=hidden_states.device)
             k_pos = torch.arange(kv_len, device=hidden_states.device)
-            allowed = k_pos[None, :] <= q_pos[:, None]
+            allowed = k_pos[None,:] <= q_pos[:, None]
             decode_mask = torch.zeros(seqlen, kv_len, dtype=query.dtype, device=hidden_states.device)
             decode_mask = decode_mask.masked_fill(~allowed, -65504.0)[None, None]
 
@@ -392,7 +400,7 @@ class GroupedQueryAttention(nn.Module):
         # FLASH/cuDNN kernel: ~2x lower attention memory + faster. Training-under-autocast only;
         # inference/decode (self.training False) is untouched.
         if self.training and torch.is_autocast_enabled() and query.dtype not in (torch.float16, torch.bfloat16):
-            _ac_dtype = torch.get_autocast_dtype("cuda") if hasattr(torch, "get_autocast_dtype") else torch.get_autocast_gpu_dtype()
+            _ac_dtype = torch.get_autocast_dtype(query.device.type) if hasattr(torch, "get_autocast_dtype") else torch.get_autocast_gpu_dtype()
             query = query.to(_ac_dtype)
             key = key.to(_ac_dtype)
             value = value.to(_ac_dtype)
@@ -454,8 +462,8 @@ class GroupedQueryAttention(nn.Module):
                     # Token i attends to keys in [i-w, i].
                     qi = torch.arange(seqlen, device=hidden_states.device)
                     ki = torch.arange(kv_len, device=hidden_states.device)
-                    win_mask = (ki[None, :] <= qi[:, None]) & (
-                        ki[None, :] >= qi[:, None] - self.sliding_window)
+                    win_mask = (ki[None,:] <= qi[:, None]) & (
+                        ki[None,:] >= qi[:, None] - self.sliding_window)
                     attn_output = F.scaled_dot_product_attention(
                         query,
                         key,
@@ -485,7 +493,7 @@ class GroupedQueryAttention(nn.Module):
                         dropout_p=self.attention_dropout if self.training else 0.0,
                         is_causal=False,  # Mask already includes causal component
                     )
-            except torch.cuda.OutOfMemoryError:
+            except _OOM_ERRORS:
                 # Do NOT degrade to math attention on OOM. torch.OutOfMemoryError subclasses
                 # RuntimeError, so the old blanket `except RuntimeError` turned a recoverable SDPA
                 # OOM into the seq^2 math path -- which needs strictly MORE memory and then dies
@@ -514,7 +522,7 @@ class GroupedQueryAttention(nn.Module):
                 if self.sliding_window is not None:
                     qi = torch.arange(seqlen, device=hidden_states.device)
                     ki = torch.arange(kv_len, device=hidden_states.device)
-                    too_old = ki[None, :] < qi[:, None] - self.sliding_window
+                    too_old = ki[None,:] < qi[:, None] - self.sliding_window
                     scores = scores.masked_fill(too_old, mask_value)
                 if attention_mask is not None:
                     # Bool masks (argonne4.5 document masking) are True == attend; the legacy
@@ -695,7 +703,7 @@ class ArgonneModel(PreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([Block(config, idx) for idx in range(config.num_hidden_layers)])
         # argonne4.5 layout: an explicit 'L'/'G' pattern (e.g. Muse Glimmer's "LLLG" = 3
-        # sliding@2048 : 1 full) takes precedence over the legacy odd/even interleave. On 'G'
+        # sliding@2048: 1 full) takes precedence over the legacy odd/even interleave. On 'G'
         # layers `nope_global` removes RoPE outright -- Muse sets layer_rope_theta=0 on exactly
         # those layers, so the only layers that see the whole sequence carry no frequency basis
         # to extrapolate incorrectly past the training block.
@@ -732,8 +740,8 @@ class ArgonneModel(PreTrainedModel):
         # Selective activation checkpointing (ported from argonne4.0). Runtime-only --
         # NOT part of config or state_dict, so checkpoint/resume compatibility with every
         # existing argonne3.5 checkpoint is unaffected. checkpoint_stride S:
-        #   S == 1 : checkpoint ALL layers (default; identical to prior behavior).
-        #   S >= 2 : checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer
+        #   S == 1: checkpoint ALL layers (default; identical to prior behavior).
+        #   S >= 2: checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer
         #            -> store ceil(n_layers/S), recompute the rest. Smaller S stores MORE
         #            (more HBM, less recompute, faster); too-small S OOMs.
         # Numerically identical either way: it only chooses store-vs-recompute.
@@ -941,7 +949,7 @@ class ArgonneModel(PreTrainedModel):
                 max_horizon = min(self.config.mtp_horizon, labels.shape[1])
                 for horizon in range(2, max_horizon + 1):
                     shift = horizon - 1
-                    shifted_logits = logits[:, :-shift, :]
+                    shifted_logits = logits[:,:-shift,:]
                     shifted_labels = labels[:, shift:]
                     if shifted_logits.numel() == 0:
                         continue
@@ -962,7 +970,7 @@ class ArgonneModel(PreTrainedModel):
                 loss = loss + (self.config.z_loss_weight * z.pow(2).mean()).to(loss.dtype)
 
             # A NaN loss becomes a zero loss that is still connected to every
-            # parameter — but through the parameters directly, NOT through the
+            # parameter: but through the parameters directly, NOT through the
             # network's (possibly NaN) activations. Backward then delivers an
             # exact zero gradient to each parameter: DDP/FSDP gradient hooks
             # all fire (no collective desync/hang) and the optimizer step is a
@@ -993,14 +1001,14 @@ class ArgonneModel(PreTrainedModel):
         across every layer with the same window (at most two under an 'LLLG' layout).
         """
         qi = torch.arange(seq_length, device=document_ids.device)
-        same_doc = document_ids[:, :, None] == document_ids[:, None, :]   # (B, T, T)
-        base = same_doc & (qi[:, None] >= qi[None, :])
+        same_doc = document_ids[:,:, None] == document_ids[:, None,:]   # (B, T, T)
+        base = same_doc & (qi[:, None] >= qi[None,:])
         masks = {}
         for window in {block.attn.sliding_window for block in self.blocks}:
             if window is None:
                 masks[None] = base.unsqueeze(1)
             else:
-                masks[window] = (base & (qi[None, :] >= qi[:, None] - window)).unsqueeze(1)
+                masks[window] = (base & (qi[None,:] >= qi[:, None] - window)).unsqueeze(1)
         return masks
 
     def _mtp_module_loss(self, hidden_states, labels, rotary):
@@ -1026,14 +1034,25 @@ class ArgonneModel(PreTrainedModel):
             usable = ((seq_len - k) // align) * align
             if usable < 1:
                 break
-            h_in = h_prev[:, :usable, :]
-            tokens_in = labels[:, k - 1 : k - 1 + usable]
-            targets = labels[:, k : k + usable]
+            h_in = h_prev[:,:usable,:]
+            tokens_in = labels[:, k - 1: k - 1 + usable]
+            targets = labels[:, k: k + usable]
             # Ignored positions (-100) would index the embedding out of range; their targets are
             # ignored by cross_entropy anyway, so any in-range id works as a placeholder.
             embeds_in = self.embed_tokens(tokens_in.clamp_min(0))
             rot_k = (rotary[0][:usable], rotary[1][:usable])
             h_out = module(h_in, embeds_in, rot_k)
+            # ⛔ DO NOT "optimise" this with _chunked_lm_loss -- MEASURED WORSE, 2026-08-27.
+            # Real MTP (mtp_module_layers=1) is a genuine iso-token quality win (tgt -0.058, code
+            # -0.118, both seeds, every domain) but costs -42% throughput (5,348 -> 3,082 tok/s), so
+            # iso-compute it LOSES by 0.27-0.33: the same wall buys 1.73x more tokens without it.
+            # I hypothesised the -42% was this line materialising [T, 151680] logits per depth, and
+            # routed it through _chunked_lm_loss (equivalence proven to 9.5e-7). Result: tok/s went
+            # 3,082 -> 2,723, i.e. cost rose to -49.1%, at HBM 0.960 with quality unchanged.
+            # ⇒ The transient was NOT the bottleneck; chunking's recompute overhead is pure loss here.
+            # The cost is INHERENT: each depth runs a full extra block AND a 151,680-wide lm_head GEMM
+            # in forward and backward. MTP is rejected on cost, not on an artifact -- do not retry
+            # this optimisation.
             mtp_logits = self.lm_head(h_out)
             if cap > 0:
                 mtp_logits = torch.tanh(mtp_logits / cap) * cap
@@ -1125,7 +1144,7 @@ class ArgonneModel(PreTrainedModel):
                 chunk = input_ids[:, -ctx:]
                 outputs = self.forward(chunk, use_cache=True)
                 past = outputs.past_key_values
-            logits = outputs.logits[:, -1, :] / temperature
+            logits = outputs.logits[:, -1,:] / temperature
 
             if repetition_penalty != 1.0:
                 for b in range(input_ids.shape[0]):
@@ -1144,12 +1163,12 @@ class ArgonneModel(PreTrainedModel):
                     seq = input_ids[b].tolist()
                     ngrams = {}
                     for i in range(len(seq) - n + 1):
-                        prefix = tuple(seq[i : i + n - 1]) if n > 1 else tuple()
+                        prefix = tuple(seq[i: i + n - 1]) if n > 1 else tuple()
                         next_token = seq[i + n - 1]
                         if prefix not in ngrams:
                             ngrams[prefix] = set()
                         ngrams[prefix].add(next_token)
-                    current_prefix = tuple(seq[-(n - 1) :]) if n > 1 else tuple()
+                    current_prefix = tuple(seq[-(n - 1):]) if n > 1 else tuple()
                     banned = ngrams.get(current_prefix, set())
                     if banned:
                         logits[b, list(banned)] = float("-inf")
@@ -1162,7 +1181,7 @@ class ArgonneModel(PreTrainedModel):
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                     sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[...,:-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
                     indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                     logits = logits.masked_fill(indices_to_remove, float("-inf"))

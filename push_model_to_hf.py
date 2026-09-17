@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 from collections import OrderedDict
@@ -825,6 +826,73 @@ CHAT_EOS_TOKEN_ID = 151645          # <|im_end|> -- the turn terminator for the 
 CTX13568 = 13568
 
 
+def staged_tensor_names(temp_path):
+    """Every tensor name in the staged weight files, read with the STDLIB only.
+
+    Used to DERIVE tie_word_embeddings from the artifact instead of trusting a class default. Reads a
+    safetensors shard header directly (8-byte little-endian JSON length, then the JSON) rather than
+    importing `safetensors`, because a publish preflight must not turn a missing dependency into a
+    claim about the weights -- that exact substitution produced a "corpus corrupt" verdict from an
+    absent numpy (INFRA M+175).
+
+    Returns None if it cannot enumerate, which callers must treat as UNKNOWN, never as "not present".
+    """
+    index = temp_path / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            return set(json.loads(index.read_text())["weight_map"])
+        except (ValueError, KeyError):
+            return None
+    names = set()
+    shards = sorted(temp_path.glob("*.safetensors"))
+    if not shards:
+        return None
+    for sh in shards:
+        try:
+            with open(sh, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                if not 0 < n < 100_000_000:
+                    return None
+                head = json.loads(fh.read(n))
+        except (OSError, ValueError, struct.error):
+            return None
+        names.update(k for k in head if k != "__metadata__")
+    return names or None
+
+
+def derive_special_token_ids(temp_path):
+    """Map the staged tokenizer's special TOKENS to their IDS, stdlib only.
+
+    ⛔ WHY (2026-09-15, INFRA M+227). `rewrite_config_dtype`'s own docstring lists `eos_token_id` as
+    one of the four silent release defects it exists to fix -- but it only ever SET it for the chat
+    profiles. A dry-run of the a4.5 base export staged `eos_token_id: null`, so `.generate()` would
+    have had no stop token unless the caller passed one, which is the same defect the function was
+    written for, unhandled for the one profile that is not chat. (Memory
+    argonne-3-think-published: `eos_token_id` null on 5 published repos.)
+
+    ⭐ DERIVED, not hardcoded -- the lesson from the vocab pad that was gated on `--fp8`: read the
+    property off the artifact. `tokenizer_config.json` names the token, `tokenizer.json`'s
+    `added_tokens` gives its id, so the right answer falls out per profile automatically (base wants
+    <|endoftext|> = 151643, chat wants <|im_end|> = 151645) instead of a constant per profile.
+    Returns {} when the files are unreadable, so the CALLER decides -- an unreadable tokenizer must
+    not silently become "no eos".
+    """
+    out = {}
+    try:
+        tk = json.loads((Path(temp_path) / "tokenizer_config.json").read_text())
+        tj = json.loads((Path(temp_path) / "tokenizer.json").read_text())
+    except (OSError, ValueError):
+        return out
+    ids = {t.get("content"): t.get("id") for t in tj.get("added_tokens", []) if isinstance(t, dict)}
+    for key in ("eos_token", "bos_token", "pad_token", "unk_token"):
+        tok = tk.get(key)
+        if isinstance(tok, dict):
+            tok = tok.get("content")
+        if isinstance(tok, str) and tok in ids:
+            out[key.replace("_token", "_token_id")] = ids[tok]
+    return out
+
+
 def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     """Normalise the config for RELEASE, not for the local eval harness.
 
@@ -859,9 +927,62 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     config["torch_dtype"] = dtype_name
     config["auto_map"] = AUTO_MAP
     config["use_cache"] = True
+    # ⛔ PORTED FROM `main` 2026-09-15 (INFRA M+230). These three normalisations are the 5th and 6th
+    # release-config defects, found on `main` while releasing argonne-4.0-base -- and they were NEVER
+    # ported to the argonne4.5 branch, which is the branch a4.5 would be published FROM. 40 lines
+    # differed between the two copies and this was all of it.
+    #
+    # interleaved_local_attention / local_attention_window: every Argonne pretrain since 3.0 carried
+    # `true, 256` in the config and ran FULL causal attention in the computation, because model.py
+    # implements the window only on the flash-attn-2 path (`flash_attn.flash_attn_interface`) and this
+    # cluster's env has flash-attn-4, which does not expose it. Publishing the flags as-is describes a
+    # model that was never trained: a downstream user who happens to have flash-attn-2 gets a 256-token
+    # window on odd layers, silently, on weights that only ever saw full attention. The live Hub audit
+    # (M+229) still finds this on 5 published repos. Setting false/null makes model.py take the
+    # full-attention branch on EVERY path; `use_flash_attention` stays true, so flash-attn is still used
+    # for speed, just without a window it was never trained with.
+    #
+    # loss_chunk_size: a TRAINING memory knob (the a4 checkpoints carry 10240). Inert at inference, but
+    # a base model exists to be fine-tuned, and on that path a nonzero value makes forward() return
+    # `logits=None` -- a silent surprise for any loop that reads them. Ship the default.
+    # ⚠️ All three are MOOT for a4.5's own export, which already reads false/null/0 -- which is exactly
+    # why the gap was invisible here. The value is the ASSERTION below: it is what would catch a
+    # 3.0/3.5-era checkpoint being published from this tree.
+    config["interleaved_local_attention"] = False
+    config["local_attention_window"] = None
+    config["loss_chunk_size"] = 0
+
+    # ⛔ tie_word_embeddings: ASSERT IT, and DERIVE it from the weights. Added 2026-09-14 10:5x CDT.
+    # a4.5's export has 338 tensors and NO `lm_head.weight` -- the head is the tied embedding matrix.
+    # But `tie_word_embeddings` is ABSENT from that config.json, so the artifact loads correctly only
+    # because ArgonneConfig's signature default happens to be True (model.py:81) and
+    # `_tied_weights_keys` (:697) hands transformers the mapping. **Correctness rests on a class
+    # default, not on the published file.** If that default ever flips, or anyone loads the config
+    # against a different class, transformers finds no lm_head weight and RANDOMLY INITIALISES the
+    # output head -- a model that loads cleanly and emits noise. This is the same family as the five
+    # release-config defects already on record, where a missing `auto_map` made 8 of 15 repos
+    # unloadable: a release must state its own invariants rather than inherit them from code.
+    # ⭐ DERIVED, NOT HARDCODED: a flag that decides whether a tensor exists is not a preference --
+    # read it off the checkpoint (the lesson from the vocab pad that was gated on --fp8).
+    names = staged_tensor_names(temp_path)
+    if names is None:
+        raise SystemExit(
+            "cannot enumerate the staged tensors, so tie_word_embeddings cannot be derived -- "
+            "refusing to publish a config whose output head may be randomly initialised. "
+            "State UNKNOWN, not untied."
+        )
+    config["tie_word_embeddings"] = "lm_head.weight" not in names
 
     if profile in ("instruct", "ctx13568_instruct"):
         config["eos_token_id"] = CHAT_EOS_TOKEN_ID
+    # Fill any special-token id the config is MISSING from the staged tokenizer. Never overwrites one
+    # that is already set (so the chat override above still wins), and never invents one.
+    _derived = derive_special_token_ids(temp_path)
+    for _k in ("eos_token_id", "bos_token_id", "pad_token_id"):
+        if config.get(_k) is None and _derived.get(_k) is not None:
+            config[_k] = _derived[_k]
+            print(f"[config] {_k} was absent -> {config[_k]}, derived from the staged tokenizer",
+                  flush=True)
     if profile == "ctx13568_instruct":
         config["block_size"] = CTX13568
         config["max_position_embeddings"] = CTX13568
@@ -871,10 +992,33 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     problems = []
     if config.get("auto_map") != AUTO_MAP:
         problems.append("auto_map missing//wrong -> standalone trust_remote_code load will fail")
+    if config.get("interleaved_local_attention") or config.get("local_attention_window") is not None:
+        problems.append(
+            "interleaved_local_attention/local_attention_window still advertise a sliding window "
+            "-> a flash-attn-2 user gets attention the weights never saw"
+        )
+    if config.get("loss_chunk_size"):
+        problems.append(f"loss_chunk_size {config.get('loss_chunk_size')} != 0 -> a fine-tuning loop "
+                        "that reads forward().logits gets None")
     if not config.get("use_cache"):
         problems.append("use_cache is false in the JSON (cosmetic for this arch, but keep the family consistent)")
+    tied_expected = "lm_head.weight" not in names
+    if config.get("tie_word_embeddings") is not tied_expected:
+        problems.append(
+            f"tie_word_embeddings is {config.get('tie_word_embeddings')!r} but the staged weights say "
+            f"{tied_expected} (lm_head.weight {'absent' if tied_expected else 'present'}) -> the output "
+            "head would be randomly initialised on load"
+        )
     if profile in ("instruct", "ctx13568_instruct") and config.get("eos_token_id") != CHAT_EOS_TOKEN_ID:
         problems.append(f"eos_token_id {config.get('eos_token_id')} != {CHAT_EOS_TOKEN_ID} (<|im_end|>)")
+    # ⛔ EVERY profile needs a stop token, base included. A null one publishes a model that never stops.
+    _eos = config.get("eos_token_id")
+    if _eos is None:
+        problems.append("eos_token_id is null and could not be derived from the staged tokenizer -- "
+                        ".generate() would have no stop token")
+    elif not isinstance(_eos, int) or not (0 <= _eos < int(config.get("vocab_size", 0) or 0)):
+        problems.append(f"eos_token_id {_eos!r} is not a valid index into vocab_size "
+                        f"{config.get('vocab_size')}")
     if profile == "ctx13568_instruct":
         for k in ("block_size", "max_position_embeddings"):
             if config.get(k) != CTX13568:
@@ -882,6 +1026,7 @@ def rewrite_config_dtype(temp_path, dtype_name, profile=None):
     if problems:
         raise SystemExit("release config is wrong:\n  - " + "\n  - ".join(problems))
     print(f"[config] normalised for release (profile={profile}): auto_map set, use_cache=True"
+          + f", tie_word_embeddings={config['tie_word_embeddings']} (derived from {len(names)} staged tensors)"
           + (f", eos={CHAT_EOS_TOKEN_ID}" if profile in ("instruct", "ctx13568_instruct") else "")
           + (f", ctx={CTX13568}" if profile == "ctx13568_instruct" else ""))
 
@@ -946,6 +1091,18 @@ def prepare_upload_folder(model_dir, profile, repo_id, model_name, shard_count, 
 
     for item in model_path.iterdir():
         if item.name in skip_names or item.name.startswith(skip_prefixes):
+            continue
+        # ⛔ NEVER STAGE A DOTFILE. Added 2026-09-14 13:3x CDT. This loop copies EVERY file from the
+        # source dir into the upload staging dir, so the local verification sentinels that live
+        # alongside an export -- `.verified` (mirror md5, final_export_backup.sh) and `.liveness`
+        # (forward-pass record, export_liveness.sh) -- would have been PUBLISHED to a public repo.
+        # Confirmed by enumerating the staging selection against the real a4.5 export: both appeared.
+        # An HF repo's real contents carry no dotfiles; every dotfile beside an export is a local
+        # record ABOUT it. `.gitattributes` was already excluded BY NAME above, which is the tell --
+        # dotfiles were being handled one name at a time, and that is exactly how the same defect bit
+        # final_export_backup.sh twice in two days (INFRA M+190): a fix that enumerates the one value
+        # you have seen is a fix with n=1. Excluded as a CLASS so the next sentinel is covered too.
+        if item.name.startswith("."):
             continue
         if item.name.endswith(".safetensors") or item.name.endswith(".index.json"):
             continue

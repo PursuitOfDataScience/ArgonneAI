@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:
     pass
 
-# (prompt, expected answer) — expected is for eyeballing only, not auto-graded.
+# (prompt, expected answer): expected is for eyeballing only, not auto-graded.
 MATH_PROBES = [
     ("What is 17 - 5?", "12"),
     ("What is 8 + 3?", "11"),
@@ -79,7 +79,7 @@ def decode_loop(model, input_ids, *, max_new_tokens, eos_id,
     cur = input_ids.to(device)
     out = []
     for _ in range(max_new_tokens):
-        logits = model.forward(cur[:, -ctx:]).logits[:, -1, :].float()
+        logits = model.forward(cur[:, -ctx:]).logits[:, -1,:].float()
         # Repetition penalty + no-repeat-ngram over GENERATED tokens only (never
         # the prompt -- §5's prompt-inclusive-ban bug). Defaults (1.0 / 0) are no-ops.
         if repetition_penalty != 1.0 and out:
@@ -101,7 +101,7 @@ def decode_loop(model, input_ids, *, max_new_tokens, eos_id,
                 s_logits, s_idx = torch.sort(logits, descending=True)
                 cum = torch.cumsum(torch.softmax(s_logits, dim=-1), dim=-1)
                 rm = cum > top_p
-                rm[..., 1:] = rm[..., :-1].clone(); rm[..., 0] = False
+                rm[..., 1:] = rm[...,:-1].clone(); rm[..., 0] = False
                 logits = logits.masked_fill(rm.scatter(1, s_idx, rm), float("-inf"))
             nxt = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
         else:

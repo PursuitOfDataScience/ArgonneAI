@@ -1522,6 +1522,14 @@ def prune_old_checkpoints(checkpoint_dir, keep_path):
         for _, p in sorted(found):
             if os.path.realpath(p) in keep:
                 continue
+            if os.path.exists(p + ".keep"):
+                # ⛔ THIRD COPY of this function (pretrain.py, continue_pretrain.py, here). Ported in
+                # the same sweep 2026-09-15 -- INFRA M+224/M+225. A `.keep` sibling marks a checkpoint
+                # that is itself a RESULT (a4.5's step-95055 recovery anchor is the live case), which
+                # retention's own exception exempts. It can only ever PREVENT a deletion.
+                print(f"[retention] KEEPING {os.path.basename(p)}: a .keep marker is present "
+                      f"({open(p + '.keep').read().strip()[:120]})", flush=True)
+                continue
             try:
                 gib = os.path.getsize(p) / 2**30
                 os.remove(p)

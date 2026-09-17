@@ -93,7 +93,7 @@ labelled_bars(ax, ["SVAMP\ngreedy", "SVAMP\nself-cons", "ASDiv\ngreedy", "ASDiv\
               [("Argonne 3.0-think", a30), ("Argonne 3.5-think", a35)], [S2, S1])
 ax.set_ylabel("accuracy (%)", color=INK2, fontsize=10)
 ax.yaxis.set_major_locator(MultipleLocator(20))
-ax.set_title("Argonne 3.5-think vs 3.0-think — uncontaminated SVAMP / ASDiv",
+ax.set_title("Argonne 3.5-think vs 3.0-think: uncontaminated SVAMP / ASDiv",
              color=INK, fontsize=12.5, fontweight="semibold", pad=14, loc="left")
 ax.text(0, 1.015, prov, transform=ax.transAxes, fontsize=8, color=MUTED)
 ax.legend(frameon=False, fontsize=9.5, labelcolor=INK2, loc="upper left", ncol=2,
@@ -112,7 +112,7 @@ ax.set_ylabel("answers never emitted (%)", color=INK2, fontsize=10)
 ax.yaxis.set_major_locator(MultipleLocator(10))
 ax.set_title("Non-termination solved at the weights", color=INK, fontsize=12.5,
              fontweight="semibold", pad=14, loc="left")
-ax.text(0, 1.015, "greedy `no_answer` rate — the trace never closes </think>, so no answer is produced",
+ax.text(0, 1.015, "greedy `no_answer` rate: the trace never closes </think>, so no answer is produced",
         transform=ax.transAxes, fontsize=8, color=MUTED)
 ax.legend(frameon=False, fontsize=9.5, labelcolor=INK2, loc="upper left",
           bbox_to_anchor=(0, -0.13))

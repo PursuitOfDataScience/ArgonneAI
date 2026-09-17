@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""§24 Tier-1 — EXTERNAL-verifier best-of-N (the pivotal capturability experiment).
+"""§24 Tier-1: EXTERNAL-verifier best-of-N (the pivotal capturability experiment).
 
 §22i/§23b established that a *same-base* picker (learned verifier, majority vote, confidence /
 budget-forced vote) is saturated: it is as weak as the base, so it cannot cash the pass@K latent
@@ -11,11 +11,11 @@ one untried question that decides the whole go-forward tree:
 This harness is the external analogue of `vllm_bon.py` (which reranks with a same-base verifier).
 It runs in two processes (separate vLLM engines, don't co-reside):
 
-  --mode generate : the shipped Argonne policy (default x_v6v2_040 = HF v3) samples K candidates per
+  --mode generate: the shipped Argonne policy (default x_v6v2_040 = HF v3) samples K candidates per
                     CLEAN problem (SVAMP/ASDiv via clean_eval.load_clean -- contamination-free), and
                     dumps {source, question, gold, candidates}. Prints self-consistency + pass@K free.
 
-  --mode rerank   : an EXTERNAL verifier (default Qwen3-4B: tokenizer-aligned Qwen BPE, a strong
+  --mode rerank: an EXTERNAL verifier (default Qwen3-4B: tokenizer-aligned Qwen BPE, a strong
                     drop-in judge) reranks. Three scoring lenses (fair, complementary; run all):
                       yesno    - non-thinking 1-token judge; rank distinct answers by P("Yes").
                       reasoned - thinking judge; reasons then emits "Verdict: Yes/No"; rank by verdict.
@@ -386,18 +386,18 @@ def run_rerank(args):
             lo, hi = wilson(k, n)
             return f"[{lo:.1f}-{hi:.1f}]"
         out(f"\n  ---- [{src}]  n={n} ----")
-        out(f"    single-sample acc     : {m['single']:.1f}%")
-        out(f"    self-cons (closed)    : {m['vote_closed']:.1f}%  {ci(m['cnt']['vote_closed'])}   "
+        out(f"    single-sample acc: {m['single']:.1f}%")
+        out(f"    self-cons (closed): {m['vote_closed']:.1f}%  {ci(m['cnt']['vote_closed'])}   "
             f"<- fair same-base baseline")
-        out(f"    self-cons (full pool) : {m['vote_full']:.1f}%  {ci(m['cnt']['vote_full'])}")
+        out(f"    self-cons (full pool): {m['vote_full']:.1f}%  {ci(m['cnt']['vote_full'])}")
         for k in kinds:
             b, c = m["disc"][k]
             p = mcnemar_p(b, c)
             sig = "SIG" if p < 0.05 else "ns"
-            out(f"    BEST-OF-N [{k:<8}]   : {m['bon'][k]:.1f}%  {ci(m['cnt']['bon'][k])}   "
+            out(f"    BEST-OF-N [{k:<8}]: {m['bon'][k]:.1f}%  {ci(m['cnt']['bon'][k])}   "
                 f"lift vs closed-vote {m['bon'][k]-m['vote_closed']:+.1f}pts  "
                 f"(McNemar b={b} c={c} p={p:.3f} {sig})")
-        out(f"    pass@{args.k} (ceiling)    : {m['passk']:.1f}%  {ci(m['cnt']['passk'])}")
+        out(f"    pass@{args.k} (ceiling): {m['passk']:.1f}%  {ci(m['cnt']['passk'])}")
         if "solver" in kinds:
             out(f"    [solver diag] Qwen-solo acc {m['solver_solo']:.1f}%  |  its answer in "
                 f"candidates (coverage) {m['solver_cov']:.1f}%  |  no-boxed {m['solver_noans']:.1f}%")

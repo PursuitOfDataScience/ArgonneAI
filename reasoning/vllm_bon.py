@@ -1,10 +1,10 @@
-"""vLLM-backed best-of-N reranking (§22 step-change) — the fast, HBM-filling payoff harness.
+"""vLLM-backed best-of-N reranking (§22 step-change): the fast, HBM-filling payoff harness.
 
 Uses the VALIDATED vLLM port (reasoning/vllm_argonne.py) for BOTH phases via continuous
 batching (fills the card + 10-50x faster than the old per-prompt loop):
-  --mode generate : policy samples K candidates for every problem in ONE llm.generate (n=K),
+  --mode generate: policy samples K candidates for every problem in ONE llm.generate (n=K),
                     save {question, gold, candidates}. Prints self-consistency + pass@K for free.
-  --mode rerank   : verifier scores every closed+boxed candidate (1-token gen, top-logprobs of
+  --mode rerank: verifier scores every closed+boxed candidate (1-token gen, top-logprobs of
                     'Yes'/'No'), batched across ALL candidates. Reports best-of-N vs majority
                     vs single-sample vs pass@K on the same samples.
 
@@ -77,8 +77,8 @@ def run_generate(args):
     print("=" * 60)
     print(f"[generate] {n} problems x K={args.k} in {dt:.1f}s "
           f"({args.k*n/dt:.0f} samples/s) -> {args.gen_out}")
-    print(f"  single-sample acc : {100*corr/max(tot,1):.2f}%")
-    print(f"  self-consistency  : {100*n_maj/n:.2f}%  (majority vote)")
+    print(f"  single-sample acc: {100*corr/max(tot,1):.2f}%")
+    print(f"  self-consistency: {100*n_maj/n:.2f}%  (majority vote)")
     print(f"  pass@{args.k:<11}: {100*n_pass/n:.2f}%  (ceiling)")
     print("=" * 60)
 
@@ -157,11 +157,11 @@ def run_rerank(args):
     print(f"vLLM best-of-N rerank | policy={Path(args.gen_out).name} "
           f"verifier={Path(args.verifier).name}")
     print(f"  scored {len(vprompts)} candidates in {dt:.1f}s ({len(vprompts)/max(dt,1):.0f}/s)")
-    print(f"  single-sample acc      : {100*corr/max(tot,1):.2f}%")
-    print(f"  majority vote (self-c) : {100*n_maj/n:.2f}%  ({n_maj}/{n})")
-    print(f"  BEST-OF-N (verifier)   : {100*n_bon/n:.2f}%  ({n_bon}/{n})")
-    print(f"  pass@K (ceiling)       : {100*n_pass/n:.2f}%  ({n_pass}/{n})")
-    print(f"  verifier lift vs vote  : {100*(n_bon-n_maj)/n:+.2f} pts")
+    print(f"  single-sample acc: {100*corr/max(tot,1):.2f}%")
+    print(f"  majority vote (self-c): {100*n_maj/n:.2f}%  ({n_maj}/{n})")
+    print(f"  BEST-OF-N (verifier): {100*n_bon/n:.2f}%  ({n_bon}/{n})")
+    print(f"  pass@K (ceiling): {100*n_pass/n:.2f}%  ({n_pass}/{n})")
+    print(f"  verifier lift vs vote: {100*(n_bon-n_maj)/n:+.2f} pts")
     print("=" * 64)
 
 

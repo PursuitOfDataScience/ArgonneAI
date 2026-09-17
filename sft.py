@@ -72,17 +72,17 @@ QUALITY_EVERY = 200
 MAX_NEW_TOKENS_QUALITY = 160
 
 QUALITY_QUESTIONS = [
-    # 1. Basic greeting — can it respond like a chatbot at all?
+    # 1. Basic greeting: can it respond like a chatbot at all?
     "Hey! How's it going?",
-    # 2. Open-ended helpfulness — the bread and butter of SFT
+    # 2. Open-ended helpfulness: the bread and butter of SFT
     "I'm planning a weekend trip. Any tips for packing light?",
-    # 3. Instruction following — can it explain something clearly?
+    # 3. Instruction following: can it explain something clearly?
     "Explain what a black hole is in a way a 10-year-old would understand.",
-    # 4. Empathy / emotional support — common in chat data
+    # 4. Empathy / emotional support: common in chat data
     "I just failed an exam I studied really hard for. I feel terrible.",
-    # 5. Multi-step reasoning lite — tests coherence
+    # 5. Multi-step reasoning lite: tests coherence
     "What are three fun things to do on a rainy day, and why?",
-    # 6. Creative writing — poem generation
+    # 6. Creative writing: poem generation
     "Write a short poem about the ocean at night.",
 ]
 
@@ -620,7 +620,7 @@ def answer_questions(
 
 
 # ---------------------------------------------------------------------------
-# Loss (manual shift — ArgonneModel has no internal shift)
+# Loss (manual shift: ArgonneModel has no internal shift)
 # ---------------------------------------------------------------------------
 
 def compute_loss(model, input_ids: torch.Tensor, labels: torch.Tensor):
@@ -634,7 +634,7 @@ def compute_loss(model, input_ids: torch.Tensor, labels: torch.Tensor):
     base = getattr(model, "module", model)          # unwrap DDP
     if getattr(base, "_hf_internal_shift", False):
         return model(input_ids=input_ids, labels=labels).loss
-    x = input_ids[:, :-1].contiguous()
+    x = input_ids[:,:-1].contiguous()
     y = labels[:, 1:].contiguous()
     outputs = model(x, labels=y)
     return outputs.loss
@@ -688,6 +688,16 @@ def prune_intermediate_checkpoints(output_dir: str) -> None:
         for name in sorted(os.listdir(output_dir)):
             full = os.path.join(output_dir, name)
             if not os.path.isdir(full) or _ckpt_step(full) < 0:
+                continue
+            if os.path.exists(os.path.join(full, ".keep")):
+                # ⛔ SAME EXEMPTION AS EVERY OTHER DELETION PATH (INFRA M+224/M+225/M+226). This is the
+                # PHASE-END sweep, a second and more total deletion path than rotate_checkpoints: it
+                # removes every checkpoint dir once the final export lands. Marking a dir exempt in one
+                # path and not the other is the "fixed the instance, not the class" failure this
+                # project keeps re-learning -- the marker would have been honoured during training and
+                # ignored at the end, which is when it matters most.
+                print(f"[retention] KEEPING {name}: .keep marker present "
+                      f"({open(os.path.join(full, '.keep')).read().strip()[:120]})", flush=True)
                 continue
             gib = sum(
                 os.path.getsize(os.path.join(full, f))
@@ -806,6 +816,18 @@ def rotate_checkpoints(output_dir: str, save_total_limit: int) -> None:
         if step >= 0:
             candidates.append((step, full))
     candidates.sort(key=lambda x: x[0])
+    # ⛔ HONOUR A `.keep` MARKER, as the three pretrain-family prunes now do (INFRA M+224/M+225).
+    # Added 2026-09-15 to finish that sweep: this rotation deletes DIRECTORIES, so the file-level
+    # marker those functions look for could never protect anything here -- and with the default now 1
+    # (it was -1 = keep-all, i.e. retention was off unless a launcher passed the flag) an exempt
+    # checkpoint would be removed on the very next save. A published checkpoint, a soup ingredient or a
+    # reference point is exactly what retention's own exception carves out, so the exemption must exist
+    # in every path that can delete one. A marker can only ever PREVENT a deletion.
+    exempt = [(s, p) for s, p in candidates if os.path.exists(os.path.join(p, ".keep"))]
+    for s, p in exempt:
+        print(f"[ckpt] KEEPING checkpoint-{s}: .keep marker present "
+              f"({open(os.path.join(p, '.keep')).read().strip()[:120]})")
+    candidates = [(s, p) for s, p in candidates if (s, p) not in exempt]
     while len(candidates) > save_total_limit:
         step, path = candidates.pop(0)
         try:
@@ -923,8 +945,17 @@ def main() -> None:
                         help="Save every N optimizer steps when save_strategy=steps.")
     parser.add_argument("--save_seconds", type=int, default=0,
                         help="Save every N wall-clock seconds when save_strategy=time. 0 disables.")
-    parser.add_argument("--save_total_limit", type=int, default=-1,
-                        help="Keep at most N most recent checkpoint directories (-1 = keep all).")
+    # ⛔ DEFAULT IS 1 (latest-only), changed 2026-09-15 (INFRA M+225). It was -1 = KEEP ALL, and the
+    # rotation body starts `if save_total_limit <= 0: return`, so retention was DISABLED unless a
+    # launcher happened to pass the flag. The owner's standing rule is the opposite: "Implement the
+    # prune in the training/save path ITSELF so retention holds automatically." Each of these dirs is
+    # ~34 GB (13 GB weights + 23 GB AdamW moments), which is exactly the "silently eats hundreds of
+    # GB" failure the rule exists to prevent -- and one such dir was still on disk from 2026-08-02.
+    # -1 still means keep-all for anyone who asks for it explicitly; what changed is which behaviour
+    # you get by SAYING NOTHING.
+    parser.add_argument("--save_total_limit", type=int, default=1,
+                        help="Keep at most N most recent checkpoint directories (-1 = keep all; "
+                             "default 1 = latest-only, the standing retention rule).")
     parser.add_argument("--resume_from_checkpoint", type=str, default="",
                         help="Path to a checkpoint directory to resume from. Use 'auto' to pick the latest under --output_dir.")
     parser.add_argument("--exit_after_checkpoint_save", action="store_true",

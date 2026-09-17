@@ -2,7 +2,7 @@
 """Fast vLLM labeled-rollout generator + RLVR-DPO pair builder (contamination-safe).
 
 Replaces the slow HF path in `star_generate.py` (~56 s/problem, 30h for 2000 problems) with the
-validated vLLM port (~4.5 s/problem) — a ~12x speedup that makes a properly-powered RLVR-DPO /
+validated vLLM port (~4.5 s/problem): a ~12x speedup that makes a properly-powered RLVR-DPO /
 STaR corpus cheap.
 
 TWO BUGS THIS FIXES vs star_generate.py:
@@ -98,7 +98,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--seed", type=int, default=1234, help="NOT 0 — keep disjoint from the old seed-0 runs")
+    ap.add_argument("--seed", type=int, default=1234, help="NOT 0: keep disjoint from the old seed-0 runs")
     ap.add_argument("--all-out", default=None)
     ap.add_argument("--dpo-out", default=None)
     ap.add_argument("--max-neg-per-q", type=int, default=2)
@@ -168,9 +168,9 @@ def main():
 
     n = len(probs)
     tot = sum(fm.values())
-    out(f"\n  pass@{args.k}            : {100*n_solved/n:.2f}%  ({n_solved}/{n} problems)")
-    out(f"  single-sample acc    : {100*fm['correct']/max(tot,1):.2f}%")
-    out(f"  label dist           : {dict(fm)}")
+    out(f"\n  pass@{args.k}: {100*n_solved/n:.2f}%  ({n_solved}/{n} problems)")
+    out(f"  single-sample acc: {100*fm['correct']/max(tot,1):.2f}%")
+    out(f"  label dist: {dict(fm)}")
 
     if args.all_out:
         from datasets import Dataset

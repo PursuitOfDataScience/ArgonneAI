@@ -4,7 +4,7 @@
 The midtraining loader (`DocManifestDataLoader`) slices ONE contiguous T+1 window
 from within a SINGLE document, so every stored "document" must be >= block_size+1
 (13569) tokens or it crashes. FineMath docs are short web pages, so we PACK many
-source docs (EOS-separated) into >=16k-token super-documents — mirroring how the
+source docs (EOS-separated) into >=16k-token super-documents: mirroring how the
 16k-32k longmino pool is laid out.
 
 Per source parquet -> one shard trio, matching the pool:

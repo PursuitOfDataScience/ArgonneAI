@@ -3,7 +3,7 @@
 
 WHY (§33s). The verify tier cost **−23.8pt on one-step arithmetic** (shipped 40/80 vs candidate
 21/80): it taught the model that "Wait, let me double-check that" is part of the default trace, so the
-cue fires on `2 + 2`, the second derivation has nowhere to go, and it invents an error — then the
+cue fires on `2 + 2`, the second derivation has nowhere to go, and it invents an error, then the
 verification re-derives the same wrong way and *confirms* it. Two causes, both addressed:
   1. the cue fired UNCONDITIONALLY  -> `build_verify_tier.py --min-eqs N` now restricts verify rows to
      genuinely multi-step derivations, so the cue is never associated with one-step work;

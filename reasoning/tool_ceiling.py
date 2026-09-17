@@ -5,7 +5,7 @@ Tool-use (calculator offload) only helps traces whose PROCEDURE is right but ARI
 wrong. This bounds that: over the banked vLLM candidates, of the wrong-but-closed traces, how
 many are 'interceptable' (contain a detectably-wrong inline `a op b = c` step, OR the correct
 gold equals the true value of some inline `a op b` the model miscomputed) vs 'structural'
-(all inline steps correct but wrong answer = wrong operand/procedure — tool-use can't fix).
+(all inline steps correct but wrong answer = wrong operand/procedure: tool-use can't fix).
 High interceptable fraction => tool-use has real headroom => worth the full build.
 """
 import argparse
@@ -94,13 +94,13 @@ def main():
     print("=" * 66)
     print(f"tool-use ceiling from {len(rows)} problems, {closed} closed traces")
     print("=" * 66)
-    print(f"  closed w/ any inline `a op b=`  : {closed_with_eq} ({100*closed_with_eq/max(closed,1):.0f}%)  <- tool surface")
-    print(f"  correct / wrong (closed)        : {correct} / {wrong}")
+    print(f"  closed w/ any inline `a op b=`: {closed_with_eq} ({100*closed_with_eq/max(closed,1):.0f}%)  <- tool surface")
+    print(f"  correct / wrong (closed): {correct} / {wrong}")
     if wrong:
-        print(f"  wrong INTERCEPTABLE (bad step)  : {wrong_interceptable} ({100*wrong_interceptable/wrong:.0f}% of wrong)")
-        print(f"    of which gold-recoverable     : {wrong_gold_recoverable} ({100*wrong_gold_recoverable/wrong:.0f}% of wrong)  <- calc would flip to GOLD")
-        print(f"  wrong STRUCTURAL (steps ok)     : {wrong_structural} ({100*wrong_structural/wrong:.0f}% of wrong)  <- tool-use CAN'T fix")
-    print(f"  PROBLEMS solvable ONLY via calc  : {n_prob_wrong_only}/{len(rows)} "
+        print(f"  wrong INTERCEPTABLE (bad step): {wrong_interceptable} ({100*wrong_interceptable/wrong:.0f}% of wrong)")
+        print(f"    of which gold-recoverable: {wrong_gold_recoverable} ({100*wrong_gold_recoverable/wrong:.0f}% of wrong)  <- calc would flip to GOLD")
+        print(f"  wrong STRUCTURAL (steps ok): {wrong_structural} ({100*wrong_structural/wrong:.0f}% of wrong)  <- tool-use CAN'T fix")
+    print(f"  PROBLEMS solvable ONLY via calc: {n_prob_wrong_only}/{len(rows)} "
           f"({100*n_prob_wrong_only/len(rows):.1f}%)  <- headroom tool-use ADDS beyond current")
     print("=" * 66)
 

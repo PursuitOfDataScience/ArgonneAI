@@ -9,16 +9,16 @@ that get the wrong final answer, how many contain a detectable wrong inline arit
 
 This script samples K traces/problem (reusing star_generate's KV-cached sampler + verifier)
 and splits WRONG-but-closed traces into:
-  * INTERCEPTABLE : >=1 inline `a op b = c` step is arithmetically wrong  -> #5 could fix it
-  * STRUCTURAL    : every inline step is correct but the final answer is wrong
+  * INTERCEPTABLE: >=1 inline `a op b = c` step is arithmetically wrong  -> #5 could fix it
+  * STRUCTURAL: every inline step is correct but the final answer is wrong
                     (wrong operand / wrong procedure / missing step)       -> #5 cannot help
 
 It also reports, over ALL closed traces, the fraction that contain any checkable `a op b =`
 step (feasibility gate: if the model rarely writes explicit inline equations, interception has
-little surface to act on), and the "lucky" rate (CORRECT final answer despite >=1 wrong step —
+little surface to act on), and the "lucky" rate (CORRECT final answer despite >=1 wrong step: 
 the poison that motivates step-verified filtering, lever #7).
 
-No weights changed, no training — pure measurement. ~1 GPU-hr for a few hundred problems.
+No weights changed, no training: pure measurement. ~1 GPU-hr for a few hundred problems.
 """
 
 import argparse
@@ -178,14 +178,14 @@ def main():
                 f"lucky={lucky} | {el/(pi+1):.2f}s/prob")
 
     out("\n  " + "-" * 66)
-    out(f"  closed traces               : {closed}")
+    out(f"  closed traces: {closed}")
     out(f"  of closed, contain any `a op b =`: {closed_with_eq} "
         f"({100*closed_with_eq/max(closed,1):.1f}%)   <- feasibility surface for #5")
-    out(f"  correct / wrong (closed)    : {correct} / {wrong}")
+    out(f"  correct / wrong (closed): {correct} / {wrong}")
     if wrong:
         out(f"  wrong INTERCEPTABLE (>=1 bad step): {wrong_interceptable} "
             f"({100*wrong_interceptable/wrong:.1f}% of wrong)   <- CEILING of arith-interception #5")
-        out(f"  wrong STRUCTURAL (all steps ok)  : {wrong_structural} "
+        out(f"  wrong STRUCTURAL (all steps ok): {wrong_structural} "
             f"({100*wrong_structural/wrong:.1f}% of wrong)   <- #5 CANNOT fix (procedure/operand)")
     out(f"  'lucky' correct (>=1 bad step but right answer): {lucky} "
         f"({100*lucky/max(correct,1):.1f}% of correct)   <- poison for STaR/SFT (motivates #7)")

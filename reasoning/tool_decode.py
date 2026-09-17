@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tool-EXECUTION decode loop — makes v7's learned tool-calling actually useful (§26 → §27).
+"""Tool-EXECUTION decode loop: makes v7's learned tool-calling actually useful (§26 → §27).
 
 §26 finding: think_v7 emits 100% valid <tool_call> with 100% correct expressions, but because the
 tool_calc tier baked the <tool_response> in-trace (single-turn), the model HALLUCINATES the response
@@ -10,7 +10,7 @@ resumes -> so the model reasons on CORRECT tool outputs instead of its own hallu
 
 Compares, on held-out arithmetic word problems, the shipped-style greedy trace (model hallucinates its
 own tool response) vs the tool-EXECUTED loop (real calculator/python results injected). If real execution
-lifts final-answer accuracy, tool-calling is a genuine capability — delivered via a serving loop, not weights.
+lifts final-answer accuracy, tool-calling is a genuine capability: delivered via a serving loop, not weights.
 
 Batched, continuous rounds: each round generates all open sequences to `</tool_call>` (a regular-text
 stop string) or natural end; sequences that called a tool get the REAL result appended; done sequences
@@ -132,10 +132,10 @@ def main():
     avg_exec = sum(n_exec) / n
     out("=" * 70)
     out(f"TOOL-EXECUTION decode  model={Path(args.model).name}  n={n}")
-    out(f"  (A) greedy, self-hallucinated tool response : {100*base_ok/n:.1f}%  ({base_ok}/{n})")
-    out(f"  (B) REAL tool-execution loop                : {100*tool_ok/n:.1f}%  ({tool_ok}/{n})")
-    out(f"  lift from real execution                    : {100*(tool_ok-base_ok)/n:+.1f} pts")
-    out(f"  avg tool calls executed / problem           : {avg_exec:.2f}")
+    out(f"  (A) greedy, self-hallucinated tool response: {100*base_ok/n:.1f}%  ({base_ok}/{n})")
+    out(f"  (B) REAL tool-execution loop: {100*tool_ok/n:.1f}%  ({tool_ok}/{n})")
+    out(f"  lift from real execution: {100*(tool_ok-base_ok)/n:+.1f} pts")
+    out(f"  avg tool calls executed / problem: {avg_exec:.2f}")
     out("=" * 70)
     for i in range(min(args.show, n)):
         out(f"\n--- sample {i} (gold={probs[i][1]}) [execed {n_exec[i]}] ---\n{texts[i][:600]}\n---")

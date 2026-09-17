@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """Re-admit the LONG reasoning traces that build_mix_v6.py drops, and see if termination survives.
 
-THE ARGUMENT. `build_mix_v6.py:71` drops every source row over 768 tokens — deliberately, to create
+THE ARGUMENT. `build_mix_v6.py:71` drops every source row over 768 tokens, deliberately, to create
 "termination pressure", because the defining failure of the 3.0 line was traces that never closed
 `</think>`. That worked: §32 turned no_answer from ~55% into ~1.5%.
 
 But it was decided while the §34 loader defect was active, i.e. on a pipeline that ALSO severed every
 surviving trace at 128 think-tokens mid-derivation. Non-termination was therefore being fought on two
 fronts at once, and the 768 cap got credit for a problem the truncation was partly causing. With traces
-now preserved whole (§35/§36) the cap may be paying for nothing — and it is expensive, because it is
+now preserved whole (§35/§36) the cap may be paying for nothing, and it is expensive, because it is
 not a uniform filter. Measured against `cot_sft_mix_v3` (113,341 rows):
 
     tier            total   <=768   769-1536   >1536
@@ -23,7 +23,7 @@ and GSM-Plus (42.00) are exactly where the model is weakest.
 
 WHAT THIS BUILDS. The shipped mix, plus the 769-1536 band of the MATH/REASONING tiers only. General
 tiers (direct_tulu, gen_ultrachat) are NOT extended: their long rows would shift the general/math
-composition at the same time and confound the test — §36's whole lesson is that composition shifts are
+composition at the same time and confound the test: §36's whole lesson is that composition shifts are
 what cost instruction-following. easy_gsm8k stays dropped (contaminated).
 
 The >1536 band is left out on purpose: it needs max_seq >= 2048 to train without re-creating the very

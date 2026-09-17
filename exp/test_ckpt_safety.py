@@ -19,7 +19,7 @@ import tempfile
 import torch
 import torch.nn as nn
 
-TREES = ["/home/youzhi/ArgonneAI-4.5", "/home/youzhi/ArgonneAI"]
+TREES = ["/home/youzhi/ArgonneAI"]  # single tree since the 2026-08-23 worktree consolidation
 MODULES = ["pretrain", "continue_pretrain"]
 
 failures = []
@@ -191,5 +191,5 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("ALL PASS — corrupt weights and torn writes are refused, and a refusal never")
+print("ALL PASS: corrupt weights and torn writes are refused, and a refusal never")
 print("           destroys the last good checkpoint, in all 4 trainer files.")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Distractor-augmented gsm8k-TRAIN problems — a robustness pool for §33's follow-up round.
+"""Distractor-augmented gsm8k-TRAIN problems: a robustness pool for §33's follow-up round.
 
 WHY (2026-08-02, after §33n). Across five held-out sets the verify tier's two significant gains were
-ASDiv (+4.80, p=0.0005) and **GSM-Plus (+5.20, p=0.017)** — and GSM-Plus is where the model is
+ASDiv (+4.80, p=0.0005) and **GSM-Plus (+5.20, p=0.017)**, and GSM-Plus is where the model is
 weakest in absolute terms (shipped greedy 27.8%, pass@8 ~59%), so it holds the most headroom. But the
 tier's fuel was rollouts on *clean* phrasings (gsm8k-train, MATH L1-3); nothing in it trains the
 model to survive a perturbed problem. This builds the missing pool.
@@ -10,7 +10,7 @@ model to survive a perturbed problem. This builds the missing pool.
 WHAT IT DOES, and the ONE axis it covers. GSM-Plus perturbs along ~8 axes (numeric substitution,
 digit expansion, int->decimal, added/reversed operation, rephrasing, distractor insertion, critical
 thinking). Only **distractor insertion** can be done programmatically with the gold answer provably
-unchanged, so that is the only one done here — an irrelevant sentence about a DIFFERENT subject,
+unchanged, so that is the only one done here: an irrelevant sentence about a DIFFERENT subject,
 carrying its own numbers, spliced in before the final question. Everything else would need a teacher
 model to re-derive the gold, and a wrong gold poisons the tier silently.
 

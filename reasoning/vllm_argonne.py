@@ -1,13 +1,13 @@
-"""vLLM 0.11.2 custom-model port of ArgonneModel (argonne2) — §22 fast-inference engine.
+"""vLLM 0.11.2 custom-model port of ArgonneModel (argonne2): §22 fast-inference engine.
 
 Reproduces the deployed model EXACTLY (see reasoning/thinking_training.md §0/§16):
   * GQA 12 query / 4 KV heads, head_dim=256, RoPE θ=1e6 (NeoX).
-  * qk-norm (RMSNorm on q AND k, per head) — like Qwen3.
-  * v-norm (RMSNorm on the value, per head) — NOVEL to Argonne; applied before attention.
-  * sandwich norm (input/post-attn/pre-mlp/post-mlp) — like Gemma2's 4-norm layer.
+  * qk-norm (RMSNorm on q AND k, per head): like Qwen3.
+  * v-norm (RMSNorm on the value, per head): NOVEL to Argonne; applied before attention.
+  * sandwich norm (input/post-attn/pre-mlp/post-mlp): like Gemma2's 4-norm layer.
   * final logit softcap tanh(x/15)*15 (NO attention-logit softcap).
   * tied embeddings (no lm_head in checkpoint).
-  * FULL CAUSAL on every layer — the config's local_attention_window=256 is IGNORED at
+  * FULL CAUSAL on every layer: the config's local_attention_window=256 is IGNORED at
     runtime in the reference (§16), so we do NOT use sliding window (would diverge).
   * NO embedding scaling (unlike Gemma2).
 
@@ -18,7 +18,7 @@ Register + config (do this BEFORE LLM(...), in the driver / launcher):
     AutoConfig.register("argonne2", ArgonneConfig)
     from vllm import ModelRegistry
     ModelRegistry.register_model("ArgonneModel", "vllm_argonne:ArgonneForCausalLM")
-`register()` at the bottom does exactly this — call it, or use it as a vllm.general_plugins entrypoint.
+`register()` at the bottom does exactly this: call it, or use it as a vllm.general_plugins entrypoint.
 """
 from collections.abc import Iterable
 
@@ -73,7 +73,7 @@ class ArgonneAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=config.rope_theta, is_neox_style=True)
 
-        # FULL causal — no sliding window (§16: config window ignored at runtime),
+        # FULL causal: no sliding window (§16: config window ignored at runtime),
         # no attention-logit softcap (Argonne only softcaps the FINAL logits).
         self.attn = Attention(
             self.total_num_heads, self.head_dim, self.scaling,
@@ -242,7 +242,7 @@ class ArgonneForCausalLM(nn.Module, SupportsPP):
         loaded: set[str] = set()
         for name, w in weights:
             if name.startswith("lm_head."):
-                continue  # tied — reuses embed_tokens
+                continue  # tied: reuses embed_tokens
             if name == "embed_tokens.weight":
                 name = "model.embed_tokens.weight"
             elif name == "norm.weight":

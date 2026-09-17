@@ -159,5 +159,5 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("ALL PASS — every production switch is live, the disabled ones are still reachable,")
+print("ALL PASS: every production switch is live, the disabled ones are still reachable,")
 print("           and checkpoint_stride changes speed without changing the model.")
