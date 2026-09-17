@@ -16345,3 +16345,25 @@ via pythia is not true for this path. Every tick in this session ssh's midway3 -
 ControlMaster, and `scp` has been used repeatedly, so a direct rsync to the /eagle login node works.
 (The login node, not a compute node.) Two things still to do: md5 all 100 shards on both sides when
 the copy finishes, and confirm the mirror's copy time has not degraded while the relay runs.
+
+### §M+401: the relay is byte-verified in flight, and the second mirror cron is idle ON PURPOSE. 2026-09-17 09:1x CDT.
+Checked the relayed shards while the copy was still running rather than after all 48 GB, so a
+transport fault would cost minutes instead of two hours: compared sizes first, then md5 on every
+shard whose size matched on both sides. **20 of 20 identical**, no size mismatches. rsync has its own
+rolling checksum, but the standing rule is that byte-exact means a checksum and not a length, and it
+exists because three separate verifications once compared lengths on a 23 GB checkpoint and all three
+reported success.
+No contention so far: the trainer holds 9.56 s/step and 7,069 tok/s per GPU (99.6% of reference) with
+the relay at 19.4 MB/s, and the first Sophia save of the slice landed normally at 09:09
+(`checkpoint_step_214517.pt`, 24.76 GB, verified, and retention pruned 214150 for 23.1 GiB). The open
+question is the mirror's own 24.76 GB copy under that load, which the 09:15 cron will answer.
+⚠️ Two mirror crons exist and one looks dead: line 12 watches the PRETRAIN dir and has logged
+"in sync: /eagle newest is 203451" every 15 minutes since that stage finished on 09-13, while line 23
+(`CKSUB=ckpt_anneal DSUB=anneal`) is the live one. **Deliberately kept.** It is a permanent green
+that means nothing, which by my own rule is noise, but it is also insurance: its glob is
+`checkpoint_step_*.pt` in `$R/ckpt`, so anything that ever writes a new one there (a restart from the
+203451 anchor, for instance) gets mirrored without a cron edit. Deleting backup coverage to quiet a
+log is the wrong trade. It leaves no `.mirror_stage_*` hardlinks behind, so it costs one `ls` per tick.
+⚠️ And my own check for a running mirror used `pgrep -f eagle_mirror`, which matched THIS shell's
+command line. That is the self-match trap already on record as having lied three times; the correct
+form is `ps -o cmd` against the script name.
