@@ -16244,3 +16244,34 @@ launchers and the phase-B one, with the checkpoint dir taken per launcher (`ckpt
 `ckpt_ctx`, asserted in the patch rather than assumed). Tested on a fixture in all four directions:
 forward on a newer save, no-op on nothing new, no move when an older file is present, and **refusal
 of a newer but empty file**, which is the torn-write case the §M+289 hardening exists for.
+
+### §M+398: the census read POLARIS telemetry to answer a question about SOPHIA, and fixing that emptied the node blacklist. 2026-09-17 08:2x CDT.
+With the trainer back on Sophia the census reported `BLIND on sophia` while quoting
+`CSV=polaris_smi_prod_20260917-1213_7629765.csv`. /eagle is shared, the glob was `*_smi_prod_*`, and
+`ls -t | head -1` returns the other machine's newest file. Only the staleness gate prevented a
+verdict. **Had a polaris slice been running concurrently the csv would have been FRESH and this tool
+would have declared sophia's 8 GPUs healthy from polaris data** -- §M+313's lie with a wider mouth,
+introduced by my own fix for §M+313, because "stop being host-pinned" got implemented as "look at
+every host" rather than "look at THIS host".
+⛔⛔ **And the one-line fix immediately emptied the blacklist.** Host-scoping both globs meant the
+§M+392 rebuild, running with `H=sophia`, scanned only sophia csvs and dropped the two capped polaris
+nodes: `CHANGED from [b0n0 b1n0 x3101...] to [x3101...]`. The gap-filler would then have been free to
+land on a node measured at 84%. **They are two different questions and one glob was answering both:**
+"is the GPU under the LIVE trainer capped" is host-scoped, "which nodes in the CLUSTER are known bad"
+is not, because the polaris launchers consult that list no matter which host is training. Restored
+within the same tick, verified identical from both hosts, and no job started during the ~4-minute
+window (polaris held only a `W` job). ⭐ **A derived file multiplies the blast radius of a scope
+change**: the edit that made one reader honest emptied another reader's input.
+⭐ Second half: a blind census is not the same as an unanswered question. What the census exists to
+catch is one clock-capped GPU gating every DDP rank at ~84% while util still reads 100%, and per-GPU
+tok/s answers that from an independent instrument, since a cap costs ~16% against a 1-2% healthy
+spread. The tick now prints `a capped GPU is RULED OUT by throughput: 7084 tok/s per GPU is 100% of
+the 7099 reference`, or escalates to NEEDS ATTENTION below 90%. This matters for the next 12 hours:
+sophia job 186168 is a 12 h slice whose spool predates the sampler edit, so the census will have no
+verdict for its entire life.
+⚠️ Two traps in that substitute, both hit and fixed before it shipped: `LIVETPS`/`NRANK` belong to the
+pending-jobs section and are out of scope there, so the first version always printed "could not be
+read"; and the eff/inst disagreement form ALSO prints "N/GPU on M ranks", but that N is the effective
+rate, which a boundary or a save pushes far down, so using it would have raised a capped-GPU alarm
+about a healthy trainer at every boundary. It now reads `$TS` and skips the check whenever the two
+rates disagreed. Verified on all three inputs: healthy, degraded, and disagreeing.
