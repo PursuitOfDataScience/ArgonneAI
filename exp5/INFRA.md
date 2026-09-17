@@ -16367,3 +16367,19 @@ log is the wrong trade. It leaves no `.mirror_stage_*` hardlinks behind, so it c
 ⚠️ And my own check for a running mirror used `pgrep -f eagle_mirror`, which matched THIS shell's
 command line. That is the self-match trap already on record as having lied three times; the correct
 form is `ps -o cmd` against the script name.
+
+### §M+402: the relay costs the mirror 55-69 s per checkpoint, measured, and nothing else. 2026-09-17 09:2x CDT.
+The open question from §M+400/401 is answered by the mirror's own log, same start/end pair as the
+number on record so the two are the same quantity:
+```
+09:15:01 pinned step 214517 via hardlink   ->   09:20:24 VERIFIED md5=a928319c...
+```
+**323 s for 24.76 GB copy+md5 = 76.7 MB/s**, against 254-268 s (92-98 MB/s) recorded with no relay
+running. So the 19.5 MB/s inbound stream costs the mirror **21-27%, i.e. 55-69 s per checkpoint**, at
+one save per hour on a Sophia slice. The trainer itself is untouched: 9.56 s/step and 7,069 tok/s per
+GPU, 100% of the 7,099 reference, across the whole window.
+That is a price worth paying for a 48 GB transfer that comes off the critical path, and it is
+self-limiting since the relay finishes in ~20 min. Recorded so the next person who sees a 323 s
+mirror copy does not go looking for a fault: the mirror was fine and something else was using the
+link. The hardlink pin did its job through the slower window, and retention pruned 214150 only after
+the md5 verified.
