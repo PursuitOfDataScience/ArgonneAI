@@ -16511,3 +16511,26 @@ of that size either.
 14-slice regression (residual sd 0.0577, §M+3xx), not mean10, which exists to catch a catastrophe in
 one tick and is too noisy for anything else. I caveated it correctly last tick; the lesson is that
 the caveat was load-bearing.
+
+### §M+409: two fixes from this morning confirmed on live data, and the mirror-tracks-the-link claim now has n=3. 2026-09-17 11:2x CDT.
+**`config_drift.sh` works on the host that is training.** With three real saves in the Sophia slice
+(214517, 214894, 215271, dead-regular 377 steps apart) it reports
+`ok -- saves every ~3563 s (elapsed clock, 4 saves) vs --checkpoint_interval 3600`, 1.0% off. That is
+the elapsed-clock path which §M+386 found had never once run, plus the save-line anchoring that
+replaced counting mentions of a filename. Both now verified against a live trainer rather than a
+finished slice's log.
+**The §M+405 retraction turns into a positive finding.** Three mirror copies of the same 24.76 GB
+against the independent link probe nearest in time:
+
+| copy | effective | probe | ratio |
+| --- | --- | --- | --- |
+| 294 s | 84.2 MB/s | 96.4 MB/s | 0.87 |
+| 587 s | 42.2 MB/s | 20.4 MB/s | 2.07 |
+| 368 s | 67.3 MB/s | 82.8 MB/s | 0.81 |
+
+Two of the three land within 20% of the probe once md5 time is allowed for (~50 s for 24.76 GB), and
+the third is the 20.4 MB/s sample, a single instantaneous reading taken mid-copy of a link that
+swings 11x. **The mirror's duration tracks the link, not anything we run**, which is what the
+retraction asserted and now has three pairs behind it instead of one. Practical consequence for a
+future tick: a mirror copy anywhere between ~250 s and ~600 s is normal and needs no investigation;
+check `relay_probe.log` before suspecting the mirror.
