@@ -16073,3 +16073,34 @@ cause, with no hardcoded steady state:
 All four verified against synthetic inputs, plus the agreeing case. ⚠️ And the first version printed
 TWO explanations on the boundary line, because I put the `lo`/`hi` assignment between the branches:
 an assignment ends an awk if/else chain. Caught by looking at the output rather than at the patch.
+
+### §M+391: my punctuation sweep broke a live monitor's field, `bash -n` passed it, and the tick's own grep hid it. 2026-09-17 07:0x CDT.
+The tick opened with a stray line in blockers' output:
+```
+tr: invalid option -- ','
+```
+Cause: §M+389's whitespace tidy (`\s+([,:])` collapsed to `\1`) ran on **every** line, not only lines
+holding a dash, and it turned `| tr -d ,` into `| tr -d,`. `tr` reads that as an option and refuses,
+so `LIVETPS` came back empty for a whole tick. That is not a cosmetic field: it is the live tok/s of
+whatever is covering us, and it decides whether a pending Sophia job gets labelled an UPGRADE or a
+no-op wait, which is the routing the owner's blockers directive exists for.
+⛔ **Three defences were in place and all three passed it.** `bash -n` is syntactically satisfied by a
+bad argument inside a valid command. `recipe_smoke.sh` trips on silence, shell errors and
+"could not resolve", and a getopt refusal matched none of those, so the monitor kept printing rows
+with one field empty. And I pipe blockers through `grep` in the tick, so the stderr line sat next to
+output I was filtering.
+⭐ Fixes, at the two levels that failed:
+1. **blockers.sh audits its own stderr.** It captures fd 2, and on exit reports anything that is not
+   known ssh noise as `NEEDS ATTENTION: blockers.sh itself emitted errors, so a FIELD above may be
+   silently empty`. In-band, so a tick's grep cannot drop it by accident. Positive control: injecting
+   `tr -d,` makes it fire with the exact message; negative control: the live run is silent.
+2. **recipe_smoke.sh** now also trips on `invalid option`, `unrecognized option`, `illegal option`
+   and the `Try 'x --help'` follow-up.
+Swept both trees for the same damage class (an option letter glued to a comma or colon) and found no
+other instance; `cut`, `sort`, `paste` and `join` accept a glued delimiter, `tr` does not, which is
+why this was the only break. All 33 touched shell files parse.
+⚠️ **The general lesson is about blast radius, not about `tr`.** A formatting pass is not a safe
+operation on executable text: the dash recast itself was fine, but the whitespace tidy that rode
+along with it edited code. If a sweep must touch code, its verification has to be semantic (the AST
+comparison I ran on the Python files) rather than syntactic, and shell has no AST, so the honest
+answer for `.sh` is to convert only lines that actually contain the character being removed.
