@@ -16820,3 +16820,24 @@ of two means is not a place in a distribution.
 ⭐ Incidental and worth keeping: **embedding row norms have fallen from 1.363 at init to a median of
 1.119 after 116.8B tokens**, which is a direct read on what weight decay has done to the embedding
 table and is not recorded anywhere else.
+
+### §M+421: relaying the larger replay source, because my own recommended ratio was the one shape ALCF could not build. 2026-09-17 14:4x CDT.
+§M+411 flagged it and §M+416 made it binding: r=0.75 needs **4.29B** replay tokens and `fineweb_edu`
+holds only 2.201B, so the ratio I recommend was the single shape that could NOT be built on /eagle
+while r=0.9 could. That is a poor place to leave a decision the owner has not made yet. Started
+`fineweb_edu_a4` (77 GB on disk, 82.4 GB apparent, 655 files, 218 bins, **20.61B tokens**) at the same
+20 MB/s cap, ~70 min, verification armed the same way.
+⭐ The point is not the bytes, it is that **whichever of r=0.75 or r=0.9 is chosen, the build can then
+start immediately** instead of waiting on a 70-minute transfer discovered at the handover. /eagle has
+29 PB free, so the only cost is time I am not otherwise using.
+⚠️ **The two general sources OVERLAP and a real mix must name only one.** Shard names are
+`fineweb-edu-train-NNNNN-of-00218` in both, so the 24-bin `fineweb_edu` is a PREFIX of the 218-bin
+`fineweb_edu_a4`. Naming both in `--budgets` would draw the same documents twice and quietly inflate
+the replay share above whatever r was chosen.
+⚠️ And the disjointness rule in `cmd_flatten` applies to the replay draw: shrink a source's
+contribution with `--skips`, never by lowering its budget, because `use = min(avail, budget)` moves
+the main/holdout split and a smaller budget re-serves data phase A already trained on.
+⇒ After this lands, the only manual step left in the phase A -> B handover is the ratio itself. The
+plan is to pre-build to a NON-default filename (`ctx_mix_r0NN_flat.bin`), which the watchdog's gate
+on `ctx_mix_flat.bin` deliberately will not see, so the last action is a rename rather than a 25-min
+build, and phase B cannot start on an unapproved mix.
