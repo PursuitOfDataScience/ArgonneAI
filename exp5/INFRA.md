@@ -16458,3 +16458,39 @@ third int32, which reads 886,453,074 for a file holding 18.066B tokens and is ig
 Anyone dividing that field by anything gets a number 20x too small. And the check confirms phase A's
 corpus is sized to exactly one epoch: 18.0663B tokens available against 33,414 x 540,672 = 18.0654B
 required, a ratio of 1.00002.
+
+### §M+407: the phase-B mix ratio is NOT gated on phase A's loss curve, and r sets the run length as much as the purity. 2026-09-17 10:5x CDT.
+The record says the ratio "waits on phase A's end-state curve" and that at 30% completion the curve
+is uninformative **for the mix ratio**. The second half is right; the first half does not survive
+being asked *how* a loss curve would set a ratio. It would not. What the ratio actually trades:
+
+| r = arxiv share of tokens | single-doc window purity at block 13,568 | mix size | phase-B steps (one epoch, 542,720 tok/step) | wall at 9.53 s/step |
+| --- | --- | --- | --- | --- |
+| 0.25 | 17.8% | 51.4B | 94,782 | ~251 h |
+| 0.50 | 35.5% | 25.7B | 47,391 | ~125 h |
+| 0.75 | 53.3% | 17.1B | 31,594 | ~84 h |
+| 0.90 | 64.0% | 14.3B | 26,328 | ~70 h |
+| 1.00 | 71.1% | 12.9B | 23,695 | ~63 h |
+⭐ **The coupling nobody had priced: with `--max_epochs 1` the corpus IS the schedule, so a LOWER r
+both worsens purity and lengthens the run**, because the 12.86B-token arxiv source is fixed and
+everything else is dilution. r=0.5 is a 125 h phase B at half the purity of r=1.0's 63 h. That makes
+the decision far less symmetric than "purity versus forgetting" suggested, and it is computable now.
+Measured from the relayed source itself (274,362 docs, 12,860,433,463 tokens, min 27,136 as the
+filter promised, max 10.4M, mean 46,874), not from a plan.
+⛔ **And I nearly reported 87.8% as an improvement on the recorded 71.1%.** Both are correct
+arithmetic on the same lengths; they are different samplers:
+- **Model A**, `sum(max(L-B+1,0))/sum(L)` = **71.1%**: the chance a window at a RANDOM offset in a
+  packed stream lies entirely inside one document. Reproduces the recorded figure exactly, including
+  the closed form `(sum(L) - n*(B-1))/sum(L)`.
+- **Model B**, `sum(floor(L/B))/floor(sum(L)/B)` = 87.8%: non-overlapping windows ALIGNED to each
+  document start.
+The trainer memmaps a flat packed stream and cuts fixed blocks with no knowledge of boundaries, so
+Model A is ours and the record was right. [[which-statistic-is-this-number]] again, and the tell was
+that a "new, better" number disagreed with a recorded one in the favourable direction.
+⇒ **What the ratio needs is not the curve**: purity (above), forgetting tolerance
+([[anneal-no-lr-decay-and-general-forgetting]] shows general forgetting is real in this family), and
+the wall budget. What phase A's end state IS good for is a per-tier CE probe on the final checkpoint,
+which says which domain to replay, not how much. My recommendation when the call is made: **r ~= 0.9**
+(64% purity, 26,328 steps, ~70 h, 10% replay to hold general), with r=0.75 as the conservative
+alternative at 14 h more wall. Not acted on: the build is ~25 min and nothing is gained by committing
+early.
