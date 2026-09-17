@@ -16681,3 +16681,33 @@ reading a future liveness failure as a weights problem.
 Footprint removed on both sides with `find -delete` plus `rm -f` on named files, and the three real
 completion markers verified untouched (`.pretrain_complete` present as it should be, the other two
 absent).
+
+### §M+416: revising my own r recommendation DOWN, because the benefit side is measured and the risk side is not. 2026-09-17 13:2x CDT.
+§M+407 priced purity and run length and recommended **r ~= 0.9**. Going back through the record for
+a forgetting prior found the passage that explains why the mix was deferred in the first place:
+> a pure-arxiv 6B-token stage would invite the general-forgetting failure
+> [[anneal-no-lr-decay-and-general-forgetting]] records, so it wants a disjoint reasoning slice
+> alongside the long documents
+That is a recorded concern pointing the opposite way from my recommendation, and **r=0.9 is close to
+the "pure-arxiv" shape it warns about**. So the two sides of this decision are not symmetric in the
+way a table makes them look:
+- **Benefit of a high r: measured.** Purity 64.0% vs 53.3%, wall 70 h vs 84 h, both computed from the
+  actual document lengths.
+- **Cost of a high r: recorded but never quantified.** Nothing in the registry gives a general-
+  capability delta as a function of the long-document share. I grepped for one; there is no a4 phase-C
+  composition-versus-forgetting measurement to import, and [[a4-phasec-base-dominated-by-qwen3-06b]]
+  frames phase C as a domain trade rather than a context extension, so it is not the same axis.
+⇒ **Revised recommendation: r ~= 0.75** (53.3% purity, 17.1B tokens, 31,595 steps, ~84 h, 25%
+replay). An unquantified downside argues against the aggressive end of a range, and 14 h of extra
+wall is a cheap premium against re-running a context-extension stage that forgot its general
+ability. r=0.9 stays on the table if the owner weights wall time higher.
+⭐ And it is auditable rather than a guess-forever: `reasoning/tier_ce_probe.py` on phase A's final
+checkpoint gives the per-tier baseline, and the same probe after phase B gives the delta. That does
+not choose r in advance, but it means whichever r is chosen produces the measurement the next
+extension stage needs. **Note for phase B's plan: run the probe on the final phase-A export BEFORE
+phase B starts**, because once phase B overwrites nothing the baseline is unrecoverable only in the
+sense that it costs a checkpoint load, but the export is the natural place to take it.
+⚠️ Also: §M+400 recorded "midway3 can reach ALCF directly" as a correction to a memory note, and the
+record ALREADY said exactly that at §M+260's tail ("do not build a relay for phase B's data"). I
+rediscovered a recorded fact and wrote it up as new. Grep the record before writing a correction, not
+only before taking a measurement.
