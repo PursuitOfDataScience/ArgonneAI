@@ -16414,3 +16414,26 @@ than to pick a side: above 2x it now reports that neither number is quotable and
 likely cause when inst sits far above the host reference.
 All six branches re-verified after the change: wide bound, tight bound, EMA above the bound, save
 inside the window, slice boundary, and agreement.
+
+### §M+405: RETRACTION of §M+402. The relay-vs-mirror contention number is not supported, and the instrument that refutes it was already running. 2026-09-17 10:2x CDT.
+§M+402 claimed the 19.5 MB/s relay cost the mirror **21-27%, or 55-69 s per checkpoint**, from a
+single 323 s copy against a remembered 254-268 s baseline. Withdrawn. This tick the mirror took
+**587 s** (10:16:13 to 10:26:00, 42 MB/s) with **zero rsync processes running**, which is worse than
+the copy I blamed on the relay.
+⛔ **`relay_probe.sh` has been sampling the /eagle to midway3 rate every 20 minutes the whole time,
+and I did not look at it.** Its own crontab comment says it exists to decide whether the mirror's slow
+window is time-of-day predictable. Today, n=32:
+
+| min | median | max | range |
+| --- | --- | --- | --- |
+| 20.4 MB/s | 116 MB/s | 226 MB/s | **11.1x** |
+
+A 20.4 MB/s sample lands at 10:20 with no relay running, and both mirror copies track the probe
+sample nearest in time (09:20 copy 84 MB/s against probe 96.4; 10:20 copy 42 MB/s against probe
+20.4). **An effect of 21-27% cannot be extracted from n=1 when the underlying quantity varies 11x**,
+and the baseline I differenced against was itself two observations from a different day.
+⭐ The honest statements: the mirror's copy time is dominated by link variability, not by us; a 587 s
+copy is not a fault and needs no investigation; and identifying the relay's real cost would need
+paired on/off samples at matched times of day, which is not worth the effort for a transfer that has
+already finished. This is [[which-statistic-is-this-number]] plus the rule about reading the registry
+before measuring: the confounder had a dedicated instrument, on a cron, feeding a log I never opened.
