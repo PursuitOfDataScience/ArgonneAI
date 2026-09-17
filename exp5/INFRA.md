@@ -16316,3 +16316,32 @@ with a literal asterisk, so `qstat -f` returned nothing and the first run report
 while a parked job sat right there** -- the precise false all-clear the tool exists to prevent. Alarm
 arithmetic then verified against the real historical values: 42,600 s late against a 15,300 s slack
 fires, as it should have this morning.
+
+### §M+400: phase B's 48 GB corpus was on the wrong cluster, and the transfer does NOT depend on the mix decision. Relay started 46 h early. 2026-09-17 09:0x CDT.
+Audited phase B's data paths the same way §M+395 audited its flags, since neither launcher has ever
+been submitted. Three results:
+- `ckpt_ctx` does not exist, and that is fine: `ctx_chain_sn.pbs:74` does `mkdir -p $R/ckpt_ctx`.
+- `data/ctx_mix/ctx_mix_flat.bin` does not exist, also fine: the `MIN_DATA_BYTES=4e9` floor refuses to
+  train without it, which is the guard working.
+- **The filtered long-context source is not on /eagle at all.** It is on midway3:
+  `/project/rcc/youzhi/data/reasoning_anneal/longctx_arxiv`, 100 shards, 48 GB, 51,442,967,084 bytes
+  = **12.86B tokens** at uint32 with no docbin header.
+⭐ **The scheduling insight: the relay is unconditional.** The phase-B mix RATIO is still ~46 h away
+(it needs phase A's cooldown curve at 85%, and we are at 32.9%), and I had been treating the whole
+corpus build as blocked behind it. It is not: the ratio is realised at FLATTEN time by how much of
+each source is sampled, so the 12.86B-token source has to be on /eagle either way. Waiting for the
+ratio to start a 48 GB cross-WAN copy would have put the transfer on the critical path at handover
+for no reason.
+Measured before committing: one 445 MB shard took 41 s = **11 MB/s**, so 48 GB is 1-2.5 h (the rate
+fluctuates between 5 and 20 MB/s). Started with `rsync -a --partial --bwlimit=20000`, which is not
+binding at these rates but caps it if the link improves, so it cannot starve the checkpoint mirror.
+⚠️ Destination verified BEFORE the copy rather than after, because getting it wrong means sending
+48 GB twice: `build_reasoning_corpus.py:56` reads `RC_OUT_ROOT` (default
+`/project/rcc/youzhi/data/reasoning_anneal`) and `cmd_flatten` globs `$RC_OUT_ROOT/<name>/*.bin`, so
+with `RC_OUT_ROOT` pointed at /eagle the source resolves to `reasoning_anneal/longctx_arxiv/*.bin`,
+which is exactly where the relay is writing, beside the existing `reasoning_anneal_flat.bin`.
+⚠️ Also corrected a stale premise of my own: the note that midway3 cannot reach ALCF and must relay
+via pythia is not true for this path. Every tick in this session ssh's midway3 -> polaris over a
+ControlMaster, and `scp` has been used repeatedly, so a direct rsync to the /eagle login node works.
+(The login node, not a compute node.) Two things still to do: md5 all 100 shards on both sides when
+the copy finishes, and confirm the mirror's copy time has not degraded while the relay runs.
