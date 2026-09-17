@@ -16275,3 +16275,44 @@ read"; and the eff/inst disagreement form ALSO prints "N/GPU on M ranks", but th
 rate, which a boundary or a save pushes far down, so using it would have raised a capped-GPU alarm
 about a healthy trainer at every boundary. It now reads `$TS` and skips the check whenever the two
 rates disagreed. Verified on all three inputs: healthy, degraded, and disagreeing.
+
+### §M+399: our only training insurance was parked until 16 hours AFTER the boundary it was supposed to cover. Full causal chain, and the file that healed did not heal the consumer. 2026-09-17 08:4x CDT.
+Checked the gap-filler's park time because Sophia had just claimed an 11.5 h slice, which is 11.5 h
+for the insurance to be wrong in. Job 7629851 read
+`Execution_Time = Fri Sep 18 12:23:45`, against a Sophia boundary of Sep 18 00:33:45 UTC.
+**The chain, verified end to end rather than guessed:**
+1. Sophia job 186168 was submitted 2026-09-16 11:00 UTC. The launcher's comment-skip fix for the
+   boundary grep landed ~12:2x UTC that day, **1.5 h later**, so this job's spool still takes the
+   FIRST `--wall_time N` in the file, which is `84600` inside a comment ([[patching-a-script-does-not-patch-queued-jobs]]).
+2. At 13:03:45 it therefore wrote `stime + 84600` = Sep 18 12:33:45 to `.sophia_boundary`.
+3. At 13:04:23, 38 seconds later, the yielding gap-filler read that and submitted `-a boundary-600`
+   = Sep 18 12:23:45. **Exact match with the observed value**, so this is the cause, not a story.
+4. `boundary_check.sh` healed the file at 13:07:06, three minutes later. The running trainer was never
+   at risk (its own log says `Wall time: 41400s, will save checkpoint at 41220s`), and the file now
+   agrees with the derived boundary to 0 minutes.
+⛔ **A monitor that repairs state after a consumer has acted on it is only half a fix.** The file
+heals; a submitted `-a` does not. That is the general defect, and it is why the detector below exists
+rather than just a better boundary writer.
+⭐ Three fixes, at three levels:
+- **The park is now clamped** (`MAXPARK`, 4 h) in all four Polaris launchers. An unbounded park turns
+  a wrong boundary into an unbounded unfilled gap. 4 h is priced against the churn it replaces: the
+  original problem was re-queueing every 10 min (72 placements across a 12 h primary), and waking
+  every 4 h is 3, so the churn saving survives while the worst case becomes bounded. Once the boundary
+  is inside MAXPARK the precise park takes over, so no gap is introduced. Tested in six directions.
+- **The live job was replaced** (`qalter -a` is rejected by the same account_check hook that rejects
+  `qalter -m n`, so qdel + qsub): 7629916 now wakes at 17:46 UTC.
+- **`~/bin/park_check.sh`** asks the consumer instead of the state: how does the parked job's own
+  `Execution_Time` compare with the boundary we believe now? Wired into blockers (speaks only on a
+  problem) and into the liveness list.
+⚠️ **And I proved the `-a` format was innocent before blaming it.** The 12-hour-looking discrepancy
+(00:23 vs 12:23) invited an AM/PM parse theory; resubmitting with `-a 202609171746.47` produced
+`Execution_Time = Thu Sep 17 17:46:47`, exactly as asked. A held probe job would have been cheaper but
+the `generic` Q limit refuses one while a `W` job exists, which is the same effective-limit-of-1
+already on record.
+⚠️ Two of my own bugs in that detector, both caught by running it rather than reading it: the clamp's
+diagnostic `echo` went to STDOUT inside a function called as `-a $(requeue_at)`, so the message would
+have become part of the qsub argument; and `qstat -u` truncates the job id to `7629916.polaris-pbs*`
+with a literal asterisk, so `qstat -f` returned nothing and the first run reported **"0 parked jobs"
+while a parked job sat right there** -- the precise false all-clear the tool exists to prevent. Alarm
+arithmetic then verified against the real historical values: 42,600 s late against a 15,300 s slack
+fires, as it should have this morning.
