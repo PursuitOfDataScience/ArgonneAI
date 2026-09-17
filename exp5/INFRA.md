@@ -16383,3 +16383,18 @@ self-limiting since the relay finishes in ~20 min. Recorded so the next person w
 mirror copy does not go looking for a fault: the mirror was fine and something else was using the
 link. The hardlink pin did its job through the slower window, and retention pruned 214150 only after
 the md5 verified.
+
+### §M+403: the phase-B corpus is on /eagle and byte-exact. 301 files, and the 12 KB that did not match was a directory inode. 2026-09-17 09:5x CDT.
+Relay finished 09:46:50 CDT, so 48 GB took ~45 min at a sustained 19.5 MB/s. Verdict from the armed
+verification: **301 of 301 files md5-identical on both sides**, file counts equal.
+⚠️ But `du -sb` disagreed by **12,288 bytes** (51,442,967,084 local vs 51,442,954,796 remote), which
+alongside 301 matching checksums is exactly the kind of small residual that is either meaningless or
+the whole story, and the rule is to name it rather than wave it away. It is the directory inode:
+`du -sb` sums apparent sizes including directories, and the entry is 32,768 bytes on /project against
+20,480 on Lustre. Summing FILES only gives **51,442,934,316 on both sides, delta 0**.
+⭐ So the correct source size is 51,442,934,316 bytes = **12.86B tokens** at uint32. The figure I put
+in §M+400 was the `du` total including directory entries; the token count is unchanged because the
+error is 0.00002%, but the raw byte number there should not be divided by 4 by a later reader.
+Phase B's data is now off the critical path entirely: the source is in place beside
+`reasoning_anneal_flat.bin` where `RC_OUT_ROOT` resolves it, and what remains is the flatten, which
+genuinely does wait on the mix ratio (~45 h out, at 85% of phase A).
