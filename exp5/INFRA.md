@@ -16711,3 +16711,29 @@ sense that it costs a checkpoint load, but the export is the natural place to ta
 record ALREADY said exactly that at §M+260's tail ("do not build a relay for phase B's data"). I
 rediscovered a recorded fact and wrote it up as new. Grep the record before writing a correction, not
 only before taking a measurement.
+
+### §M+417: ran the standing shape check for the first time today and found its queue cap goes INERT off-site. 2026-09-17 13:4x CDT.
+The standing instruction says to re-check every tick whether the trainer could run on a better shape,
+because a degraded-but-working job produces no symptoms. I had been answering that implicitly from
+tok/s per GPU and had not actually run `best_shape.sh` since the trainer moved to Sophia. It agrees
+with the throughput reading (`no upgrade available`) and independently reproduces
+`~/bin/sophia_free_gpu.sh`: **0 free+untagged, 2 raw free including tag-fenced.** Two tools, different
+parses, same answer.
+⛔ But it printed `submit queue : debug-scaling (nodect ?-?, max wall ?)` while claiming
+`site : sophia`. `debug-scaling` is a POLARIS queue, so the `qmgr` lookup returned nothing and
+`QCAP` came back empty, and the cap test is `[ -n "$QCAP" ] && [ "$n" -gt "$QCAP" ] && continue`:
+**an unresolvable queue means no cap at all.** With 6 nodes free it would have proposed 6 nodes /
+48 GPU against a real `by-node` ceiling of 8 and with no wall check. FREE=0 hid it today, and the
+measured-throughput gate further down would still have refused the recommendation (48 GPU measures
+~1,083 tok/s per GPU), so this was latent rather than harmful. A cap that evaporates on an unknown
+input is the wrong direction to fail in.
+⭐ Fixed both halves: the queue now defaults per site (`sophia -> by-node`, `polaris ->
+debug-scaling`), and an unresolvable queue **refuses with exit 3** instead of silently running
+uncapped. Verified both directions, plus the real limits it now reads (sophia `by-node` nodect<=8,
+wall 24 h; `single-node` nodect<=1, wall 12 h; polaris `debug-scaling` nodect<=10, wall 1 h).
+⚠️ And I nearly "corrected" a true comment. The script warns that
+`polaris_chain_keeper4.sh` and `shape_upgrade.sh` both grep its `free+untagged` line; my literal grep
+for that string found neither, which looked like stale documentation. They grep
+`free.untagged +: +\K[0-9]+` -- the `+` is a regex metacharacter, so my search was the thing that was
+wrong. Confirmed at the real call site: both invoke it as `QUEUE_TAG=prod bash best_shape.sh` against
+POLARIS, which takes the unchanged branch and still extracts `10`.
