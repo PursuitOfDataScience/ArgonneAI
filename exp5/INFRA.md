@@ -16652,3 +16652,32 @@ boundary, which is inside MAXPARK, so the next park will be the precise `boundar
 UTC. Two extra 2-node placements across a 11.5 h primary slice, against the 72 that the original
 10-minute requeue would have made, and the worst-case unfilled gap is now bounded at 4 h instead of
 unbounded. `park_check` agrees the parked job wakes before the boundary.
+
+### §M+415: exercised the anneal export backup with a synthetic marker. All four stages work, and the liveness check correctly refused a fake model. 2026-09-17 13:1x CDT.
+The anneal line of `final_export_backup.sh` (§M+374) fires in ~55 h, unattended, and had never run:
+phase A's publishable artifact is `$R/ckpt/anneal_model_complete` behind `.continue_pretrain_complete`,
+and if that path is broken the deliverable of a multi-day run sits on /eagle alone. Testing it for
+real is impossible without lying to the chain, since creating `.continue_pretrain_complete` would
+make every launcher believe phase A is finished and STOP training. So I tested the mechanism instead
+of the marker: a synthetic pair (`$R/ckpt/.export_smoke` plus `$R/.export_smoke_mark`) driven through
+the script's own `EXPORT_SUB`/`EXPORT_MARK`/`EXPORT_TAG` parameters, which is exactly what those
+parameters are for.
+
+| stage | result |
+| --- | --- |
+| marker gate | opened on the synthetic marker, ignored the real ones |
+| copy | `config.json` + `model.safetensors` landed on /project |
+| md5 | verified, `.verified` written |
+| numerical liveness | **FAILED, correctly** |
+
+⭐ The liveness failure is the interesting part: it is a true negative. My 26-byte placeholder is not
+a loadable model, and the script said so while stating explicitly that "the md5 verdict above still
+stands" -- the non-propagating behaviour it was built with. A check that had passed on that input
+would have been the defect.
+⚠️ It failed on a TOKENIZER instantiation error, not a numeric one, so the liveness check depends on
+the tokenizer being present in the export dir. The real completion path does
+`tokenizer.save_pretrained`, so this will not bite, but it is a dependency worth knowing before
+reading a future liveness failure as a weights problem.
+Footprint removed on both sides with `find -delete` plus `rm -f` on named files, and the three real
+completion markers verified untouched (`.pretrain_complete` present as it should be, the other two
+absent).
