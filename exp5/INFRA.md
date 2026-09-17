@@ -16636,3 +16636,19 @@ written down rather than left to be rediscovered.
 ⚠️ My first harness split its labels on spaces and fed the label to the arithmetic, producing five
 `integer expression expected` errors and a column of 1,658s that looked like a suspicious constant.
 The code was fine; the test was not. Re-run with label:value pairs.
+
+### §M+414: the park clamp ran in production on its first wake, and the stdout trap it nearly shipped with stayed fixed. 2026-09-17 12:5x CDT.
+The §M+399 clamp had never executed. Slice 838 woke at 17:51 UTC, saw Sophia's flag fresh, yielded,
+and logged:
+```
+=== park clamped: boundary says 2026-09-18 00:23:45 which is over 14400s away; waking at 2026-09-17 21:51:14 instead ===
+```
+`Submit_arguments = -m n -a 202609172151.14` and `Execution_Time = Thu Sep 17 21:51:14`, so the
+resubmission carried a clean timestamp: the diagnostic went to the log and stderr and **not** into the
+`-a` argument, which is the failure the pre-ship fix prevented (a function called as
+`-a $(requeue_at)` cannot print to stdout).
+The hop sequence is behaving as designed rather than as hoped: the new wake is **2.71 h** before the
+boundary, which is inside MAXPARK, so the next park will be the precise `boundary - 600` = 00:23:45
+UTC. Two extra 2-node placements across a 11.5 h primary slice, against the 72 that the original
+10-minute requeue would have made, and the worst-case unfilled gap is now bounded at 4 h instead of
+unbounded. `park_check` agrees the parked job wakes before the boundary.
