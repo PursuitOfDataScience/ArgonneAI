@@ -16049,3 +16049,27 @@ identical on all four backed-up files and punctuation-only on the rest.
 whitespace-tidy substitutions (`\s+([,:])` and `,\s*,`) ran on **every** line, not only lines that
 held a dash, so they could have edited spacing inside an unrelated string literal. The AST check is
 what proves they did not.
+
+### §M+390: the eff/inst disagreement has FOUR causes, not one, and the granularity bound separates them. 2026-09-17 06:5x CDT.
+Twenty minutes after §M+387 taught this line to say "slice boundary", it produced a third wrong
+label: `8.40 s/step eff / 10.76 inst  64365 tok/s eff  8045/GPU ... which is what a checkpoint save
+looks like`. **8,045 tok/s per GPU is above anything either machine has ever produced** (Polaris
+measures ~6,357, Sophia ~7,099), so the label invited a fabricated throughput record. And my first
+fix asserted "eff faster than inst is not a save", which is false: a save inflates the tqdm EMA
+(§M+315 measured 31.79 against a true 9.0), and that ALSO puts eff below inst. The sign does not
+separate the causes.
+⭐ **The discriminator is a bound, not a sign.** The step comes from a `Step N | Loss` line printed
+every `log_interval` steps, so each read lags the true step by up to 25 and the delta rate can be
+anything in `[m*60/(d+25), m*60/(d-25)]`. Where `inst` falls relative to that interval names the
+cause, with no hardcoded steady state:
+
+| inst vs the bound | cause | what to quote |
+| --- | --- | --- |
+| process up < 0.9 x window | slice boundary (gap + setup + compile) | inst, and the boundary cost |
+| inside `[lo, hi]` | nothing: the two readings do not actually disagree | inst |
+| above `hi` | the tqdm EMA is unwinding from a save | eff |
+| below `lo` | the window itself contains the ~84 s save stall | inst |
+
+All four verified against synthetic inputs, plus the agreeing case. ⚠️ And the first version printed
+TWO explanations on the boundary line, because I put the `lo`/`hi` assignment between the branches:
+an assignment ends an awk if/else chain. Caught by looking at the output rather than at the patch.
