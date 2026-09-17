@@ -16586,3 +16586,28 @@ Verification armed the same way, md5 on every file once the rsync exits.
 ⚠️ 2.201B tokens of `fineweb_edu` covers the r=0.9 replay need (1.43B) but not r=0.75 (4.3B). If the
 call lands below ~0.85, `fineweb_edu_a4` has to come across too, and that is 82 GB, so it is worth
 knowing the direction of the decision before phase A ends rather than after.
+
+### §M+412: phase B's build now runs on ALCF, proven there rather than inferred. Two missing pieces found by trying it. 2026-09-17 12:1x CDT.
+Replay source relayed and verified: **73 files, 8,802,745,650 bytes, all md5-identical**, ~9 min for
+8.2 GB. So both mix sources are on /eagle. Then I tried to actually run the build there, which found
+two things no amount of reading would have:
+1. **`build_reasoning_corpus.py` was not on /eagle at all.** The launchers live there, the data lives
+   there, the build script did not. Staged (one scp).
+2. **The Sophia/Polaris login python has no numpy**, which I had already tripped over an hour earlier
+   when an `od` check replaced a numpy one. The launchers' env
+   (`.../members/youzhi/envs/llm`, numpy 2.4.3, python 3.11.15) does, so the build must be invoked
+   with `$E/bin/python`, not `python3`.
+Then ran the real thing small, on ALCF, writing to /eagle:
+```
+RC_OUT_ROOT=$R/data/reasoning_anneal $E/bin/python build_reasoning_corpus.py flatten \
+  --include longctx_arxiv --budgets longctx_arxiv=90000000,fineweb_edu=10000000
+```
+100,000,000 tokens, exactly 90/10, 400,001,024 bytes = 1024 + 100M x 4, magic **20240801**, ids
+0-151,643. Output deleted by name.
+⇒ **Phase B's data path is now end-to-end executable and the only missing input is the ratio.** The
+recipe, so the handover is mechanical: `RC_OUT_ROOT=$R/data/reasoning_anneal $E/bin/python
+build_reasoning_corpus.py flatten --include longctx_arxiv --budgets longctx_arxiv=12860433463,fineweb_edu=<replay>
+--out_bin $R/data/ctx_mix/ctx_mix_flat.bin`, then the launcher's own `MIN_DATA_BYTES` and derived
+`COOLDOWN` take it from there.
+⚠️ Do NOT write a smoke output to `data/ctx_mix/ctx_mix_flat.bin`: the launcher's 4 GB floor would
+pass on a test file and phase B would train on it. Both smokes went to scratch names on purpose.
