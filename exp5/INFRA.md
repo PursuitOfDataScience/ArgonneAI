@@ -16161,3 +16161,27 @@ derivation proves the alignment: it obtained compile = 93 s as `1466 - 129 x 10.
 ⭐ So the fix went into the code rather than into the record: the §M+387 boundary line said
 "gap+setup+compile", which is the same mislabel shipped as a monitor. It now names the segment it
 actually computes and says explicitly that the compile is not in it. [[which-statistic-is-this-number]]
+
+### §M+395: a launcher is only validated by being submitted, so phase B has never been checked. Built the check; it passes, and its own first two versions did not. 2026-09-17 07:4x CDT.
+The exposure: an unrecognised flag is not a warning, it is an immediate argparse exit. So a typo in a
+launcher for a stage that has not started, or a flag renamed in the trainer while a launcher keeps the
+old spelling, surfaces hours later at a slice boundary with the node already ours and the job dead on
+arrival. Both phase-B launchers are unsubmitted, which is exactly where this can hide.
+`~/bin/launcher_flag_check.sh` joins each launcher's continuation lines, takes the command that runs
+the trainer, reads the flags AFTER the script name, and requires each to appear in that script's
+`add_argument` list. Result: **ok, 56 launcher/script pairs, no dead flags**, phase B included. A
+negative result, and now a standing one: it is wired into `recipe_smoke.sh` so any future launcher
+edit is covered.
+⛔ **Its first version produced 130 findings, every one false**, and its second produced 8, also all
+false. Both were parse failures, not query failures:
+1. It attributed every `--flag` anywhere in the file to the trainer, so `nvidia-smi --query-gpu
+   --format`, `mpiexec --cpu-bind --env`, `torchrun --nnodes --node_rank` and `qstat --format` all
+   came back as dead trainer flags, with any real defect buried in the noise.
+2. **`pretrain.py` is a suffix of `continue_pretrain.py`.** A plain substring match found the
+   continue_pretrain invocation, the greedy `sed` stripped through it, and the flags were then checked
+   against `pretrain.py`, where `--started_marker` legitimately does not exist. Eight launchers, one
+   fake finding each. The script name now has to be preceded by a slash or whitespace.
+⭐ Both directions verified before believing the clean result: injecting
+`--this_flag_does_not_exist` into a copy of `ctx_chain_sn.pbs` produces exactly one finding with the
+right attribution. A checker that has only ever printed "ok" has not been tested.
+[[a-checker-inherits-its-authors-blind-spot]]
