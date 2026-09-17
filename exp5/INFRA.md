@@ -16437,3 +16437,24 @@ copy is not a fault and needs no investigation; and identifying the relay's real
 paired on/off samples at matched times of day, which is not worth the effort for a transfer that has
 already finished. This is [[which-statistic-is-this-number]] plus the rule about reading the registry
 before measuring: the confounder had a dedicated instrument, on a cron, feeding a log I never opened.
+
+### §M+406: phase B's data format is consistent end to end, checked before the handover rather than at it. 2026-09-17 10:4x CDT.
+The highest-consequence silent failure available to phase B is a data-format mismatch, so I traced it
+before the stage starts. `continue_pretrain.py:81-85` **requires** a 1024-byte header with magic
+`20240801` and memmaps uint32 from offset `256*4`, raising `Unknown magic number` otherwise. Three
+links checked with `od`, since the Sophia login node has no numpy:
+
+| artifact | first bytes | reading |
+| --- | --- | --- |
+| `reasoning_anneal_flat.bin` (phase A reads it today) | `a1 d9 34 01` | magic **20240801** |
+| relayed `shard_00000.bin` (a docbin shard) | `3b 00 00 00` | token id 59, **no header**, as designed |
+| `cmd_flatten` in `build_reasoning_corpus.py:747` | `MAGIC, HDR = 20240801, 256` | writes the header the trainer needs |
+
+So docbin shards -> flatten -> `ctx_mix_flat.bin` -> trainer is consistent, and a missing header would
+have been a loud `ValueError` at the first phase-B slice rather than silent garbage. Negative result,
+which is the one I wanted.
+⭐ A useful by-product: the authoritative token count is `(bytes - 1024) / 4`, **not** the header's
+third int32, which reads 886,453,074 for a file holding 18.066B tokens and is ignored by the loader.
+Anyone dividing that field by anything gets a number 20x too small. And the check confirms phase A's
+corpus is sized to exactly one epoch: 18.0663B tokens available against 33,414 x 540,672 = 18.0654B
+required, a ratio of 1.00005.
