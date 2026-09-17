@@ -16139,3 +16139,25 @@ i.e. the launch site deleted it, so the next refusal is the first one that will 
 ⚠️ The tempting second source is the predecessor's log (`launching N ranks`, which barren_slices.sh
 already parses), and it would have covered this transition. Declined: [[alarms-must-key-on-state-not-log-text]].
 The marker IS the state, and the transition costs one spurious strike out of three, once.
+
+### §M+394: the inductor cache is already warm (measured, no action), and I nearly "corrected" a fixed-cost figure by comparing a segment against a total. 2026-09-17 07:2x CDT.
+Chased the per-slice fixed cost, since at a 1 h Polaris wall it is 7.4% of every slice and the
+standing goal is reducing pending time. Two candidate levers, both measured before touching anything,
+and **both declined on the measurement**:
+1. **A shared torch.compile cache.** Already configured (`TORCHINDUCTOR_CACHE_DIR=$R/.inductor` in
+   both launchers) and already warm: 82,751 files, and in the last 10 minutes of a running slice it
+   wrote **zero**, with 2 `best_config` files in the last hour. My hypothesis that each slice
+   recompiles is refuted by that count.
+2. **Pruning the cache.** 3.1 GB against a 50 T quota with 28.81 T used, i.e. 0.01%. 76,131 of the
+   files are older than 7 days, so a TTL would bite, but it would buy nothing measurable and every
+   eviction risks a recompile. Declined; recorded so the next tick does not re-derive it.
+⛔ **The near-miss is the point of this entry.** The live slice measures `(now - stime) - tqdm_elapsed`
+= **211 s**, and the record says the Polaris fixed cost is 268 s (175 s setup + 93 s compile, §M+338).
+I was one sentence from writing "the record is 27% high". It is not: `window - elapsed` is job start to
+**loop entry**, and tqdm starts its clock at iterator creation, so the first-step `torch.compile` sits
+INSIDE the elapsed figure. The right comparison is 211 s against 175 s, both the same segment, which
+is ordinary variation in a 24.76 GB checkpoint load from a contended /eagle. The record's own
+derivation proves the alignment: it obtained compile = 93 s as `1466 - 129 x 10.64` from **loop** time.
+⭐ So the fix went into the code rather than into the record: the §M+387 boundary line said
+"gap+setup+compile", which is the same mislabel shipped as a monitor. It now names the segment it
+actually computes and says explicitly that the compile is not in it. [[which-statistic-is-this-number]]
