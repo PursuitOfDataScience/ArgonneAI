@@ -12,10 +12,16 @@ Unlike the campaign's proxy build (capped at 1-1.6B/source), this uses ALL avail
 default (edu ~2B, math ~9.5B, code ~7.5B ~= 19B combined). Streaming/chunked so host RAM stays tiny;
 idempotent (skips a target already >= the requested size).
 
-  !! DATA GAP (2026-07-20): edu is only ~2B tokenized but carries the highest recipe weight (50%),
-  so a large run repeats edu heavily. Tokenize MORE FineWeb-Edu (upstream is ~1.3T) into
-  EDU_DOCBIN_DIR and re-run to close it. math (~9.5B ~= all FineMath-4plus) and code (~7.5B) are
-  better; FineMath-3plus (~34B) can extend math. See ARGONNE4.0.md.
+  DATA GAP (2026-07-20) -- CLOSED. That note said edu was only ~2B against a 50% weight. More
+  FineWeb-Edu has since been tokenized: measured 2026-08-14 the built bins are
+  edu 20,587,073,161 / math 9,945,557,331 / code 7,500,140,816 = 38,032,771,308 combined.
+
+  The binding constraint is now MATH, not edu. Repetition is per source, and math draws 30% of
+  the tokens from 26% of the corpus, so at the 110B a4.5 budget the passes are
+  edu 2.67x / math 3.32x / code 2.93x -- against a 2.89x corpus average. That 3.32x is what caps
+  the budget: 133B would put math at 4.01x and 154B at 4.65x, past the ~4x point where repeats
+  stop being ~free (Muennighoff). To train longer, extend math first (FineMath-3plus is ~34B),
+  not edu. exp/preflight.py enforces the per-source bound. See ARGONNE4.0.md / ARGONNE4.5.md.
 """
 import os, glob, json, argparse, numpy as np
 

@@ -42,13 +42,6 @@ EVAL_LEN = 24576
 EXTRA_EDGES = [32768, 40960, 49152, 65536]
 DOCBIN = "/project/rcc/youzhi/data/proof_pile2_arxiv_qwen3_docbin/data"
 TOKP = "/project/rcc/youzhi/toxic-models/Qwen/Qwen3-0.6B-Base"
-# `repo` in ARMS is the tree whose pretrain.py constants describe the checkpoint's ARCH. The a4
-# arms used to hardcode /home/youzhi/ArgonneAI-4.0; that worktree was removed on 2026-08-08 when
-# argonne4.0 was consolidated into the main clone, so every a4 arm died on a missing pretrain.py.
-# Derive it from this file instead -- the tree holding this script is the tree holding the
-# matching constants. (An arch mismatch is not silent either way: load_state_dict raises on a
-# size mismatch, so pointing an arm at the wrong tree aborts rather than mismeasuring.)
-REPO_SELF = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_ckpt(pt_path, repo, theta=1e6):
@@ -89,6 +82,39 @@ def load_ckpt(pt_path, repo, theta=1e6):
     assert not bad, "arch mismatch, missing: %s" % bad[:6]
     assert not unexp, "unexpected: %s" % list(unexp)[:6]
     return m.to(torch.bfloat16).to("cuda").eval(), step, len(tok)
+
+
+def load_hf(d, repo="/home/youzhi/ArgonneAI"):
+    """A STAGED HF export (config.json + model.safetensors), e.g. argonne-4.5-base(-ctx13568). Every arch
+    field and rope theta come from the checkpoint's own config; only the RoPE table is sized to EVAL_LEN,
+    because windows past the trained context are the extrapolation being measured."""
+    sys.path.insert(0, repo)
+    from model import ArgonneConfig, ArgonneModel
+    from safetensors.torch import load_file
+    cd = json.load(open(os.path.join(d, "config.json")))
+    cd = {k: v for k, v in cd.items() if not k.startswith("_")
+          and k not in ("auto_map", "architectures", "transformers_version", "torch_dtype", "dtype")}
+    trained_ctx = cd.get("max_position_embeddings")
+    cfg = ArgonneConfig(**cd); cfg.max_position_embeddings = EVAL_LEN; cfg.block_size = EVAL_LEN
+    cfg._keep_in_fp32_modules = []
+    # Built on the GPU and loaded straight to it: the CPU route (fp32 model + bf16 weights) peaks near
+    # 12 GiB of host RAM, too close to a 16 GiB allocation's limit.
+    with torch.device("cuda"):
+        m = ArgonneModel(cfg)
+    single = os.path.join(d, "model.safetensors")
+    if os.path.exists(single):
+        sd = load_file(single, device="cuda")
+    else:   # an HF sharded save: transformers 4.51's Trainer writes an 8 GB fp32 model as shards + an index
+        wm = json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+        sd = {}
+        for f in sorted(set(wm.values())):
+            sd.update(load_file(os.path.join(d, f), device="cuda"))
+    miss, unexp = m.load_state_dict(sd, strict=False)
+    del sd
+    bad = [k for k in miss if "lm_head" not in k]
+    assert not bad, "arch mismatch, missing: %s" % bad[:6]
+    assert not unexp, "unexpected: %s" % list(unexp)[:6]
+    return m.to(torch.bfloat16).to("cuda").eval(), "hf ctx %s" % trained_ctx, cd.get("vocab_size")
 
 
 def eval_windows(model, windows):
@@ -148,6 +174,11 @@ if __name__ == "__main__":
                          "so a multi-stage job silently measures two different models.")
     ap.add_argument("--eval_len", type=int, default=EVAL_LEN,
                     help="Window length; buckets auto-extend to cover it.")
+    ap.add_argument("--docbin", default=DOCBIN,
+                    help="Tokenized long-document dir (docbin contract). For a4.5 use the proof-pile-2 arXiv TEST "
+                         "split (reasoning/build_arxiv_test_docbin.py): phase B trained on the train split's long pool.")
+    ap.add_argument("--hf", action="append", default=[], metavar="ARM=DIR",
+                    help="Add an arm from a staged HF export dir (config.json + model.safetensors).")
     ap.add_argument("--docbin_glob", default="*.bin",
                     help="Restrict eval windows to these shards. REQUIRED once a model trains on "
                          "arXiv: phase C trains on proof-pile-2, so the default '*.bin' would draw "
@@ -171,18 +202,23 @@ if __name__ == "__main__":
     a4 = sorted(glob.glob(os.path.join(a4d, "checkpoint_step_*.pt")),
                 key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
     if a4:
-        ARMS["a4_anneal"] = (a4[-1], REPO_SELF)
+        ARMS["a4_anneal"] = (a4[-1], "/home/youzhi/ArgonneAI-4.0")
 
     if a.eval_len != EVAL_LEN:
         EVAL_LEN = a.eval_len
         edges = [e for e in [1024, 2048, 4096, 8192, 13568, 20480, 24576] + EXTRA_EDGES if e < EVAL_LEN]
         BUCKETS = list(zip([0] + edges, edges + [EVAL_LEN]))
     ARMS["a4_phaseb"] = ("/project/rcc/youzhi/models/argonne4_midtrain/checkpoint_step_109622.pt",
-                         REPO_SELF)
+                         "/home/youzhi/ArgonneAI-4.0")
     c = sorted(glob.glob("/project/rcc/youzhi/models/argonne4_midtrain_c/checkpoint_step_*.pt"),
                key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
     if c:
-        ARMS["a4_phasec"] = (c[-1], REPO_SELF)
+        ARMS["a4_phasec"] = (c[-1], "/home/youzhi/ArgonneAI-4.0")
+    DOCBIN = a.docbin
+    for spec in a.hf:
+        arm, _, d = spec.partition("=")
+        assert os.path.exists(os.path.join(d, "config.json")), "not a staged HF dir: %s" % d
+        ARMS[arm] = (d, "HF")
     for spec in a.pin:
         arm, _, pt = spec.partition("=")
         assert arm in ARMS, "cannot pin unknown arm %r (known: %s)" % (arm, ",".join(sorted(ARMS)))
@@ -191,6 +227,7 @@ if __name__ == "__main__":
         print("PINNED %s -> %s" % (arm, pt))
     print("eval shards: %s   window %d" % (a.docbin_glob, EVAL_LEN))
     w = get_windows(a.docs, glob_pat=a.docbin_glob)
+    print("eval data: %s" % DOCBIN)
     print("eval: %d held-out arXiv windows of %d tokens (%.2fM tokens/arm)"
           % (len(w), EVAL_LEN, len(w) * EVAL_LEN / 1e6), flush=True)
     res = {}
@@ -199,7 +236,7 @@ if __name__ == "__main__":
             print("  skip unknown arm %s" % name); continue
         pt, repo = ARMS[name]
         t0 = time.time()
-        m, step, _ = load_ckpt(pt, repo)
+        m, step, _ = load_hf(pt) if repo == "HF" else load_ckpt(pt, repo)
         nll, cnt = eval_windows(m, w)
         res[name] = dict(ckpt=pt, step=step, nll={"%d-%d" % b: v for b, v in nll.items()},
                          tokens={"%d-%d" % b: c for b, c in cnt.items()})

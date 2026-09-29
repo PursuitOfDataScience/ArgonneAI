@@ -4,6 +4,7 @@ Supports pretraining, continued pretraining on new data (--reset_schedule),
 and automatic checkpoint resume.
 """
 
+import gc
 import os
 import re
 import sys
@@ -34,8 +35,28 @@ ENABLE_QK_NORM = True
 ENABLE_V_NORM = True
 ENABLE_SANDWICH_NORM = True
 Z_LOSS_WEIGHT = 0.0
-ENABLE_INTERLEAVED_LOCAL_ATTENTION = True
-LOCAL_ATTENTION_WINDOW = 256
+# ⛔⛔ THE SLIDING WINDOW WAS LIVE IN THE MIDTRAIN AND FULL ATTENTION IN THE PRETRAIN. Fixed
+# 2026-09-15 23:4x CDT, ~900 steps into phase A. The startup banners say it outright, side by side:
+#   pretrain slice 773: "full attention on all 24 layers"
+#   anneal  slice 800: "sliding window 256 ACTIVE on 12/24 layers (pattern=odd-layer legacy)"
+# pretrain.py sets these two flags True/256 here and then OVERRIDES them to False/None ~35 lines
+# later, with its reasoning attached. continue_pretrain.py was never given that override, so every
+# phase-A step has trained the odd layers on a 256-token window the base was never pretrained with.
+# ⭐ AND IT EXPLAINS THE UNEXPLAINED 16%: pretrain.py's own note records this exact arm as
+# "REFUTED at +0.038 CE and -14.6% throughput, precisely because without flash-attn-2 the window
+# forces an explicit SDPA mask and loses the fused is_causal kernel". Measured tonight: the anneal
+# runs 42,707 tok/s against the pretrain's reproducible 50,800 at the identical 2-node/8-GPU shape
+# = **-16%**. The recorded -14.6% and the observed -16% are the same effect. So this was never a
+# loader problem (§M+254's candidate, refuted by arithmetic: 264 KB read per rank per step) -- it
+# was a silent architecture change that cost quality AND speed at the same time.
+# ⛔ CAUSE, which is the part that must not recur: a fix applied in ONE tree and not the other. The
+# identical failure is on the record -- [[anneal-no-lr-decay-and-general-forgetting]]: "the same
+# `--cooldown 0` bug hit a4 because the 3.5 fix was never ported -- fix launchers in BOTH trees."
+# The standing cron prompt even names this exact trap in its diagnosis section ("silently enabled
+# sliding window 256 on 12/24 layers ... REBUILD CONFIGS FROM THE RUN'S OWN ARGS"), where it is
+# recorded as a diagnostic mistake. It was also a production one.
+ENABLE_INTERLEAVED_LOCAL_ATTENTION = False
+LOCAL_ATTENTION_WINDOW = None
 LOGIT_SOFTCAP = 15.0
 
 # Distributed setup
@@ -212,6 +233,140 @@ def _verify_written_checkpoint(path, expect_step, expect_tensors):
     return None
 
 
+# --- ZeRO helpers. DUPLICATED FROM pretrain.py ON PURPOSE ------------------------------------
+# `from pretrain import ...` cannot be used: pretrain.py calls parser.parse_args() at MODULE level
+# (line ~171), so importing it re-parses THIS script's argv and exits with SystemExit 2.
+# Keep these three in sync with pretrain.py if either changes.
+def build_optimizer(params, args, world_size):
+    """AdamW, optionally with its state SHARDED across ranks (ZeRO stage 1/2).
+
+    Needed on 40-48 GB cards. MEASURED 2026-08-21 on A100/A40 cards: params 7.69 + DDP gradient buckets
+    7.69 (allocated EAGERLY at DDP construction) + AdamW m/v 15.38 = 30.75 GiB, so an A100-40G
+    (39.39 usable) OOMs at every micro-batch. Sharding m/v makes micro 1 (A100) / 2 (A40) fit.
+    """
+    kw = dict(lr=args.lr, betas=(args.adam_beta1, args.adam_beta2),
+              weight_decay=args.weight_decay, fused=True)
+    if getattr(args, 'zero_optimizer', 0) == 1 and world_size > 1 and dist.is_initialized():
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        return ZeroRedundancyOptimizer(params, optimizer_class=torch.optim.AdamW, **kw)
+    return torch.optim.AdamW(params, **kw)
+
+
+def fix_optimizer_step_device(optimizer):
+    """Move AdamW's per-param `step` scalar onto the param's device.
+
+    Checkpoints load with map_location='cpu'. Plain Optimizer.load_state_dict relocates `step` for
+    the fused kernel; ZeroRedundancyOptimizer's does NOT, and the mismatch only surfaces at the
+    FIRST .step() as "state_steps is on cpu" -- after every memory probe has said it fits.
+    """
+    inner = getattr(optimizer, 'optim', optimizer)
+    moved = 0
+    for group in inner.param_groups:
+        for prm in group['params']:
+            st = inner.state.get(prm)
+            if st and 'step' in st and torch.is_tensor(st['step']) and st['step'].device.type == 'cpu':
+                st['step'] = st['step'].to(prm.device)
+                moved += 1
+    return moved
+
+
+def sharded_optimizer_state_dict(optimizer, model, checkpoint_dir, rank, world_size):
+    """Plain-AdamW-format optimizer state from a ZeRO-sharded optimizer, merged VIA DISK.
+
+    consolidate_state_dict() is NOT usable: PyTorch gathers each rank's PICKLED local state through
+    the process group and at this optimizer's 15.38 GiB it never returned (still running at 962 s,
+    killed at a 20-minute ceiling; the process stayed alive, so it is pathological slowness in the
+    object gather, not a deadlock). Every rank instead writes its own shard locally -- no collective
+    -- and rank 0 merges them by GLOBAL parameter index.
+
+    ALL RANKS MUST CALL THIS (barrier inside). Merged dict on rank 0, None elsewhere. Output is
+    ordinary AdamW format, so a checkpoint written sharded still resumes UNSHARDED.
+    """
+    inner = getattr(optimizer, 'optim', optimizer)
+    base = get_base_model(model)
+    gidx = {id(prm): i for i, prm in enumerate(base.parameters())}
+    local = {}
+    for group in inner.param_groups:
+        for prm in group['params']:
+            st = inner.state.get(prm)
+            if not st:
+                continue
+            i = gidx.get(id(prm))
+            if i is None:
+                continue
+            local[i] = {k: (v.detach().to('cpu', copy=True) if torch.is_tensor(v) else v)
+                        for k, v in st.items()}
+    shard_dir = os.path.join(checkpoint_dir, ".optshards")
+    os.makedirs(shard_dir, exist_ok=True)
+    sp = os.path.join(shard_dir, f"rank{rank}.pt")
+    torch.save(local, sp + ".tmp")
+    os.replace(sp + ".tmp", sp)
+
+    # Every rank has just made a CPU copy of its shard (~3.85 GiB each at 4 ranks). Non-zero ranks
+    # then sit on that copy doing nothing while rank 0 merges, so the cgroup briefly holds ~2x the
+    # whole optimizer state: 4 local copies (15.4 GiB) PLUS rank 0's merged dict (15.4 GiB). That is
+    # what pushed MaxRSS to 46.5 GiB and OOM-killed job 54075116 at 48G. Rank 0 keeps its copy
+    # because `merged` aliases those same tensors; everyone else drops theirs now that it is on disk.
+    if rank != 0:
+        local.clear()
+        del local
+        gc.collect()
+    if dist.is_initialized():
+        dist.barrier()
+    if rank != 0:
+        return None
+    # Rank 0 already HOLDS its own shard in memory -- re-reading it from disk would double it.
+    # Every other shard is read, folded in, and its file deleted IMMEDIATELY: a save writes 15.38 GiB
+    # of shards on top of a 24.8 GB checkpoint, and holding all of that as dirty page cache is what
+    # OOM-killed job 54072934 at an aggressive 240 s save cadence. Freeing as we go keeps the
+    # footprint at roughly one shard above the merged dict instead of the whole set.
+    merged = dict(local)
+    for r in range(world_size):
+        if r == rank:
+            continue
+        rp = os.path.join(shard_dir, f"rank{r}.pt")
+        if not os.path.exists(rp):
+            raise RuntimeError(f"optimizer shard missing for rank {r}: {rp}")
+        part = torch.load(rp, map_location='cpu', weights_only=False)
+        merged.update(part)
+        del part
+        try:
+            os.remove(rp)          # drop it now, not in a cleanup pass at the end
+        except OSError:
+            pass
+        gc.collect()
+    if len(merged) != len(gidx):
+        print(f"WARNING: merged optimizer state has {len(merged)} entries for {len(gidx)} params; "
+              f"a shard may be incomplete.", flush=True)
+    template = inner.param_groups[0]
+    group = {k: v for k, v in template.items() if k != 'params'}
+    group['params'] = list(range(len(gidx)))
+    for rr in range(world_size):
+        try:
+            os.remove(os.path.join(shard_dir, f"rank{rr}.pt"))
+        except OSError:
+            pass
+    try:
+        os.rmdir(shard_dir)
+    except OSError:
+        pass
+    gc.collect()
+    return {'state': merged, 'param_groups': [group]}
+
+
+def prepare_optimizer_state(optimizer, model, checkpoint_dir, rank, world_size):
+    """Called by EVERY rank at a save point. None => not sharded, use optimizer.state_dict()."""
+    if not hasattr(optimizer, 'consolidate_state_dict'):
+        return None
+    return sharded_optimizer_state_dict(optimizer, model, checkpoint_dir, rank, world_size)
+
+
+def consolidate_if_sharded(optimizer):
+    """No-op shim; the work moved to sharded_optimizer_state_dict(). Do NOT reinstate
+    consolidate_state_dict() here -- it hangs at this state size."""
+    return None
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -226,6 +381,7 @@ def save_checkpoint(
     dataset_base_tokens_processed,
     dataset_num_tokens,
     dataset_path,
+    optimizer_state=None,
 ):
     """Write a checkpoint only if it is provably good, then prune.
 
@@ -256,7 +412,9 @@ def save_checkpoint(
         'dataset_num_tokens': dataset_num_tokens,
         'dataset_path': dataset_path,
         'model_state_dict': base_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        # Supplied when ZeRO-sharded: the shard-merged plain-AdamW dict. optimizer.state_dict()
+        # on a sharded optimizer would persist only THIS RANK'S shard.
+        'optimizer_state_dict': optimizer_state if optimizer_state is not None else optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
     n_tensors = len(checkpoint['model_state_dict'])
@@ -285,6 +443,7 @@ def save_checkpoint(
         os.replace(latest_tmp_path, latest_path)
     except OSError:
         pass
+
     # only now is deleting the previous checkpoint safe
     print(f"[retention] checkpoint at step {global_step} verified; pruning older checkpoints",
           flush=True)
@@ -308,7 +467,17 @@ def prune_old_checkpoints(checkpoint_dir, keep_path):
       * only `checkpoint_step_<int>.pt` directly in `checkpoint_dir` (glob, not a walk)
       * never `keep_path`, never a symlink (so `checkpoint_last.pt` is untouched), never a `.tmp`
       * never the numerically-highest step present, even if `keep_path` somehow is not it
+      * never one with a sibling `<name>.keep` marker
       * per-file try/except: a failed unlink must not abort training after a good save
+
+    ⛔ THE `.keep` MARKER -- PORTED FROM pretrain.py 2026-09-15 IN THE SAME EDIT, because this file is
+    the MIDTRAIN PHASE A path and the recorded failure is exactly a fix that was applied to one tree and
+    not the other (memory anneal-no-lr-decay-and-general-forgetting: the same `--cooldown 0` bug hit a4
+    because the 3.5 fix was never ported). a4.5's `checkpoint_step_95055.pt` is the RECOVERY ANCHOR,
+    declared exempt from retention in the owner's standing prompt and md5-asserted by
+    run_complete_check.sh; that exemption lived only in prose, so any save into its dir would have
+    deleted it, correctly by this function's own rule and silently. The marker is a file, so it survives
+    a clone, an env reset and a different launcher, and it can only ever PREVENT a deletion.
     """
     try:
         keep = {os.path.realpath(keep_path)}
@@ -323,6 +492,10 @@ def prune_old_checkpoints(checkpoint_dir, keep_path):
         keep.add(os.path.realpath(max(found)[1]))
         for _, p in sorted(found):
             if os.path.realpath(p) in keep:
+                continue
+            if os.path.exists(p + ".keep"):
+                print(f"[retention] KEEPING {os.path.basename(p)}: a .keep marker is present "
+                      f"({open(p + '.keep').read().strip()[:120]})", flush=True)
                 continue
             try:
                 gib = os.path.getsize(p) / 2**30
@@ -421,6 +594,9 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
 
     global AUTOCAST_DTYPE, USE_AUTOCAST
+    # rebound from the resume checkpoint's own tensor shapes -- see the arch-derivation
+    # block below. A shape-bearing constant must not outrank the artifact.
+    global HIDDEN_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, INTERMEDIATE_SIZE
     if args.precision == "bf16":
         AUTOCAST_DTYPE = torch.bfloat16
         USE_AUTOCAST = True
@@ -434,13 +610,105 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     VOCAB_SIZE = len(tokenizer)
-    if args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
-        # Pad vocab to a mult of 128 so the tied lm_head GEMM is FP8-eligible (see pretrain.py). Export
-        # trims back. Must match the pretrain-stage padded vocab so the resumed checkpoint shape agrees.
+    # Vocab padding, DECOUPLED from --fp8 -- the same fix as pretrain.py (2026-08-20). Padding to a
+    # multiple of 128 changes the EMBEDDING SHAPE, so it belongs to the checkpoint's identity, not to
+    # fp8. Gating it on `args.fp8 == 1` meant this stage could not pick up an fp8-padded pretrain
+    # checkpoint on a card without fp8 -- e.g. A100s (sm80), where torchao float8 needs
+    # sm89+ so --fp8 0 is forced. Ported here so the pretrain -> anneal handoff survives the card
+    # change too; fixing only pretrain.py would just move the crash to the handoff.
+    _ckpt_vocab = None
+    _peek_path = args.resume_from or get_latest_checkpoint_path(args.checkpoint_dir)
+    if _peek_path and os.path.exists(_peek_path):
+        try:
+            _peek = torch.load(_peek_path, map_location='cpu', weights_only=False, mmap=True)
+            _sd = _peek.get('model_state_dict', {})
+            _emb = _sd.get('embed_tokens.weight')
+            if _emb is not None:
+                _ckpt_vocab = int(_emb.shape[0])
+            # ⛔⛔ DERIVE THE ARCHITECTURE FROM THE CHECKPOINT, NOT FROM MODULE CONSTANTS.
+            # 2026-09-15: phase A's first slice took 8 GPUs on one node and ALL EIGHT RANKS died at
+            # step 0 -- `size mismatch for embed_tokens.weight: checkpoint [151680, 2560] vs current
+            # [151680, 1536]` plus `Missing key(s) blocks.24..31`. Cause: HIDDEN_SIZE / NUM_LAYERS /
+            # NUM_HEADS / INTERMEDIATE_SIZE at the top of this file are the a4 (1.04B) shape
+            # 1536/32/6/4096, and a4.5 is 2560/24/10/7040. The vocab width was ALREADY peeked right here
+            # for exactly this reason (the fp8-coupled vocab pad); the same argument covers every other
+            # shape-bearing field and only vocab had been done. A constant that determines a tensor
+            # shape is not a hyperparameter -- read it off the artifact.
+            # ⭐ head_dim = 256 is the ONE value the tensors cannot give: with
+            # `head_dim = hidden // num_heads` (model.py:285) q_proj is [hidden, hidden], so it carries
+            # no information about the split. 256 is this line's measured invariant
+            # (argonne4-phase1-results: "head_dim 256 confirmed") and it reproduces BOTH models --
+            # a4.5 hidden 2560 -> 10 heads, k_proj 512 -> 2 kv; a4 hidden 1536 -> 6 heads, 512 -> 2 kv
+            # (verified against synthetic state_dicts for both before this shipped). Everything else is
+            # read directly, and the reconstruction is ASSERTED against the checkpoint's own shapes, so
+            # a wrong head_dim becomes a startup refusal instead of 8 dead ranks.
+            if _sd:
+                _HD = 256
+                _nl = 1 + max((int(k.split('.')[1]) for k in _sd if k.startswith('blocks.')), default=-1)
+                _gp = _sd.get('blocks.0.mlp.gate_proj.weight')
+                _kp = _sd.get('blocks.0.attn.k_proj.weight')
+                if _emb is not None and _nl > 0 and _gp is not None and _kp is not None:
+                    _h = int(_emb.shape[1])
+                    _arch = dict(hidden_size=_h, num_hidden_layers=_nl,
+                                 num_attention_heads=_h // _HD,
+                                 num_key_value_heads=int(_kp.shape[0]) // _HD,
+                                 intermediate_size=int(_gp.shape[0]))
+                    _want = {
+                        'embed_tokens.weight': (int(_emb.shape[0]), _h),
+                        'blocks.0.attn.q_proj.weight': (_arch['num_attention_heads'] * _HD, _h),
+                        'blocks.0.attn.k_proj.weight': (_arch['num_key_value_heads'] * _HD, _h),
+                        'blocks.0.attn.o_proj.weight': (_h, _arch['num_attention_heads'] * _HD),
+                        'blocks.0.mlp.gate_proj.weight': (_arch['intermediate_size'], _h),
+                        'blocks.0.mlp.down_proj.weight': (_h, _arch['intermediate_size']),
+                    }
+                    _bad = [(k, tuple(_sd[k].shape), v) for k, v in _want.items()
+                            if k in _sd and tuple(_sd[k].shape) != v]
+                    if _bad:
+                        raise SystemExit(
+                            "FATAL: the architecture derived from %s does not reproduce that "
+                            "checkpoint's own tensor shapes -- refusing to start rather than dying at "
+                            "load. head_dim=%d is likely wrong here. %s"
+                            % (_peek_path, _HD,
+                               '; '.join('%s ckpt%s != derived%s' % b for b in _bad)))
+                    HIDDEN_SIZE = _arch['hidden_size']
+                    NUM_LAYERS = _arch['num_hidden_layers']
+                    NUM_HEADS = _arch['num_attention_heads']
+                    NUM_KV_HEADS = _arch['num_key_value_heads']
+                    INTERMEDIATE_SIZE = _arch['intermediate_size']
+                    if IS_MAIN:
+                        print("Arch DERIVED from %s: hidden=%d layers=%d heads=%d kv=%d inter=%d "
+                              "(head_dim=%d); the module constants are ignored"
+                              % (os.path.basename(_peek_path), HIDDEN_SIZE, NUM_LAYERS, NUM_HEADS,
+                                 NUM_KV_HEADS, INTERMEDIATE_SIZE, _HD), flush=True)
+            del _peek, _emb, _sd
+        except Exception as _e:
+            if IS_MAIN:
+                print(f"WARNING: could not peek vocab width from {_peek_path} ({_e}); "
+                      f"falling back to the flag/fp8 default.")
+
+    if args.pad_vocab_multiple > 0:
+        m = args.pad_vocab_multiple
+        padded = ((VOCAB_SIZE + m - 1) // m) * m
+        if padded != VOCAB_SIZE and IS_MAIN:
+            print(f"Vocab padding: {VOCAB_SIZE} -> {padded} (--pad_vocab_multiple {m})")
+        VOCAB_SIZE = padded
+    elif _ckpt_vocab is not None and _ckpt_vocab != VOCAB_SIZE:
+        if IS_MAIN:
+            print(f"Vocab padding: {VOCAB_SIZE} -> {_ckpt_vocab} (auto, from resume checkpoint "
+                  f"{os.path.basename(_peek_path)}; fp8={args.fp8})")
+        VOCAB_SIZE = _ckpt_vocab
+    elif args.fp8 == 1 and args.fp8_lm_head == 1 and (VOCAB_SIZE % 16 != 0):
         padded = ((VOCAB_SIZE + 127) // 128) * 128
         if IS_MAIN:
             print(f"FP8 lm_head: padding vocab {VOCAB_SIZE} -> {padded} (mult of 128; export trims back)")
         VOCAB_SIZE = padded
+
+    if _ckpt_vocab is not None and _ckpt_vocab != VOCAB_SIZE:
+        raise SystemExit(
+            f"FATAL: vocab width mismatch. Building a {VOCAB_SIZE}-row embedding but "
+            f"{_peek_path} holds {_ckpt_vocab} rows. Resume would fail. "
+            f"Pass --pad_vocab_multiple to match the checkpoint."
+        )
     if IS_MAIN:
         print(f"Vocab size: {VOCAB_SIZE}, EOS token ID: {tokenizer.eos_token_id}")
 
@@ -469,7 +737,7 @@ def main():
     model = ArgonneModel(config)
     model = model.to(DEVICE)
 
-    # Keep model weights in fp32 — autocast handles bf16/fp16 for forward pass
+    # Keep model weights in fp32: autocast handles bf16/fp16 for forward pass
 
     # Gradient checkpointing (before DDP and compile)
     if args.gradient_checkpointing == 1:
@@ -486,13 +754,13 @@ def main():
     # Argonne-3.5 FP8 (torchao float8): convert Linear matmuls to FP8 BEFORE DDP/compile.
     if args.fp8 == 1:
         if args.torch_compile != 1 and IS_MAIN:
-            print("WARNING: --fp8 without --torch_compile — FP8 scaling won't fuse; expect NO speedup.")
+            print("WARNING: --fp8 without --torch_compile, FP8 scaling won't fuse; expect NO speedup.")
         embed_w = model.get_input_embeddings().weight
         n_conv, n_skip, lm_status = apply_fp8_training(model, include_lm_head=(args.fp8_lm_head == 1))
         assert model.get_output_embeddings().weight is embed_w, (
-            "FP8 conversion broke the embedding<->lm_head tie — do not train (would be a different model)")
+            "FP8 conversion broke the embedding<->lm_head tie: do not train (would be a different model)")
         if args.fp8_lm_head == 1 and lm_status != "converted" and IS_MAIN:
-            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status} — expect ~1.18x not 1.25x.")
+            print(f"WARNING: --fp8_lm_head 1 requested but lm_head {lm_status}, expect ~1.18x not 1.25x.")
         if IS_MAIN:
             print(f"FP8 training ON (torchao tensorwise): converted {n_conv} Linear, skipped {n_skip}; "
                   f"lm_head={lm_status}; embedding tie preserved.")
@@ -505,8 +773,48 @@ def main():
 
     # torch.compile
     if args.torch_compile == 1:
+        # Inductor's persistent-reduction switch, set IN-PROCESS (INFRA M+585). The env var never
+        # reached the codegen on the gap-filler cluster: all nine TC=1 phase-B attempts (2026-09-20 15:08-15:59)
+        # still emitted `triton_per_fused_..._16`, and torch 2.10's heuristic cannot produce a
+        # persistent kernel with the switch off (choices.py: `if not config.triton.persistent_reductions:
+        # return False`). A CLI flag reaches every rank; an env var through PALS did not.
+        import torch._inductor.config as _inductor_cfg
+        if args.inductor_persistent_reductions in (0, 1):
+            _inductor_cfg.triton.persistent_reductions = bool(args.inductor_persistent_reductions)
+        # ⚠️ The persistent switch above does NOT govern the kernel that kills phase B (INFRA M+586):
+        # torch 2.10's MIX-ORDER reduction (RMSNorm backward: row reduction fused with the weight-grad
+        # column reduction over all 13,568 tokens) is generated with override_persistent_reduction=True.
+        # Generic in-process overrides, so the next Inductor test is a qsub -v, not a trainer edit.
+        _ic_set = []
+        if args.inductor_config not in ("", "none"):
+            for _kv in args.inductor_config.split(","):
+                _k, _sep, _v = _kv.partition("=")
+                _k, _v = _k.strip(), _v.strip()
+                *_path, _leaf = _k.split(".")
+                _obj = _inductor_cfg
+                for _part in _path:
+                    _obj = getattr(_obj, _part)
+                if not _sep or not hasattr(_obj, _leaf):
+                    raise SystemExit(f"--inductor_config: unknown or malformed entry '{_kv}'")
+                _cur = getattr(_obj, _leaf)
+                if isinstance(_cur, bool):
+                    if _v.lower() not in ("0", "1", "true", "false"):
+                        raise SystemExit(f"--inductor_config: {_k} is a bool, got '{_v}'")
+                    _val = _v.lower() in ("1", "true")
+                elif _v.lower() == "none":
+                    _val = None
+                else:
+                    try:
+                        _val = int(_v)
+                    except ValueError:
+                        _val = float(_v)
+                setattr(_obj, _leaf, _val)
+                _ic_set.append(f"{_k}={getattr(_obj, _leaf)!r}")
         if IS_MAIN:
-            print("Compiling model with torch.compile...")
+            print(f"Compiling model with torch.compile... (inductor persistent_reductions="
+                  f"{_inductor_cfg.triton.persistent_reductions}, flag {args.inductor_persistent_reductions}; "
+                  f"mix_order_reduction={_inductor_cfg.triton.mix_order_reduction}; "
+                  f"overrides: {', '.join(_ic_set) if _ic_set else 'none'})")
         model = torch.compile(model, mode=args.torch_compile_mode)
 
     if IS_MAIN:
@@ -525,17 +833,12 @@ def main():
     estimated_steps = int((num_tokens * args.max_epochs) / ACTUAL_TOTAL_BATCH)
     dataset_base_global_step = 0
     dataset_base_tokens_processed = 0
+    tokens_at_slice_start = 0
     if IS_MAIN:
         print(f"Training for {args.max_epochs} epoch(s) ~= {estimated_steps} steps ({num_tokens * args.max_epochs:,} tokens)")
 
     # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.weight_decay,
-        fused=True,
-    )
+    optimizer = build_optimizer(model.parameters(), args, WORLD_SIZE)
 
     # Scheduler with warmup (cosine or WSD)
     min_lr = args.lr * args.min_lr_ratio
@@ -570,14 +873,33 @@ def main():
     checkpoint = None
     initial_steps = 0
 
+    # Post-resume loss guard state (INFRA M+593): armed only when a checkpoint is actually loaded.
+    _rg_on, _rg_ref, _rg_sum, _rg_n, _RG_STEPS = False, None, 0.0, 0, 20
     if resume_from and os.path.exists(resume_from):
         if IS_MAIN:
             print(f"\n=== Resuming from checkpoint: {resume_from} ===")
-        checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False)
+        # mmap=True is load-bearing: without it every DDP rank reads the whole checkpoint into
+        # anonymous host memory and the cgroup OOM-kills a rank (pretrain.py hit exactly this on
+        # 2026-08-14: 23.1 GiB x 3 ranks vs a 56 GiB limit). File-backed pages are reclaimable.
+        checkpoint = torch.load(resume_from, map_location='cpu', weights_only=False, mmap=True)
         base_model = get_base_model(model)
         base_model.load_state_dict(checkpoint['model_state_dict'])
         global_step = checkpoint['global_step']
         tokens_processed = checkpoint['tokens_processed']
+        try:
+            _rg_ref = float(checkpoint.get('loss')) if checkpoint.get('loss') is not None else None
+        except (TypeError, ValueError):
+            _rg_ref = None
+        _rg_on = True
+        # ⛔ A CUMULATIVE COUNTER DIVIDED BY A SLICE-LOCAL CLOCK IS NOT A RATE. Added 2026-09-15
+        # 21:2x CDT. The end-of-slice SUMMARY printed `tokens_per_sec=38021273.11` -- 38 MILLION
+        # tok/s on 8 A100s, ~900x the real 42,572 -- because `tokens_processed` carries the 110B
+        # inherited from the resumed checkpoint while `elapsed_time` measures only THIS slice. Every
+        # phase-A slice would publish that, and a reader comparing slices would be comparing
+        # 110B/elapsed, i.e. almost purely 1/elapsed. Keep the resume baseline so the summary can
+        # report the slice's OWN rate (which is the only rate a slice can measure) alongside the
+        # cumulative total. Same error class as [which-statistic-is-this-number], in code this time.
+        tokens_at_slice_start = tokens_processed
         data_position = checkpoint.get('data_position', 0)
         checkpoint_dataset_epoch = checkpoint.get('dataset_epoch')
         checkpoint_dataset_num_tokens = checkpoint.get('dataset_num_tokens')
@@ -602,6 +924,9 @@ def main():
             is_resumed = False
         else:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            _moved = fix_optimizer_step_device(optimizer)
+            if IS_MAIN and _moved:
+                print(f"Relocated {_moved} AdamW `step` scalars CPU -> {DEVICE} (fused kernel requires it)")
             scheduler_state = checkpoint.get('scheduler_state_dict')
             if scheduler_state:
                 scheduler.load_state_dict(scheduler_state)
@@ -653,6 +978,15 @@ def main():
         print(f"Training for {args.max_epochs} epoch(s) (estimated ~{estimated_steps} steps)")
         print(f"Dataset-local progress at launch: {initial_steps}/{estimated_steps} step(s), dataset epoch {train_loader.epoch}")
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
+        # !! PRINT THE ALLOCATOR CONFIG AS THE RANK SEES IT (2026-09-20 20:1x CDT, INFRA M+547).
+        # "is expandable_segments actually on inside the ranks?" has been an INFERENCE three times
+        # today and it has cost two primary-trainer slots. The launchers export it, PALS may or may not forward
+        # it (M+517 proved it does not, for the codegen flag), torchrun is assumed to inherit it, and
+        # every OOM message advises setting it whether or not it is set. One line turns the question
+        # into an observation, for every future slice, on both hosts.
+        print(f"Allocator: PYTORCH_ALLOC_CONF={os.environ.get('PYTORCH_ALLOC_CONF', '<unset>')} "
+              f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')} "
+              f"TORCHINDUCTOR_PERSISTENT_REDUCTIONS={os.environ.get('TORCHINDUCTOR_PERSISTENT_REDUCTIONS', '<unset>')}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
         if args.wall_time > 0:
@@ -714,6 +1048,31 @@ def main():
         # the single sync per optimizer step
         step_loss = (step_loss_total / GRAD_ACCUM_STEPS).item()
         train_losses.append(step_loss)
+        # ⛔ POST-RESUME LOSS GUARD (2026-09-23 00:3x CDT, INFRA M+593). The standing rule is that a resume
+        # far above the checkpoint's own stored loss is broken by definition and must be stopped BEFORE it
+        # writes a checkpoint, because latest-only retention then deletes the last good one. Until now only
+        # a tick could apply it, and ticks can lapse for hours. After the first _RG_STEPS steps of a
+        # resumed slice, the rank-mean loss is ALL-REDUCED (step_loss is rank-local, and ranks deciding
+        # on different numbers would hang), and every rank exits together if it exceeds
+        # max(6.0, stored + 4.0): healthy phase B sits near 1.4 per step, a random model near 7-12.
+        if _rg_on:
+            _rg_sum += step_loss; _rg_n += 1
+            if _rg_n == _RG_STEPS:
+                _rg_on = False
+                _rg_t = torch.tensor([_rg_sum / _rg_n], device=DEVICE, dtype=torch.float64)
+                if WORLD_SIZE > 1:
+                    dist.all_reduce(_rg_t, op=dist.ReduceOp.SUM)
+                    _rg_t /= WORLD_SIZE
+                _rg_m = float(_rg_t.item())
+                _rg_lim = max(6.0, (_rg_ref if _rg_ref is not None else 0.0) + 4.0)
+                if IS_MAIN:
+                    print(f"[resume-guard] mean loss over the first {_RG_STEPS} steps after resume = {_rg_m:.4f}, "
+                          f"limit {_rg_lim:.2f} (checkpoint stored {_rg_ref})", flush=True)
+                if _rg_m > _rg_lim:
+                    if IS_MAIN:
+                        print(f"[resume-guard] FATAL: {_rg_m:.4f} > {_rg_lim:.2f}: this resume is broken. Exiting on every "
+                              f"rank BEFORE any checkpoint is written (INFRA M+593).", flush=True)
+                    raise SystemExit(3)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -728,6 +1087,69 @@ def main():
         if IS_MAIN and global_step % 10 == 0:
             perplexity = np.exp(step_loss)
             print(f"Step {global_step} | Loss: {step_loss:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}")
+            # ⛔⛔ HBM WAS UNOBSERVABLE ON THE PRIMARY. Ported from pretrain.py:1537 on 2026-09-16
+            # 06:3x CDT, the first tick after the 8-GPU primary became the trainer. The standing cron prompt asks
+            # for "HBM fill (target ~90%, and report it -- 57% means throughput is being left on the
+            # table)" EVERY tick, and this script never printed it: every HBM number I have quoted for
+            # phase A came from the SMI sampler I had added to the gap-filler launchers, and
+            # anneal_chain_sn.pbs runs no sampler at all (0 matches for nvidia-smi). So the moment the
+            # run moved to its FASTEST shape, the field went silently blank -- `grep HBM` on the
+            # primary's log returns nothing, which reads identically to "not printed yet".
+            # ⭐ Printing it from the TRAINER, not from a sidecar sampler, makes it host-independent:
+            # one line, both clusters, no extra process, and it survives any launcher rewrite. Same
+            # "fix it in BOTH trees" lesson that the sliding window just charged us 4.5 h for --
+            # pretrain.py has had this line for months.
+            # !! args.log_interval DOES NOT EXIST IN THIS SCRIPT -- ported from pretrain.py, which
+            # defines it; this file does not, under any spelling. The dereference was in the `if`
+            # CONDITION, outside the try, so it would have raised AttributeError on the first logging
+            # step. Caught 2026-09-16 ~30 min before a slice boundary would have run it.
+            try:
+                # ⛔ THE 4x MULTIPLIER WAS INHERITED, NOT CHOSEN, AND IT MADE THE FIELD MISSING HALF
+                # THE TIME. `4 * log_interval` = every 100 global steps, ported verbatim from
+                # pretrain.py where it sits beside a much shorter step. At phase B's 15.7 s/step that
+                # is a 26-MINUTE gap between prints, against a 15-minute tick, so roughly HALF of all
+                # ticks land in the gap and report no HBM at all -- which is exactly the state a
+                # BROKEN print produces (found 2026-09-22 06:5x CDT on slice 093, 57 steps in).
+                # The enclosing `if` is already `global_step % 10 == 0`, so matching it costs one
+                # extra log line per 10 steps in a file that already carries a tqdm line per STEP,
+                # and `memory_allocated`/`memory_reserved` are host-side counter reads, not syncs.
+                # ⭐ Keep this modulus literal and equal to the outer gate: the external trainer_status.sh
+                # derives "the print is periodic, next at step N" from HBM_EVERY and the two must
+                # move together.
+                if global_step % 10 == 0:
+                    # !! PEAK AND CURRENT ARE DIFFERENT QUESTIONS AND ONLY ONE WAS PRINTED.
+                    # `max_memory_reserved` is an all-time high-water mark since process start and
+                    # nothing calls reset_peak_memory_stats, so it never falls. Measured 2026-09-20:
+                    # phase B's FIRST slice printed 91.2% and every RESUMED slice printed 98.0%, and
+                    # the difference is the transient during the optimizer-state load, not anything
+                    # about training. The standing prompt asks for HBM because "57% means throughput
+                    # is being left on the table" -- that is a question about steady-state occupancy,
+                    # which the peak cannot answer, and at 98.0% it invites a throughput conclusion
+                    # ([[optimize-gpu-hbm-usage]]: >93% is SLOWER) about a card that is not full.
+                    # The peak still matters: it is what has to fit, and it is the number to compare
+                    # against an OOM. So print both and label which is which.
+                    # !! AND `allocated`, WHICH IS THE ONLY ONE OF THE THREE THAT MEANS "IN USE".
+                    # The now/peak pair added an hour earlier was still two POOL figures:
+                    # memory_reserved is what the caching allocator holds from CUDA, allocated is what
+                    # live tensors occupy, and the gap between them is cached free blocks that cost
+                    # nothing to reuse. The first live reading came back `now 41.6 GB (98.0%) peak 41.6
+                    # GB (98.0%)`, which refuted the guess that 98% was a load-time transient: the pool
+                    # really is that big mid-training. Whether the CARD is full is a different question
+                    # and needs the third number. It also explains the chunk-2048 OOM exactly: a
+                    # contiguous 1.16 GiB block must come from the unreserved remainder or from a
+                    # cached block big enough, not from "8.8% free".
+                    _mem_res = torch.cuda.max_memory_reserved() / 1e9
+                    _mem_cur = torch.cuda.memory_reserved() / 1e9
+                    _mem_alloc = torch.cuda.memory_allocated() / 1e9
+                    _mem_tot = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    print(f"  [HBM] step {global_step}: live {_mem_alloc:.1f} GB ({100*_mem_alloc/_mem_tot:.1f}%) "
+                          f"pool {_mem_cur:.1f} GB ({100*_mem_cur/_mem_tot:.1f}%) "
+                          f"peak {_mem_res:.1f}/{_mem_tot:.1f} GB ({100*_mem_res/_mem_tot:.1f}%) "
+                          f"| micro_batch={args.batch_size} "
+                          f"block={args.block_size} grad_ckpt={args.gradient_checkpointing} "
+                          f"chunk={args.loss_chunk_size}", flush=True)
+            except Exception as _e:
+                print(f"  [HBM] unavailable: {type(_e).__name__}", flush=True)
             if pbar:
                 pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
 
@@ -741,6 +1163,7 @@ def main():
             dist.broadcast(should_checkpoint, src=0)
 
         if should_checkpoint[0] == 1:
+            _opt_sd = prepare_optimizer_state(optimizer, model, args.checkpoint_dir, RANK, WORLD_SIZE)  # ALL ranks
             if IS_MAIN:
                 print("\n" + "=" * 60)
                 print("Saving checkpoint...")
@@ -759,6 +1182,7 @@ def main():
                     dataset_base_tokens_processed,
                     num_tokens,
                     args.data_path,
+                    optimizer_state=_opt_sd,
                 )
                 if checkpoint_path is None:
                     # save_checkpoint already explained why. Do NOT advance the progress marker:
@@ -800,10 +1224,29 @@ def main():
                     should_wall_stop[0] = 1
                 if args.save_deadline_epoch > 0 and time.time() >= args.save_deadline_epoch:
                     should_wall_stop[0] = 1
+                # !! A THIRD TRIGGER: SOMEONE OUTSIDE ASKED FOR A SAVE (2026-09-20 18:0x CDT, M+541).
+                # The gap-filler job yields to the primary trainer by SIGTERMing every rank, so everything since
+                # the last checkpoint is discarded. Measured on the 2026-09-20 handover: 180 steps, 46
+                # minutes of 8-GPU work, and handovers happen every time the primary's queue wait ends.
+                # The save takes ~200 s and the primary already waits up to 5 min for the filler to confirm
+                # it stopped, so the whole cost fits inside a window that is already being paid.
+                # A file, not a signal: this block already owns the all-ranks broadcast and the
+                # save-then-exit path that has now worked three slices in a row, and a SIGTERM handler
+                # would be a second path through the same code with none of that history.
+                # ⚠️ RANK 0 UNLINKS IT ON SIGHT. A sentinel left on disk would make the NEXT slice save
+                # and exit at step 1, forever, which is the stale-marker failure this project keeps
+                # paying for ([[alarms-must-key-on-state-not-log-text]]).
+                if args.save_on_flag and os.path.exists(args.save_on_flag):
+                    should_wall_stop[0] = 1
+                    try:
+                        os.unlink(args.save_on_flag)
+                    except OSError:
+                        pass
             if WORLD_SIZE > 1:
                 dist.broadcast(should_wall_stop, src=0)
 
             if should_wall_stop[0] == 1:
+                _opt_sd = prepare_optimizer_state(optimizer, model, args.checkpoint_dir, RANK, WORLD_SIZE)  # ALL ranks
                 if IS_MAIN:
                     print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
@@ -821,6 +1264,7 @@ def main():
                         dataset_base_tokens_processed,
                         num_tokens,
                         args.data_path,
+                        optimizer_state=_opt_sd,
                     )
                     if checkpoint_path is None:
                         print("Wall-time checkpoint REFUSED; exiting on the previous good checkpoint.")
@@ -853,6 +1297,10 @@ def main():
         print("-" * 60)
         elapsed_time = time.time() - training_start_time
         print(f"Training completed in {elapsed_time:.1f} seconds!")
+
+    # The final checkpoint is written inside `if IS_MAIN`, so hoist the collective to where every
+    # rank still reaches it.
+    _opt_sd = prepare_optimizer_state(optimizer, model, args.checkpoint_dir, RANK, WORLD_SIZE)  # ALL ranks
 
     # Evaluate on validation (rank 0 only)
     if IS_MAIN:
@@ -921,6 +1369,7 @@ def main():
                 dataset_base_tokens_processed,
                 num_tokens,
                 args.data_path,
+                optimizer_state=_opt_sd,
             )
             if checkpoint_path is None:
                 # The gate refused these weights. Exporting them to final_model_dir would publish
@@ -929,7 +1378,7 @@ def main():
                 # ranks on the barrier below until SLURM killed the job at the wall clock. Flag it
                 # and exit nonzero after every rank has cleaned up.
                 export_refused = True
-                print("Final checkpoint REFUSED — skipping HF export. The last good checkpoint in "
+                print("Final checkpoint REFUSED: skipping HF export. The last good checkpoint in "
                       f"{args.checkpoint_dir} is the deliverable; investigate before exporting.")
             else:
                 print(f"Final checkpoint saved: {checkpoint_path}")
@@ -943,7 +1392,7 @@ def main():
                     clean = ArgonneModel(config)
                     missing, unexpected = clean.load_state_dict(save_model.state_dict(), strict=False)
                     assert not missing, (
-                        f"FP8 export: clean model missing weights {missing[:8]} — refusing to export garbage")
+                        f"FP8 export: clean model missing weights {missing[:8]}, refusing to export garbage")
                     if hasattr(clean, "tie_weights"):
                         clean.tie_weights()
                     if IS_MAIN:
@@ -976,7 +1425,10 @@ def main():
 
         elapsed_time = time.time() - training_start_time
         print("\n" + "=" * 60)
-        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} tokens_per_sec={tokens_processed/elapsed_time:.2f} steps={global_step}")
+        _slice_tok = tokens_processed - tokens_at_slice_start
+        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} "
+              f"slice_tokens_per_sec={_slice_tok/elapsed_time:.2f} slice_tokens={_slice_tok} "
+              f"cumulative_tokens={tokens_processed} steps={global_step}")
         print("=" * 60)
 
     if WORLD_SIZE > 1:
@@ -1010,9 +1462,11 @@ if __name__ == "__main__":
     parser.add_argument("--cooldown", type=int, default=0, help="Cooldown steps at end of WSD schedule")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Training precision")
-    # Argonne-3.5 FP8 (torchao float8, tensorwise) — same as pretrain.py. Requires --torch_compile 1.
+    # Argonne-3.5 FP8 (torchao float8, tensorwise): same as pretrain.py. Requires --torch_compile 1.
     parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable FP8 training via torchao float8")
     parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head")
+    parser.add_argument("--zero_optimizer", type=int, default=0, choices=[0, 1], help="Shard AdamW state across DDP ranks (ZeRO 1/2). Required on 40-48 GB cards -- see pretrain.py. Checkpoints stay in plain-AdamW format so a run can move between sharded and unsharded hardware.")
+    parser.add_argument("--pad_vocab_multiple", type=int, default=0, help="Pad vocab up to a multiple of N independently of --fp8. 0 = auto: 128 when fp8+fp8_lm_head are on, else take the width from the resume checkpoint. Needed to resume an fp8-PADDED checkpoint on a card without fp8 (e.g. A100 sm80).")
     parser.add_argument("--loss_chunk_size", type=int, default=0, help="If >0, chunked cross-entropy over this many (batch*seq) rows/chunk -- frees the full-logit fp32 transient so batch can grow at long context. 0 = off.")
     parser.add_argument("--flash_attention", type=int, default=1, choices=[0, 1], help="Use flash attention")
     parser.add_argument("--checkpoint_interval", type=int, default=1800, help="Checkpoint interval in seconds")
@@ -1021,8 +1475,17 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_stride", type=int, default=1, help="Selective activation checkpointing (ported from argonne4.0). 1=checkpoint ALL layers (default, prior behavior). >=2=checkpoint every layer EXCEPT store (un-checkpoint) every Sth layer (store ceil(n_layers/S), recompute the rest) -> smaller S stores MORE = more HBM + less recompute = faster (too-small S OOMs). Numerically identical; requires --gradient_checkpointing 1.")
     parser.add_argument("--torch_compile", type=int, default=0, choices=[0, 1], help="Use torch.compile for speedup")
     parser.add_argument("--torch_compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    parser.add_argument("--inductor_persistent_reductions", type=int, default=-1, choices=[-1, 0, 1],
+                        help="-1 keeps torch's default; 0 forces looped (non-persistent) reductions in Inductor "
+                             "codegen. Set in-process because TORCHINDUCTOR_PERSISTENT_REDUCTIONS never reached "
+                             "the codegen on the gap-filler cluster (INFRA M+585). Only acts with --torch_compile 1.")
+    parser.add_argument("--inductor_config", type=str, default="none",
+                        help="comma-separated torch._inductor.config overrides set in-process before compile, e.g. "
+                             "triton.mix_order_reduction=0. 'none' = no overrides. Unknown keys abort at startup. "
+                             "Only acts with --torch_compile 1 (INFRA M+586).")
     parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint file")
     parser.add_argument("--wall_time", type=int, default=0, help="Wall time in seconds. If > 0, save checkpoint 3 min before this limit. 0 = disabled.")
+    parser.add_argument("--save_on_flag", type=str, default="", help="Path to a sentinel file: when it appears, save ONE checkpoint and exit cleanly, same path as the wall-limit save. Used by a gap-filler job to yield to the primary trainer WITH its work instead of losing it to a SIGTERM. Rank 0 unlinks the file when it acts on it. Empty = disabled.")
     parser.add_argument("--save_deadline_epoch", type=int, default=0, help="Absolute wall-clock deadline (unix epoch seconds): when time.time() reaches it, save ONE checkpoint and exit cleanly. SLURM-clock-relative (run_full_training.sh sets it = job_start + slice_seconds - lead), so it fires a FIXED time before the SLURM kill regardless of compile/startup drift. 0 = disabled.")
     parser.add_argument("--reset_schedule", type=int, default=0, choices=[0, 1], help="Restart the data position from the beginning of the current dataset when resuming, while preserving optimizer, scheduler, and cumulative step/token counters.")
     parser.add_argument("--val_data_path", type=str, default=None, help="Optional path to held-out validation data (.bin)")
@@ -1030,6 +1493,16 @@ if __name__ == "__main__":
     parser.add_argument("--completion_marker", type=str, default=None, help="Optional marker file written only after max_epochs is completed and the final model export succeeds.")
     parser.add_argument("--started_marker", type=str, default=None, help="Optional marker file written after the first continued-pretrain checkpoint is saved.")
     args = parser.parse_args()
+    # ⛔ AN EXPLICIT RESUME TARGET THAT DOES NOT EXIST MUST ABORT (2026-09-23 00:2x CDT, INFRA M+593).
+    # This script used to fall through to a FRESH model: `if resume_from and os.path.exists(...)` just
+    # skipped the resume, and the architecture peek fell back to the module defaults (32 layers where
+    # the checkpoint has 24). Primary slice 007 did exactly that when a handover pruned the file its
+    # launcher had resolved minutes earlier, and trained from random at loss 7.86 until it was killed.
+    # A fresh start is legitimate only when NO --resume_from is given. Checked before any NCCL setup,
+    # so every rank exits at once.
+    if args.resume_from and not os.path.exists(args.resume_from):
+        raise SystemExit(f"FATAL: --resume_from {args.resume_from} does not exist; refusing to train a fresh "
+                         f"model in its place (INFRA M+593). Re-resolve the newest checkpoint and resubmit.")
 
     RANK, LOCAL_RANK, WORLD_SIZE = setup_distributed()
     IS_MAIN = RANK == 0

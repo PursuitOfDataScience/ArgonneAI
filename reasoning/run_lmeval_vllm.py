@@ -1,4 +1,4 @@
-"""lm-eval-harness via the VALIDATED vLLM backend (fast + 90% HBM) — the right way to benchmark
+"""lm-eval-harness via the VALIDATED vLLM backend (fast + 90% HBM): the right way to benchmark
 the custom argonne2 arch. Same task suite as run_lmeval.py (the published card), but uses
 lm_eval's native VLLM model (continuous batching) instead of the bs=1 HF path (~10-50x faster).
 Builds the vLLM engine ONCE and reuses it across tasks; isolates per-task failures."""
@@ -30,6 +30,12 @@ def main():
     ap.add_argument("--out", default="report/lmeval_a06_vllm.json")
     ap.add_argument("--tasks", nargs="*", default=None)
     ap.add_argument("--limit", type=float, default=None)
+    ap.add_argument("--batch-size", default="auto",
+                    help="lm-eval's vLLM request chunk. 'auto' (default) sends a task's requests in ONE chunk and holds "
+                         "every output in host memory: hellaswag's ~40k 10-shot requests needed >16 GiB. 512 bounds it.")
+    ap.add_argument("--swap-space", type=float, default=4,
+                    help="vLLM CPU swap space in GiB (its default 4). 0 inside a small-RAM allocation: the a4.5 "
+                         "full suite was OOM-killed at hellaswag in a 16 GiB job.")
     args = ap.parse_args()
 
     import vllm_argonne
@@ -38,7 +44,9 @@ def main():
     from lm_eval.models.vllm_causallms import VLLM
 
     lm = VLLM(pretrained=args.model_path, dtype="bfloat16", trust_remote_code=True,
-              gpu_memory_utilization=args.gpu_util, max_model_len=args.max_model_len)
+              gpu_memory_utilization=args.gpu_util, max_model_len=args.max_model_len,
+              swap_space=args.swap_space,
+              batch_size=(args.batch_size if args.batch_size == "auto" else int(args.batch_size)))
 
     suite = SUITE if not args.tasks else [(t, dict(SUITE).get(t, 0)) for t in args.tasks]
     results = {}
