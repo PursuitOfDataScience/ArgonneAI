@@ -17,7 +17,7 @@ Key features:
 - Masks loss so only assistant tokens contribute to training.
 - Manual input/label shift in ShiftedLossTrainer because ArgonneModel's
   forward() computes loss as cross_entropy(logits, labels) with NO
-  internal shift — the caller must align inputs and targets.
+  internal shift: the caller must align inputs and targets.
 - Auto-detects the end-of-turn token from the chat template and sets
   it as eos_token so generation stops correctly.
 - Supports DDP/multi-GPU when launched with torchrun.
@@ -375,7 +375,7 @@ def has_excessive_word_repetition(words: List[str]) -> bool:
         return True
 
     ngrams = [
-        tuple(words[i : i + TRAINING_REPEAT_NGRAM])
+        tuple(words[i: i + TRAINING_REPEAT_NGRAM])
         for i in range(0, len(words) - TRAINING_REPEAT_NGRAM + 1)
     ]
     if not ngrams:
@@ -542,7 +542,7 @@ def extract_first_answer_letter(text: str) -> Optional[str]:
 
 def maybe_expand_mcq_letter_answer(answer_line: str, user_text: str) -> str:
     stripped = answer_line.strip()
-    with_text = re.match(r"^([ABCD])\s*[\)\].:\-–]\s*(.+)$", stripped, flags=re.IGNORECASE)
+    with_text = re.match(r"^([ABCD])\s*[\)\].:\-, ]\s*(.+)$", stripped, flags=re.IGNORECASE)
     if with_text and with_text.group(2).strip():
         return with_text.group(2).strip()
 
@@ -927,7 +927,7 @@ def has_repeated_ngram_tail(token_ids: List[int], n: int, repeats: int) -> bool:
         return False
     tail = token_ids[-n:]
     for i in range(2, repeats + 1):
-        if token_ids[-i * n : -(i - 1) * n] != tail:
+        if token_ids[-i * n: -(i - 1) * n] != tail:
             return False
     return True
 
@@ -938,7 +938,7 @@ def get_no_repeat_ngram_banned_tokens(token_ids: List[int], n: int) -> List[int]
     prefix = tuple(token_ids[-(n - 1):]) if n > 1 else tuple()
     banned: List[int] = []
     for i in range(0, len(token_ids) - n + 1):
-        if tuple(token_ids[i : i + n - 1]) == prefix:
+        if tuple(token_ids[i: i + n - 1]) == prefix:
             banned.append(token_ids[i + n - 1])
     if not banned:
         return []
@@ -974,9 +974,9 @@ def generate_quality_sequence(
     answer_start_len: Optional[int] = None
 
     while generated.shape[1] < max_length:
-        chunk = generated[:, -model_to_eval.config.max_position_embeddings :]
+        chunk = generated[:, -model_to_eval.config.max_position_embeddings:]
         outputs = model_to_eval(chunk)
-        logits = outputs.logits[:, -1, :]
+        logits = outputs.logits[:, -1,:]
         gen_ids = generated[0].tolist()
         if QUALITY_NO_REPEAT_NGRAM > 1:
             banned_tokens = get_no_repeat_ngram_banned_tokens(gen_ids, QUALITY_NO_REPEAT_NGRAM)
@@ -995,7 +995,7 @@ def generate_quality_sequence(
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > QUALITY_TOP_P
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[...,:-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits = logits.masked_fill(indices_to_remove, float("-inf"))
@@ -1244,7 +1244,7 @@ def select_mcq_answer_letter(
         total = 0.0
         for tok in suffix_ids:
             chunk = torch.tensor([ids[-max_pos:]], dtype=torch.long, device=device)
-            logits = model_to_eval(chunk).logits[:, -1, :]
+            logits = model_to_eval(chunk).logits[:, -1,:]
             log_probs = torch.log_softmax(logits, dim=-1)
             total += float(log_probs[0, tok].item())
             ids.append(tok)
@@ -1302,7 +1302,7 @@ def select_yes_no_answer(
         total = 0.0
         for tok in suffix_ids:
             chunk = torch.tensor([ids[-max_pos:]], dtype=torch.long, device=device)
-            logits = model_to_eval(chunk).logits[:, -1, :]
+            logits = model_to_eval(chunk).logits[:, -1,:]
             log_probs = torch.log_softmax(logits, dim=-1)
             total += float(log_probs[0, tok].item())
             ids.append(tok)
@@ -1343,7 +1343,7 @@ def generate_open_ended_answer(
         input_ids=input_ids,
         max_length=max_length,
     )
-    gen_ids = out[0, input_ids.shape[1] :].tolist()
+    gen_ids = out[0, input_ids.shape[1]:].tolist()
     eos_id = tokenizer.eos_token_id
     if eos_id is not None and eos_id in gen_ids:
         gen_ids = gen_ids[: gen_ids.index(eos_id)]
@@ -1406,7 +1406,7 @@ def answer_questions(model, tokenizer, questions: List[str], tag: str, step: int
             input_ids=gen_kwargs["input_ids"],
             max_length=gen_kwargs["max_length"],
         )
-        gen_ids = out[0, input_ids.shape[1] :].tolist()
+        gen_ids = out[0, input_ids.shape[1]:].tolist()
         eos_id = tokenizer.eos_token_id
         if eos_id is not None and eos_id in gen_ids:
             gen_ids = gen_ids[: gen_ids.index(eos_id)]
@@ -1627,10 +1627,10 @@ class StopAfterCheckpointSaveCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 # Shifted-loss Trainer
 # ---------------------------------------------------------------------------
-# ArgonneModel.forward() does NOT shift internally — it computes:
+# ArgonneModel.forward() does NOT shift internally: it computes:
 #   loss = cross_entropy(logits.view(-1, V), labels.view(-1), ignore_index=-100)
 # So the caller must provide:
-#   x = input_ids[:, :-1]   (input tokens 0..N-2)
+#   x = input_ids[:,:-1]   (input tokens 0..N-2)
 #   y = labels[:, 1:]        (target tokens 1..N-1)
 # This way logits[i] (predicted from token i) is trained against token i+1.
 
@@ -1639,15 +1639,20 @@ class ShiftedLossTrainer(Trainer):
 
     Autocast is applied here instead of via TrainingArguments(bf16=True)
     because Accelerate's mixed-precision forward wrapper converts ALL model
-    outputs to fp32 — including the full [batch, seq, vocab] logits tensor,
+    outputs to fp32: including the full [batch, seq, vocab] logits tensor,
     a ~2 GiB/sample allocation at vocab 151k that training never reads
     (only the loss is used). That copy was the direct cause of step-1 OOMs
     at large batch sizes. sft.py's manual loop autocasts the same way.
     """
 
-    def __init__(self, *args, autocast_dtype: Optional[torch.dtype] = None, **kwargs):
+    def __init__(self, *args, autocast_dtype: Optional[torch.dtype] = None, autocast_cache: bool = True,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.autocast_dtype = autocast_dtype
+        # False: autocast re-casts each fp32 weight per use instead of holding a bf16 copy of all of them
+        # through the forward. Measured on a 40 GB A100 (bs 2 x seq 1024, chunked CE): 36.17 -> 35.10 GiB
+        # peak at 1.80 -> 1.81 s/step, same loss.
+        self.autocast_cache = autocast_cache
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = inputs["input_ids"]
@@ -1660,13 +1665,13 @@ class ShiftedLossTrainer(Trainer):
         if getattr(base, "_hf_internal_shift", False):
             x, y = input_ids, labels
         else:
-            x = input_ids[:, :-1].contiguous()
+            x = input_ids[:,:-1].contiguous()
             y = labels[:, 1:].contiguous()
             if attention_mask is not None:
-                attention_mask = attention_mask[:, :-1].contiguous()
+                attention_mask = attention_mask[:,:-1].contiguous()
 
         if self.autocast_dtype is not None and torch.cuda.is_available():
-            with torch.autocast("cuda", dtype=self.autocast_dtype):
+            with torch.autocast("cuda", dtype=self.autocast_dtype, cache_enabled=self.autocast_cache):
                 outputs = model(
                     input_ids=x,
                     attention_mask=attention_mask,
@@ -1692,7 +1697,7 @@ def replace_rotary_embeddings(model, RotaryEmbedding, rope_theta: float, max_seq
     rope_theta and max_position_embeddings."""
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
-    # Top-level (used by ArgonneModel — shared RoPE called in forward()).
+    # Top-level (used by ArgonneModel: shared RoPE called in forward()).
     if hasattr(model, "rotary_emb"):
         model.rotary_emb = RotaryEmbedding(
             head_dim,
@@ -1793,7 +1798,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="If > 0, cap the number of reasoning rows kept after cheap filtering",
     )
-    p.add_argument("--rope_theta", type=float, default=10000.0)
+    # Default None = KEEP THE CHECKPOINT'S OWN rope_theta (argonne4.5, 2026-09-25). It was 10000.0,
+    # and main() writes it into the model unconditionally, so any launcher that forgot the flag would
+    # silently re-base RoPE 100x away from the 1e6 every Argonne base was trained with and save that
+    # into the config. Every existing launcher passes --rope_theta explicitly, so they are unchanged.
+    p.add_argument("--rope_theta", type=float, default=None,
+                   help="RoPE base. Default: the loaded checkpoint's config value (1e6 on argonne).")
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
@@ -1822,6 +1832,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quality_force_mcq_postprocess", type=int, default=0, choices=[0, 1])
     p.add_argument("--quality_force_non_mcq_postprocess", type=int, default=1, choices=[0, 1])
     p.add_argument("--quality_log_raw", type=int, default=0, choices=[0, 1])
+    p.add_argument("--optim", default="",
+                   help="TrainingArguments.optim; empty = the installed transformers' default. That default is "
+                        "adamw_torch_fused under transformers 5.x but plain foreach adamw_torch under 4.51, whose "
+                        "full-size fp32 temporary does not fit a 2B model on a 40 GB card: pass adamw_torch_fused there.")
+    p.add_argument("--autocast_cache", type=int, default=1, choices=[0, 1],
+                   help="1 = torch.autocast's weight-cast cache (old behaviour). 0 drops the bf16 copy of every "
+                        "weight held through each forward: ~1 GiB less peak on a 2B model, same speed and loss.")
+    p.add_argument("--loss_chunk_size", type=int, default=0,
+                   help="Chunked cross-entropy in model.py (rows per chunk; 0 = full logits, the old path). "
+                        "Bounds the fp32 [batch, seq, vocab] logits. Measured on a 40 GB A100, bs 2 x seq 1024: "
+                        "peak 37.2 GiB full vs 36.2 GiB at 1024 (of 39.4), identical loss. Argonne models only.")
     p.add_argument(
         "--no_text_generation",
         type=int,
@@ -2063,6 +2084,12 @@ def main() -> None:
             f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}",
             flush=True,
         )
+        # A missing weight is a randomly initialised weight; the tied lm_head is the one legit gap.
+        _tied = bool(getattr(config, "tie_word_embeddings", True))
+        _bad = [k for k in missing_keys if not (_tied and k == "lm_head.weight")]
+        if _bad:
+            raise RuntimeError(f"checkpoint is missing {len(_bad)} model weight(s), e.g. {_bad[:6]}; "
+                               "they would be randomly initialised. Refusing.")
         model.tie_weights()
         print("Weights tied (embed_tokens <-> lm_head).", flush=True)
 
@@ -2076,6 +2103,12 @@ def main() -> None:
             if args.model_context_length > 0
             else max(args.max_seq_length, loaded_context_length)
         )
+        ckpt_theta = float(getattr(model.config, "rope_theta", 1000000.0) or 1000000.0)
+        if args.rope_theta is None:
+            args.rope_theta = ckpt_theta
+        elif float(args.rope_theta) != ckpt_theta:
+            print(f"WARNING: --rope_theta {args.rope_theta} differs from the checkpoint's {ckpt_theta}: "
+                  "RoPE is being RE-BASED, which changes the model.", flush=True)
         model.config.rope_theta = args.rope_theta
         model.config.max_position_embeddings = model_context_length
         model.config.block_size = model_context_length
@@ -2096,6 +2129,10 @@ def main() -> None:
                 if hasattr(blk, "attn") and hasattr(blk.attn, "use_flash_attention"):
                     blk.attn.use_flash_attention = True
         model.config.use_cache = False
+        # The staged config carries loss_chunk_size=0; the CLI flag is what turns chunking on for this run.
+        model.config.loss_chunk_size = int(args.loss_chunk_size)
+        if model.config.loss_chunk_size > 0:
+            print(f"Chunked cross-entropy ON: loss_chunk_size={model.config.loss_chunk_size}", flush=True)
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
         model.to(device)
@@ -2107,8 +2144,8 @@ def main() -> None:
         dt = torch.bfloat16 if args.precision == "bf16" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path, dtype=dt, trust_remote_code=True)
-        # The recipe pins rope_theta; honour it if the base exposes one.
-        if hasattr(model.config, "rope_theta"):
+        # The recipe pins rope_theta; honour it if the base exposes one (and it was passed).
+        if hasattr(model.config, "rope_theta") and args.rope_theta is not None:
             model.config.rope_theta = args.rope_theta
         model.config.use_cache = False
         if hasattr(model, "gradient_checkpointing_enable"):
@@ -2184,14 +2221,16 @@ def main() -> None:
         gradient_checkpointing=True,
         report_to=[],
         remove_unused_columns=False,
+        **({"optim": args.optim} if args.optim else {}),
     )
 
     # ShiftedLossTrainer because ArgonneModel.forward() does NOT shift
-    # labels internally — it computes cross_entropy(logits, labels) directly.
+    # labels internally: it computes cross_entropy(logits, labels) directly.
     trainer = ShiftedLossTrainer(
         model=model,
         args=train_args,
         autocast_dtype=torch.bfloat16 if bf16 else None,
+        autocast_cache=bool(args.autocast_cache),
         train_dataset=train_dataset,
         data_collator=CausalCollator(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
         callbacks=[
@@ -2227,6 +2266,16 @@ def main() -> None:
     else:
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        # A staged argonne4.5 input carries auto_map + model.py; save_model() keeps the auto_map but
+        # not the file, and a dangling auto_map breaks every trust_remote_code load (vLLM included).
+        try:
+            with open(os.path.join(args.output_dir, "config.json")) as _f:
+                _has_auto_map = "auto_map" in json.load(_f)
+        except (OSError, ValueError):
+            _has_auto_map = False
+        if _has_auto_map and not os.path.exists(os.path.join(args.output_dir, "model.py")):
+            shutil.copy2(args.model_def, os.path.join(args.output_dir, "model.py"))
+            print(f"Bundled {args.model_def} as model.py (config has auto_map)", flush=True)
         trainer.save_state()
         print(f"Saved final model/tokenizer to: {args.output_dir}")
         # Write a completion marker so wrapper scripts can detect end-of-training

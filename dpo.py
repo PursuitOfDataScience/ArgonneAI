@@ -18,6 +18,7 @@ Important design choice:
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -966,6 +967,53 @@ class PreferenceCollator:
         return batch
 
 
+def load_argonne_state_dict(model_path: str) -> Dict[str, torch.Tensor]:
+    """model.safetensors, or the shards named by model.safetensors.index.json (argonne4.5 exports
+    are sharded). Same behaviour as sft.py / reasoning/cot-sft.py."""
+    from safetensors.torch import load_file
+
+    single = os.path.join(model_path, "model.safetensors")
+    if os.path.isfile(single):
+        return load_file(single)
+    index = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        raise FileNotFoundError(f"no model.safetensors or model.safetensors.index.json in {model_path}")
+    with open(index) as f:
+        weight_map = json.load(f)["weight_map"]
+    state_dict: Dict[str, torch.Tensor] = {}
+    for shard in dict.fromkeys(weight_map.values()):
+        part = load_file(os.path.join(model_path, shard))
+        overlap = state_dict.keys() & part.keys()
+        if overlap:
+            raise ValueError(f"tensor(s) in two shards: {sorted(overlap)[:4]}")
+        state_dict.update(part)
+    return state_dict
+
+
+def refuse_missing_weights(missing_keys, config) -> None:
+    """A missing weight is a randomly initialised weight. The load used to be strict=False with
+    no report at all. lm_head.weight on a tied model is the one legitimate gap."""
+    tied = bool(getattr(config, "tie_word_embeddings", True))
+    bad = [k for k in missing_keys if not (tied and k == "lm_head.weight")]
+    if bad:
+        raise RuntimeError(f"checkpoint is missing {len(bad)} model weight(s), e.g. {bad[:6]}; "
+                           "they would be randomly initialised. Refusing.")
+
+
+def bundle_model_py(output_dir: str, argonne_root: str) -> None:
+    """If the saved config carries auto_map (a staged argonne4.5 input), ship the model.py it
+    points at; otherwise every trust_remote_code load of the output fails. See sft.py."""
+    try:
+        with open(os.path.join(output_dir, "config.json")) as f:
+            has_auto_map = "auto_map" in json.load(f)
+    except (OSError, ValueError):
+        return
+    dst = os.path.join(output_dir, "model.py")
+    if has_auto_map and not os.path.exists(dst):
+        shutil.copy2(os.path.join(argonne_root, "model.py"), dst)
+        print(f"Bundled model.py into {output_dir} (config has auto_map)")
+
+
 def build_model_and_tokenizer(
     device: torch.device,
     argonne_root: str,
@@ -994,9 +1042,6 @@ def build_model_and_tokenizer(
     else:
         print(f"EOS token: {repr(tokenizer.eos_token)} (id={tokenizer.eos_token_id})")
 
-    import json
-    from safetensors.torch import load_file
-
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
@@ -1017,15 +1062,26 @@ def build_model_and_tokenizer(
         return model, tokenizer
 
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
-    config.max_position_embeddings = max_seq_len
+    # Never shrink below the checkpoint's trained context, and keep block_size in step (it used to
+    # set max_position_embeddings only, so the saved config carried two different contexts and
+    # ArgonneConfig lets block_size win on reload). max() == the old value for max_seq_len >= ckpt.
+    ckpt_ctx = int(config.max_position_embeddings or 0)
+    model_ctx = max(int(max_seq_len), ckpt_ctx)
+    if max_seq_len > ckpt_ctx:
+        print(f"WARNING: --max_seq_length {max_seq_len} exceeds the checkpoint's trained context "
+              f"{ckpt_ctx}; RoPE beyond the trained length is NOT extrapolation-safe on this arch.")
+    config.max_position_embeddings = model_ctx
+    config.block_size = model_ctx
     config.use_flash_attention = True
     config._keep_in_fp32_modules = []
 
     model = ArgonneModel(config)
 
-    weights_path = os.path.join(model_path, "model.safetensors")
-    state_dict = load_file(weights_path)
-    model.load_state_dict(state_dict, strict=False)
+    state_dict = load_argonne_state_dict(model_path)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    del state_dict
+    print(f"State dict applied. missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}")
+    refuse_missing_weights(missing_keys, config)
     model.tie_weights()
 
     model.config.use_cache = False
@@ -1171,6 +1227,170 @@ def sequence_logps(
     }
 
 
+def sequence_logps_rows(
+    model,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """The statistics of sequence_logps, one row at a time, through the model's OWN cross-entropy.
+
+    For a single sequence, model(x, labels=y).loss is the mean over its valid label tokens of
+    -log p, i.e. exactly -avg_logps. With config.loss_chunk_size > 0 (and the model in train mode)
+    model.py computes that loss in checkpointed chunks, so the [batch, seq, vocab] logits that
+    sequence_logps materializes never exist: 2 x 3072 tokens is ~10 GB of logits and their
+    logsumexp. Each row is trimmed to its last valid label, so right padding costs nothing.
+    """
+    x = input_ids[:, :-1]
+    y = labels[:, 1:]
+    avgs: List[torch.Tensor] = []
+    counts: List[int] = []
+    for b in range(x.size(0)):
+        valid = y[b].ne(-100)
+        n = int(valid.sum().item())
+        if n == 0:
+            avgs.append(torch.zeros((), device=x.device, dtype=torch.float32))
+            counts.append(0)
+            continue
+        last = int(valid.nonzero()[-1].item()) + 1
+        out = model(input_ids=x[b:b + 1, :last].contiguous(), labels=y[b:b + 1, :last].contiguous())
+        avgs.append(-out.loss.float())
+        counts.append(n)
+    avg_logps = torch.stack(avgs)
+    token_counts = torch.tensor(counts, device=avg_logps.device)
+    seq_logps = avg_logps * token_counts.to(avg_logps.dtype)
+    token_nll = -seq_logps.sum() / token_counts.sum().clamp_min(1).to(seq_logps.dtype)
+    return {
+        "seq_logps": seq_logps,
+        "avg_logps": avg_logps,
+        "token_counts": token_counts,
+        "token_nll": token_nll,
+    }
+
+
+def model_logps(model, input_ids, labels, rows: bool) -> Dict[str, torch.Tensor]:
+    return sequence_logps_rows(model, input_ids, labels) if rows else sequence_logps(model, input_ids, labels)
+
+
+def pair_key(chosen_ids, rejected_ids) -> str:
+    """Content key of a preference pair (unpadded token ids), independent of dataset index."""
+    a = np.asarray(list(chosen_ids) + [-1] + list(rejected_ids), dtype=np.int64)
+    return hashlib.md5(a.tobytes()).hexdigest()
+
+
+@torch.no_grad()
+def precompute_reference_scores(reference_model, dataset, tokenizer, max_seq_len: int, device,
+                                use_cuda: bool, rows: bool) -> Dict[str, Tuple[float, float, float, float]]:
+    """(avg chosen, avg rejected, sum chosen, sum rejected) reference log-probs for EVERY pair the
+    dataset can return, keyed by content. The reference model is frozen, so these numbers never change
+    during training; computing them once lets the caller free the reference model (7.7 GiB fp32 for
+    a 2B model), which is what makes single-GPU DPO fit a 40 GB card. Keyed by content rather than
+    index because __getitem__ may substitute a neighbouring or random pair for an unusable one."""
+    reference_model.eval()
+    table: Dict[str, Tuple[float, float, float, float]] = {}
+    t0 = time.time()
+    for n, raw_idx in enumerate(dataset.indices):
+        built = build_preference_example(dataset.raw[raw_idx], tokenizer=tokenizer, max_seq_len=max_seq_len)
+        if built is None:
+            continue
+        key = pair_key(built["chosen_input_ids"], built["rejected_input_ids"])
+        if key in table:
+            continue
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_cuda):
+            c = model_logps(reference_model, torch.tensor([built["chosen_input_ids"]], device=device),
+                            torch.tensor([built["chosen_labels"]], device=device), rows)
+            r = model_logps(reference_model, torch.tensor([built["rejected_input_ids"]], device=device),
+                            torch.tensor([built["rejected_labels"]], device=device), rows)
+        table[key] = (float(c["avg_logps"][0]), float(r["avg_logps"][0]),
+                      float(c["seq_logps"][0]), float(r["seq_logps"][0]))
+        if (n + 1) % 1000 == 0:
+            print(f"[ref-precompute] {n + 1:,}/{len(dataset.indices):,} pairs, {time.time() - t0:.0f}s", flush=True)
+    print(f"[ref-precompute] {len(table):,} distinct pairs in {time.time() - t0:.0f}s", flush=True)
+    return table
+
+
+def dpo_split_backward(
+    policy_model,
+    reference_model,
+    chosen_input_ids: torch.Tensor,
+    chosen_labels: torch.Tensor,
+    rejected_input_ids: torch.Tensor,
+    rejected_labels: torch.Tensor,
+    beta: float,
+    score_mode: str,
+    label_smoothing: float,
+    chosen_sft_weight: float,
+    accum_divisor: int,
+    amp,
+    ref_scores: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """compute_dpo_loss(...) / accum_divisor followed by .backward(), with ONE sequence's graph alive.
+
+    The DPO loss depends on the policy only through one scalar score per sequence, so by the chain rule
+    dL/dtheta = sum over sequences of (dL/dscore) * dscore/dtheta. Pass 1 scores every sequence without
+    a graph and differentiates the (cheap) loss with respect to those scalars; pass 2 re-runs each
+    sequence WITH a graph and back-propagates its score scaled by that coefficient, then frees it. Same
+    gradient; peak activation memory of one sequence instead of chosen + rejected together (the
+    difference between fitting a 40 GB card and OOM on the longest pairs), for ~25% more compute.
+    Needs the row-wise path (config.loss_chunk_size > 0) and a policy without dropout. Returns the
+    undivided loss (detached) and the same metrics as compute_dpo_loss.
+    """
+    if score_mode not in {"sum", "avg"}:
+        raise ValueError(f"Unsupported score_mode={score_mode!r}; expected 'sum' or 'avg'")
+    avg = score_mode == "avg"
+    score_key = "avg_logps" if avg else "seq_logps"
+    with torch.no_grad(), amp():
+        pc = sequence_logps_rows(policy_model, chosen_input_ids, chosen_labels)
+        pr = sequence_logps_rows(policy_model, rejected_input_ids, rejected_labels)
+        if ref_scores is None:
+            ref_c = sequence_logps_rows(reference_model, chosen_input_ids, chosen_labels)[score_key]
+            ref_r = sequence_logps_rows(reference_model, rejected_input_ids, rejected_labels)[score_key]
+        else:
+            ref_c, ref_r = ref_scores
+    sc = pc[score_key].detach().float().requires_grad_(True)
+    sr = pr[score_key].detach().float().requires_grad_(True)
+    n_c = pc["token_counts"].to(sc.dtype)
+    # token_nll of the chosen side written as a function of its scores (sequence_logps_rows' formula).
+    seq_c = sc * n_c if avg else sc
+    chosen_sft_loss = -seq_c.sum() / n_c.sum().clamp_min(1)
+    preference_logits = beta * ((sc - sr) - (ref_c.float() - ref_r.float()))
+    dpo_losses = (
+        -(1.0 - label_smoothing) * F.logsigmoid(preference_logits)
+        - label_smoothing * F.logsigmoid(-preference_logits)
+    )
+    dpo_loss = dpo_losses.mean()
+    loss = dpo_loss + chosen_sft_weight * chosen_sft_loss
+    g_c, g_r = torch.autograd.grad(loss, (sc, sr))
+
+    x_c, y_c = chosen_input_ids[:, :-1], chosen_labels[:, 1:]
+    x_r, y_r = rejected_input_ids[:, :-1], rejected_labels[:, 1:]
+    for coeffs, x, y in ((g_c, x_c, y_c), (g_r, x_r, y_r)):
+        for b in range(x.size(0)):
+            valid = y[b].ne(-100)
+            n = int(valid.sum().item())
+            if n == 0 or float(coeffs[b]) == 0.0:
+                continue
+            last = int(valid.nonzero()[-1].item()) + 1
+            with amp():
+                out = policy_model(input_ids=x[b:b + 1, :last].contiguous(), labels=y[b:b + 1, :last].contiguous())
+                score = -out.loss.float() * (1 if avg else n)
+            (coeffs[b].detach() * score / accum_divisor).backward()
+
+    ref_c_f, ref_r_f = ref_c.float(), ref_r.float()
+    chosen_rewards = beta * (sc.detach() - ref_c_f)
+    rejected_rewards = beta * (sr.detach() - ref_r_f)
+    metrics = {
+        "dpo_loss": float(dpo_loss.detach().item()),
+        "chosen_sft_loss": float(chosen_sft_loss.detach().item()),
+        "reward_accuracy": float((chosen_rewards > rejected_rewards).float().mean().item()),
+        "reward_margin": float((chosen_rewards - rejected_rewards).mean().item()),
+        "chosen_reward": float(chosen_rewards.mean().item()),
+        "rejected_reward": float(rejected_rewards.mean().item()),
+        "chosen_tokens": float(pc["token_counts"].float().mean().item()),
+        "rejected_tokens": float(pr["token_counts"].float().mean().item()),
+    }
+    return loss.detach(), metrics
+
+
 def compute_dpo_loss(
     policy_model,
     reference_model,
@@ -1182,22 +1402,29 @@ def compute_dpo_loss(
     score_mode: str,
     label_smoothing: float,
     chosen_sft_weight: float,
+    rows: bool = False,
+    ref_scores: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """``rows``: row-wise log-probs through the model's own (chunkable) cross-entropy.
+    ``ref_scores``: precomputed (chosen, rejected) reference scores for this batch, in score_mode's
+    units; when given, the reference model is not run (and may be None)."""
     if score_mode not in {"sum", "avg"}:
         raise ValueError(f"Unsupported score_mode={score_mode!r}; expected 'sum' or 'avg'")
 
-    policy_chosen_stats = sequence_logps(policy_model, chosen_input_ids, chosen_labels)
-    policy_rejected_stats = sequence_logps(policy_model, rejected_input_ids, rejected_labels)
-
-    with torch.no_grad():
-        ref_chosen_stats = sequence_logps(reference_model, chosen_input_ids, chosen_labels)
-        ref_rejected_stats = sequence_logps(reference_model, rejected_input_ids, rejected_labels)
+    policy_chosen_stats = model_logps(policy_model, chosen_input_ids, chosen_labels, rows)
+    policy_rejected_stats = model_logps(policy_model, rejected_input_ids, rejected_labels, rows)
 
     score_key = "avg_logps" if score_mode == "avg" else "seq_logps"
+    if ref_scores is None:
+        with torch.no_grad():
+            ref_chosen_stats = model_logps(reference_model, chosen_input_ids, chosen_labels, rows)
+            ref_rejected_stats = model_logps(reference_model, rejected_input_ids, rejected_labels, rows)
+        ref_chosen_scores = ref_chosen_stats[score_key]
+        ref_rejected_scores = ref_rejected_stats[score_key]
+    else:
+        ref_chosen_scores, ref_rejected_scores = ref_scores
     policy_chosen_scores = policy_chosen_stats[score_key]
     policy_rejected_scores = policy_rejected_stats[score_key]
-    ref_chosen_scores = ref_chosen_stats[score_key]
-    ref_rejected_scores = ref_rejected_stats[score_key]
 
     policy_logratios = policy_chosen_scores - policy_rejected_scores
     reference_logratios = ref_chosen_scores - ref_rejected_scores
@@ -1290,7 +1517,16 @@ def save_checkpoint(
 
     from safetensors.torch import save_file
 
-    state_dict = {k: v.detach().contiguous().cpu() for k, v in policy_model.state_dict().items()}
+    # Tied weights (lm_head.weight IS embed_tokens.weight) are one tensor under two names and
+    # safetensors refuses aliases: on GPU .cpu() copied each name (the embedding written twice), on CPU
+    # it raised. Keep the first name; load_checkpoint's strict=False load re-ties through the parameter.
+    state_dict, _seen = {}, set()
+    for k, v in policy_model.state_dict().items():
+        _alias = (v.data_ptr(), v.dtype, tuple(v.shape), tuple(v.stride()))
+        if v.numel() and _alias in _seen:
+            continue
+        _seen.add(_alias)
+        state_dict[k] = v.detach().contiguous().cpu()
     save_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
 
     if hasattr(policy_model, "config"):
@@ -1341,6 +1577,18 @@ def rotate_checkpoints(output_dir: str, save_total_limit: int) -> None:
         if step >= 0:
             candidates.append((step, full))
     candidates.sort(key=lambda x: x[0])
+    # ⛔ HONOUR A `.keep` MARKER, as the three pretrain-family prunes now do (INFRA M+224/M+225).
+    # Added 2026-09-15 to finish that sweep: this rotation deletes DIRECTORIES, so the file-level
+    # marker those functions look for could never protect anything here -- and with the default now 1
+    # (it was -1 = keep-all, i.e. retention was off unless a launcher passed the flag) an exempt
+    # checkpoint would be removed on the very next save. A published checkpoint, a soup ingredient or a
+    # reference point is exactly what retention's own exception carves out, so the exemption must exist
+    # in every path that can delete one. A marker can only ever PREVENT a deletion.
+    exempt = [(s, p) for s, p in candidates if os.path.exists(os.path.join(p, ".keep"))]
+    for s, p in exempt:
+        print(f"[ckpt] KEEPING checkpoint-{s}: .keep marker present "
+              f"({open(os.path.join(p, '.keep')).read().strip()[:120]})")
+    candidates = [(s, p) for s, p in candidates if (s, p) not in exempt]
     while len(candidates) > save_total_limit:
         step, path = candidates.pop(0)
         try:
@@ -1433,6 +1681,15 @@ def prune_intermediate_checkpoints(output_dir: str) -> None:
             full = os.path.join(output_dir, name)
             if not os.path.isdir(full) or not re.search(r"checkpoint-\d+$", name):
                 continue
+            if os.path.exists(os.path.join(full, ".keep")):
+                # ⛔ SAME EXEMPTION AS EVERY OTHER DELETION PATH (INFRA M+224/M+225/M+226). This body
+                # differs from sft.py's (inline regex vs `_ckpt_step`), so the identical patch did NOT
+                # apply here -- and the unit test then caught this file deleting a `.keep`-marked dir
+                # while sft.py honoured it. Half-applied is the recorded failure mode; what found it was
+                # running the test on BOTH files, not reading the diff.
+                print(f"[retention] KEEPING {name}: .keep marker present "
+                      f"({open(os.path.join(full, '.keep')).read().strip()[:120]})", flush=True)
+                continue
             gib = sum(os.path.getsize(os.path.join(full, f))
                       for f in os.listdir(full)
                       if os.path.isfile(os.path.join(full, f))) / 2**30
@@ -1519,6 +1776,30 @@ def main() -> None:
         help="Run quality generations every N optimizer steps",
     )
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
+    parser.add_argument("--run_before_quality", type=int, default=1, choices=[0, 1],
+                        help="Run the locked probe generations before DPO (default 1, unchanged).")
+    parser.add_argument("--run_after_quality", type=int, default=1, choices=[0, 1],
+                        help="Run the locked probe generations after DPO (default 1, unchanged).")
+    parser.add_argument("--loss_chunk_size", type=int, default=0,
+                        help="> 0: log-probs row by row through model.py's chunked cross-entropy instead of "
+                             "materializing [batch, seq, vocab] logits (exact for both score modes). 0 = old path.")
+    parser.add_argument("--precompute_ref", type=int, default=0, choices=[0, 1],
+                        help="1: compute every pair's reference scores once before training, then free the "
+                             "reference model (7.7 GiB fp32 for a 2B model). 0 = run it every step (old path).")
+    parser.add_argument("--adam_fused", type=int, default=0, choices=[0, 1],
+                        help="1: fused AdamW. The default foreach AdamW allocates a full-size fp32 temporary "
+                             "(7.7 GiB for a 2B model) at every step; fused does not. Same update rule.")
+    parser.add_argument("--split_backward", type=int, default=0, choices=[0, 1],
+                        help="1: back-propagate one sequence at a time via the chain rule through its score "
+                             "(same gradient, peak activations of one sequence instead of chosen + rejected; "
+                             "~25%% more compute). Requires --loss_chunk_size > 0.")
+    parser.add_argument("--autocast_cache", type=int, default=1, choices=[0, 1],
+                        help="0: autocast re-casts weights per use instead of holding a bf16 copy of all of them "
+                             "through each forward (~1 GiB less peak on a 2B model, same speed).")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                        help="cuda (default, unchanged). cpu = fp32 smoke test only (no autocast).")
+    parser.add_argument("--log_every", type=int, default=LOG_EVERY,
+                        help="Print the metrics line every N optimizer steps (default 10).")
 
     # Checkpointing + resume
     parser.add_argument("--save_strategy", type=str, default="none",
@@ -1528,8 +1809,17 @@ def main() -> None:
                         help="Save every N optimizer steps when save_strategy=steps.")
     parser.add_argument("--save_seconds", type=int, default=0,
                         help="Save every N wall-clock seconds when save_strategy=time. 0 disables.")
-    parser.add_argument("--save_total_limit", type=int, default=-1,
-                        help="Keep at most N most recent checkpoint directories (-1 = keep all).")
+    # ⛔ DEFAULT IS 1 (latest-only), changed 2026-09-15 (INFRA M+225). It was -1 = KEEP ALL, and the
+    # rotation body starts `if save_total_limit <= 0: return`, so retention was DISABLED unless a
+    # launcher happened to pass the flag. The owner's standing rule is the opposite: "Implement the
+    # prune in the training/save path ITSELF so retention holds automatically." Each of these dirs is
+    # ~34 GB (13 GB weights + 23 GB AdamW moments), which is exactly the "silently eats hundreds of
+    # GB" failure the rule exists to prevent -- and one such dir was still on disk from 2026-08-02.
+    # -1 still means keep-all for anyone who asks for it explicitly; what changed is which behaviour
+    # you get by SAYING NOTHING.
+    parser.add_argument("--save_total_limit", type=int, default=1,
+                        help="Keep at most N most recent checkpoint directories (-1 = keep all; "
+                             "default 1 = latest-only, the standing retention rule).")
     parser.add_argument("--resume_from_checkpoint", type=str, default="",
                         help="Path to a checkpoint directory to resume from. Use 'auto' to pick the latest under --output_dir.")
     parser.add_argument("--exit_after_checkpoint_save", action="store_true",
@@ -1544,10 +1834,12 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this script.")
+    USE_CUDA = args.device == "cuda"
+    if USE_CUDA and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this script (or pass --device cpu for a smoke test).")
 
-    device = torch.device("cuda")
+    device = torch.device("cuda" if USE_CUDA else "cpu")
+    log_every = max(1, int(args.log_every))
     reference_model_path = args.reference_model_path or args.model_path
     train_embed_and_head = bool(args.train_embed_and_head)
     save_final = bool(args.save_final)
@@ -1555,7 +1847,7 @@ def main() -> None:
     print("=" * 90)
     print("Argonne SFT checkpoint DPO on local preference dataset")
     print("=" * 90)
-    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"Device: {torch.cuda.get_device_name(0) if USE_CUDA else 'cpu (fp32 smoke test)'}")
     print(f"Data: {args.data_path}")
     print(f"Policy checkpoint: {args.model_path}")
     print(f"Reference checkpoint: {reference_model_path}")
@@ -1607,6 +1899,17 @@ def main() -> None:
     reference_model.eval()
     for param in reference_model.parameters():
         param.requires_grad_(False)
+    ROWS = int(args.loss_chunk_size) > 0
+    SPLIT = bool(args.split_backward)
+    if SPLIT and not ROWS:
+        raise SystemExit("--split_backward 1 needs --loss_chunk_size > 0 (the row-wise path).")
+    if ROWS:
+        # The staged config carries loss_chunk_size=0; the flag turns chunking on for this run. The
+        # reference model runs in eval mode, where model.py computes the same loss from full logits
+        # of ONE row under no_grad: transient, and numerically the same quantity.
+        policy_model.config.loss_chunk_size = int(args.loss_chunk_size)
+        reference_model.config.loss_chunk_size = int(args.loss_chunk_size)
+        print(f"Row-wise chunked log-probs ON: loss_chunk_size={args.loss_chunk_size}")
 
     probe_ds, probe_split_name = load_preference_split(args.data_path)
     probe_valid = 0
@@ -1632,16 +1935,32 @@ def main() -> None:
         shuffle=True,
         drop_last=True,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=USE_CUDA,
         collate_fn=collator,
     )
 
+    _fused = bool(args.adam_fused) and USE_CUDA
     optimizer = torch.optim.AdamW(
         [p for p in policy_model.parameters() if p.requires_grad],
         lr=args.lr,
         betas=(ADAM_BETA1, ADAM_BETA2),
         weight_decay=WEIGHT_DECAY,
+        **({"fused": True} if _fused else {}),
     )
+    if _fused:
+        print("AdamW: fused kernel")
+
+    # Reference scores once, then drop the reference model (after the loader exists, before training).
+    REF_TABLE = None
+    if args.precompute_ref:
+        REF_TABLE = precompute_reference_scores(reference_model, train_dataset, tokenizer,
+                                                args.max_seq_length, device, USE_CUDA, ROWS)
+        del reference_model
+        reference_model = None
+        gc.collect()
+        if USE_CUDA:
+            torch.cuda.empty_cache()
+        print("Reference model freed; training uses the precomputed scores.")
 
     num_micro_batches = len(train_loader)
     steps_per_epoch = max(1, math.ceil(num_micro_batches / max(1, args.grad_accum)))
@@ -1689,15 +2008,16 @@ def main() -> None:
             raise FileNotFoundError(f"--resume_from_checkpoint path does not exist: {resume_path}")
         resume_metadata = load_checkpoint(resume_path, policy_model, optimizer, scheduler, device)
 
-    answer_questions(
-        policy_model,
-        tokenizer,
-        device,
-        QUALITY_QUESTIONS,
-        tag="BEFORE_DPO",
-        step=0,
-        max_seq_len=args.max_seq_length,
-    )
+    if args.run_before_quality == 1:
+        answer_questions(
+            policy_model,
+            tokenizer,
+            device,
+            QUALITY_QUESTIONS,
+            tag="BEFORE_DPO",
+            step=0,
+            max_seq_len=args.max_seq_length,
+        )
 
     global_step = int(resume_metadata.get("global_step", 0))
     tokens_seen = int(resume_metadata.get("tokens_seen", 0))
@@ -1778,22 +2098,44 @@ def main() -> None:
             )
             accum_divisor = last_update_micro_batches if in_last_partial_update else max(1, args.grad_accum)
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-                loss, metrics = compute_dpo_loss(
-                    policy_model=policy_model,
-                    reference_model=reference_model,
-                    chosen_input_ids=chosen_input_ids,
-                    chosen_labels=chosen_labels,
-                    rejected_input_ids=rejected_input_ids,
-                    rejected_labels=rejected_labels,
-                    beta=args.beta,
-                    score_mode=args.score_mode,
-                    label_smoothing=args.label_smoothing,
-                    chosen_sft_weight=args.chosen_sft_weight,
+            _ref_scores = None
+            if REF_TABLE is not None:
+                _cm, _rm = batch["chosen_attention_mask"], batch["rejected_attention_mask"]
+                _vals = [REF_TABLE[pair_key(batch["chosen_input_ids"][b][: int(_cm[b].sum())].tolist(),
+                                            batch["rejected_input_ids"][b][: int(_rm[b].sum())].tolist())]
+                         for b in range(_cm.size(0))]
+                _i = (0, 1) if args.score_mode == "avg" else (2, 3)
+                _ref_scores = (torch.tensor([v[_i[0]] for v in _vals], device=device),
+                               torch.tensor([v[_i[1]] for v in _vals], device=device))
+            _amp = lambda: torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=USE_CUDA,
+                                              cache_enabled=bool(args.autocast_cache))
+            if SPLIT:
+                # backward happens inside, one sequence at a time
+                loss, metrics = dpo_split_backward(
+                    policy_model, reference_model, chosen_input_ids, chosen_labels,
+                    rejected_input_ids, rejected_labels, beta=args.beta, score_mode=args.score_mode,
+                    label_smoothing=args.label_smoothing, chosen_sft_weight=args.chosen_sft_weight,
+                    accum_divisor=accum_divisor, amp=_amp, ref_scores=_ref_scores,
                 )
                 loss = loss / accum_divisor
-
-            loss.backward()
+            else:
+                with _amp():
+                    loss, metrics = compute_dpo_loss(
+                        policy_model=policy_model,
+                        reference_model=reference_model,
+                        chosen_input_ids=chosen_input_ids,
+                        chosen_labels=chosen_labels,
+                        rejected_input_ids=rejected_input_ids,
+                        rejected_labels=rejected_labels,
+                        beta=args.beta,
+                        score_mode=args.score_mode,
+                        label_smoothing=args.label_smoothing,
+                        chosen_sft_weight=args.chosen_sft_weight,
+                        rows=ROWS,
+                        ref_scores=_ref_scores,
+                    )
+                    loss = loss / accum_divisor
+                loss.backward()
 
             running_loss += float(loss.detach().item()) * args.grad_accum
             running_dpo_loss += metrics["dpo_loss"]
@@ -1833,7 +2175,7 @@ def main() -> None:
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
 
-            if global_step % LOG_EVERY == 0:
+            if global_step % log_every == 0:
                 print(
                     f"[step {global_step}] loss={mean_loss:.4f} dpo={mean_dpo_loss:.4f} "
                     f"chosen_sft={mean_sft_loss:.4f} reward_acc={mean_reward_acc:.3f} "
@@ -1897,18 +2239,20 @@ def main() -> None:
 
         pbar.close()
 
-    answer_questions(
-        policy_model,
-        tokenizer,
-        device,
-        QUALITY_QUESTIONS,
-        tag="AFTER_DPO",
-        step=global_step,
-        max_seq_len=args.max_seq_length,
-    )
+    if args.run_after_quality == 1:
+        answer_questions(
+            policy_model,
+            tokenizer,
+            device,
+            QUALITY_QUESTIONS,
+            tag="AFTER_DPO",
+            step=global_step,
+            max_seq_len=args.max_seq_length,
+        )
 
     if save_final:
         save_model_and_tokenizer(policy_model, tokenizer, args.output_dir)
+        bundle_model_py(args.output_dir, args.argonne_root)
 
     # Write completion marker so wrapper scripts can detect end-of-training.
     completion_path = os.path.join(args.output_dir, ".dpo_complete")

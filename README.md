@@ -6,8 +6,11 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 | Model | Params | Context | Training tokens | Hugging Face |
 |-------|--------|---------|-----------------|--------------|
+| [Argonne 4.5-think](#argonne-45-think) | 2.06B | 13,568 | 145.21B + post-training | [Argonne-4.5-think](https://huggingface.co/PursuitOfDataScience/Argonne-4.5-think) |
+| [Argonne 4.5-instruct](#argonne-45-instruct) | 2.06B | 13,568 | 145.21B + SFT and DPO | [argonne-4.5-instruct](https://huggingface.co/PursuitOfDataScience/argonne-4.5-instruct) |
 | [Argonne 4.5-base-ctx13568](#argonne-45-base-ctx13568) | **2.06B** | **13,568** (trained) | 145.21B | [argonne-4.5-base-ctx13568](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base-ctx13568) |
 | [Argonne 4.5-base](#argonne-45-base) | 2.06B | 1,024 | 128.07B | [argonne-4.5-base](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base) |
+| [Argonne 4.0-think](#argonne-40-think) | 1.04B | 65,536 | ~65.12B + post-training | [Argonne-4.0-think](https://huggingface.co/PursuitOfDataScience/Argonne-4.0-think) |
 | [Argonne 4.0-base](#argonne-40-base) | **1.04B** | **65,536** (trained) | ~65.12B | [argonne-4.0-base](https://huggingface.co/PursuitOfDataScience/argonne-4.0-base) |
 | [Argonne 3.5-think](#argonne-35-think) | 2.88B | 13,568 | ~88.84B + post-training | [Argonne-3.5-think](https://huggingface.co/PursuitOfDataScience/Argonne-3.5-think) |
 | [Argonne 3.5-base](#argonne-35-base) | 2.88B | **13,568** (trained) | ~88.84B | [argonne-3.5-base](https://huggingface.co/PursuitOfDataScience/argonne-3.5-base) |
@@ -16,6 +19,46 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 | [Argonne 2.0](#argonne-20) | 4.9B | 4,096 | ~21.9B | not released |
 | [Argonne 1.5](#argonne-15) | 357M | 2,048 | ~15.45B | [Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5) |
 | [Argonne 1.0](#argonne-10) | 276M | 2,048 | FineWeb-Edu | [Argonne-1.0](https://huggingface.co/PursuitOfDataScience/Argonne-1.0) |
+
+---
+
+# Argonne 4.5-think
+
+The reasoning model of the 4.5 line, released as [`PursuitOfDataScience/Argonne-4.5-think`](https://huggingface.co/PursuitOfDataScience/Argonne-4.5-think). Built on [argonne-4.5-base-ctx13568](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base-ctx13568); writes a short `<think>…</think>` trace, then a `\boxed{}` answer. Full model card: [`model_cards/Argonne-4.5-think.md`](model_cards/Argonne-4.5-think.md).
+
+Greedy accuracy on four clean arithmetic word-problem pools, paired on identical items (n = 1000 ASDiv/SVAMP, 500 GSM-Plus/MAWPS; pooled = correct over all 3,000; exact McNemar):
+
+| | CoT-SFT start | Argonne-4.0-think (1.04B) | Argonne-3.5-think (2.88B) | **4.5-think (2.06B)** |
+|---|---:|---:|---:|---:|
+| ASDiv | 47.00 | 70.80 | 73.20 | **69.40** |
+| SVAMP | 40.80 | 60.40 | 68.00 | **62.30** |
+| GSM-Plus | 15.80 | 36.00 | 42.20 | **39.60** |
+| MAWPS | 39.00 | 58.80 | 60.80 | **59.60** |
+| **pooled** | 38.40 | 59.53 | 64.23 | **60.43** |
+| 4.5-think vs this column | +22.03 (p 1.8e-113) | +0.90 (p 0.32) | −3.80 (p 1.7e-5) | |
+
+Post-training took the start from 38.40 to 60.43. That makes it level with the 1.04B 4.0-think on this gate, and 3.80 below its teacher: the base lost most of its step-by-step math in the long-context stage (gsm8k 20.62 to 4.78) and post-training had to win it back. Where it does beat 4.0-think is general capability: 51.04 against 47.96 on the 8-task lm-eval mean, same harness. Self-consistency over 8 samples reaches 67.83; pass@8 is 79.97.
+
+| stage | what it does |
+|---|---|
+| 1-3 | SFT on UltraChat, DPO on argilla/dpo-mix-7k, CoT-SFT on the 3.5-think short-trace mix (`sft.py`, `dpo.py`, `reasoning/cot-sft.py`) |
+| 4 | 5 rounds of on-policy distillation from Argonne-3.5-think: per-token reverse KL on the student's own samples (`reasoning/opd_train.py`, `reasoning/rft_generate.py`) |
+| 5 | 2 repair passes: plain cross-entropy at LR 3e-6 on the model's own verified-correct samples; they restore termination |
+| 6-7 | one more distillation round and repair, then the same on 12,000 unseen, decontaminated NuminaMath-CoT problems |
+| 8 | RLVR-DPO on 7,743 (correct, wrong) pairs with length-matched negatives, then repair: +2.97 pooled (p 2.9e-5), the largest step after distillation |
+
+---
+
+# Argonne 4.5-instruct
+
+The chat model of the 4.5 line, released as [`PursuitOfDataScience/argonne-4.5-instruct`](https://huggingface.co/PursuitOfDataScience/argonne-4.5-instruct): [argonne-4.5-base-ctx13568](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base-ctx13568) after SFT on UltraChat 200k (`sft.py`) and DPO on argilla/dpo-mix-7k (`dpo.py`), the first two stages of 4.5-think. Full model card: [`model_cards/argonne-4.5-instruct.md`](model_cards/argonne-4.5-instruct.md).
+
+| | argonne-4.5-instruct | Qwen2.5-0.5B-Instruct | Llama-3.2-3B-Instruct |
+|---|---:|---:|---:|
+| IFEval, prompt-level strict | 11.83 | 26.25 | 66.36 |
+| IFEval, instruction-level strict | 20.62 | 35.97 | 75.66 |
+
+Same harness for all three ([`reasoning/run_ifeval_vllm.py`](reasoning/run_ifeval_vllm.py): chat template on, greedy). It keeps most of the base's knowledge (8-task lm-eval mean 53.28 against 54.67) and still uses its 13,568-token context, but it follows formatting instructions poorly and makes frequent factual errors. Render prompts with `enable_thinking=False`.
 
 ---
 
@@ -119,6 +162,12 @@ Argonne 4.5-base is the same run stopped at the end of stage 2 (global step 236,
 ## Benchmarks
 
 The 4.5-base column of the table above. It is the better start for math at short context: stage 3 later cut gsm8k from **20.62 to 4.78** and made the anneal's code, math, reasoning and tool tiers worse on held-out cross-entropy (+27% to +408% perplexity), while adding 1.36 to the 8-task mean. Past its 1,024-token window it is effectively blind (2.21 nats/token inside it, 5.4 to 6.1 past it on held-out arXiv), which is why it is the control column of the long-context table.
+
+---
+
+# Argonne 4.0-think
+
+The reasoning model of the 4.0 line, released as [`PursuitOfDataScience/Argonne-4.0-think`](https://huggingface.co/PursuitOfDataScience/Argonne-4.0-think) (1.04B, built on argonne-4.0-base). Recipe: SFT, DPO and CoT-SFT as above, then on-policy distillation from Argonne-3.5-think and a cross-entropy repair pass at LR 3e-6. On its own release gate it scored 59.17 pooled, 4.93 below the 2.88B 3.5-think. Details are in its [model card](https://huggingface.co/PursuitOfDataScience/Argonne-4.0-think).
 
 ---
 

@@ -20,7 +20,7 @@ for _p in (RDIR, REPO):
 
 MODEL = "/project/rcc/youzhi/models/instruct/soup_blend_a085"
 MAX_NEW = 64
-# math + general, think and no-think — cover both code paths.
+# math + general, think and no-think: cover both code paths.
 PROMPTS = [
     ("What is 17 - 5?", True), ("What is 7 times 6?", False),
     ("If 2x + 5 = 17, what is x?", True),
@@ -38,7 +38,7 @@ def build_prompt_ids(tok):
         enc = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=True,
                                       add_generation_prompt=True, enable_thinking=think,
                                       return_tensors=None)
-        # transformers 5.x may return a BatchEncoding (dict) or nested list — extract flat ids.
+        # transformers 5.x may return a BatchEncoding (dict) or nested list: extract flat ids.
         if hasattr(enc, "keys"):
             enc = enc["input_ids"]
         if len(enc) > 0 and isinstance(enc[0], (list, tuple)):
@@ -47,7 +47,13 @@ def build_prompt_ids(tok):
     return ids
 
 
-def run_vllm(out_path):
+def model_context(path):
+    """The checkpoint's own context (block_size wins in ArgonneConfig, as in model.py)."""
+    cfg = json.load(open(Path(path) / "config.json"))
+    return int(cfg.get("block_size") or cfg.get("max_position_embeddings") or 2048)
+
+
+def run_vllm(out_path, gpu_mem=0.55, max_model_len=0):
     import vllm_argonne
     vllm_argonne.register()
     from vllm import LLM, SamplingParams
@@ -55,8 +61,12 @@ def run_vllm(out_path):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     pids = build_prompt_ids(tok)
+    # max_model_len may not exceed the checkpoint's context (vLLM refuses), so a 1024-context export
+    # cannot take the old fixed 2048. The prompts are ~30 tokens + MAX_NEW, so min() changes nothing
+    # for any model that has >= 2048.
+    mml = max_model_len or min(2048, model_context(MODEL))
     llm = LLM(model=MODEL, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=0.55, max_model_len=2048, trust_remote_code=True)
+              gpu_memory_utilization=gpu_mem, max_model_len=mml, trust_remote_code=True)
     sp = SamplingParams(temperature=0.0, max_tokens=MAX_NEW)
     outs = llm.generate([TokensPrompt(prompt_token_ids=p) for p in pids], sp)
     gen = [list(o.outputs[0].token_ids) for o in outs]
@@ -91,7 +101,7 @@ def compare(vllm_path, ref_path, tok_path):
     tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     V = json.load(open(vllm_path))
     R = json.load(open(ref_path))
-    assert V["prompt_ids"] == R["prompt_ids"], "prompt ids differ — tokenization mismatch!"
+    assert V["prompt_ids"] == R["prompt_ids"], "prompt ids differ: tokenization mismatch!"
     n_exact = 0
     total_match_frac = 0.0
     print("=" * 70)
@@ -112,21 +122,29 @@ def compare(vllm_path, ref_path, tok_path):
             print(f"       vllm: ...{tok.decode(vg[max(0,div-3):div+3])!r}")
     n = len(V["gen"])
     print("-" * 70)
-    print(f"  EXACT-match prompts : {n_exact}/{n}")
-    print(f"  mean matched-prefix : {100*total_match_frac/n:.1f}% of tokens")
+    print(f"  EXACT-match prompts: {n_exact}/{n}")
+    print(f"  mean matched-prefix: {100*total_match_frac/n:.1f}% of tokens")
     print("  VERDICT:", "PASS (port is numerically faithful)" if n_exact == n
-          else ("CLOSE (accumulation drift — inspect)" if total_match_frac/n > 0.9
-                else "FAIL (arch bug — do NOT use the port)"))
+          else ("CLOSE (accumulation drift: inspect)" if total_match_frac/n > 0.9
+                else "FAIL (arch bug: do NOT use the port)"))
 
 
 def main():
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True, choices=["vllm", "ref", "compare"])
     ap.add_argument("--vllm-out", default="report/vllm_val_vllm.json")
     ap.add_argument("--ref-out", default="report/vllm_val_ref.json")
+    ap.add_argument("--model", default=MODEL,
+                    help="checkpoint dir to gate (default: the historical 3.0 soup, unchanged)")
+    ap.add_argument("--gpu-mem", type=float, default=0.55,
+                    help="vLLM gpu_memory_utilization for --mode vllm")
+    ap.add_argument("--max-model-len", type=int, default=0,
+                    help="0 = min(2048, the checkpoint's own context)")
     args = ap.parse_args()
+    MODEL = args.model
     if args.mode == "vllm":
-        run_vllm(args.vllm_out)
+        run_vllm(args.vllm_out, gpu_mem=args.gpu_mem, max_model_len=args.max_model_len)
     elif args.mode == "ref":
         run_ref(args.ref_out)
     else:

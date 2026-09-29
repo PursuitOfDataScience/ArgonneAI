@@ -37,12 +37,21 @@ has no output for.)
 The teacher is only ever run FORWARD, never sampled. vLLM arch support is therefore irrelevant --
 a teacher vLLM 0.11.2 cannot serve is still usable here.
 
+MULTI-GPU (2026-09-26, for a4.5). Launched under torchrun it runs DDP: every rank builds the same rows
+and the same shuffled micro-batches, takes a strided 1/world share truncated to equal length (so ranks
+stay in lockstep), holds its own frozen teacher, and syncs gradients once per optimizer step (no_sync on
+the other micro-steps). --zero_optimizer 1 shards AdamW's state (ZeroRedundancyOptimizer), which is what
+lets a 2.06B student fit a 40 GB card next to its teacher: fp32 weights 8.25 + grads 8.25 + Adam 16.5/world
++ a bf16 2.88B teacher 5.8 GB. An optimizer step covers world x grad_accum micro-batches, so divide
+--grad-accum by the world size to keep a single-GPU recipe's step. Diagnostics are summed over ranks
+before printing; only rank 0 prints and saves. With WORLD_SIZE unset nothing changes.
+
   python reasoning/opd_train.py \
-      --student /project/rcc/youzhi/models/a4_think_final/think_combo \
+      --student <student HF dir> \
       --model_def model.py \
-      --teacher /project/rcc/youzhi/toxic-models/Qwen/Qwen3-4B-Thinking-2507 \
-      --rollouts /project/rcc/youzhi/data/a4_dpo/a4_dpo_all.jsonl \
-      --out /project/rcc/youzhi/models/a4_think_final/think_opd
+      --teacher <teacher HF dir> \
+      --rollouts <rollouts .jsonl> \
+      --out <output dir>
 """
 import argparse
 import importlib.util
@@ -88,7 +97,7 @@ LABEL_ORDER = ["correct", "wrong", "unclosed", "no_answer"]
 
 
 def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
-               eos_id, seed, hint_template="", solve_band=None):
+               eos_id, seed, hint_template="", solve_band=None, select_start="first"):
     """One row per rollout: prompt ids + the trace the STUDENT actually generated.
 
     Stratified by label so a batch contains both states the student got right and states it got
@@ -133,8 +142,12 @@ def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
                 buckets[r["label"]].append(r)
         for v in buckets.values():
             rng.shuffle(v)
-        # round-robin over labels so every problem contributes a MIX, not 3 copies of one mode
-        picked, i = [], 0
+        # round-robin over labels so every problem contributes a MIX, not 3 copies of one mode.
+        # select_start="random" starts the round-robin at a random available label per problem. The default starts
+        # at `correct`, so with --per-problem 1 a problem contributes its correct rollout whenever it has one: the
+        # 36k x 1 diversity arm's KD rows came out 38% correct against 19% in the 12k x 3 arm (POSTTRAIN_A45.md).
+        avail0 = [L for L in LABEL_ORDER if buckets.get(L)]
+        picked, i = [], (rng.randrange(len(avail0)) if select_start == "random" and avail0 else 0)
         while len(picked) < per_problem:
             avail = [L for L in LABEL_ORDER if buckets.get(L)]
             if not avail:
@@ -177,6 +190,103 @@ def build_rows(rollouts, tok, build_ids, max_seq_len, per_problem, labels_keep,
                          "t_ids": t_ids + c_ids, "t_n_prompt": len(t_ids),
                          "n_comp": len(c_ids), "label": r["label"], "pool": pool})
             stat[f"keep_{r['label']}"] += 1
+    rng.shuffle(rows)
+    return rows, stat
+
+
+def build_pairs(rollouts, tok, build_ids, max_seq_len, eos_id, seed, max_pos, max_neg, only_mode_wrong,
+                min_think_tok=48, neg_order="short"):
+    """RLVR-DPO pairs from the student's own labelled rollouts: (verified-correct, wrong) per problem.
+
+    The objective every other pass here lacks. KD and the repair are likelihood objectives: they raise
+    what the teacher or the model's own correct traces say and never push a wrong mode DOWN, and greedy
+    returns the mode. On a4, whole-trace RLVR-DPO (beta 0.4) gave the best acc|ANSWERED of any arm and
+    still lost greedy because unclosed rose 13.7% -> 22.4%; on a4.5 a repair pass buys termination back
+    after a KD step, so the composition is DPO then repair. Same construction as build_rlvr_pairs.py
+    (the a4 corpus), with this trainer's prompts (build_ids) so the pairs are exactly on-policy:
+      * positives: correct, no arithmetically wrong `a op b = c`, not degenerate (>= min_think_tok think
+        tokens with the gold derived inside <think>), distinct step signatures, shortest first;
+      * negatives: `wrong` only (never unclosed/no_answer: those pairs let DPO learn the FORMAT, the GRPO
+        reward-proxy trap), the MODAL wrong answer's traces first, since that is what greedy emits;
+      * only_mode_wrong keeps problems whose majority answer is wrong, as the a4 corpus did.
+    Each row holds the chosen sequence in `ids` and the rejected one in `t_ids` over the same prompt.
+    neg_order="matched" picks, for EACH positive, the modal-wrong traces closest to it in length (then any wrong).
+    The default takes the shortest ones, and the first run showed what that costs: chosen 257.5 vs rejected 223.0
+    tokens (chosen longer in 61% of pairs), so part of the margin was LENGTH, and the DPO model's greedy thinking grew
+    222 -> 285 tokens with unclosed 13.0 -> 17.4% (POSTTRAIN_A45.md, 2026-09-29).
+    """
+    from rft_generate import has_bad_arith, is_degenerate, step_signature
+    by_q = defaultdict(list)
+    for path in ([rollouts] if isinstance(rollouts, str) else list(rollouts)):
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line)
+                by_q[(r["pool"], r["question"])].append(r)
+    rng = random.Random(seed)
+    rows, stat = [], Counter()
+    for (pool, q), rs in sorted(by_q.items()):
+        good = [r for r in rs if r["label"] == "correct"]
+        bad = [r for r in rs if r["label"] == "wrong"]
+        if not good or not bad:
+            stat["skip_need_both"] += 1
+            continue
+        gold = str(rs[0].get("gold", ""))
+        votes = Counter(r["pred"] for r in rs if r["label"] in ("correct", "wrong") and r.get("pred"))
+        mode = votes.most_common(1)[0][0] if votes else None
+        mode_wrong = mode is not None and mode != gold
+        if only_mode_wrong and not mode_wrong:
+            stat["skip_mode_right"] += 1
+            continue
+        pos, sigs = [], set()
+        for r in sorted(good, key=lambda r: len(r["trace"])):
+            if len(pos) >= max_pos:
+                break
+            t = r["trace"]
+            if has_bad_arith(t):
+                stat["pos_drop_bad_arith"] += 1
+                continue
+            if is_degenerate(t.split("</think>")[0].split("<think>")[-1], gold, min_think_tok, tok, True, 0):
+                stat["pos_drop_degenerate"] += 1
+                continue
+            sg = step_signature(t)
+            if sg in sigs:
+                continue
+            sigs.add(sg)
+            pos.append(t)
+        if not pos:
+            stat["skip_no_clean_positive"] += 1
+            continue
+        negs = []
+        if mode_wrong:
+            negs = sorted({r["trace"] for r in bad if r.get("pred") == mode}, key=len)[:max_neg]
+            stat["neg_from_mode"] += len(negs)
+        rest = sorted({r["trace"] for r in bad} - set(negs))
+        extra = rng.sample(rest, min(max_neg - len(negs), len(rest)))
+        stat["neg_random"] += len(extra)
+        mode_pool = sorted({r["trace"] for r in bad if r.get("pred") == mode}) if mode_wrong else []
+        all_pool = sorted({r["trace"] for r in bad})
+
+        def negs_for(c):
+            if neg_order != "matched":
+                return negs + extra
+            near = lambda t: (abs(len(t) - len(c)), t)
+            ns = sorted(mode_pool, key=near)[:max_neg]
+            return ns + sorted(set(all_pool) - set(ns), key=near)[:max_neg - len(ns)]
+        p_ids = build_ids(tok, q)
+        for c in pos:
+            for n in negs_for(c):
+                if c.strip() == n.strip():
+                    continue
+                # both ended on their own (correct/wrong are never unclosed), so both keep the terminator
+                c_ids = tok.encode(c, add_special_tokens=False) + [eos_id]
+                r_ids = tok.encode(n, add_special_tokens=False) + [eos_id]
+                if len(p_ids) + max(len(c_ids), len(r_ids)) > max_seq_len:
+                    stat["drop_too_long"] += 1
+                    continue
+                rows.append({"ids": p_ids + c_ids, "n_prompt": len(p_ids),
+                             "t_ids": p_ids + r_ids, "t_n_prompt": len(p_ids),
+                             "n_comp": len(c_ids), "label": "pair", "pool": pool})
+                stat["pairs_mode_wrong" if mode_wrong else "pairs_mode_right"] += 1
     rng.shuffle(rows)
     return rows, stat
 
@@ -329,9 +439,88 @@ def ce_loss(s_flat, ids, tgt_mask, row_mask):
     return F.cross_entropy(s_flat[keep].float(), tgt[keep])
 
 
+def seq_logps(logits, ids, tgt_mask, V):
+    """Summed log p of each row's completion tokens (padding and prompt excluded)."""
+    lg = logits[:, :-1, :V].float()
+    tok_lp = lg.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1) - lg.logsumexp(-1)
+    return (tok_lp * tgt_mask[:, 1:]).sum(-1)
+
+
+def dpo_loop(a, model, ref, rows, mb, reshard, params, opt, lr_at, dev, ddp, pad_id, total_steps, V):
+    """DPO over (chosen, rejected) rows against a frozen bf16 copy of the student.
+
+    Chosen and rejected go through ONE forward per model (2n packed rows), which is also what DDP needs:
+    one forward per backward. d_chosen/d_rej are the policy-minus-reference log-likelihoods; a margin that
+    grows while d_chosen falls is likelihood displacement, the failure beta 0.05 showed on 3.5-think.
+    --dpo-nll adds a length-normalised NLL on the CHOSEN sequence (iterative reasoning preference optimisation's
+    DPO+NLL for verifiable math): it anchors the winning traces, terminator included, where plain DPO only ranks them.
+    """
+    import contextlib
+    hist, step, micro_i = [], 0, 0
+    acc = {"loss": 0.0, "margin_acc": 0.0, "d_chosen": 0.0, "d_rej": 0.0, "nll": 0.0, "n": 0}
+    t_start = time.time()
+    for ep in range(a.epochs):
+        epoch_mb = mb if ep == 0 else reshard(ep)
+        for group in epoch_mb:
+            batch = [rows[i] for i in group]
+            n = len(batch)
+            seqs = batch + [{"ids": b["t_ids"], "n_prompt": b["t_n_prompt"]} for b in batch]
+            ids, cmask = _pack(seqs, pad_id, "ids", "n_prompt")
+            ids, cmask = ids.to(dev), cmask.to(dev)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                ref_lp = seq_logps(ref(input_ids=ids).logits, ids, cmask, V)
+            sync_ctx = (model.no_sync() if ddp and (micro_i + 1) % a.grad_accum != 0
+                        else contextlib.nullcontext())
+            with sync_ctx:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    pol_lp = seq_logps(model(input_ids=ids).logits, ids, cmask, V)
+                dc, dr = pol_lp[:n] - ref_lp[:n], pol_lp[n:] - ref_lp[n:]
+                z = a.dpo_beta * (dc - dr)
+                L = -F.logsigmoid(z).mean()
+                L_nll = -(pol_lp[:n] / cmask[:n, 1:].sum(-1).clamp_min(1)).mean()
+                if a.dpo_nll > 0:
+                    L = L + a.dpo_nll * L_nll
+                (L / a.grad_accum).backward()
+            acc["loss"] += float(L)
+            acc["margin_acc"] += float((z > 0).float().mean())
+            acc["d_chosen"] += float(dc.mean())
+            acc["d_rej"] += float(dr.mean())
+            acc["nll"] += float(L_nll)
+            acc["n"] += 1
+            micro_i += 1
+            if micro_i % a.grad_accum == 0:
+                for g in opt.param_groups:
+                    g["lr"] = lr_at(step)
+                gn = torch.nn.utils.clip_grad_norm_(params, a.grad_clip)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                step += 1
+                if step % a.log_every == 0 or step == 1:
+                    if ddp:
+                        keys = sorted(acc)
+                        tv = torch.tensor([float(acc[k]) for k in keys], device=dev, dtype=torch.float64)
+                        torch.distributed.all_reduce(tv)
+                        acc = dict(zip(keys, tv.tolist()))
+                    k = max(1, acc["n"])
+                    print(f"[dpo] step {step}/{total_steps}  loss {acc['loss'] / k:.4f}  "
+                          f"margin_acc {acc['margin_acc'] / k * 100:.1f}%  d_chosen {acc['d_chosen'] / k:+.2f}  "
+                          f"d_rej {acc['d_rej'] / k:+.2f}  nll_chosen {acc['nll'] / k:.4f}  gnorm {float(gn):.2f}  "
+                          f"lr {lr_at(step):.2e}  "
+                          f"HBM {torch.cuda.max_memory_allocated() / 2**30:.1f}G  "
+                          f"{(time.time() - t_start) / 60:.1f}min", flush=True)
+                    hist.append({"step": step, "loss": acc["loss"] / k, "margin_acc": acc["margin_acc"] / k,
+                                 "d_chosen": acc["d_chosen"] / k, "d_rej": acc["d_rej"] / k,
+                                 "nll_chosen": acc["nll"] / k})
+                    acc = {kk: 0.0 for kk in acc}
+                if step >= total_steps:
+                    return step, hist
+    return step, hist
+
+
 # ---------------------------------------------------------------------------
 
 def main():
+    import contextlib
     ap = argparse.ArgumentParser()
     ap.add_argument("--student", required=True)
     ap.add_argument("--model_def", default="model.py")
@@ -363,6 +552,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-problem", type=int, default=3)
     ap.add_argument("--labels", nargs="*", default=["correct", "wrong", "unclosed", "no_answer"])
+    ap.add_argument("--select-start", default="first", choices=["first", "random"],
+                    help="per-problem label round-robin starts at `correct` (first) or a random available label")
     ap.add_argument("--max-seq-len", type=int, default=1024)
     ap.add_argument("--rope-theta", type=float, default=1000000.0)
     ap.add_argument("--lr", type=float, default=1e-5)
@@ -380,11 +571,38 @@ def main():
     ap.add_argument("--seed", type=int, default=46)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--stats-out", default="")
+    ap.add_argument("--zero_optimizer", type=int, default=0,
+                    help="under torchrun: shard AdamW state across ranks (ZeroRedundancyOptimizer)")
+    ap.add_argument("--save_fp32", type=int, default=0,
+                    help="save fp32 weights (for update-equivalence tests: 8 steps at lr 1e-5 are below bf16's resolution)")
+    ap.add_argument("--adam_fused", type=int, default=0,
+                    help="fused AdamW: no full-size foreach temporary (numerically equivalent)")
+    ap.add_argument("--dpo-beta", type=float, default=0.0,
+                    help="> 0: RLVR-DPO on (correct, wrong) pairs from --rollouts instead of KD/CE, against a "
+                         "frozen copy of the student (build_pairs). 0.4 on this line: 0.05 collapsed 3.5-think")
+    ap.add_argument("--dpo-max-pos", type=int, default=2)
+    ap.add_argument("--dpo-max-neg", type=int, default=2)
+    ap.add_argument("--dpo-nll", type=float, default=0.0,
+                    help="weight of a length-normalised NLL on the chosen sequence added to the DPO loss (0 = plain DPO)")
+    ap.add_argument("--dpo-neg-order", default="short", choices=["short", "matched"],
+                    help="negatives per problem: shortest modal-wrong first (short) or closest in length to each positive")
+    ap.add_argument("--dpo-all-problems", type=int, default=0,
+                    help="1 = also pair problems whose majority answer is already right (default: mode-wrong only)")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed)
     random.seed(a.seed)
-    dev = "cuda"
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp = world > 1
+    rank, local_rank = 0, 0
+    if ddp:
+        torch.distributed.init_process_group("nccl")
+        rank, local_rank = torch.distributed.get_rank(), int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        if rank != 0:   # one log: rank 0 prints; errors still reach stderr from every rank
+            sys.stdout = open(os.devnull, "w")
+    dev = f"cuda:{local_rank}" if ddp else "cuda"
+    print(f"[opd] world={world} zero_optimizer={a.zero_optimizer} adam_fused={a.adam_fused}", flush=True)
     cot = _load_cotsft()
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from clean_eval import build_ids
@@ -445,7 +663,19 @@ def main():
     # verified-correct traces to pull in the unclosed tail and the empty-think mode, and loading a 2.88B
     # teacher to multiply its output by zero would cost a forward pass per micro-batch for nothing.
     t0 = time.time()
-    if a.kd_weight == 0.0:
+    ref = None
+    if a.dpo_beta > 0:
+        if a.kd_weight != 0.0 or a.ce_weight != 0.0:
+            raise SystemExit("--dpo-beta is its own objective: pass --kd-weight 0 --ce-weight 0")
+        teacher = None
+        ref, _, _ = load_argonne(a.student, False)
+        ref.to(torch.bfloat16).to(dev).eval()
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        print(f"[opd] DPO mode: beta {a.dpo_beta}, reference = frozen bf16 copy of the student, "
+              f"max_pos {a.dpo_max_pos} max_neg {a.dpo_max_neg} mode_wrong_only {not a.dpo_all_problems}",
+              flush=True)
+    elif a.kd_weight == 0.0:
         if a.ce_weight <= 0.0:
             raise SystemExit("--kd-weight 0 with --ce-weight 0 has no loss at all")
         teacher = None
@@ -507,9 +737,14 @@ def main():
           f"(+ <think>/</think>/<|im_end|> ids)", flush=True)
 
     # ---- data ------------------------------------------------------------------------
-    rows, dstat = build_rows(a.rollouts, tok, build_ids, a.max_seq_len, a.per_problem,
-                             set(a.labels), eos_id, a.seed, a.hint_template,
-                             tuple(a.solve_band) if a.solve_band else None)
+    if a.dpo_beta > 0:
+        rows, dstat = build_pairs(a.rollouts, tok, build_ids, a.max_seq_len, eos_id, a.seed,
+                                  a.dpo_max_pos, a.dpo_max_neg, not a.dpo_all_problems,
+                                  neg_order=a.dpo_neg_order)
+    else:
+        rows, dstat = build_rows(a.rollouts, tok, build_ids, a.max_seq_len, a.per_problem,
+                                 set(a.labels), eos_id, a.seed, a.hint_template,
+                                 tuple(a.solve_band) if a.solve_band else None, a.select_start)
     print(f"[opd] rows={len(rows):,}  " + "  ".join(f"{k}={v:,}" for k, v in sorted(dstat.items())),
           flush=True)
     if not rows:
@@ -518,20 +753,38 @@ def main():
     print(f"[opd] mean completion tokens {mean_comp:.0f}  mean total {sum(len(r['ids']) for r in rows) / len(rows):.0f}",
           flush=True)
 
-    mb = make_micro_batches(rows, a.max_batch_tokens, a.seed)
+    # a DPO row is TWO sequences (chosen + rejected) packed into one forward, so it gets half the budget
+    mbt = a.max_batch_tokens // 2 if a.dpo_beta > 0 else a.max_batch_tokens
+    mb = make_micro_batches(rows, mbt, a.seed)
     seq_per_mb = sum(len(b) for b in mb) / len(mb)
     _rl = lambda i: max(len(rows[i]["ids"]), len(rows[i].get("t_ids") or ()))
     pad_frac = 1.0 - sum(sum(_rl(i) for i in b) for b in mb) / \
         sum(len(b) * max(_rl(i) for i in b) for b in mb)
-    steps_per_epoch = len(mb) // a.grad_accum
+    def shard(batches):
+        n_per = len(batches) // world
+        return batches[rank::world][:n_per]
+    steps_per_epoch = (len(mb) // world) // a.grad_accum
     total_steps = a.max_steps if a.max_steps > 0 else steps_per_epoch * a.epochs
     print(f"[opd] micro-batches={len(mb):,}  {seq_per_mb:.1f} seq/micro  "
           f"{a.max_batch_tokens} tok budget  padding {pad_frac * 100:.1f}%  "
-          f"accum={a.grad_accum}  eff {seq_per_mb * a.grad_accum:.0f} seq/step  "
+          f"accum={a.grad_accum} x world {world}  eff {seq_per_mb * a.grad_accum * world:.0f} seq/step  "
           f"steps/epoch={steps_per_epoch}  total={total_steps}", flush=True)
+    mb = shard(mb)
 
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                            lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0, eps=1e-8)
+    core = model
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(core, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False, gradient_as_bucket_view=True)
+    params = [p for p in core.parameters() if p.requires_grad]
+    akw = dict(lr=a.lr, betas=(0.9, 0.95), weight_decay=0.0, eps=1e-8)
+    if a.adam_fused:
+        akw["fused"] = True
+    if ddp and a.zero_optimizer:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        opt = ZeroRedundancyOptimizer(params, optimizer_class=torch.optim.AdamW, **akw)
+    else:
+        opt = torch.optim.AdamW(params, **akw)
 
     def lr_at(s):
         if s < a.warmup:
@@ -561,8 +814,12 @@ def main():
              "close_pt": 0.0, "close_n": 0, "haz_ps": 0.0, "haz_pt": 0.0}
     warned_hazard = False
 
-    for ep in range(a.epochs):
-        epoch_mb = mb if ep == 0 else make_micro_batches(rows, a.max_batch_tokens, a.seed + ep)
+    if a.dpo_beta > 0:
+        step, hist = dpo_loop(a, model, ref, rows, mb,
+                              lambda ep: shard(make_micro_batches(rows, mbt, a.seed + ep)),
+                              params, opt, lr_at, dev, ddp, pad_id, total_steps, V)
+    for ep in range(0 if a.dpo_beta > 0 else a.epochs):
+        epoch_mb = mb if ep == 0 else shard(make_micro_batches(rows, a.max_batch_tokens, a.seed + ep))
         for group in epoch_mb:
             batch = [rows[i] for i in group]
             ids, cmask, t_ids, t_cmask, is_corr, kmask, t_kmask = collate(
@@ -575,6 +832,9 @@ def main():
             if teacher is not None:
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     t_logits = teacher(input_ids=t_ids).logits
+            sync_ctx = (model.no_sync() if ddp and (micro_i + 1) % a.grad_accum != 0
+                        else contextlib.nullcontext())
+            sync_ctx.__enter__()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s_out = model(input_ids=ids)
             s_logits = s_out.logits
@@ -599,6 +859,7 @@ def main():
                 L_ce = ce_loss(gather_completion(s_logits, cmask, V), ids, cmask, is_corr)
                 L = L + a.ce_weight * L_ce
             (L / a.grad_accum).backward()
+            sync_ctx.__exit__(None, None, None)
 
             # Diagnostics run on the FIRST micro-step of each accumulation group (micro_i is still
             # pre-increment here, so this fires exactly once per optimizer step): they need
@@ -651,11 +912,16 @@ def main():
             if micro_i % a.grad_accum == 0:
                 for g in opt.param_groups:
                     g["lr"] = lr_at(step)
-                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
+                gn = torch.nn.utils.clip_grad_norm_(params, a.grad_clip)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 step += 1
                 if step % a.log_every == 0 or step == 1:
+                    if ddp:   # every rank reaches this at the same step: sum the counters and sums
+                        keys = sorted(accum)
+                        tv = torch.tensor([float(accum[k]) for k in keys], device=dev, dtype=torch.float64)
+                        torch.distributed.all_reduce(tv)
+                        accum = dict(zip(keys, tv.tolist()))
                     n = max(1, accum["n"])
                     dn = max(1, accum["diag_n"])
                     cn = max(1, accum["close_n"])
@@ -690,14 +956,21 @@ def main():
             break
 
     print(f"[opd] done {step} steps in {(time.time() - t_start) / 60:.1f} min", flush=True)
+    if ddp:
+        torch.distributed.barrier()
+        if rank != 0:
+            torch.distributed.destroy_process_group()
+            return
+    model = core
     os.makedirs(a.out, exist_ok=True)
-    model.to(torch.bfloat16)
+    if not a.save_fp32:
+        model.to(torch.bfloat16)
     model.save_pretrained(a.out, safe_serialization=True)
     tok.save_pretrained(a.out)
     cpath = os.path.join(a.out, "config.json")
     c = json.load(open(cpath))
     c["eos_token_id"] = 151645       # the deployed stop token; 151643 never terminates a chat turn
-    c["dtype"] = "bfloat16"
+    c["dtype"] = "float32" if a.save_fp32 else "bfloat16"
     c.pop("auto_map", None)
     json.dump(c, open(cpath, "w"), indent=2)
     # build_ids() renders the chat template, so a checkpoint without one silently evaluates on a
@@ -733,7 +1006,10 @@ def main():
             "rollouts": a.rollouts, "labels": sorted(a.labels), "div": a.div,
             "kd_weight": a.kd_weight, "ce_weight": a.ce_weight, "lr": a.lr, "seed": a.seed,
             "hint_template": a.hint_template, "kd_prefix_frac": getattr(a, "kd_prefix_frac", 1.0),
-            "exclude_terminators": getattr(a, "exclude_terminators", 0)}
+            "exclude_terminators": getattr(a, "exclude_terminators", 0),
+            "dpo_beta": a.dpo_beta, "dpo_max_pos": a.dpo_max_pos, "dpo_max_neg": a.dpo_max_neg,
+            "dpo_all_problems": a.dpo_all_problems, "dpo_neg_order": a.dpo_neg_order, "dpo_nll": a.dpo_nll,
+            "select_start": a.select_start}
     with open(os.path.join(a.out, ".opd_complete"), "w") as fh:
         fh.write(str(step) + "\n" + json.dumps(prov, indent=1) + "\n")
     print(f"[opd] provenance recorded in {a.out}/.opd_complete", flush=True)
@@ -742,6 +1018,8 @@ def main():
         json.dump({"rows": len(rows), "data_stat": dstat, "steps": step,
                    "hist": hist, "args": vars(a)}, open(a.stats_out, "w"), indent=1)
         print(f"[opd] wrote {a.stats_out}", flush=True)
+    if ddp:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

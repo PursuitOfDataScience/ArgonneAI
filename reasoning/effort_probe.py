@@ -46,7 +46,8 @@ for _p in (RDIR, REPO):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-DATA = "/project/rcc/youzhi/data"
+# ARGONNE_DATA: the same data tree at another location (for a machine that keeps the evaluation pools elsewhere)
+DATA = __import__("os").environ.get("ARGONNE_DATA", "/project/rcc/youzhi/data")
 CLOSE_STR = "\n</think>\n\nThe answer is $\\boxed{"
 
 

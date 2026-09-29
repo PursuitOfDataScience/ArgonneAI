@@ -3,10 +3,9 @@
 SFT the latest Argonne checkpoint on UltraChat train_sft.
 
 Requirements implemented:
-- Loads the final pretrained model from
-  /project/rcc/youzhi/llm.c/checkpoints/final_model.
-- Loads data from disk:
-  /project/rcc/youzhi/data/HuggingFaceH4_ultrachat_200k/train_sft
+- Loads the pretrained model from --model_path.
+- Loads data from disk (--data_path): a `save_to_disk` export of
+  HuggingFaceH4/ultrachat_200k, split train_sft
 - Uses `prompt` + `messages` to build x/y:
     x = full context before the final assistant turn
     y = final assistant answer
@@ -72,17 +71,17 @@ QUALITY_EVERY = 200
 MAX_NEW_TOKENS_QUALITY = 160
 
 QUALITY_QUESTIONS = [
-    # 1. Basic greeting — can it respond like a chatbot at all?
+    # 1. Basic greeting: can it respond like a chatbot at all?
     "Hey! How's it going?",
-    # 2. Open-ended helpfulness — the bread and butter of SFT
+    # 2. Open-ended helpfulness: the bread and butter of SFT
     "I'm planning a weekend trip. Any tips for packing light?",
-    # 3. Instruction following — can it explain something clearly?
+    # 3. Instruction following: can it explain something clearly?
     "Explain what a black hole is in a way a 10-year-old would understand.",
-    # 4. Empathy / emotional support — common in chat data
+    # 4. Empathy / emotional support: common in chat data
     "I just failed an exam I studied really hard for. I feel terrible.",
-    # 5. Multi-step reasoning lite — tests coherence
+    # 5. Multi-step reasoning lite: tests coherence
     "What are three fun things to do on a rainy day, and why?",
-    # 6. Creative writing — poem generation
+    # 6. Creative writing: poem generation
     "Write a short poem about the ocean at night.",
 ]
 
@@ -428,6 +427,64 @@ class LengthGroupedBatchSampler(Sampler):
         return iter(batches[self.skip:])
 
 
+class ResumableDistributedSampler(DistributedSampler):
+    """DistributedSampler that can start part-way through an epoch, for resumed DDP slices.
+
+    DistributedSampler shards ONE permutation per epoch: rank r takes positions r, r+W, r+2W, ...
+    So once every rank has trained k samples, the consumed set is exactly the first k*W positions
+    of that permutation. Skipping that global prefix and re-sharding the rest continues each
+    rank's stream exactly when the world size is unchanged, and still visits every remaining
+    sample once when it changed (a checkpoint written on 8 GPUs resumed on 4). With skip 0 it
+    defers to DistributedSampler itself, so a run that never resumes is unchanged.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.drop_last:
+            raise ValueError("ResumableDistributedSampler assumes drop_last=True (no padding).")
+        self.skip = 0  # GLOBAL samples of this epoch's permutation already trained
+        self._checked = False
+
+    def set_skip(self, skip: int) -> None:
+        self.skip = max(0, int(skip))
+
+    def __len__(self) -> int:
+        return max(0, self.total_size - self.skip) // self.num_replicas
+
+    def __iter__(self):
+        if self.skip == 0:
+            return super().__iter__()
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            order = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            order = list(range(len(self.dataset)))
+        order = order[: self.total_size]
+        if not self._checked:
+            # The lines above mirror DistributedSampler's private recipe. If a torch upgrade
+            # changes it, the skip would silently land on the wrong samples, so check once.
+            if order[self.rank:self.total_size:self.num_replicas] != list(super().__iter__()):
+                raise RuntimeError("ResumableDistributedSampler: the epoch order no longer matches "
+                                   "DistributedSampler's, so the resume skip would be wrong.")
+            self._checked = True
+        rest = order[self.skip:]
+        rest = rest[: (len(rest) // self.num_replicas) * self.num_replicas]
+        return iter(rest[self.rank::self.num_replicas])
+
+
+def global_token_count(base: int, local: int, device, ddp: bool) -> int:
+    """Corpus-wide tokens: the resumed total plus every rank's count since launch.
+
+    A collective under DDP, so every rank must call it.
+    """
+    if not ddp:
+        return base + local
+    t = torch.tensor([local], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return base + int(t.item())
+
+
 def proxy_lengths(dataset) -> List[int]:
     """Character length of each kept record's messages -- a cheap stand-in for token length."""
     raw = dataset.raw
@@ -477,6 +534,68 @@ class CausalCollator:
 # Model + tokenizer
 # ---------------------------------------------------------------------------
 
+def load_argonne_state_dict(model_path: str) -> Dict[str, torch.Tensor]:
+    """model.safetensors, or the shards named by model.safetensors.index.json.
+
+    argonne4.5 exports are written by transformers 4.51 with its 5 GB shard default, so a
+    raw export is SHARDED; the old single-file-only read raised FileNotFoundError on it. Same
+    behaviour as reasoning/cot-sft.py:load_hf_state_dict.
+    """
+    from safetensors.torch import load_file
+
+    single = os.path.join(model_path, "model.safetensors")
+    if os.path.isfile(single):
+        return load_file(single)
+    index = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        raise FileNotFoundError(f"no model.safetensors or model.safetensors.index.json in {model_path}")
+    with open(index) as f:
+        weight_map = json.load(f)["weight_map"]
+    state_dict: Dict[str, torch.Tensor] = {}
+    for shard in dict.fromkeys(weight_map.values()):
+        part = load_file(os.path.join(model_path, shard))
+        overlap = state_dict.keys() & part.keys()
+        if overlap:
+            raise ValueError(f"tensor(s) in two shards: {sorted(overlap)[:4]}")
+        state_dict.update(part)
+    return state_dict
+
+
+def refuse_missing_weights(missing_keys, config) -> None:
+    """A missing weight is a randomly initialised weight: refuse instead of training on it.
+
+    `load_state_dict(strict=False)` used to be followed by a print only, so a checkpoint whose
+    names did not match would have trained from noise. The one legitimate gap is lm_head.weight on
+    a tied model (the export omits it; tie_weights() points it at embed_tokens).
+    """
+    tied = bool(getattr(config, "tie_word_embeddings", True))
+    bad = [k for k in missing_keys if not (tied and k == "lm_head.weight")]
+    if bad:
+        raise RuntimeError(f"checkpoint is missing {len(bad)} model weight(s), e.g. {bad[:6]}; "
+                           "they would be randomly initialised. Refusing.")
+
+
+def bundle_model_py(output_dir: str, argonne_root: str) -> None:
+    """If the saved config carries auto_map, ship the model.py it points at.
+
+    A staged argonne4.5 input (reasoning/stage_a45_posttrain.py) has auto_map + model.py so it
+    loads standalone. save_pretrained() copies auto_map into the output config but NOT model.py
+    (the class came from `import model`, not from the Hub loader), and a dir whose auto_map points
+    at a missing model.py breaks every trust_remote_code load of it, vLLM's included. Inputs
+    without auto_map (every earlier launcher) are untouched.
+    """
+    cfg_path = os.path.join(output_dir, "config.json")
+    try:
+        with open(cfg_path) as f:
+            has_auto_map = "auto_map" in json.load(f)
+    except (OSError, ValueError):
+        return
+    dst = os.path.join(output_dir, "model.py")
+    if has_auto_map and not os.path.exists(dst):
+        shutil.copy2(os.path.join(argonne_root, "model.py"), dst)
+        print(f"Bundled model.py into {output_dir} (config has auto_map)")
+
+
 def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_path: str, max_seq_len: int,
                               loss_chunk_size: int = 0):
     sys.path.insert(0, argonne_root)
@@ -503,9 +622,6 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
         print(f"EOS token: {repr(tokenizer.eos_token)} (id={tokenizer.eos_token_id})")
 
     # Load config from json, construct model, load safetensors weights.
-    import json
-    from safetensors.torch import load_file
-
     config_path = os.path.join(model_path, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
@@ -535,8 +651,20 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
         return model, tokenizer
 
     config = ArgonneConfig(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
-    config.max_position_embeddings = max_seq_len
-    config.block_size = max_seq_len
+    # Context: NEVER shrink below the checkpoint's own trained context (argonne4.5, 2026-09-25).
+    # This used to set max_seq_len unconditionally, so an SFT at 4096 on a 13.5K/65K base wrote
+    # 4096 into the saved config and silently capped every downstream stage (the exact defect
+    # stage_a4_think_hf.py had to undo by hand). max() keeps the old result whenever
+    # max_seq_len >= the checkpoint context, which is every earlier 1024-context launcher.
+    ckpt_ctx = int(config.max_position_embeddings or 0)
+    model_ctx = max(int(max_seq_len), ckpt_ctx)
+    if max_seq_len > ckpt_ctx:
+        print(f"WARNING: --max_seq_length {max_seq_len} exceeds the checkpoint's trained context "
+              f"{ckpt_ctx}; RoPE beyond the trained length is NOT extrapolation-safe on this arch.")
+    config.max_position_embeddings = model_ctx
+    config.block_size = model_ctx
+    print(f"Context: training max_seq_length={max_seq_len}, model/config context={model_ctx} "
+          f"(checkpoint {ckpt_ctx})")
     config.use_flash_attention = True
     config._keep_in_fp32_modules = []
     # The exported config carries loss_chunk_size=0; the CLI flag is what turns chunked CE on for
@@ -547,13 +675,14 @@ def build_model_and_tokenizer(device: torch.device, argonne_root: str, model_pat
 
     model = ArgonneModel(config)
 
-    weights_path = os.path.join(model_path, "model.safetensors")
-    state_dict = load_file(weights_path)
+    state_dict = load_argonne_state_dict(model_path)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    del state_dict
     print(
         f"State dict applied. missing_keys={len(missing_keys)} "
         f"unexpected_keys={len(unexpected_keys)}"
     )
+    refuse_missing_weights(missing_keys, config)
     model.tie_weights()
 
     model.config.use_cache = False
@@ -620,7 +749,7 @@ def answer_questions(
 
 
 # ---------------------------------------------------------------------------
-# Loss (manual shift — ArgonneModel has no internal shift)
+# Loss (manual shift: ArgonneModel has no internal shift)
 # ---------------------------------------------------------------------------
 
 def compute_loss(model, input_ids: torch.Tensor, labels: torch.Tensor):
@@ -634,7 +763,7 @@ def compute_loss(model, input_ids: torch.Tensor, labels: torch.Tensor):
     base = getattr(model, "module", model)          # unwrap DDP
     if getattr(base, "_hf_internal_shift", False):
         return model(input_ids=input_ids, labels=labels).loss
-    x = input_ids[:, :-1].contiguous()
+    x = input_ids[:,:-1].contiguous()
     y = labels[:, 1:].contiguous()
     outputs = model(x, labels=y)
     return outputs.loss
@@ -689,6 +818,16 @@ def prune_intermediate_checkpoints(output_dir: str) -> None:
             full = os.path.join(output_dir, name)
             if not os.path.isdir(full) or _ckpt_step(full) < 0:
                 continue
+            if os.path.exists(os.path.join(full, ".keep")):
+                # ⛔ SAME EXEMPTION AS EVERY OTHER DELETION PATH (INFRA M+224/M+225/M+226). This is the
+                # PHASE-END sweep, a second and more total deletion path than rotate_checkpoints: it
+                # removes every checkpoint dir once the final export lands. Marking a dir exempt in one
+                # path and not the other is the "fixed the instance, not the class" failure this
+                # project keeps re-learning -- the marker would have been honoured during training and
+                # ignored at the end, which is when it matters most.
+                print(f"[retention] KEEPING {name}: .keep marker present "
+                      f"({open(os.path.join(full, '.keep')).read().strip()[:120]})", flush=True)
+                continue
             gib = sum(
                 os.path.getsize(os.path.join(full, f))
                 for f in os.listdir(full)
@@ -740,8 +879,14 @@ def save_checkpoint(
     scheduler,
     args,
     last_save_time: float,
+    optimizer_state=None,
+    extra_meta: Optional[Dict] = None,
 ) -> str:
     """Save model+optimizer+scheduler+metadata to ``output_dir/checkpoint-step-N``.
+
+    ``optimizer_state``: a plain-AdamW-format dict already merged from a sharded optimizer
+    (zero_sharded_optimizer_state_dict); None means save optimizer.state_dict() as before.
+    ``extra_meta``: merged into metadata.json (the data-stream position a resume needs).
 
     Returns the path of the saved checkpoint.
     """
@@ -753,7 +898,18 @@ def save_checkpoint(
     # architecture (config) without re-deriving it.
     from safetensors.torch import save_file
 
-    state_dict = {k: v.detach().contiguous().cpu() for k, v in model.state_dict().items()}
+    # Tied weights (lm_head.weight IS embed_tokens.weight here) are one tensor under two names, and
+    # safetensors refuses aliases. GPU runs never noticed because .cpu() copies each name
+    # separately, which silently wrote the fp32 embedding twice (1.55 GB per checkpoint); a CPU
+    # run raised. Keep the first name: load_checkpoint's strict=False load re-ties through the
+    # shared parameter, and checkpoints that hold both names still load.
+    state_dict, _seen = {}, set()
+    for k, v in model.state_dict().items():
+        _alias = (v.data_ptr(), v.dtype, tuple(v.shape), tuple(v.stride()))
+        if v.numel() and _alias in _seen:
+            continue
+        _seen.add(_alias)
+        state_dict[k] = v.detach().contiguous().cpu()
     save_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
 
     # Config snapshot for self-describing checkpoints.
@@ -763,7 +919,8 @@ def save_checkpoint(
         except Exception as e:
             print(f"  warn: could not save model.config: {e}")
 
-    torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+    torch.save(optimizer_state if optimizer_state is not None else optimizer.state_dict(),
+               os.path.join(ckpt_dir, "optimizer.pt"))
     torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
 
     rng_state = {
@@ -786,6 +943,8 @@ def save_checkpoint(
             for k, v in vars(args).items()
         },
     }
+    if extra_meta:
+        metadata.update(extra_meta)
     with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2, default=str)
 
@@ -806,6 +965,18 @@ def rotate_checkpoints(output_dir: str, save_total_limit: int) -> None:
         if step >= 0:
             candidates.append((step, full))
     candidates.sort(key=lambda x: x[0])
+    # ⛔ HONOUR A `.keep` MARKER, as the three pretrain-family prunes now do (INFRA M+224/M+225).
+    # Added 2026-09-15 to finish that sweep: this rotation deletes DIRECTORIES, so the file-level
+    # marker those functions look for could never protect anything here -- and with the default now 1
+    # (it was -1 = keep-all, i.e. retention was off unless a launcher passed the flag) an exempt
+    # checkpoint would be removed on the very next save. A published checkpoint, a soup ingredient or a
+    # reference point is exactly what retention's own exception carves out, so the exemption must exist
+    # in every path that can delete one. A marker can only ever PREVENT a deletion.
+    exempt = [(s, p) for s, p in candidates if os.path.exists(os.path.join(p, ".keep"))]
+    for s, p in exempt:
+        print(f"[ckpt] KEEPING checkpoint-{s}: .keep marker present "
+              f"({open(os.path.join(p, '.keep')).read().strip()[:120]})")
+    candidates = [(s, p) for s, p in candidates if (s, p) not in exempt]
     while len(candidates) > save_total_limit:
         step, path = candidates.pop(0)
         try:
@@ -813,6 +984,88 @@ def rotate_checkpoints(output_dir: str, save_total_limit: int) -> None:
             print(f"[ckpt] rotated out checkpoint-{step} (limit={save_total_limit})")
         except OSError as e:
             print(f"  warn: could not remove {path}: {e}")
+
+
+def _zero_param_index(model) -> Dict[int, int]:
+    """Map each parameter OBJECT to the index a plain AdamW built on model.parameters() gives it."""
+    return {id(p): i for i, p in enumerate(model.parameters())}
+
+
+def zero_sharded_optimizer_state_dict(optimizer, model, out_dir: str, rank: int, world: int):
+    """PLAIN-AdamW-format state_dict from a ZeroRedundancyOptimizer, merged through disk.
+
+    Ported from pretrain.py's sharded_optimizer_state_dict(), which is proven on this model.
+    ZeroRedundancyOptimizer.consolidate_state_dict() gathers pickled state through the process
+    group and, at a 2B model's ~15 GiB of AdamW state, never returned in pretrain.py's timing
+    (killed at 20 min). Instead every rank writes its own shard (no collective), then rank 0
+    merges them. The result is ordinary AdamW format, so an SFT checkpoint written with the
+    optimizer sharded over N GPUs resumes on any GPU count, sharded or not.
+
+    EVERY rank must call this (there is a barrier inside). Returns the merged dict on rank 0 and
+    None on the other ranks.
+    """
+    inner = getattr(optimizer, "optim", optimizer)
+    gidx = _zero_param_index(model)
+    local = {}
+    for group in inner.param_groups:
+        for prm in group["params"]:
+            st = inner.state.get(prm)
+            i = gidx.get(id(prm))
+            if not st or i is None:
+                continue
+            local[i] = {k: (v.detach().to("cpu", copy=True) if torch.is_tensor(v) else v)
+                        for k, v in st.items()}
+    shard_dir = os.path.join(out_dir, ".optshards")
+    os.makedirs(shard_dir, exist_ok=True)
+    shard_path = os.path.join(shard_dir, f"rank{rank}.pt")
+    torch.save(local, shard_path + ".tmp")
+    os.replace(shard_path + ".tmp", shard_path)   # rank 0 never reads a half-written shard
+    if rank != 0:
+        local.clear()
+    dist.barrier()
+    if rank != 0:
+        return None
+    merged = dict(local)
+    for r in range(world):
+        if r == rank:
+            continue
+        rp = os.path.join(shard_dir, f"rank{r}.pt")
+        if not os.path.exists(rp):
+            raise RuntimeError(f"optimizer shard missing for rank {r}: {rp}")
+        merged.update(torch.load(rp, map_location="cpu", weights_only=False))
+        os.remove(rp)
+    try:
+        os.remove(shard_path)
+        os.rmdir(shard_dir)
+    except OSError:
+        pass
+    if len(merged) != len(gidx):
+        print(f"WARNING: merged optimizer state has {len(merged)} entries for {len(gidx)} params; "
+              f"a shard may be incomplete.", flush=True)
+    # Hyperparameters from the WRAPPER's group. The LR scheduler writes each new lr there after the
+    # step, and ZeRO copies it into the inner optimizer only at the start of the NEXT step(), so at
+    # save time the inner group still holds the previous step's lr. Saving that made every resume
+    # take one step at the stale lr (the 2-rank equivalence test caught it as 1.2e-6 weight drift).
+    group = {k: v for k, v in optimizer.param_groups[0].items() if k != "params"}
+    group["params"] = list(range(len(gidx)))
+    return {"state": merged, "param_groups": [group]}
+
+
+def zero_fix_step_device(optimizer) -> int:
+    """Move AdamW's per-param `step` scalars onto the param's device after a CPU-mapped load.
+
+    ZeroRedundancyOptimizer.load_state_dict() does not relocate them (plain AdamW does), and the
+    mismatch surfaces only at the first .step() as a device error (pretrain.py, three jobs lost).
+    """
+    inner = getattr(optimizer, "optim", optimizer)
+    moved = 0
+    for group in inner.param_groups:
+        for prm in group["params"]:
+            st = inner.state.get(prm)
+            if st and "step" in st and torch.is_tensor(st["step"]) and st["step"].device != prm.device:
+                st["step"] = st["step"].to(prm.device)
+                moved += 1
+    return moved
 
 
 def load_checkpoint(
@@ -846,11 +1099,19 @@ def load_checkpoint(
 
     if os.path.isfile(opt_path):
         optimizer.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=False))
-        # Move optimizer state to the right device after load.
-        for state in optimizer.state.values():
+        # Move optimizer state to the right device after load (the INNER optimizer's state when
+        # it is a ZeroRedundancyOptimizer, whose own .state is not the per-param store).
+        for state in getattr(optimizer, "optim", optimizer).state.values():
             for k, v in state.items():
                 if torch.is_tensor(v):
                     state[k] = v.to(device, non_blocking=True)
+        zero_fix_step_device(optimizer)
+        if hasattr(optimizer, "optim"):
+            # ZeroRedundancyOptimizer.load_state_dict() also hands the full dict to the base
+            # Optimizer, which keeps a device-side COPY of this rank's shard in the wrapper's own
+            # .state. ZeRO never reads that store (step() runs the inner optimizer), so on a GPU
+            # it is a dead duplicate of the shard.
+            optimizer.state.clear()
         print(f"[ckpt] loaded optimizer state from {opt_path}")
 
     if os.path.isfile(sched_path):
@@ -873,6 +1134,8 @@ def load_checkpoint(
         metadata["global_step"] = int(meta.get("global_step", 0))
         metadata["tokens_seen"] = int(meta.get("tokens_seen", 0))
         metadata["epoch"] = int(meta.get("epoch", 0))
+        if "epoch_samples_consumed" in meta:
+            metadata["epoch_samples_consumed"] = int(meta["epoch_samples_consumed"])
         print(
             f"[ckpt] loaded metadata: step={metadata['global_step']} "
             f"tokens={metadata['tokens_seen']:,} epoch={metadata['epoch']}"
@@ -914,6 +1177,12 @@ def main() -> None:
     parser.add_argument("--run_after_quality", type=int, default=1, choices=[0, 1], help="Run quality samples after SFT")
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, stop after this many optimizer steps")
     parser.add_argument("--skip_final_save", action="store_true", help="Skip final save_pretrained output")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                        help="cuda (default, unchanged). cpu = single-process fp32 smoke test only "
+                             "(no autocast, no DDP); used to verify a new checkpoint end to end "
+                             "without a GPU.")
+    parser.add_argument("--log_every", type=int, default=LOG_EVERY,
+                        help="Print the loss line every N optimizer steps (default 10).")
 
     # Checkpointing + resume
     parser.add_argument("--save_strategy", type=str, default="none",
@@ -923,8 +1192,33 @@ def main() -> None:
                         help="Save every N optimizer steps when save_strategy=steps.")
     parser.add_argument("--save_seconds", type=int, default=0,
                         help="Save every N wall-clock seconds when save_strategy=time. 0 disables.")
-    parser.add_argument("--save_total_limit", type=int, default=-1,
-                        help="Keep at most N most recent checkpoint directories (-1 = keep all).")
+    # ⛔ DEFAULT IS 1 (latest-only), changed 2026-09-15 (INFRA M+225). It was -1 = KEEP ALL, and the
+    # rotation body starts `if save_total_limit <= 0: return`, so retention was DISABLED unless a
+    # launcher happened to pass the flag. The owner's standing rule is the opposite: "Implement the
+    # prune in the training/save path ITSELF so retention holds automatically." Each of these dirs is
+    # ~34 GB (13 GB weights + 23 GB AdamW moments), which is exactly the "silently eats hundreds of
+    # GB" failure the rule exists to prevent -- and one such dir was still on disk from 2026-08-02.
+    # -1 still means keep-all for anyone who asks for it explicitly; what changed is which behaviour
+    # you get by SAYING NOTHING.
+    parser.add_argument("--save_total_limit", type=int, default=1,
+                        help="Keep at most N most recent checkpoint directories (-1 = keep all; "
+                             "default 1 = latest-only, the standing retention rule).")
+    parser.add_argument("--zero_optimizer", type=int, default=0, choices=[0, 1],
+                        help="Shard the AdamW state across DDP ranks (ZeroRedundancyOptimizer, as in "
+                             "pretrain.py). Needed on 40 GB cards: plain DDP keeps full fp32 AdamW "
+                             "on every rank (33 GB for a 2B model). Inert without torchrun. "
+                             "Checkpoints stay in plain-AdamW format.")
+    parser.add_argument("--autocast_cache", type=int, default=0, choices=[0, 1],
+                        help="torch.autocast's weight-cast cache. 0 (default since 2026-09-25): re-cast each fp32 "
+                             "weight per use instead of holding a bf16 copy of every weight through the forward; "
+                             "identical numbers, ~1 GiB less peak on a 2B model at the same speed (measured in "
+                             "cot-sft.py on a 40 GB A100), taken because the a4.5 SFT ran at 39.5 of 40.96 GB. "
+                             "1 = the old behaviour.")
+    parser.add_argument("--ddp_bucket_view", type=int, default=1, choices=[0, 1],
+                        help="DDP gradient_as_bucket_view: gradients are views into the all-reduce "
+                             "buckets instead of a second copy, saving one fp32 gradient per rank "
+                             "(7.7 GiB for a 2B model; decisive on 40 GB cards). Numerically identical. "
+                             "0 restores the old layout.")
     parser.add_argument("--resume_from_checkpoint", type=str, default="",
                         help="Path to a checkpoint directory to resume from. Use 'auto' to pick the latest under --output_dir.")
     parser.add_argument("--exit_after_checkpoint_save", action="store_true",
@@ -952,8 +1246,12 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this script.")
+    USE_CUDA = args.device == "cuda"
+    if USE_CUDA and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this script (or pass --device cpu for a smoke test).")
+    # CPU + torchrun runs DDP over gloo: a plumbing test of the multi-rank paths (ZeRO shard merge,
+    # collective save decisions, resume) on a machine without two GPUs. Not for real training.
+    log_every = max(1, int(args.log_every))
 
     # --- Optional DDP (2026-08-01) -------------------------------------------------------
     # Multi-GPU is OPT-IN and fully inert unless launched under torchrun: with WORLD_SIZE unset
@@ -965,13 +1263,17 @@ def main() -> None:
     DDP_ON = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if DDP_ON:
         LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device(f"cuda:{LOCAL_RANK}")
+        if USE_CUDA:
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(LOCAL_RANK)
+            device = torch.device(f"cuda:{LOCAL_RANK}")
+        else:
+            dist.init_process_group(backend="gloo")
+            device = torch.device("cpu")
         RANK, WORLD = dist.get_rank(), dist.get_world_size()
     else:
         LOCAL_RANK, RANK, WORLD = 0, 0, 1
-        device = torch.device("cuda")
+        device = torch.device("cuda" if USE_CUDA else "cpu")
     IS_MAIN = RANK == 0
 
     def rprint(*a, **kw):
@@ -981,7 +1283,7 @@ def main() -> None:
     print("=" * 90)
     print("Argonne checkpoint SFT on UltraChat train_sft")
     print("=" * 90)
-    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"Device: {torch.cuda.get_device_name(0) if USE_CUDA else 'cpu (fp32 smoke test)'}")
     print(f"Data: {args.data_path}")
     print(f"Checkpoint: {args.model_path}")
     print(f"Max sequence length: {MAX_SEQ_LEN}")
@@ -1037,8 +1339,8 @@ def main() -> None:
     sampler = None
     batch_sampler = None
     if DDP_ON:
-        sampler = DistributedSampler(dataset, num_replicas=WORLD, rank=RANK, shuffle=True,
-                                     drop_last=True)
+        sampler = ResumableDistributedSampler(dataset, num_replicas=WORLD, rank=RANK, shuffle=True,
+                                              drop_last=True)
         loader = DataLoader(
             dataset,
             batch_size=BATCH_SIZE,
@@ -1046,7 +1348,7 @@ def main() -> None:
             sampler=sampler,
             drop_last=True,
             num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
-            pin_memory=True,
+            pin_memory=USE_CUDA,
             collate_fn=collator,
         )
     elif args.group_by_length:
@@ -1061,7 +1363,7 @@ def main() -> None:
             dataset,
             batch_sampler=batch_sampler,
             num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
-            pin_memory=True,
+            pin_memory=USE_CUDA,
             collate_fn=collator,
         )
     else:
@@ -1071,7 +1373,7 @@ def main() -> None:
             shuffle=True,
             drop_last=True,
             num_workers=0,  # Keep deterministic/reliable with custom tokenization in __getitem__.
-            pin_memory=True,
+            pin_memory=USE_CUDA,
             collate_fn=collator,
         )
 
@@ -1084,12 +1386,15 @@ def main() -> None:
         rprint(f"DDP: world_size={WORLD} | effective batch "
                f"= {BATCH_SIZE} x {GRAD_ACCUM_STEPS} x {WORLD} = {BATCH_SIZE*GRAD_ACCUM_STEPS*WORLD}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        betas=(ADAM_BETA1, ADAM_BETA2),
-        weight_decay=WEIGHT_DECAY,
-    )
+    ZERO_ON = DDP_ON and int(getattr(args, "zero_optimizer", 0)) == 1
+    _opt_kw = dict(lr=LEARNING_RATE, betas=(ADAM_BETA1, ADAM_BETA2), weight_decay=WEIGHT_DECAY)
+    if ZERO_ON:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        optimizer = ZeroRedundancyOptimizer(model.parameters(),
+                                            optimizer_class=torch.optim.AdamW, **_opt_kw)
+        rprint(f"ZeRO: AdamW state sharded across {WORLD} ranks")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), **_opt_kw)
 
     min_lr = LEARNING_RATE * MIN_LR_RATIO
     min_lr_scale = min_lr / LEARNING_RATE
@@ -1128,8 +1433,10 @@ def main() -> None:
     # `model` stays the unwrapped module (what save_pretrained/save_checkpoint must see);
     # `train_model` is what we run forward/backward through.
     if DDP_ON:
-        train_model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
-                          find_unused_parameters=False)
+        train_model = DDP(model, device_ids=[LOCAL_RANK] if USE_CUDA else None,
+                          output_device=LOCAL_RANK if USE_CUDA else None,
+                          find_unused_parameters=False,
+                          gradient_as_bucket_view=bool(args.ddp_bucket_view))
     else:
         train_model = model
 
@@ -1138,15 +1445,26 @@ def main() -> None:
 
     # Resume counters (if a checkpoint was loaded).
     global_step = int(resume_metadata.get("global_step", 0))
-    tokens_seen = int(resume_metadata.get("tokens_seen", 0))
+    # tokens_seen counts THIS process's tokens since launch and tokens_base is the corpus-wide total
+    # the checkpoint recorded. Starting every rank's counter at the checkpoint's total (as before)
+    # counted the resumed tokens once per rank in every summed figure after a DDP resume.
+    tokens_base = int(resume_metadata.get("tokens_seen", 0))
+    tokens_seen = 0
+    tokens_at_step = 0  # tokens_seen as of the last optimizer step: what a checkpoint records
     resume_epoch = int(resume_metadata.get("epoch", 0))
     micro_step = global_step * GRAD_ACCUM_STEPS
     running_loss = 0.0
+    running_n = 0  # micro-batches in running_loss: a window right after a resume is partial
+    # GLOBAL samples of the current epoch's order trained as of the last optimizer step (saved in
+    # every checkpoint so a resumed DDP slice can skip them), and the same count including a
+    # still-open accumulation window.
+    epoch_samples_done = 0
+    epoch_samples_run = 0
 
     if global_step > 0:
         print(
             f"[resume] starting from global_step={global_step} "
-            f"tokens_seen={tokens_seen:,} (resumed epoch index {resume_epoch})"
+            f"tokens_seen={tokens_base:,} (resumed epoch index {resume_epoch})"
         )
         # Fast-forward the data stream to match the optimizer state. The loop below always
         # restarts an epoch at its first batch, so without this a resumed slice would re-train
@@ -1155,10 +1473,25 @@ def main() -> None:
             batches_per_epoch = len(dataset) // BATCH_SIZE
             consumed_this_epoch = micro_step - resume_epoch * batches_per_epoch
             batch_sampler.set_skip(consumed_this_epoch)
+            epoch_samples_done = epoch_samples_run = consumed_this_epoch * BATCH_SIZE
             print(
                 f"[resume] skipping {consumed_this_epoch:,} already-trained batches of "
                 f"{batches_per_epoch:,} in epoch {resume_epoch} "
                 f"({len(batch_sampler):,} batches left)"
+            )
+        elif sampler is not None:
+            _skip = resume_metadata.get("epoch_samples_consumed")
+            if _skip is None:
+                # A checkpoint from before the field existed: derive it from the step counter,
+                # which is exact only if the world size and batch shape are unchanged.
+                _skip = max(0, micro_step - resume_epoch * len(loader)) * BATCH_SIZE * WORLD
+                print("[resume] checkpoint has no epoch_samples_consumed; fast-forwarding on the "
+                      "assumption that world size and batch shape are unchanged.")
+            sampler.set_skip(_skip)
+            epoch_samples_done = epoch_samples_run = int(_skip)
+            print(
+                f"[resume] DDP: skipping {int(_skip):,} already-trained samples of epoch "
+                f"{resume_epoch} ({len(sampler):,} per rank left)"
             )
         else:
             print(
@@ -1175,6 +1508,10 @@ def main() -> None:
         rprint(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
         if sampler is not None:
             sampler.set_epoch(epoch)  # required, else every epoch sees the same per-rank shard order
+            if epoch != resume_epoch:
+                sampler.set_skip(0)  # the skip only applies to the epoch we resumed into
+        if epoch != resume_epoch:
+            epoch_samples_done = epoch_samples_run = 0
         if batch_sampler is not None:
             batch_sampler.set_epoch(epoch)
             if epoch != resume_epoch:
@@ -1200,17 +1537,23 @@ def main() -> None:
                     f"[slice] wall time {args.slice_time_limit}s reached; "
                     f"saving checkpoint and exiting."
                 )
+                _opt_sd = (zero_sharded_optimizer_state_dict(optimizer, model, args.output_dir, RANK, WORLD)
+                           if ZERO_ON else None)
+                _tok_ck = global_token_count(tokens_base, tokens_at_step, device, DDP_ON)
                 if IS_MAIN:
                     save_checkpoint(
                         args.output_dir,
                         global_step=global_step,
-                        tokens_seen=tokens_seen,
+                        tokens_seen=_tok_ck,
                         epoch=epoch,
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         args=args,
                         last_save_time=last_save_time,
+                        optimizer_state=_opt_sd,
+                        extra_meta={"epoch_samples_consumed": epoch_samples_done, "world_size": WORLD,
+                                    "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM_STEPS},
                     )
                     rotate_checkpoints(args.output_dir, args.save_total_limit)
                 pbar.close()
@@ -1234,12 +1577,15 @@ def main() -> None:
             _last_micro = ((micro_step + 1) % GRAD_ACCUM_STEPS == 0)
             _sync_ctx = train_model.no_sync() if (DDP_ON and not _last_micro) else contextlib.nullcontext()
             with _sync_ctx:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=USE_CUDA,
+                                        cache_enabled=bool(args.autocast_cache)):
                     loss = compute_loss(train_model, input_ids=input_ids, labels=labels)
                     scaled_loss = loss / GRAD_ACCUM_STEPS
                 scaled_loss.backward()
             running_loss += float(loss.detach().item())
+            running_n += 1
             micro_step += 1
+            epoch_samples_run += BATCH_SIZE * WORLD
 
             if micro_step % GRAD_ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(train_model.parameters(), GRAD_CLIP)
@@ -1248,24 +1594,31 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
+                epoch_samples_done = epoch_samples_run
+                tokens_at_step = tokens_seen
 
-                if global_step % LOG_EVERY == 0:
-                    avg_loss = running_loss / (LOG_EVERY * GRAD_ACCUM_STEPS)
+                if global_step % log_every == 0:
+                    # Divide by what was accumulated: the first window after a resume at a step that is not
+                    # a multiple of log_every is partial, and a fixed divisor printed 0.48 for a true 1.19.
+                    avg_loss = running_loss / max(1, running_n)
                     running_loss = 0.0
+                    running_n = 0
                     lr = optimizer.param_groups[0]["lr"]
                     # tokens_seen is per-rank. Sum it for the log line too, not just at the
                     # end -- otherwise an N-GPU run under-reports throughput by exactly N and
                     # looks half as fast as the equivalent single-GPU run.
-                    _tok_disp = tokens_seen
-                    if DDP_ON:
-                        _d = torch.tensor([tokens_seen], dtype=torch.float64, device=device)
-                        dist.all_reduce(_d, op=dist.ReduceOp.SUM)
-                        _tok_disp = int(_d.item())
+                    _tok_disp = global_token_count(tokens_base, tokens_seen, device, DDP_ON)
+                    # Peak HBM since launch on this rank: the allocator's own figure (reserved is
+                    # what nvidia-smi shows), so a 40 GB card's headroom is visible in the log.
+                    _hbm = ""
+                    if USE_CUDA:
+                        _hbm = (f" | hbm {torch.cuda.max_memory_allocated(device) / 2**30:.1f}/"
+                                f"{torch.cuda.max_memory_reserved(device) / 2**30:.1f} GiB")
                     rprint(
                         f"Step {global_step:>6} | "
                         f"loss {avg_loss:.4f} | "
                         f"tokens {_tok_disp:,} | "
-                        f"lr {lr:.2e}"
+                        f"lr {lr:.2e}{_hbm}"
                     )
 
                 if QUALITY_EVERY > 0 and global_step % QUALITY_EVERY == 0 and IS_MAIN:
@@ -1295,17 +1648,23 @@ def main() -> None:
                     should_save = bool(_s.item())
 
                 if should_save:
+                    _opt_sd = (zero_sharded_optimizer_state_dict(optimizer, model, args.output_dir, RANK, WORLD)
+                               if ZERO_ON else None)
+                    _tok_ck = global_token_count(tokens_base, tokens_at_step, device, DDP_ON)
                     if IS_MAIN:
                         save_checkpoint(
                             args.output_dir,
                             global_step=global_step,
-                            tokens_seen=tokens_seen,
+                            tokens_seen=_tok_ck,
                             epoch=epoch,
                             model=model,
                             optimizer=optimizer,
                             scheduler=scheduler,
                             args=args,
                             last_save_time=last_save_time,
+                            optimizer_state=_opt_sd,
+                            extra_meta={"epoch_samples_consumed": epoch_samples_done, "world_size": WORLD,
+                                        "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM_STEPS},
                         )
                         rotate_checkpoints(args.output_dir, args.save_total_limit)
                     last_save_time = time.monotonic()
@@ -1330,6 +1689,7 @@ def main() -> None:
         _tt = torch.tensor([tokens_seen], dtype=torch.float64, device=device)
         dist.all_reduce(_tt, op=dist.ReduceOp.SUM)
         tokens_seen = int(_tt.item())
+    tokens_seen += tokens_base
 
     rprint("\nTraining finished.")
     rprint(f"Optimizer steps: {global_step:,}")
@@ -1352,6 +1712,7 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        bundle_model_py(args.output_dir, args.argonne_root)
         print(f"Saved model and tokenizer to: {args.output_dir}")
 
         # Write a completion marker so wrapper scripts can detect end-of-training.
