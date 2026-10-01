@@ -6,6 +6,7 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 
 | Model | Params | Context | Training tokens | Hugging Face |
 |-------|--------|---------|-----------------|--------------|
+| [Argonne 4.5-decision](#argonne-45-decision) | 2.06B | 13,568 | 145.21B + decision tuning | [argonne-4.5-decision](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision) |
 | [Argonne 4.5-think](#argonne-45-think) | 2.06B | 13,568 | 145.21B + post-training | [Argonne-4.5-think](https://huggingface.co/PursuitOfDataScience/Argonne-4.5-think) |
 | [Argonne 4.5-instruct](#argonne-45-instruct) | 2.06B | 13,568 | 145.21B + SFT and DPO | [argonne-4.5-instruct](https://huggingface.co/PursuitOfDataScience/argonne-4.5-instruct) |
 | [Argonne 4.5-base-ctx13568](#argonne-45-base-ctx13568) | **2.06B** | **13,568** (trained) | 145.21B | [argonne-4.5-base-ctx13568](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base-ctx13568) |
@@ -19,6 +20,26 @@ Training pipeline and release history for the Argonne causal LM family, trained 
 | [Argonne 2.0](#argonne-20) | 4.9B | 4,096 | ~21.9B | not released |
 | [Argonne 1.5](#argonne-15) | 357M | 2,048 | ~15.45B | [Argonne-1.5](https://huggingface.co/PursuitOfDataScience/Argonne-1.5) |
 | [Argonne 1.0](#argonne-10) | 276M | 2,048 | FineWeb-Edu | [Argonne-1.0](https://huggingface.co/PursuitOfDataScience/Argonne-1.0) |
+
+---
+
+# Argonne 4.5-decision
+
+The decision model of the 4.5 line, released as [`PursuitOfDataScience/argonne-4.5-decision`](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision): [argonne-4.5-base-ctx13568](https://huggingface.co/PursuitOfDataScience/argonne-4.5-base-ctx13568) plus a small decision head that answers typed questions in one forward pass: Choice (one of up to 255 options), Score (an expected level on your own scale) and Noul (the probability that a statement is true), each with calibrated probabilities. It never generates text, so it cannot answer outside the options it was given. Code and usage: [`decision/`](decision/README.md). Full model card: [`model_cards/argonne-4.5-decision.md`](model_cards/argonne-4.5-decision.md).
+
+| | argonne-4.5-decision | Jev (published) |
+|---|---:|---:|
+| calibration error, Choice | 0.022 | 0.082 |
+| calibration error, Score | 0.024 | 0.325 |
+| Banking77, zero-shot | 62.5% | 81.1% |
+| latency, ticket with 3 questions | 118 ms | 150-250 ms |
+| latency, one 77-way question | 59 ms | |
+| latency, 6,576-token document with 2 questions | 301 ms | |
+
+Calibration error is measured on held-out test questions after one temperature per question type; latency is the median on one A100.
+
+
+It is a 2B model. Most of the Banking77 gap is model size: a 35B general model reaches 74.8% on the same items in our harness. Yes/no probabilities on unfamiliar tasks bunch toward the middle, so set the threshold on a few labeled examples rather than trusting 0.5.
 
 ---
 
@@ -181,7 +202,7 @@ It is deliberately **smaller** than 3.5-base (36% of the parameters on 73% of th
 
 ![Argonne 4.0 loss curve](plots/argonne4_0_loss_plot.png)
 
-Four stages. Two easy misreadings: the **sawtooth in stage 1 is the mixture sampler**, not the optimization: each step draws one of the three sources and their entropies differ (edu ≈2.7, math/code ≈1.0–1.5), so consecutive logged steps alternate (faint = raw, solid = rolling median); and loss steps at stage boundaries are **changes of data mixture**, not capability jumps.
+Four stages. Two easy misreadings: the **sawtooth in stage 1 is the mixture sampler**, not the optimization: each step draws one of the three sources and their entropies differ (edu ≈2.7, math/code ≈1.0-1.5), so consecutive logged steps alternate (faint = raw, solid = rolling median); and loss steps at stage boundaries are **changes of data mixture**, not capability jumps.
 
 ## Training details
 
@@ -190,7 +211,7 @@ Four stages. Two easy misreadings: the **sawtooth in stage 1 is the mixture samp
 | **Stages** | Pretrain (`pretrain.py`) → reasoning anneal → ctx extension to 13,568 → ctx extension to 65,536 (`continue_pretrain.py`) |
 | **Total optimizer steps** | 112,674 |
 | **Tokens processed** | ~65.12B (38.03B pretrain + 18.07B anneal + 6.02B ctx 13,568 + 3.00B ctx 65,536) |
-| **Sequence length** | 1,024 (stages 1–2) → 13,568 (stage 3) → **65,536** (stage 4) |
+| **Sequence length** | 1,024 (stages 1-2) → 13,568 (stage 3) → **65,536** (stage 4) |
 | **Effective batch** | 522,240 → 589,824 → 976,896 → 983,040 tokens/step |
 | **Peak learning rate** | 6e-4 pretrain / 2e-4 anneal / 1e-4 both extensions; WSD, 8,000 warmup steps |
 | **Optimizer** | AdamW (β₁=0.9, β₂=0.95, weight decay 0.1), grad clip 0.4 |
@@ -234,7 +255,7 @@ Params / tokens: **4.0-base 1.04B / 65.12B** · Llama-3.2-1B 1.24B / ~9T · Qwen
 - **Stage 4 was a domain trade, not a free context extension:** +0.78 MC mean and the whole 65,536 window, against **−2.19 gsm8k** (the only generative task), plus worse held-out CE on 7 of 8 reasoning tiers (`reason_r1` +69% PPL). Detail in [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §39.
 - Finishing the LR cooldown (262 steps, 0.26B tokens past §39's mid-cooldown reading) **moved nothing**: 49.86 vs 49.94 mean, 26.15 vs 25.95 mmlu.
 
-**The internal two-axis base gate disagrees, and the gate is wrong.** It rates the released weights **17/20 math · 14/15 general** (pooled 34/40 · 28/30, CLEARED), *ahead* of the 2.88B base behind Argonne-3.5-think (14/20 · 14/15) at 36% of the parameters, while blind to a 2× MMLU and 6.6× gsm8k gap. The general axis has a ceiling of 15 and every a4 checkpoint tested reads 14–15 on it; two phase-C checkpoints 40 steps apart differ by the probe's own ±2-item noise floor. **A saturating gate cannot rank bases; it can only reject very bad ones.** Reproduce with [`reasoning/a4_gate_probe.py`](reasoning/a4_gate_probe.py).
+**The internal two-axis base gate disagrees, and the gate is wrong.** It rates the released weights **17/20 math · 14/15 general** (pooled 34/40 · 28/30, CLEARED), *ahead* of the 2.88B base behind Argonne-3.5-think (14/20 · 14/15) at 36% of the parameters, while blind to a 2× MMLU and 6.6× gsm8k gap. The general axis has a ceiling of 15 and every a4 checkpoint tested reads 14-15 on it; two phase-C checkpoints 40 steps apart differ by the probe's own ±2-item noise floor. **A saturating gate cannot rank bases; it can only reject very bad ones.** Reproduce with [`reasoning/a4_gate_probe.py`](reasoning/a4_gate_probe.py).
 
 ## The 65,536-token context is trained, not extrapolated
 
@@ -242,17 +263,17 @@ RoPE θ=1e6 does **not** extrapolate unaided on this architecture. All three arm
 
 | Token position | stage 2 (ctx 1,024) | stage 3 (ctx 13,568) | **Argonne 4.0-base** (ctx 65,536) |
 |---|---:|---:|---:|
-| 0 – 1,024 | 2.561 | 2.401 | **1.970** |
-| 1,024 – 2,048 | 5.086 | 2.061 | **1.671** |
-| 4,096 – 8,192 | 6.051 | 1.427 | **1.139** |
-| 8,192 – 13,568 | 5.964 | 1.242 | **0.980** |
-| 13,568 – 20,480 | 5.920 | 1.197 | **0.924** |
-| 24,576 – 32,768 | 5.990 | 1.198 | **0.864** |
-| 40,960 – 49,152 | 6.075 | 1.300 | **0.820** |
+| 0 to 1,024 | 2.561 | 2.401 | **1.970** |
+| 1,024 to 2,048 | 5.086 | 2.061 | **1.671** |
+| 4,096 to 8,192 | 6.051 | 1.427 | **1.139** |
+| 8,192 to 13,568 | 5.964 | 1.242 | **0.980** |
+| 13,568 to 20,480 | 5.920 | 1.197 | **0.924** |
+| 24,576 to 32,768 | 5.990 | 1.198 | **0.864** |
+| 40,960 to 49,152 | 6.075 | 1.300 | **0.820** |
 
 Stage 2 is coherent inside its 1,024-token window and **flat at ~6 nats for the next 48,000 tokens**: the counterexample to "a large RoPE base buys free context", measured on this model's own ancestor. The release falls monotonically with position and pays no short-context tax.
 
-**But the stage 3 → 4.0-base gain is not context extension.** The probe's falsifiable test says a real extension makes the gap *grow* with position; instead it is **U-shaped**: −0.43 nats at 0–1,024, −0.26 at the minimum, −0.48 in the 40,960–49,152 tail. It is as large at position 0 as at position 49,000, and stage 4 did not need to extend position 0–1,024. With stage 4 also making 7 of 8 reasoning tiers worse, the honest attribution is **distribution (toward arXiv), not length**. The extension proper is stage 3's. Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
+**But the stage 3 → 4.0-base gain is not context extension.** The probe's falsifiable test says a real extension makes the gap *grow* with position; instead it is **U-shaped**: −0.43 nats at 0-1,024, −0.26 at the minimum, −0.48 in the 40,960-49,152 tail. It is as large at position 0 as at position 49,000, and stage 4 did not need to extend position 0-1,024. With stage 4 also making 7 of 8 reasoning tiers worse, the honest attribution is **distribution (toward arXiv), not length**. The extension proper is stage 3's. Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
 
 ---
 
@@ -280,7 +301,7 @@ Fixing the two defaults (**no new data, no new method, same recipe**) produced t
 
 Single-step arithmetic is the headline: the first release answered `a op b` wrong about half the time (its own model card documented computing `17−5=12` and then subtracting 5 again to answer 7), which was the truncated-data defect showing through. **Replicated at three seeds** before release (five-set 57.25 / 57.35 / 57.38, spread 0.13pt; arithmetic 142/143/144 of 144). Significance is exact McNemar on paired outcomes.
 
-GSM-Plus is perturbed GSM8K *test*, so it was audited directly: the training mix's GSM8K tier is 4,338/4,338 from the **train** split with zero test items, and no judged GSM-Plus item exceeds Jaccard 0.60 against any training row. **MATH-500 does carry measured leakage** (17 of 319 items have a near-duplicate in the mix); re-scored on the 302 clean items the current model gets 39.07 vs the first release's 31.46, so the gap is unchanged. Audit tool: [`reasoning/pool_decontam.py`](reasoning/pool_decontam.py). Full diagnosis, fix and gate: [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §34–§37.
+GSM-Plus is perturbed GSM8K *test*, so it was audited directly: the training mix's GSM8K tier is 4,338/4,338 from the **train** split with zero test items, and no judged GSM-Plus item exceeds Jaccard 0.60 against any training row. **MATH-500 does carry measured leakage** (17 of 319 items have a near-duplicate in the mix); re-scored on the 302 clean items the current model gets 39.07 vs the first release's 31.46, so the gap is unchanged. Audit tool: [`reasoning/pool_decontam.py`](reasoning/pool_decontam.py). Full diagnosis, fix and gate: [`reasoning/thinking_training.md`](reasoning/thinking_training.md) §34-§37.
 
 ## vs Argonne 3.0-think (measured on the first release)
 
@@ -322,7 +343,7 @@ The base raises the **ceiling** (pass@8 58.7 → 74.0) while greedy stays flat; 
 
 Relative to the first release, stage 3 differs in exactly two ways: reasoning traces are kept whole instead of being cut at 128 tokens, and 2,000 rows of general-instruction anchor were added back. The second part matters: restoring the traces alone costs instruction-following (13/14 → 10/14); with the anchor restored it holds at 13/14 at every seed.
 
-α = 0.85 is a measured knee, not a default: α = 0.70 reintroduces non-termination. Full build log, including the ablations that failed and the predictions that turned out wrong, is in [`reasoning/thinking_training.md`](reasoning/thinking_training.md): §32 for the original recipe, §34–§37 for the data-corruption diagnosis, the fix, and this release's gate.
+α = 0.85 is a measured knee, not a default: α = 0.70 reintroduces non-termination. Full build log, including the ablations that failed and the predictions that turned out wrong, is in [`reasoning/thinking_training.md`](reasoning/thinking_training.md): §32 for the original recipe, §34-§37 for the data-corruption diagnosis, the fix, and this release's gate.
 
 ---
 
@@ -343,8 +364,8 @@ Loss, perplexity, and LR against cumulative tokens across all three stages. The 
 | **Stages** | Pretrain (`pretrain.py`) → reasoning anneal (`continue_pretrain.py`) → context extension (`continue_pretrain.py`) |
 | **Total optimizer steps** | 321,062 |
 | **Tokens processed** | ~88.84B (65.30B pretrain + 17.50B anneal + 6.02B context extension) |
-| **Sequence length** | 1,024 (stages 1–2) → **13,568** (stage 3) |
-| **Effective batch** | 233,472 → 270,336 tokens/step (stages 1–2); 488,448 tokens/step (stage 3) |
+| **Sequence length** | 1,024 (stages 1-2) → **13,568** (stage 3) |
+| **Effective batch** | 233,472 → 270,336 tokens/step (stages 1-2); 488,448 tokens/step (stage 3) |
 | **Peak learning rate** | 6e-4 pretrain / 2e-4 anneal / 1e-4 context extension; WSD, 8,000 warmup steps, cooldown to 0.1× in every stage |
 | **Optimizer** | AdamW (β₁=0.9, β₂=0.95, weight decay 0.1), grad clip 0.4 |
 | **Precision** | FP8 (torchao tensorwise, incl. `lm_head`) under bf16 autocast, `torch.compile`, gradient checkpointing |
@@ -366,14 +387,14 @@ RoPE θ=1e6 does **not** extrapolate unaided on this architecture. Position-buck
 
 | Token position | Stage 2 (ctx 1,024) | Argonne 3.5-base (ctx 13,568) |
 |---|---|---|
-| 0 – 1,024 | 2.194 | **2.161** |
-| 1,024 – 2,048 | 5.536 | **1.860** |
-| 4,096 – 8,192 | 5.895 | **1.320** |
-| 8,192 – 13,568 | 5.961 | **1.207** |
-| 13,568 – 20,480 | 5.965 | **1.122** |
-| 20,480 – 24,576 | 5.938 | **1.096** |
+| 0 to 1,024 | 2.194 | **2.161** |
+| 1,024 to 2,048 | 5.536 | **1.860** |
+| 4,096 to 8,192 | 5.895 | **1.320** |
+| 8,192 to 13,568 | 5.961 | **1.207** |
+| 13,568 to 20,480 | 5.965 | **1.122** |
+| 20,480 to 24,576 | 5.938 | **1.096** |
 
-The stage-2 model is coherent inside its 1,024-token window and effectively blind past it. The final model improves monotonically with position, keeps improving *beyond* its own 13,568 training length, and pays no short-context tax (the 0–1,024 control bucket is better than stage 2). Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
+The stage-2 model is coherent inside its 1,024-token window and effectively blind past it. The final model improves monotonically with position, keeps improving *beyond* its own 13,568 training length, and pays no short-context tax (the 0-1,024 control bucket is better than stage 2). Reproduce with [`reasoning/exp_longctx_learning.py`](reasoning/exp_longctx_learning.py).
 
 ## Base gate
 
@@ -511,7 +532,7 @@ A 4.9B-parameter decoder-only transformer trained from scratch with a custom ten
 |------|-------|
 | **Total steps** | 1,347,890 |
 | **Tokens processed** | ~21.9B |
-| **Final loss** | ~2.5–3.5 |
+| **Final loss** | ~2.5-3.5 |
 | **Learning rate** | 1e-4 peak → 1e-5 (cosine), 2,000 warmup steps |
 | **Optimizer** | AdamW (fused), weight decay 0.1, grad clip 1.0 |
 | **Parallelism** | Tensor parallelism across 8 GPUs (sharded attention + MLP, replicated embeddings/norms, async all-reduce) |

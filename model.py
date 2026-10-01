@@ -399,7 +399,11 @@ class GroupedQueryAttention(nn.Module):
         # equivalent (measured rel diff 3.7e-3 < bf16 roundoff 7.8e-3) and lets SDPA pick a fused
         # FLASH/cuDNN kernel: ~2x lower attention memory + faster. Training-under-autocast only;
         # inference/decode (self.training False) is untouched.
-        if self.training and torch.is_autocast_enabled() and query.dtype not in (torch.float16, torch.bfloat16):
+        # argonne-decision: also in eval. Evaluating fp32 master weights under autocast (the decision trainer's
+        # in-training eval) otherwise leaves q/k/v fp32, skips SDPA and builds the O(T^2) score matrix: 6.9 GiB at
+        # 16k tokens, an OOM on a 40 GB card. Same equivalence argument as above; bf16
+        # weights and autocast-off paths never reach this branch.
+        if torch.is_autocast_enabled() and query.dtype not in (torch.float16, torch.bfloat16):
             _ac_dtype = torch.get_autocast_dtype(query.device.type) if hasattr(torch, "get_autocast_dtype") else torch.get_autocast_gpu_dtype()
             query = query.to(_ac_dtype)
             key = key.to(_ac_dtype)
