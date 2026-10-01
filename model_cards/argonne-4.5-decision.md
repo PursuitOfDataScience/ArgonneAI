@@ -248,7 +248,6 @@ Everything is on the GitHub `main` branch:
 ```bibtex
 @misc{argonne45decision,
   title  = {Argonne 4.5-decision},
-  author = {Youzhi Yu},
   year   = {2026},
   url    = {https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision}
 }
