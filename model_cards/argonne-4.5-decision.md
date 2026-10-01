@@ -23,7 +23,8 @@ probability over the options you gave it, so it cannot answer outside your schem
 
 Measured plainly: its probabilities are well calibrated (expected calibration error 0.022 on multiple choice
 and 0.024 on ratings, against the 0.082 and 0.325 that Jev publishes), a call takes 59 to 118 ms on one A100,
-and it is a 2B model: zero-shot on Banking77 it scores 62.5%, against Jev's 81.1%.
+on eleven decision sets it never trained on it is 4.5 points more accurate than DeBERTa-v3-large zero-shot, and it
+is a 2B model: zero-shot on Banking77 it scores 62.5%, against Jev's 81.1%.
 
 ![How a decision call works: text and questions in, one pass through the trunk, the decision head scores each option, calibrated typed JSON out](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision/resolve/main/assets/how.png)
 
@@ -64,7 +65,7 @@ threshold on a few labeled examples rather than trusting 0.5.
 
 Banking77's 3,076 test questions, all 77 intent names as the options, never trained on.
 
-![Banking77 zero-shot accuracy: argonne-4.5-decision against Jev and Qwen as Jev reports them](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision/resolve/main/assets/banking77.png)
+![Banking77 zero-shot accuracy: argonne-4.5-decision against Jev's published number](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision/resolve/main/assets/banking77.png)
 
 <details>
 <summary>Show the numbers</summary>
@@ -73,13 +74,11 @@ Banking77's 3,076 test questions, all 77 intent names as the options, never trai
 |---|---:|---:|---:|
 | **argonne-4.5-decision** | **62.5** | 80.7 | 86.4 |
 | Jev (published) | 81.1 | | |
-| Qwen (as reported by Jev) | 76.4 | | |
 
 </details>
 
 The misses are mostly near neighbours ("order physical card" against "get physical card") and intents whose
-names describe their questions poorly. Most of the gap is model size: a 35B general instruction model answers
-74.8% of the same items in our harness.
+names describe their questions poorly.
 
 ### Decision sets it never trained on
 
@@ -110,6 +109,44 @@ question spells the decision out in the statement: "yes when the text is A, B or
 It follows a rule written into the question well, including on label sets it has never seen. A brand-new
 yes/no criterion with no rule attached is harder (56 to 66%), and knowledge-heavy multiple choice (MMLU,
 TruthfulQA) stays at the level of its base.
+
+### Against zero-shot classifiers
+
+The same eleven never-trained sets and the same scoring code, against the two most used open zero-shot classifiers,
+[DeBERTa-v3-large zero-shot v2.0](https://huggingface.co/MoritzLaurer/deberta-v3-large-zeroshot-v2.0) and
+[BART-large-MNLI](https://huggingface.co/facebook/bart-large-mnli), each run the standard way: one entailment pair per
+option ("This example is {option}." for label lists, "The answer is: {option}" for questions) with a softmax over the
+options, and the statement itself as the hypothesis for a yes/no question.
+
+![Accuracy per never-trained set: argonne-4.5-decision against DeBERTa-v3-large zero-shot and BART-large-MNLI](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision/resolve/main/assets/baselines.png)
+
+![Mean calibration error over the eleven sets for the three models](https://huggingface.co/PursuitOfDataScience/argonne-4.5-decision/resolve/main/assets/baselines_ece.png)
+
+<details>
+<summary>Show the numbers (accuracy %, calibration error in brackets)</summary>
+
+| set | questions | **argonne-4.5-decision** | DeBERTa-v3-large zero-shot v2.0 | BART-large-MNLI |
+|---|---:|---:|---:|---:|
+| Banking77 intents, 77 options | 3,076 | **62.5 (0.160)** | 59.9 (0.096) | 43.7 (0.239) |
+| 20 Newsgroups, 20 options | 2,000 | **61.2 (0.028)** | 63.8 (0.039) | 35.5 (0.197) |
+| Finance news topics, 20 options | 4,117 | **40.3 (0.038)** | 16.2 (0.245) | 15.6 (0.149) |
+| Finance news sentiment, 3 options | 2,388 | **56.5 (0.090)** | 83.3 (0.049) | 14.9 (0.414) |
+| MMLU, 4 options | 4,000 | **45.5 (0.077)** | 40.4 (0.011) | 33.5 (0.112) |
+| TruthfulQA MC1 | 817 | **31.7 (0.240)** | 32.3 (0.050) | 47.5 (0.103) |
+| Banking77 intents, as a written rule | 798 | **83.7 (0.083)** | 54.9 (0.419) | 52.6 (0.434) |
+| 20 Newsgroups, as a written rule | 461 | **80.5 (0.100)** | 59.9 (0.357) | 53.6 (0.453) |
+| Finance news topics, as a written rule | 1,012 | **69.9 (0.119)** | 54.2 (0.419) | 50.3 (0.484) |
+| Spam email (yes / no) | 2,000 | **65.5 (0.173)** | 76.1 (0.197) | 51.4 (0.448) |
+| Unsafe chat request (yes / no) | 2,741 | **56.4 (0.201)** | 49.1 (0.479) | 56.3 (0.262) |
+| **mean of the 11 sets** | | **59.4 (0.119)** | 53.6 (0.215) | 41.4 (0.300) |
+
+</details>
+
+Paired on all 23,410 items, argonne-4.5-decision is 4.5 points more accurate than DeBERTa-v3-large
+zero-shot (95% bootstrap interval 3.7 to 5.2; exact McNemar p below 1e-30) and 18.4 points more than
+BART-large-MNLI (17.7 to 19.1), with about half DeBERTa's calibration error. It is ahead on Banking77's 77 intents, 20-way finance topics, MMLU
+and unsafe requests, and by 16 to 29 points on rules written into the question, where both NLI models sit between 50%
+and 60%. DeBERTa is better on plain sentiment, spam and 20 Newsgroups, and BART-large-MNLI on TruthfulQA.
 
 ### Latency
 

@@ -39,7 +39,7 @@ The decision model of the 4.5 line, released as [`PursuitOfDataScience/argonne-4
 Calibration error is measured on held-out test questions after one temperature per question type; latency is the median on one A100.
 
 
-It is a 2B model. Most of the Banking77 gap is model size: a 35B general model reaches 74.8% on the same items in our harness. Yes/no probabilities on unfamiliar tasks bunch toward the middle, so set the threshold on a few labeled examples rather than trusting 0.5.
+On eleven decision sets none of them trained on, it is 4.5 points more accurate than DeBERTa-v3-large zero-shot v2.0 (paired 95% interval 3.7 to 5.2) and 18.4 more than BART-large-MNLI, with about half DeBERTa's calibration error (mean ECE 0.119 against 0.215 and 0.300). It is a 2B model and trails Jev on Banking77, and yes/no probabilities on unfamiliar tasks bunch toward the middle, so set the threshold on a few labeled examples rather than trusting 0.5.
 
 ---
 
