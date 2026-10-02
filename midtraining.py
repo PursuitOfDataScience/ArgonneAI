@@ -1152,6 +1152,9 @@ def main():
     fsdp_wrapper_for_clip = get_fsdp_wrapper(model)
     last_checkpoint_time = time.time()
     training_start_time = time.time()
+    # SUMMARY's rate is this slice's tokens over this slice's clock; tokens_processed also carries
+    # the resumed checkpoint's total (same fix as pretrain.py / continue_pretrain.py).
+    tokens_at_slice_start = tokens_processed
     train_losses = []
 
     if is_main:
@@ -1474,7 +1477,7 @@ def main():
         print("\n" + "=" * 60)
         print(
             f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} "
-            f"tokens_per_sec={tokens_processed/elapsed_time:.2f} "
+            f"slice_tokens_per_sec={(tokens_processed - tokens_at_slice_start)/elapsed_time:.2f} "
             f"midtraining_tokens={midtraining_tokens_cumulative:,} (this phase: {midtraining_tokens_processed:,}) "
             f"steps={global_step}"
         )

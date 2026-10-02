@@ -44,6 +44,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
+# argonne5.0: the a5 recipe's shared pieces, Muon (muon.py) and pretrain KD (pretrain_kd.py). They live
+# in modules because continue_pretrain.py needs the same code and cannot import this file (the argparse
+# below runs at import time). The path insert makes them importable when this file is loaded by path
+# (tests, harnesses), not only as `python pretrain.py`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from muon import (add_muon_args, check_muon_args, build_muon_optimizer, muon_canonical_index,
+                  muon_canonical_param_groups, check_resume_optimizer)
+from pretrain_kd import add_kd_args, check_kd_args, setup_kd_teacher, KDStep
+
 # Model architecture -- argonne4.0: the argonne3.5 arch SCALED TO ~1.04B (the
 # data-efficiency campaign's fixed "3.5-at-1B" shape; see ARGONNE4.0.md). Only the
 # four width/depth constants change from 3.5's 2.88B; head_dim is DERIVED
@@ -179,10 +188,10 @@ parser.add_argument("--fp8", type=int, default=0, choices=[0, 1], help="Enable F
 # cannot is not a lever, it is a note.
 # DEFAULT = -1 MEANS "keep the hardcoded per-arch default", so this commit cannot change the
 # behaviour of the a4.5 resume in flight (which wants DOC_MASK=False); only an explicit 0/1 overrides.
-parser.add_argument("--doc_mask", type=int, default=-1, choices=[-1, 0, 1], help="Per-document attention masking: block attention across document boundaries within a packed sequence. -1 = keep the arch default (a4.5: off). ADOPTED for a5 on probe evidence (-0.04861 tgt CE, t=-16.79, 10 seeds); costs ~6%% tok/s at h146.")
+parser.add_argument("--doc_mask", type=int, default=-1, choices=[-1, 0, 1], help="Per-document attention masking: block attention across document boundaries within a packed sequence. -1 = keep the arch default (a4.5: off). NOT adopted for a5: it buys ~0.035 tgt CE iso-token at h400 (gone by h800) but this dense (B,T,T) mask costs ~20%% of the wall, and at equal wall OFF wins by 0.20 (A5_KD_RECIPE N+113, N+252). Reopen only with a flex_attention path.")
 parser.add_argument("--attn_gate", type=int, default=-1, choices=[-1, 0, 1], help="Per-head sigmoid output gate on attention (attn_output * sigmoid(W_g x)); attention-sink style stabiliser for high-LR training. -1 = keep the arch default (off). UNMEASURED as of 2026-09-01.")
 parser.add_argument("--fp8_lm_head", type=int, default=1, choices=[0, 1], help="Also FP8 the (tied) lm_head: recipe default; tie is preserved")
-parser.add_argument("--zero_optimizer", type=int, default=0, choices=[0, 1], help="Shard AdamW state across DDP ranks (ZeRO stage 1/2). Needed on 40-48 GB cards: MEASURED 2026-08-21, plain DDP+fp32 AdamW needs ~38.7 GiB before activations (params 7.69 + DDP gradient buckets 7.69 + m/v 15.38 = 30.75) and OOMs on A100-40G at EVERY micro-batch. With this on, A100-40G fits micro=1 and A40-46G fits micro=2. Checkpoints stay in plain-AdamW format, so a run can move between sharded and unsharded hardware.")
+parser.add_argument("--zero_optimizer", type=int, default=0, choices=[0, 1], help="Shard optimizer state across DDP ranks (ZeRO stage 1/2; AdamW or, with --optimizer muon, MuonAdamW). Needed on 40-48 GB cards: MEASURED 2026-08-21, plain DDP+fp32 AdamW needs ~38.7 GiB before activations (params 7.69 + DDP gradient buckets 7.69 + m/v 15.38 = 30.75) and OOMs on A100-40G at EVERY micro-batch. With this on, A100-40G fits micro=1 and A40-46G fits micro=2. Checkpoints stay in the UNSHARDED format (plain AdamW, or MuonAdamW's two groups), so a run can move between sharded and unsharded hardware.")
 parser.add_argument("--log_interval", type=int, default=50, help="Print the Step/Loss line every N optimizer steps (and the [HBM] line every 4N). Default 50 = prior behaviour. Lower it for short probes, where 50 steps can be the whole run.")
 parser.add_argument("--pad_vocab_multiple", type=int, default=0, help="Pad vocab up to a multiple of N independently of --fp8. 0 = auto: use 128 when fp8+fp8_lm_head are on, else take the width from the resume checkpoint. Needed to resume an fp8-PADDED checkpoint on a card with no fp8 (e.g. A100 sm80), where --fp8 0 would otherwise rebuild an unpadded 151669-row embedding and fail load_state_dict.")
 parser.add_argument("--loss_chunk_size", type=int, default=0, help="If >0, chunked cross-entropy over this many (batch*seq) rows/chunk: frees the full-logit fp32 transient so batch can grow (fill HBM higher). 0 = off. NOTE: raising batch mid-run shifts the WSD cooldown (cooldown_frac × estimated_steps); use only on a FRESH run with LR/cooldown set for the bigger batch.")
@@ -203,8 +212,29 @@ parser.add_argument("--periodic_val_every", type=int, default=0, help="If >0, ev
 parser.add_argument("--final_model_dir", type=str, default=None, help="Optional directory for the final Hugging Face model export.")
 parser.add_argument("--completion_marker", type=str, default=None, help="Optional marker file written only after max_epochs is completed and the final model export succeeds.")
 parser.add_argument("--seed", type=int, default=444, help="Base random seed")
+# ---------------------------------------------------------------------------------------------------
+# argonne5.0: the a5 recipe (Muon + pretrain KD), ported from exp/probe.py + exp/muon.py, the rig every
+# a5 number was measured on. Flags and their refusals are defined once in muon.py / pretrain_kd.py and
+# shared with continue_pretrain.py. THE DEFAULTS REPRODUCE a4.5 EXACTLY: --optimizer adamw builds the
+# same fused AdamW over model.parameters(), and --kd_alpha 0 never loads a teacher or touches the loss.
+# Model size: --arch a5 (owner 2026-10-02: "let's do the smaller one"); the default stays a4.5's shape.
+add_muon_args(parser)
+add_kd_args(parser)
+parser.add_argument("--arch", type=str, default="a45", choices=["a45", "a5"], help="Model shape for a FRESH run (a resume derives it from the checkpoint). a45 = 2,063,667,712 params (2560 x 24, FFN 7040, 10 heads), the default, unchanged. a5 = 1.39B (2048 x 24, FFN 5632, 8 heads, 2 KV, head_dim 256): the shape the a5 probe campaign tuned its recipe on. Project rule: no new base model may match an earlier release's size (276M, 357M, 4.9B, 1.27B, 2.88B, 1.04B, 2.06B); a5 is 10%% above 2.5's 1.27B.")
+parser.add_argument("--max_steps", type=int, default=0, help="If >0, stop once global_step reaches this (counted across resumes), saving ONE checkpoint and exiting like the wall-time path (no HF export). For smoke tests and exact save/resume checks. 0 = off.")
 args = parser.parse_args()
+if args.arch == "a5":
+    # argonne5: the probe campaign's shape (every a5 recipe number was measured on it), and a size no release
+    # has: 1.39B against 2.5's 1.27B and 4.5's 2.06B (owner, 2026-10-02: a new model never equals an earlier
+    # release's size). Only width and FFN change from a4.5; head_dim stays 256 (2048 // 8), 2 KV heads.
+    HIDDEN_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, INTERMEDIATE_SIZE = 2048, 24, 8, 2, 5632
 assert args.data_path or args.train_sources, "provide exactly one of --data_path or --train_sources"
+# Refuse a5 configurations the record says are wrong BEFORE any GPU work. Every rank parses argv, so
+# parser.error exits all ranks identically (no rank is left waiting on a collective).
+check_muon_args(parser, args)
+check_kd_args(parser, args)
+if args.max_steps < 0:
+    parser.error("--max_steps must be >= 0")
 
 # Distributed setup
 def setup_distributed():
@@ -784,17 +814,26 @@ def _verify_written_checkpoint(path, expect_step, expect_tensors):
     return None
 
 
-def build_optimizer(params, args, world_size):
-    """AdamW, optionally with its state SHARDED across ranks (ZeRO stage 1/2).
+def build_optimizer(model, args, world_size):
+    """AdamW (a4.5) or MuonAdamW (a5), optionally with its state SHARDED across ranks (ZeRO 1/2).
 
-    Why this exists: on a 40 GB card the fixed cost of plain DDP is fatal. Measured stage by stage
+    Why sharding exists: on a 40 GB card the fixed cost of plain DDP is fatal. Measured stage by stage
     on an A100-PCIE-40GB (39.39 GiB usable): params 7.69 + DDP gradient buckets 7.69 (allocated
     EAGERLY at DDP construction, not at the first backward) + AdamW m/v 15.38 = 30.75 GiB, leaving
     8.00 GiB -- not enough for autocast's bf16 weight copies plus the 151,680-wide logit tensor even
     at micro=1. Sharding m/v is what makes those cards usable at all.
+
+    Takes the MODEL, not model.parameters(): the Muon split needs parameter names. The AdamW branch
+    still hands AdamW exactly model.parameters(), so the a4.5 optimizer is unchanged.
     """
+    if args.optimizer == "muon":
+        # split + recorded constraints + (sharded) MuonAdamW, shared with continue_pretrain.py (muon.py)
+        return build_muon_optimizer(
+            get_base_model(model), args, is_main=IS_MAIN,
+            zero_sharded=(args.zero_optimizer == 1 and world_size > 1 and dist.is_initialized()))
     kw = dict(lr=args.lr, betas=(args.adam_beta1, args.adam_beta2),
               weight_decay=args.weight_decay, fused=True)
+    params = model.parameters()
     if args.zero_optimizer == 1 and world_size > 1 and dist.is_initialized():
         from torch.distributed.optim import ZeroRedundancyOptimizer
         return ZeroRedundancyOptimizer(params, optimizer_class=torch.optim.AdamW, **kw)
@@ -820,6 +859,25 @@ def fix_optimizer_step_device(optimizer):
                 st['step'] = st['step'].to(prm.device)
                 moved += 1
     return moved
+
+
+def drop_zero_duplicate_state(optimizer):
+    """Free the second copy of this rank's optimizer state that a ZeRO load leaves on the device.
+
+    torch 2.10's ZeroRedundancyOptimizer.load_state_dict copies the rank's shard to the device TWICE:
+    into the local optimizer (`optimizer.optim.state`, the copy step() updates and
+    sharded_optimizer_state_dict() saves) and again, through the base Optimizer.load_state_dict, into
+    the wrapper's own `state`, which ZeRO never reads or updates. A fresh run's wrapper state is
+    empty, so clearing it restores exactly the fresh-run layout. Measured 2026-09-30 on 4 x A100-40GB
+    (2.06B, Muon + KD, ZeRO-1): peak_alloc 31.5 GiB fresh against 36.0 GiB for the whole resumed run.
+    Returns the bytes released on this rank (0 when the optimizer is not ZeRO).
+    """
+    if not hasattr(optimizer, 'consolidate_state_dict'):
+        return 0
+    freed = sum(v.numel() * v.element_size() for st in optimizer.state.values() if isinstance(st, dict)
+                for v in st.values() if torch.is_tensor(v))
+    optimizer.state.clear()
+    return freed
 
 
 def _canonical_param_index(model):
@@ -853,9 +911,20 @@ def sharded_optimizer_state_dict(optimizer, model, checkpoint_dir, rank, world_s
     The output is deliberately in ordinary AdamW format, so a checkpoint written on sharded
     hardware still resumes on unsharded hardware. That is not a nicety: this run has already moved
     across three machines, and a checkpoint locked to a GPU count would be a trap.
+
+    MUON (argonne5.0): when the optimizer came from build_muon_optimizer (MuonAdamW), the output is
+    instead the TWO-group format an unsharded MuonAdamW emits: index = position in (every Muon param,
+    then every AdamW param), one param_groups entry per group carrying that group's hyperparameters.
+    That order is also ZeroRedundancyOptimizer's own global index, so the same file loads into a
+    sharded or an unsharded Muon run. The group hyperparameters come from the optimizer's GLOBAL
+    param_groups (the ones LambdaLR writes, so `lr` is the one the NEXT step will use), not from the
+    local shard's copy, which ZeRO only refreshes inside step() and is therefore one step stale. The
+    AdamW branch below is unchanged and still saves that stale local copy (pre-existing: the first
+    step after every ZeRO AdamW resume runs at the previous step's LR).
     """
     inner = getattr(optimizer, 'optim', optimizer)
-    gidx = _canonical_param_index(model)
+    muon_gidx = muon_canonical_index(optimizer)     # None unless MuonAdamW; validates on every rank
+    gidx = _canonical_param_index(model) if muon_gidx is None else muon_gidx
 
     local = {}
     for group in inner.param_groups:
@@ -922,9 +991,14 @@ def sharded_optimizer_state_dict(optimizer, model, checkpoint_dir, rank, world_s
               f"a shard may be incomplete.", flush=True)
 
     # param_groups must reference ALL global indices, exactly as unsharded AdamW would emit them.
-    template = inner.param_groups[0]
-    group = {k: v for k, v in template.items() if k != 'params'}
-    group['params'] = list(range(n_params))
+    if muon_gidx is None:
+        template = inner.param_groups[0]
+        group = {k: v for k, v in template.items() if k != 'params'}
+        group['params'] = list(range(n_params))
+        param_groups = [group]
+    else:
+        # MuonAdamW: one entry per group, indices contiguous in canonical order (Muon, then AdamW).
+        param_groups = muon_canonical_param_groups(optimizer)
 
     for rr in range(world_size):
         try:
@@ -937,7 +1011,7 @@ def sharded_optimizer_state_dict(optimizer, model, checkpoint_dir, rank, world_s
         pass
     gc.collect()
 
-    return {'state': merged, 'param_groups': [group]}
+    return {'state': merged, 'param_groups': param_groups}
 
 
 def prepare_optimizer_state(optimizer, model, checkpoint_dir, rank, world_size):
@@ -1258,6 +1332,13 @@ def main():
         print(f"Model parameters: {total_params:,}")
         print(f"Mixed precision: {'autocast ' + args.precision if USE_AUTOCAST else 'fp32 (no autocast)'}")
 
+    # --- PRETRAIN KD TEACHER (argonne5.0). Loaded only when --kd_alpha > 0, so a4.5 never sees it. ---
+    # pretrain_kd.setup_kd_teacher: bf16/eval/frozen/eager load plus the refusals (z-loss/MTP would be
+    # silently dropped on the logits path; K > vocab; teacher vocab < student vocab), all rank-identical.
+    teacher = setup_kd_teacher(args, VOCAB_SIZE, DEVICE, IS_MAIN,
+                               zloss_or_mtp=(Z_LOSS_WEIGHT > 0 or ENABLE_MTP or MTP_MODULE_LAYERS > 0),
+                               loss_chunk_size=args.loss_chunk_size)
+
     # Create data loader (flat llm.c .bin OR doc-manifest .json, chosen by extension)
     train_loader = build_train_loader(
         args.data_path,
@@ -1294,9 +1375,12 @@ def main():
     # fp32 master params (same math as the default foreach path; numerically-equivalent), fewer
     # kernel launches / less memory traffic. Master weights are plain fp32 CUDA Parameters even
     # under torchao tensorwise fp8, so fused AdamW is supported.
-    optimizer = build_optimizer(model.parameters(), args, WORLD_SIZE)
+    optimizer = build_optimizer(model, args, WORLD_SIZE)
 
-    # Scheduler with warmup (cosine or WSD)
+    # Scheduler with warmup (cosine or WSD). Under --optimizer muon, LambdaLR applies this same lambda to
+    # EACH param group from that group's own initial lr, so the Muon and AdamW groups follow one
+    # warmup/stable/cooldown shape at their own bases (muon_lr, adam_lr). min_lr_scale is a ratio, so
+    # it holds for both.
     min_lr = args.lr * args.min_lr_ratio
     min_lr_scale = min_lr / args.lr
 
@@ -1354,16 +1438,25 @@ def main():
             if IS_MAIN:
                 print("Reset schedule mode: fresh optimizer, scheduler, step counter, data position")
                 print(f"Previous training: {checkpoint['tokens_processed']:,} tokens, step {checkpoint['global_step']}")
-            optimizer = build_optimizer(model.parameters(), args, WORLD_SIZE)
+            optimizer = build_optimizer(model, args, WORLD_SIZE)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             global_step = 0
             tokens_processed = 0
             is_resumed = False
         else:
+            # AdamW state into Muon (or the reverse) is a different layout AND update rule: refuse it and
+            # name the fix (--reset_schedule 1 = fresh optimizer from these weights). muon.py, shared.
+            check_resume_optimizer(checkpoint['optimizer_state_dict'], args.optimizer, resume_from)
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # MuonAdamW keeps its AdamW-group `step` as a Python int and Muon params hold only a
+            # momentum_buffer, so this relocation is a no-op under Muon (it moves tensor steps only).
             _moved = fix_optimizer_step_device(optimizer)
             if IS_MAIN and _moved:
                 print(f"Relocated {_moved} AdamW `step` scalars CPU -> {DEVICE} (required by the fused kernel)")
+            _freed = drop_zero_duplicate_state(optimizer)
+            if IS_MAIN and _freed:
+                print(f"[zero] released the duplicate optimizer state a ZeRO load leaves on the device: "
+                      f"{_freed / 2**30:.2f} GiB on rank 0")
             scheduler_state = checkpoint.get('scheduler_state_dict')
             if scheduler_state:
                 scheduler.load_state_dict(scheduler_state)
@@ -1418,6 +1511,14 @@ def main():
             f"logit_softcap: {LOGIT_SOFTCAP}"
         )
         print(f"LR: {args.lr}, Warmup: {args.warmup_steps}, Min LR Ratio: {args.min_lr_ratio}, Precision: {args.precision}, TorchCompile: {args.torch_compile}")
+        if args.optimizer == "muon":
+            print(f"Optimizer: muon (muon_lr {args.muon_lr}, adam_lr {args.adam_lr}, both on the "
+                  f"schedule below; --lr {args.lr} unused)")
+        if teacher is not None:
+            print(f"KD: alpha {args.kd_alpha}, topk {args.kd_topk}; logged Loss = the KD objective, "
+                  f"hard_CE = plain next-token CE (the number to hold against the sanity band)")
+        if args.max_steps > 0:
+            print(f"Max steps: {args.max_steps} (save + exit when global_step reaches it)")
         print(f"Schedule: {args.schedule}, Cooldown: {cooldown_steps} steps (frac={args.cooldown_frac}, ~{(cooldown_steps/max(1,estimated_steps)*100):.1f}% of run), Grad clip: {args.grad_clip}")
         print(f"Checkpoint interval: {args.checkpoint_interval} seconds")
         print(f"Validation data: {args.val_data_path if args.val_data_path else 'disabled (no held-out file provided)'}")
@@ -1432,6 +1533,10 @@ def main():
         tokens_processed = 0
     last_checkpoint_time = time.time()
     training_start_time = time.time()
+    # The SUMMARY rate must divide THIS slice's tokens by THIS slice's clock: tokens_processed carries
+    # the resumed checkpoint's total, so a resumed slice reported ~2x its real rate (2026-09-30 canary
+    # slice 2: 5,755 vs a logged ~3,090). Same fix continue_pretrain.py got on 2026-09-15.
+    tokens_at_slice_start = tokens_processed
     def _eval_val():
         # Val loss on the underlying (non-DDP) module at a SMALL fixed batch (val_batch_size) so the
         # logit tensor never OOMs regardless of the train batch. Used for the end eval + periodic eval.
@@ -1472,8 +1577,18 @@ def main():
 
     if completed_max_epochs and IS_MAIN:
         print(f"\nCheckpoint is already at {train_loader.epoch} epoch(s); finalizing without more training.")
+    max_steps_done = args.max_steps > 0 and global_step >= args.max_steps
+    if max_steps_done and IS_MAIN:
+        print(f"\nglobal_step {global_step} is already >= --max_steps {args.max_steps}; nothing to train.")
 
-    while not completed_max_epochs:
+    # --- KD micro-step (argonne5.0). Only built when a teacher is loaded. KDStep (pretrain_kd.py) wraps
+    # the probe's KD loss with the first-micro-step KD GATE (all ranks stop together on failure) and
+    # model.py's NaN-guard contract; the loop below calls it where the plain forward used to be.
+    train_hard = []                     # hard CE per step under KD; train_losses holds the objective
+    kd_step = (KDStep(teacher, get_base_model(model), VOCAB_SIZE, args, DEVICE, WORLD_SIZE, IS_MAIN)
+               if teacher is not None else None)
+
+    while not completed_max_epochs and not max_steps_done:
         start_time = time.time()
         optimizer.zero_grad()
         # GPU-resident accumulator. Calling .item() inside the micro-step loop forces a
@@ -1481,6 +1596,8 @@ def main():
         # serialises the pipeline. At GRAD_ACCUM_STEPS=11 the old code did it TWICE per
         # micro-step = 22 syncs per optimizer step; this does one.
         step_loss_total = torch.zeros((), device=DEVICE, dtype=torch.float32)
+        if teacher is not None:
+            step_hard_total = torch.zeros((), device=DEVICE, dtype=torch.float32)
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             x, y = train_loader.next_batch()
@@ -1499,25 +1616,42 @@ def main():
                 is_eos = (x == EOS_TOKEN_ID)
                 fwd_kw["document_ids"] = torch.cumsum(is_eos.long(), dim=1) - is_eos.long()
 
+            # Under KD the micro-step loss is the probe's objective (1-a)*hard + a*soft instead of the
+            # model's CE; everything else (no_sync on all but the last micro-step, autocast around the
+            # forward only, backward outside it, division by GRAD_ACCUM_STEPS) is shared.
             if WORLD_SIZE > 1 and micro_step < GRAD_ACCUM_STEPS - 1:
                 with model.no_sync():
                     with torch.amp.autocast(DEV_TYPE, dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                        outputs = model(x, labels=y, **fwd_kw)
-                        micro_loss = outputs.loss
+                        if teacher is None:
+                            outputs = model(x, labels=y, **fwd_kw)
+                            micro_loss = outputs.loss
+                        else:
+                            micro_loss, micro_hard = kd_step(model, x, y, fwd_kw, global_step)
                         loss = micro_loss / GRAD_ACCUM_STEPS
                     loss.backward()
             else:
                 with torch.amp.autocast(DEV_TYPE, dtype=AUTOCAST_DTYPE, enabled=USE_AUTOCAST):
-                    outputs = model(x, labels=y, **fwd_kw)
-                    micro_loss = outputs.loss
+                    if teacher is None:
+                        outputs = model(x, labels=y, **fwd_kw)
+                        micro_loss = outputs.loss
+                    else:
+                        micro_loss, micro_hard = kd_step(model, x, y, fwd_kw, global_step)
                     loss = micro_loss / GRAD_ACCUM_STEPS
                 loss.backward()
 
             tokens_processed += args.batch_size * args.block_size * WORLD_SIZE
             step_loss_total += micro_loss.detach().float()   # stays on GPU, no sync
+            if teacher is not None:
+                step_hard_total += micro_hard.detach().float()
 
         # the single sync per optimizer step
-        step_loss = (step_loss_total / GRAD_ACCUM_STEPS).item()
+        if teacher is None:
+            step_loss = (step_loss_total / GRAD_ACCUM_STEPS).item()
+        else:
+            # still ONE sync: objective and hard CE come back together
+            step_loss, step_hard = (torch.stack([step_loss_total, step_hard_total])
+                                    / GRAD_ACCUM_STEPS).tolist()
+            train_hard.append(step_hard)
         train_losses.append(step_loss)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1537,7 +1671,19 @@ def main():
             print(f"  [HBM] step {global_step}: peak reserved {_mem_res:.1f}/{_mem_tot:.1f} GB ({100*_mem_res/_mem_tot:.1f}%) | micro_batch={args.batch_size} block={args.block_size} grad_ckpt={args.gradient_checkpointing} fp8={args.fp8}", flush=True)
 
         if IS_MAIN and global_step % max(1, args.log_interval) == 0:
-            perplexity = np.exp(step_loss)
+            # Under KD, Loss is the KD objective (what is optimised) and hard_CE is plain next-token CE,
+            # the number comparable to every a4.5 log and to --val_data_path; PPL is exp(hard_CE)
+            # because the exponential of a soft-target CE is not a perplexity. Under Muon the LR field
+            # shows the Muon group, then the AdamW group in parentheses. Default runs print as before.
+            if teacher is None:
+                perplexity = np.exp(step_loss)
+                _kd_txt = ""
+            else:
+                perplexity = np.exp(step_hard)
+                _kd_txt = f" | hard_CE: {step_hard:.4f}"
+            _lr_txt = f"{current_lr:.2e}"
+            if args.optimizer == "muon":
+                _lr_txt += f" (adam {optimizer.param_groups[1]['lr']:.2e})"
             # tok/s measured between consecutive log lines -- the number that decides GPU count when
             # the run has to move between card types (H100 fp8 vs A100 bf16).
             _tps = ""
@@ -1563,9 +1709,12 @@ def main():
                 _peak = torch.cuda.max_memory_allocated()
                 _hbm = (f" | HBM: {_res/2**30:.1f}/{_total/2**30:.1f}GiB"
                         f" ({100.0*_res/_total:.1f}%) peak_alloc {_peak/2**30:.1f}GiB")
-            print(f"Step {global_step} | Loss: {step_loss:.4f} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {current_lr:.2e}{_tps}{_hbm}")
+            print(f"Step {global_step} | Loss: {step_loss:.4f}{_kd_txt} | PPL: {perplexity:.2f} | Tokens: {tokens_processed:,} | LR: {_lr_txt}{_tps}{_hbm}")
             if pbar:
-                pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"})
+                _post = {"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}", "tokens": f"{tokens_processed/1e6:.2f}M"}
+                if teacher is not None:
+                    _post["hard"] = f"{step_hard:.4f}"
+                pbar.set_postfix(_post)
 
         # Periodic validation (translate-test / learning curve). Gated (default off). All ranks reach
         # here together (global_step is synced); rank 0 evals while the others wait at the barrier.
@@ -1621,14 +1770,19 @@ def main():
         # weekend.sh chain resubmits on that clean exit = save-THEN-submit). Two triggers, whichever
         # fires first: (1) --save_deadline_epoch = ABSOLUTE wall clock (job_start + slice - lead) =>
         # fires a fixed time before the SLURM kill regardless of compile/startup drift = PRIMARY;
-        # (2) WALL_TIME_SAVE = training-ELAPSED margin = backup.
-        if WALL_TIME_SAVE > 0 or args.save_deadline_epoch > 0:
+        # (2) WALL_TIME_SAVE = training-ELAPSED margin = backup. (3) --max_steps (argonne5.0): an exact
+        # STEP-count stop through the same save-and-exit path, so a smoke test can save at a known step
+        # and a resume can be compared step for step against an uninterrupted run.
+        if WALL_TIME_SAVE > 0 or args.save_deadline_epoch > 0 or args.max_steps > 0:
             should_wall_stop = torch.tensor([0], device=DEVICE)
+            _hit_max_steps = args.max_steps > 0 and global_step >= args.max_steps
             if IS_MAIN:
                 elapsed = time.time() - training_start_time
                 if WALL_TIME_SAVE > 0 and elapsed >= WALL_TIME_SAVE:
                     should_wall_stop[0] = 1
                 if args.save_deadline_epoch > 0 and time.time() >= args.save_deadline_epoch:
+                    should_wall_stop[0] = 1
+                if _hit_max_steps:
                     should_wall_stop[0] = 1
             if WORLD_SIZE > 1:
                 dist.broadcast(should_wall_stop, src=0)
@@ -1636,7 +1790,10 @@ def main():
             if should_wall_stop[0] == 1:
                 _opt_sd = prepare_optimizer_state(optimizer, model, args.checkpoint_dir, RANK, WORLD_SIZE)  # ALL ranks
                 if IS_MAIN:
-                    print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
+                    if _hit_max_steps:
+                        print(f"\nReached --max_steps {args.max_steps} at step {global_step}. Saving checkpoint and exiting...")
+                    else:
+                        print(f"\nApproaching wall limit (deadline_epoch={args.save_deadline_epoch}, wall_time={args.wall_time}s). Saving checkpoint and exiting...")
                     data_position = train_loader.get_position()
                     checkpoint_path = save_checkpoint(model, optimizer, scheduler, global_step, tokens_processed, step_loss, data_position, args.checkpoint_dir, optimizer_state=_opt_sd)
                     if checkpoint_path is None:
@@ -1687,6 +1844,8 @@ def main():
         val_loss = np.mean(val_losses) if val_losses else float("nan")
         val_loss_str = f"{val_loss:.4f}" if val_losses else "n/a"
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss_str}")
+        if teacher is not None and train_hard:
+            print(f"Train hard CE (KD run; Train Loss above is the KD objective): {np.mean(train_hard):.4f}")
 
         if completed_max_epochs:
             print("\nSaving final checkpoint...")
@@ -1743,7 +1902,10 @@ def main():
 
         elapsed_time = time.time() - training_start_time
         print("\n" + "=" * 60)
-        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} tokens_per_sec={tokens_processed/elapsed_time:.2f} steps={global_step}")
+        _slice_tok = tokens_processed - tokens_at_slice_start
+        print(f"SUMMARY: train_loss={train_loss:.4f} val_loss={val_loss_str} "
+              f"slice_tokens_per_sec={_slice_tok/elapsed_time:.2f} slice_tokens={_slice_tok} "
+              f"cumulative_tokens={tokens_processed} steps={global_step}")
         print("=" * 60)
 
     if WORLD_SIZE > 1:

@@ -848,6 +848,7 @@ class ArgonneModel(PreTrainedModel):
         past_key_values: Optional[list] = None,
         use_cache: bool = False,
         document_ids: Optional[torch.LongTensor] = None,
+        kd_targets: Optional[tuple] = None,
         **kwargs,  # Accept extra args from newer transformers (e.g., num_items_in_batch)
     ) -> CausalLMOutput:
         _, seq_length = input_ids.shape
@@ -902,6 +903,14 @@ class ArgonneModel(PreTrainedModel):
                 hidden_states = layer(hidden_states, rotary, layer_mask)
 
         hidden_states = self.norm(hidden_states)
+
+        # argonne5.0 pretrain KD with the head chunked (pretrain_kd --kd_chunked_head 1): kd_targets =
+        # (teacher top-K probs, their ids, rows per chunk). Returns loss = stack([hard, soft]) and no logits.
+        # At long context the student's full (T, vocab) logits are the HBM wall: 3.83 GiB at T=13,568 plus
+        # as much again for their gradient, which put KD at 13,568 out of reach on a 40 GB card even with
+        # ZeRO-1 (A5_KD_RECIPE N+295). Checked before the chunked-CE branch, which would otherwise take it.
+        if self.training and kd_targets is not None:
+            return CausalLMOutput(logits=None, loss=self._chunked_kd_terms(hidden_states, labels, *kd_targets))
 
         # Chunked cross-entropy (training only, flag-gated via config.loss_chunk_size): avoids
         # materializing the full (batch*seq, vocab) fp32 logit tensor -- the HBM wall at long context.
@@ -1067,6 +1076,38 @@ class ArgonneModel(PreTrainedModel):
         if not terms:
             return hidden_states.new_zeros(())
         return torch.stack(terms).mean()
+
+    @torch.compiler.disable
+    def _chunked_kd_terms(self, hidden_states, labels, tkp, tki, chunk_size):
+        """stack([hard, soft]): pretrain_kd.kd_hard_soft's two means over all B*T rows, computed from the
+        final hidden states so the full (rows, vocab) logits never exist. Each chunk runs lm_head, the
+        softcap and pretrain_kd._kd_chunk_terms (the probe's math, imported so there is one copy) under
+        torch.utils.checkpoint, so backward recomputes one chunk's logits at a time: peak logit memory is
+        chunk_size*vocab, at the price of one extra lm_head forward per chunk. Eager for the same reason
+        as _chunked_lm_loss below: inductor would fuse the chunks back into the full tensor."""
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        from pretrain_kd import _kd_chunk_terms
+        cap = float(self.config.logit_softcap)
+        H = hidden_states.reshape(-1, hidden_states.size(-1))
+        yf = labels.reshape(-1).to(H.device)
+        K = tkp.size(-1)
+        pf, idf = tkp.reshape(-1, K), tki.reshape(-1, K)
+        N = yf.numel()
+
+        def _seg(hc, yc, pc, ic):
+            lg = self.lm_head(hc)
+            if cap > 0:
+                lg = torch.tanh(lg / cap) * cap
+            return _kd_chunk_terms(lg, yc, pc, ic)
+
+        h_s = f_s = None
+        cs = max(1, int(chunk_size))
+        for c0 in range(0, N, cs):
+            sl = slice(c0, min(c0 + cs, N))
+            hc_, fc_ = _ckpt(_seg, H[sl], yf[sl], pf[sl], idf[sl], use_reentrant=False)
+            h_s = hc_ if h_s is None else h_s + hc_
+            f_s = fc_ if f_s is None else f_s + fc_
+        return torch.stack([h_s / N, f_s / N])
 
     @torch.compiler.disable
     def _chunked_lm_loss(self, hidden_states, labels, chunk_size):

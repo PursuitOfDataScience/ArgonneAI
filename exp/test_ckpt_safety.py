@@ -19,7 +19,9 @@ import tempfile
 import torch
 import torch.nn as nn
 
-TREES = ["/home/youzhi/ArgonneAI"]  # single tree since the 2026-08-23 worktree consolidation
+# The tree THIS file lives in, so a worktree (e.g. argonne5.0 at /home/youzhi/ArgonneAI-5.0) tests
+# its own trainers instead of silently re-testing the main clone. Single tree since 2026-08-23.
+TREES = [os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
 MODULES = ["pretrain", "continue_pretrain"]
 
 failures = []
